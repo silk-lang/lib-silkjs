@@ -98,6 +98,12 @@ for (const byteLength of [3, 5, 7]) {
 for (const args of [['x', -1], ['x', 0, -1], ['x', 0, 8], ['x', 0, 1, 'bad'], [42], ['x', 0.5]]) {
   record(['invalid', args], () => Buffer.alloc(4).write(...args));
 }
+// Buffer.concat with an explicit length truncates, zero-fills, or validates it.
+for (const length of [undefined, 0, 1, 5, 11, 20, 3.5, -1, '5', NaN]) {
+  record(['concat', String(length)], () => [...Buffer.concat([Buffer.from('hello'), new Uint8Array([32, 119, 111, 114, 108, 100])], length)]);
+}
+record(['concat', 'not bytes'], () => [...Buffer.concat([Buffer.from('a'), 'x'], 5)]);
+record(['concat', 'empty list'], () => Buffer.concat([], 5).length);
 // Representative consumer sizes, without putting slow JS per-unit work in the
 // assertion. Storage's quota-sized value is covered by its separate smoke.
 for (const string of ['x'.repeat(12000), ('A\ud83d\ude00\0').repeat(4000)]) {
