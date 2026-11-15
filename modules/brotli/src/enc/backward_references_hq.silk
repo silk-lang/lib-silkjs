@@ -4,8 +4,8 @@
 //! The costs are `float` (`f32`) as in C, computed in the same order. The `union` of `ZopfliNode`
 //! is a 32-bit field read as a cost or as an integer.
 //!
-//! Prepared (compound) dictionaries are not supported: the encoder has none, so
-//! `params.dictionary.compound` has no chunks and its total size (the "gap") is 0.
+//! With attached prepared dictionaries (`params.dictionary.compound`, here the `compound`
+//! argument) the searches also take the matches in them (`enc.compound_dictionary_hq`).
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
@@ -21,6 +21,8 @@ import silk.num.u16
 import silk.num.u32
 import silk.num.usize
 import enc.command { Command, INS_EXTRA, getInsertLengthCode }
+import enc.compound_dictionary { CompoundDictionary }
+import enc.compound_dictionary_hq { compoundDistanceCacheMatchLength, lookupAllCompoundDictionaryMatches, mergeMatches }
 import enc.constants { NUM_COMMAND_SYMBOLS, NUM_DISTANCE_SHORT_CODES, NUM_LITERAL_SYMBOLS, maxBackwardLimit }
 import enc.fast_log { fastLog2, log2FloorNonZero }
 import enc.hash_to_binary_tree { BackwardMatch, HASH_TYPE_LENGTH_H10, HashToBinaryTree, MAX_NUM_MATCHES_H10, STORE_LOOKAHEAD_H10, matchLength }
@@ -535,6 +537,7 @@ fn updateNodes(
   ringbuffer: &[u8],
   ringbufferMask: usize,
   params: &EncoderParams,
+  compound: &CompoundDictionary,
   maxBackwardLimit: usize,
   startingDistCache: &[i32; 16],
   numMatches: usize,
@@ -607,10 +610,16 @@ fn updateNodes(
           continue
         }
         len = matchLength(ringbuffer, prevIx, curIxMasked, maxLen)
+      } else if backward > dictionaryStart {
+        // The distances in (dictionary_start, dictionary_start + gap] address the chunks of the
+        // compound dictionary.
+        len = compoundDistanceCacheMatchLength(compound, dictionaryStart, backward, bestLen, continuation, ringbuffer, curIxMasked, maxLen)
+        if len == 0 {
+          j = j + 1
+          continue
+        }
       } else {
-        // SEAM: with a compound dictionary (gap > 0) the distances in
-        // (dictionary_start, dictionary_start + gap] address its chunks. Otherwise this is the
-        // "gray" area: it is addressable by decoder, but this encoder instance does not have that
+        // "Gray" area. It is addressable by decoder, but this encoder instance does not have that
         // data -> should not touch it.
         j = j + 1
         continue
@@ -743,6 +752,7 @@ fn zopfliIterate(
   ringbuffer: &[u8],
   ringbufferMask: usize,
   params: &EncoderParams,
+  compound: &CompoundDictionary,
   gap: usize,
   distCache: &[i32; 16],
   model: &ZopfliCostModel,
@@ -760,7 +770,7 @@ fn zopfliIterate(
   nodes[0].u = f32.toBits(0.0)
   let mut i: usize = 0
   while i + 3 < numBytes {
-    let mut skip = updateNodes(numBytes, position, i, ringbuffer, ringbufferMask, params, maxBackward, distCache, u32.toUsize(numMatches[i]), matches, curMatchPos, model, &mut queue, &mut nodes)
+    let mut skip = updateNodes(numBytes, position, i, ringbuffer, ringbufferMask, params, compound, maxBackward, distCache, u32.toUsize(numMatches[i]), matches, curMatchPos, model, &mut queue, &mut nodes)
     if skip < LONG_COPY_QUICK_STEP { skip = 0 }
     curMatchPos = curMatchPos + u32.toUsize(numMatches[i])
     if numMatches[i] == 1 && BackwardMatch.length(&matches[curMatchPos - 1]) > maxZopfli {
@@ -797,6 +807,7 @@ pub effect fn zopfliComputeShortestPath(
   ringbuffer: &[u8],
   ringbufferMask: usize,
   params: &EncoderParams,
+  compound: &CompoundDictionary,
   distCache: &[i32; 16],
   hasher: &mut HashToBinaryTree,
   nodes: &mut [ZopfliNode],
@@ -811,6 +822,7 @@ pub effect fn zopfliComputeShortestPath(
   let matches = List<BackwardMatch>.asMutSlice(&mut matchList)
   let storeEnd = if numBytes >= STORE_LOOKAHEAD_H10 { position + numBytes - STORE_LOOKAHEAD_H10 + 1 } else { position }
   let gap = params.dictionary.compoundTotalSize
+  let lzMatchesOffset = if compound.numChunks != 0 { MAX_NUM_MATCHES_H10 + 128 } else { 0 }
   nodes[0].length = 0
   nodes[0].u = f32.toBits(0.0)
   let mut model = run ZopfliCostModel.make(params.dist.alphabetSizeLimit, numBytes)
@@ -820,12 +832,17 @@ pub effect fn zopfliComputeShortestPath(
     let pos = position + i
     let maxDistance = if pos < maxBackward { pos } else { maxBackward }
     let dictionaryStart = if pos + streamOffset < maxBackward { pos + streamOffset } else { maxBackward }
-    let mut numMatches = HashToBinaryTree.findAllMatches(&mut hasher, ringbuffer, ringbufferMask, pos, numBytes - i, maxDistance, dictionaryStart + gap, params, &mut matches, 0)
+    let mut numMatches = HashToBinaryTree.findAllMatches(&mut hasher, ringbuffer, ringbufferMask, pos, numBytes - i, maxDistance, dictionaryStart + gap, params, &mut matches, lzMatchesOffset)
+    if compound.numChunks != 0 {
+      let cdMatches = lookupAllCompoundDictionaryMatches(compound, ringbuffer, ringbufferMask, pos, 3, numBytes - i, dictionaryStart, params.dist.maxDistance, &mut matches, lzMatchesOffset - 64, 64)
+      mergeMatches(&mut matches, 0, lzMatchesOffset - 64, cdMatches, lzMatchesOffset, numMatches)
+      numMatches = numMatches + cdMatches
+    }
     if numMatches > 0 && BackwardMatch.length(&matches[numMatches - 1]) > maxZopfli {
       matches[0] = matches[numMatches - 1]
       numMatches = 1
     }
-    let mut skip = updateNodes(numBytes, position, i, ringbuffer, ringbufferMask, params, maxBackward, distCache, numMatches, &matches, 0, &model, &mut queue, &mut nodes)
+    let mut skip = updateNodes(numBytes, position, i, ringbuffer, ringbufferMask, params, compound, maxBackward, distCache, numMatches, &matches, 0, &model, &mut queue, &mut nodes)
     if skip < LONG_COPY_QUICK_STEP { skip = 0 }
     if numMatches == 1 && BackwardMatch.length(&matches[0]) > maxZopfli {
       let l = BackwardMatch.length(&matches[0])
@@ -856,6 +873,7 @@ pub effect fn createZopfliBackwardReferences(
   ringbuffer: &[u8],
   ringbufferMask: usize,
   params: &EncoderParams,
+  compound: &CompoundDictionary,
   hasher: &mut HashToBinaryTree,
   distCache: &mut [i32; 16],
   lastInsertLen: &mut usize,
@@ -865,7 +883,7 @@ pub effect fn createZopfliBackwardReferences(
 ) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut nodeList = run makeZopfliNodes(numBytes + 1)
   let nodes = List<ZopfliNode>.asMutSlice(&mut nodeList)
-  let found = run zopfliComputeShortestPath(numBytes, position, ringbuffer, ringbufferMask, params, &distCache, &mut hasher, &mut nodes)
+  let found = run zopfliComputeShortestPath(numBytes, position, ringbuffer, ringbufferMask, params, compound, &distCache, &mut hasher, &mut nodes)
   numCommands.* = numCommands.* + found
   zopfliCreateCommands(numBytes, position, &nodes, &mut distCache, &mut lastInsertLen, params, &mut commands, &mut numLiterals)
 }
@@ -885,6 +903,7 @@ pub effect fn createHqZopfliBackwardReferences(
   ringbuffer: &[u8],
   ringbufferMask: usize,
   params: &EncoderParams,
+  compound: &CompoundDictionary,
   hasher: &mut HashToBinaryTree,
   distCache: &mut [i32; 16],
   lastInsertLen: &mut usize,
@@ -903,6 +922,7 @@ pub effect fn createHqZopfliBackwardReferences(
   let mut curMatchPos: usize = 0
   let mut matchesBuffer = run uninitializedMatches(matchesSize)
   let gap = params.dictionary.compoundTotalSize
+  let shadowMatches = if compound.numChunks != 0 { MAX_NUM_MATCHES_H10 + 128 } else { 0 }
   let mut i: usize = 0
   while i + HASH_TYPE_LENGTH_H10 - 1 < numBytes {
     let pos = position + i
@@ -910,7 +930,7 @@ pub effect fn createHqZopfliBackwardReferences(
     let dictionaryStart = if pos + streamOffset < maxBackward { pos + streamOffset } else { maxBackward }
     let maxLength = numBytes - i
     // Ensure that we have enough free slots (`BROTLI_ENSURE_CAPACITY`).
-    let required = curMatchPos + MAX_NUM_MATCHES_H10
+    let required = curMatchPos + MAX_NUM_MATCHES_H10 + shadowMatches
     if matchesSize < required {
       let mut newSize = if matchesSize == 0 { required } else { matchesSize }
       while newSize < required { newSize = newSize * 2 }
@@ -922,7 +942,12 @@ pub effect fn createHqZopfliBackwardReferences(
       matchesSize = newSize
     }
     let matches = unsafe RawBuffer.viewMut<BackwardMatch>(&mut matchesBuffer, 0, matchesSize)
-    let numFoundMatches = HashToBinaryTree.findAllMatches(&mut hasher, ringbuffer, ringbufferMask, pos, maxLength, maxDistance, dictionaryStart + gap, params, &mut matches, curMatchPos)
+    let mut numFoundMatches = HashToBinaryTree.findAllMatches(&mut hasher, ringbuffer, ringbufferMask, pos, maxLength, maxDistance, dictionaryStart + gap, params, &mut matches, curMatchPos + shadowMatches)
+    if compound.numChunks != 0 {
+      let cdMatches = lookupAllCompoundDictionaryMatches(compound, ringbuffer, ringbufferMask, pos, 3, maxLength, dictionaryStart, params.dist.maxDistance, &mut matches, curMatchPos + shadowMatches - 64, 64)
+      mergeMatches(&mut matches, curMatchPos, curMatchPos + shadowMatches - 64, cdMatches, curMatchPos + shadowMatches, numFoundMatches)
+      numFoundMatches = numFoundMatches + cdMatches
+    }
     let curMatchEnd = curMatchPos + numFoundMatches
     numMatches[i] = usize.wrappingToU32(numFoundMatches)
     if numFoundMatches > 0 {
@@ -973,7 +998,7 @@ pub effect fn createHqZopfliBackwardReferences(
     distCache[1] = origDistCache[1]
     distCache[2] = origDistCache[2]
     distCache[3] = origDistCache[3]
-    numCommands.* = numCommands.* + zopfliIterate(numBytes, position, ringbuffer, ringbufferMask, params, gap, &distCache, &model, &numMatches, matches, &mut nodes)
+    numCommands.* = numCommands.* + zopfliIterate(numBytes, position, ringbuffer, ringbufferMask, params, compound, gap, &distCache, &model, &numMatches, matches, &mut nodes)
     zopfliCreateCommands(numBytes, position, &nodes, &mut distCache, &mut lastInsertLen, params, &mut commands, &mut numLiterals)
     pass = pass + 1
   }
