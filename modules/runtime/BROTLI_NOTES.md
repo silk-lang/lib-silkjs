@@ -173,7 +173,8 @@ that follows the port; see below for that.
 
 Reading it:
 
-- Host noise is about 8%. Several rows are within it. Real gaps, confirmed by instruction counts:
+- (This table is from before the speed work.) Host noise is about 8%. Several rows are within it.
+  Real gaps, confirmed by instruction counts:
   the **decoder** executes 14 to 25% more instructions than C on literal- and command-heavy
   streams (768 KB of JavaScript: 17.5M against 15.3M at quality 1, 13.8M against 11.5M at 5,
   12.9M against 10.3M at 11; in the runtime, `processCommands` 255M against C's `ProcessCommands`
@@ -213,68 +214,88 @@ slower; see the `Slice.copyInto` wall). Peak RSS equal within 0.3 to 2.2 MB.
 
 ### After the speed work (final build)
 
-The same comparison, 7 interleaved rounds, on the build with both speed fixes (compat 79/79).
-Median Silk/C 0.98; compressed bytes identical in every row.
+The same comparison on the final build (compat 79/79), 9 interleaved rounds; Silk/C is the
+median of the per-round ratios. Compressed bytes identical in every row. **Median Silk/C 1.00.**
 
-| Case | Input | Quality | C MB/s | Silk MB/s | Silk/C | C peak MiB | Silk peak MiB | Output bytes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| compress | text | 1 | 153.7 | 155.3 | 1.01 | 45 | 48 | 304301 |
-| compress | text | 4 | 52.0 | 56.9 | 1.09 | 52 | 54 | 258264 |
-| compress | text | 6 | 36.2 | 27.0 | 0.75 | 53 | 56 | 231045 |
-| compress | text | 9 | 16.1 | 17.1 | 1.06 | 81 | 83 | 224322 |
-| compress | text | 11 | 0.6 | 0.6 | 1.11 | 66 | 69 | 138079 |
-| decompress | text | 5 | 299.9 | 293.1 | 0.98 | 51 | 54 | 67414426 |
-| compress | html | 1 | 171.5 | 178.5 | 1.04 | 51 | 53 | 390413 |
-| compress | html | 4 | 72.0 | 63.1 | 0.88 | 60 | 63 | 325421 |
-| compress | html | 6 | 42.0 | 33.8 | 0.80 | 61 | 64 | 282756 |
-| compress | html | 9 | 18.3 | 18.1 | 0.99 | 87 | 90 | 262555 |
-| compress | html | 11 | 0.6 | 0.6 | 1.05 | 81 | 84 | 117158 |
-| decompress | html | 5 | 425.5 | 414.1 | 0.97 | 59 | 62 | 67114368 |
-| compress | json | 1 | 159.7 | 149.5 | 0.94 | 53 | 56 | 374985 |
-| compress | json | 4 | 69.8 | 65.1 | 0.93 | 62 | 65 | 312685 |
-| compress | json | 6 | 41.5 | 35.1 | 0.85 | 63 | 66 | 299438 |
-| compress | json | 9 | 20.4 | 18.1 | 0.89 | 89 | 92 | 292556 |
-| compress | json | 11 | 0.5 | 0.6 | 1.02 | 81 | 84 | 126513 |
-| decompress | json | 5 | 433.6 | 408.4 | 0.94 | 61 | 64 | 67112256 |
-| compress | random | 1 | 185.7 | 179.4 | 0.97 | 50 | 52 | 2097157 |
-| compress | random | 4 | 106.5 | 102.1 | 0.96 | 55 | 58 | 2097157 |
-| compress | random | 6 | 84.1 | 84.9 | 1.01 | 57 | 59 | 2097157 |
-| compress | random | 9 | 41.4 | 43.0 | 1.04 | 83 | 86 | 2097160 |
-| compress | random | 11 | 2.1 | 2.3 | 1.10 | 60 | 62 | 1048581 |
-| decompress | random | 5 | 528.2 | 470.2 | 0.89 | 56 | 58 | 67108864 |
-| compress | binary | 1 | 5.4 | 5.7 | 1.04 | 110 | 112 | 7085509 |
-| compress | binary | 4 | 6.3 | 6.0 | 0.95 | 121 | 123 | 6095026 |
-| compress | binary | 6 | 7.0 | 6.3 | 0.91 | 119 | 122 | 5512274 |
-| compress | binary | 9 | 3.1 | 3.5 | 1.11 | 145 | 148 | 5372112 |
-| compress | binary | 11 | 0.5 | 0.5 | 1.04 | 127 | 130 | 981881 |
-| decompress | binary | 5 | 7.2 | 7.0 | 0.98 | 116 | 119 | 67108864 |
-| compress-stream | text | 1 | 31.8 | 31.8 | 1.00 | 46 | 48 | 459538 |
-| compress-stream | text | 4 | 28.6 | 25.3 | 0.88 | 49 | 52 | 261613 |
-| compress-stream | text | 6 | 20.2 | 17.9 | 0.89 | 51 | 54 | 232872 |
-| compress-stream | text | 9 | 10.5 | 11.2 | 1.06 | 81 | 84 | 223614 |
-| compress-stream | html | 11 | 0.6 | 0.6 | 0.98 | 81 | 84 | 117158 |
-| decompress-stream | text | 5 | 43.2 | 44.0 | 1.02 | 51 | 54 | 1465531 |
-| decompress-stream | binary | 5 | 29.7 | 27.1 | 0.91 | 116 | 119 | 16777216 |
-| compress-async | json | 5 | 127.6 | 120.1 | 0.94 | 132 | 134 | 2432592 |
-| compress-async | text | 9 | 54.2 | 52.5 | 0.97 | 336 | 338 | 1794576 |
-| fetch | html | 5 | 110.8 | 111.5 | 1.01 | 74 | 75 | 83892960 |
+| Case | Input | Quality | C MB/s | Silk MB/s | Silk/C | C peak MiB | Silk peak MiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| compress | text | 1 | 154.9 | 152.4 | 0.97 | 45 | 48 |
+| compress | text | 4 | 59.4 | 61.8 | 1.02 | 52 | 54 |
+| compress | text | 6 | 35.9 | 36.2 | 1.01 | 53 | 56 |
+| compress | text | 9 | 17.5 | 18.1 | 1.00 | 81 | 83 |
+| compress | text | 11 | 0.6 | 0.6 | 1.03 | 66 | 69 |
+| decompress | text | 5 | 344.2 | 325.3 | 0.95 | 51 | 53 |
+| compress | html | 1 | 177.5 | 186.9 | 1.06 | 51 | 53 |
+| compress | html | 4 | 73.0 | 74.2 | 1.03 | 60 | 63 |
+| compress | html | 6 | 43.4 | 44.1 | 1.04 | 61 | 64 |
+| compress | html | 9 | 19.3 | 20.0 | 1.06 | 87 | 90 |
+| compress | html | 11 | 0.6 | 0.6 | 1.00 | 81 | 83 |
+| decompress | html | 5 | 436.9 | 394.8 | 0.93 | 59 | 62 |
+| compress | json | 1 | 162.9 | 162.3 | 1.00 | 53 | 55 |
+| compress | json | 4 | 63.7 | 70.9 | 1.14 | 62 | 64 |
+| compress | json | 6 | 41.5 | 42.3 | 0.98 | 63 | 66 |
+| compress | json | 9 | 20.4 | 22.6 | 1.06 | 89 | 92 |
+| compress | json | 11 | 0.6 | 0.6 | 0.98 | 81 | 83 |
+| decompress | json | 5 | 440.2 | 395.2 | 0.92 | 61 | 64 |
+| compress | random | 1 | 181.8 | 190.5 | 1.05 | 50 | 52 |
+| compress | random | 4 | 110.2 | 109.9 | 0.95 | 55 | 57 |
+| compress | random | 6 | 91.6 | 89.5 | 0.94 | 57 | 59 |
+| compress | random | 9 | 46.6 | 48.2 | 1.02 | 83 | 86 |
+| compress | random | 11 | 2.4 | 2.7 | 1.12 | 60 | 62 |
+| decompress | random | 5 | 540.8 | 537.1 | 0.97 | 56 | 58 |
+| compress | binary | 1 | 6.3 | 6.2 | 0.93 | 109 | 112 |
+| compress | binary | 4 | 6.6 | 6.6 | 0.98 | 121 | 123 |
+| compress | binary | 6 | 7.7 | 7.7 | 1.02 | 119 | 121 |
+| compress | binary | 9 | 3.6 | 3.6 | 1.00 | 145 | 147 |
+| compress | binary | 11 | 0.6 | 0.6 | 1.04 | 127 | 129 |
+| decompress | binary | 5 | 7.5 | 7.4 | 0.97 | 116 | 119 |
+| compress-stream | text | 1 | 35.0 | 30.6 | 0.88 | 46 | 48 |
+| compress-stream | text | 4 | 32.3 | 26.6 | 0.93 | 49 | 52 |
+| compress-stream | text | 6 | 19.9 | 22.5 | 1.05 | 51 | 54 |
+| compress-stream | text | 9 | 11.3 | 12.5 | 0.99 | 81 | 83 |
+| compress-stream | html | 11 | 0.6 | 0.6 | 1.06 | 81 | 84 |
+| decompress-stream | text | 5 | 46.2 | 45.3 | 0.95 | 51 | 53 |
+| decompress-stream | binary | 5 | 32.5 | 28.2 | 0.91 | 116 | 119 |
+| compress-async | json | 5 | 128.3 | 131.9 | 1.02 | 133 | 135 |
+| compress-async | text | 9 | 54.5 | 52.8 | 1.01 | 336 | 339 |
+| fetch | html | 5 | 114.3 | 117.2 | 1.01 | 72 | 74 |
 
-- Decompression is at the C library's speed (0.89 to 1.02; the lowest row, stored random data,
-  is within this host's noise for a memory-bound copy).
-- Compression at qualities 1, 9 and 11 and on random and binary input is within noise.
-- **Quality 6 is slower: text 0.75, HTML 0.80, JSON 0.85.** Measured alone (best of 15
-  interleaved runs), text at quality 6 takes 44.7 ms against 38.8 ms in the runtime and 44.6
-  against 39.5 in the standalone tools, about 15%, with only 1 to 3% more instructions and the
-  same simulated cache misses and branch mispredictions (cachegrind: 226.2M against 223.9M
-  instructions, 3.95M D1 misses on both, 1.36M against 1.38M mispredictions). The cause: the
-  port had left out the C encoder's `PREFETCH_L1` of the bucket and tag lines in the H5, H6, H58
-  and H68 searches. A prefetch lets the cache miss overlap the search of the last distances;
-  cachegrind counts it as one instruction and does not model the overlap, which is why the
-  counts matched. A C build with the prefetch made a no-op was as slow as the port (1.049x C over
-  301 paired rounds). With the prefetches added, quality 6 on text is 0.99 of C (paired median of
-  15 runs), JSON at 9 0.96 to 0.97, text at 5 1.01; the quality 4 rows were within noise
-  already (their hashers have no prefetch in C either).
-- Peak RSS is 2 to 3 MiB higher in every row: the startup cost described above.
+- Every row is within this host's noise (about 8% per sample, more in the streamed rows, whose
+  time is mostly JavaScript stream overhead: the encoder is about 20 of their 44 ms). The rows
+  that read lowest were measured again alone: decompressing the 2 MB of JSON 30 times takes
+  74.8 ms against 97.1 ms (best of 15 paired runs; the port is faster here, and executes 974M
+  instructions against 1,142M), and quality 6 on text is 0.99 of C.
+- Quality 6 had been about 15% slower with equal instruction counts and cache behaviour. The
+  cause: the port had left out the C encoder's `PREFETCH_L1` of the bucket and tag lines in the
+  H5, H6, H58 and H68 searches. A prefetch lets the cache miss overlap the search of the last
+  distances; cachegrind counts it as one instruction and does not model the overlap. A C build
+  with the prefetch made a no-op was as slow as the port (1.049x C over 301 paired rounds). The
+  port now prefetches where C does (see the walls).
+- Peak RSS is 2 to 3 MiB higher in every row: the startup cost described above, not Brotli's
+  allocations (the codecs' own peak memory matches C's within 0.3 to 2.2 MB at tool level).
+
+## Upstreaming
+
+No standard library file was copied or changed: the runtime does not use the standard library's
+Brotli decoder or encoder, only `silk.compress.brotli_tables` (unchanged; its dictionary is the C
+library's by SHA-256). So there is no fix to upstream and no pull request on silk-lang/silk.
+`../brotli` is a new implementation, written to be movable (it knows nothing of Node or the
+runtime); whether it should replace or join `silk.compress.brotli` and
+`silk.compress.brotli_encode` is the owner's decision. The compiler walls below are the
+requests for the compiler.
+
+## Open
+
+- The startup function order (`tools/startup-order.txt`, `tools/server-order.txt`) is stale for
+  every build (38 of 896 names match), which costs every start several MiB of resident code and
+  makes the port's start 2 to 3 MiB heavier than the C library's. Regenerating it
+  (`tools/startup_order.py`) is a change for the whole runtime.
+- The decoder's distance tables are padded to 1,024 entries so a masked symbol needs no check:
+  4.3 KB more decoder state than C. Revert it if exact sizing matters more than two instructions
+  per command.
+- `differential.py`'s `dictionary` suite drives one dictionary per stream; several dictionaries,
+  attaching after the start and the serialized kind were checked with a private driver during
+  the port (1,549/1,549 for each of four seeds) and are not in the committed one.
 
 ## Compiler walls
 
