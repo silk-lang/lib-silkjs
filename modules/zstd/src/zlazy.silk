@@ -23,6 +23,7 @@ import silk.num.u64
 import silk.num.usize
 import silk.simd.u8x16
 import silk.simd.mask16
+import silk.mem.pointer { Pointer }
 
 const K_LAZY_SKIPPING_STEP: usize = 8
 /// `ZSTD_DUBT_UNSORTED_MARK`.
@@ -1203,3 +1204,641 @@ pub unsafe fn compressBlockLazyExtDictRow(ms: &mut MatchState, seqStore: &mut Se
 pub unsafe fn compressBlockLazy2ExtDictRow(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
   return unsafe lazyExtDictGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_ROW, 2)
 }
+
+// =================================================================================================
+// ---- `dictMatchState`: an attached CDict (`cdict.silk`). Added by the dictionary port: the
+// parser and the three search structures, specialized to `ZSTD_dictMatchState`. They follow the
+// noDict functions above, with the dictionary parts of `ZSTD_compressBlock_lazy_generic`,
+// `ZSTD_HcFindBestMatch`, `ZSTD_RowFindBestMatch`, `ZSTD_DUBT_findBestMatch` and
+// `ZSTD_DUBT_findBetterDictMatch`. ----
+// =================================================================================================
+
+/// The fields of the attached dictionary that the search reads.
+struct LazyDms {
+  hashTable: [*]mut u8,
+  chainTable: [*]mut u8,
+  tagTable: ?[*]mut u8,
+  hashLog: u32,
+  chainLog: u32,
+  rowHashLog: u32,
+  base: [*]const u8,
+  /// `dms.window.dictLimit`.
+  dictLimit: u32,
+  /// `dms.window.lowLimit`.
+  lowLimit: u32,
+  /// `dms.window.nextSrc - dms.window.base`.
+  endIndex: usize,
+}
+
+unsafe fn lazyDmsView(ms: &MatchState) -> LazyDms {
+  let anchor = ()
+  let dms = unsafe Pointer.borrow<(), MatchState>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut MatchState, *const MatchState>(ms.dictMatchState))
+  return LazyDms {
+    hashTable: dms.hashTable, chainTable: dms.chainTable, tagTable: dms.tagTable,
+    hashLog: dms.cParams.hashLog, chainLog: dms.cParams.chainLog, rowHashLog: dms.rowHashLog,
+    base: dms.window.base, dictLimit: dms.window.dictLimit, lowLimit: dms.window.lowLimit,
+    endIndex: mem.us(mem.addr(dms.window.nextSrc), mem.addr(dms.window.base)),
+  }
+}
+
+/// `ZSTD_HcFindBestMatch` with `ZSTD_dictMatchState`.
+@inlineAlways
+unsafe fn hcDmsFindBestMatch(ms: &mut MatchState, ip: usize, iLimit: usize, mls: u32) -> u64 {
+  let chainTable = ms.chainTable
+  let chainSize = mem.shl32(1, ms.cParams.chainLog)
+  let chainMask = mem.s32(chainSize, 1)
+  let base = ms.window.base
+  let dictLimit = ms.window.dictLimit
+  let dictLimitZ = mem.z(dictLimit)
+  let curr = mem.t32(ip)
+  let maxDistance = mem.shl32(1, ms.cParams.windowLog)
+  let lowestValid = ms.window.lowLimit
+  let withinMaxDistance = if mem.s32(curr, lowestValid) > maxDistance { mem.s32(curr, maxDistance) } else { lowestValid }
+  let lowLimit = if ms.loadedDictEnd != 0 { lowestValid } else { withinMaxDistance }
+  let minChain = if curr > chainSize { mem.s32(curr, chainSize) } else { 0 }
+  let mut nbAttempts = mem.shl32(1, ms.cParams.searchLog)
+  let mut ml: usize = 3
+  let mut offBase: u32 = NO_OFFBASE
+  let lazySkipping = ms.lazySkipping
+  let ip32 = unsafe mem.r32(base, ip)
+  let mut matchIndex = unsafe insertAndFindFirstIndex(&mut ms, base, ip, mls, lazySkipping)
+  while matchIndex >= lowLimit && nbAttempts > 0 {
+    let mut currentMl: usize = 0
+    let mIdx = mem.z(matchIndex)
+    if unsafe mem.r32(base, mem.us(mem.ua(mIdx, ml), 3)) == unsafe mem.r32(base, mem.us(mem.ua(ip, ml), 3)) {
+      currentMl = unsafe cstate.count(base, ip, base, mIdx, iLimit)
+    }
+    if currentMl > ml {
+      ml = currentMl
+      offBase = cstate.offsetToOffBase(mem.s32(curr, matchIndex))
+      if mem.ua(ip, currentMl) == iLimit { break }
+    }
+    if matchIndex <= minChain { break }
+    matchIndex = unsafe cstate.tget(chainTable, mem.z(matchIndex & chainMask))
+    nbAttempts = mem.s32(nbAttempts, 1)
+  }
+  // The chain of the dictionary, with the attempts that are left.
+  let d = unsafe lazyDmsView(&ms)
+  let dmsChainSize = mem.shl32(1, d.chainLog)
+  let dmsChainMask = mem.s32(dmsChainSize, 1)
+  let dmsLowestIndex = d.dictLimit
+  let dmsBase = d.base
+  let dmsEnd = d.endIndex
+  let dmsSize = mem.t32(dmsEnd)
+  let dmsIndexDelta = mem.s32(dictLimit, dmsSize)
+  let dmsMinChain = if dmsSize > dmsChainSize { mem.s32(dmsSize, dmsChainSize) } else { 0 }
+  matchIndex = unsafe cstate.tget(d.hashTable, unsafe cstate.hashPtr(base, ip, d.hashLog, mls))
+  while matchIndex >= dmsLowestIndex && nbAttempts > 0 {
+    let mut currentMl: usize = 0
+    let mIdx = mem.z(matchIndex)
+    if unsafe mem.r32(dmsBase, mIdx) == ip32 {
+      currentMl = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip, 4), iLimit, dmsBase, mem.ua(mIdx, 4), dmsEnd, dictLimitZ), 4)
+    }
+    if currentMl > ml {
+      ml = currentMl
+      offBase = cstate.offsetToOffBase(mem.s32(curr, mem.a32(matchIndex, dmsIndexDelta)))
+      if mem.ua(ip, currentMl) == iLimit { break }
+    }
+    if matchIndex <= dmsMinChain { break }
+    matchIndex = unsafe cstate.tget(d.chainTable, mem.z(matchIndex & dmsChainMask))
+    nbAttempts = mem.s32(nbAttempts, 1)
+  }
+  return pack(ml, offBase)
+}
+
+/// `ZSTD_RowFindBestMatch` with `ZSTD_dictMatchState`. As the reference, the candidates of a row
+/// are collected first (which counts the attempts), then compared.
+@inlineAlways
+unsafe fn rowDmsFindBestMatch(ms: &mut MatchState, ip: usize, iLimit: usize, mls: u32, rowLog: u32) -> u64 {
+  let hashTable = ms.hashTable
+  let tagTable = unsafe mem.nn(ms.tagTable)
+  let hBits = mem.a32(ms.rowHashLog, ROW_TAG_BITS)
+  let base = ms.window.base
+  let dictLimit = ms.window.dictLimit
+  let dictLimitZ = mem.z(dictLimit)
+  let curr = mem.t32(ip)
+  let maxDistance = mem.shl32(1, ms.cParams.windowLog)
+  let lowestValid = ms.window.lowLimit
+  let withinMaxDistance = if mem.s32(curr, lowestValid) > maxDistance { mem.s32(curr, maxDistance) } else { lowestValid }
+  let lowLimit = if ms.loadedDictEnd != 0 { lowestValid } else { withinMaxDistance }
+  let rowEntries = mem.shl32(1, rowLog)
+  let rowMask = mem.s32(rowEntries, 1)
+  let searchLog = ms.cParams.searchLog
+  let cappedSearchLog = if searchLog < rowLog { searchLog } else { rowLog }
+  let salt = ms.hashSalt
+  let mut nbAttempts = mem.shl32(1, cappedSearchLog)
+  let mut ml: usize = 3
+  let mut offBase: u32 = NO_OFFBASE
+  let mut hash: u32 = 0
+  // The row of the dictionary (its hash is not salted).
+  let d = unsafe lazyDmsView(&ms)
+  let dmsHash = mem.t32(unsafe cstate.hashPtr(base, ip, mem.a32(d.rowHashLog, ROW_TAG_BITS), mls))
+  let dmsRelRow = mem.z(mem.shl32(mem.shr32(dmsHash, ROW_TAG_BITS), rowLog))
+  let dmsTag = u32.wrappingToU8(dmsHash)
+  let dmsTagRow = unsafe mem.add(unsafe mem.nn(d.tagTable), dmsRelRow)
+  let dmsRow = unsafe mem.add(d.hashTable, usize.wrappingMultiply(dmsRelRow, 4))
+  // Update the rows up to (but not including) ip.
+  if !ms.lazySkipping {
+    unsafe rowUpdateInternal(&mut ms, base, ip, mls, rowLog, rowMask, true)
+    hash = unsafe rowNextCachedHash(&mut ms, base, curr, hBits, rowLog, mls, salt)
+  } else {
+    hash = unsafe hashSalted(base, ip, hBits, mls, salt)
+    ms.nextToUpdate = curr
+  }
+  ms.hashSaltEntropy = mem.a32(ms.hashSaltEntropy, hash)
+  let relRow = mem.z(mem.shl32(mem.shr32(hash, ROW_TAG_BITS), rowLog))
+  let tag = u32.wrappingToU8(hash)
+  let row = unsafe mem.add(hashTable, usize.wrappingMultiply(relRow, 4))
+  let tagRow = unsafe mem.add(tagTable, relRow)
+  let head = u8.toU32(unsafe mem.r8(unsafe mem.ro(tagRow), 0)) & rowMask
+  let mut matches = unsafe rowMatchMask(unsafe mem.ro(tagRow), tag, head, rowEntries)
+  let ip32 = unsafe mem.r32(base, ip)
+  let mut buffer: [u32; 64] = [0; 64]
+  let mut numMatches: usize = 0
+  while matches != 0 && nbAttempts > 0 {
+    let matchPos = mem.z(mem.a32(head, u64.trailingZeros(matches)) & rowMask)
+    matches = matches & u64.wrappingSubtract(matches, 1)
+    if matchPos == 0 { continue }
+    let matchIndex = unsafe cstate.tget(row, matchPos)
+    if matchIndex < lowLimit { break }
+    buffer[numMatches] = matchIndex
+    numMatches = numMatches + 1
+    nbAttempts = mem.s32(nbAttempts, 1)
+  }
+  // Insert the current position too.
+  let pos = unsafe rowNextIndex(tagRow, rowMask)
+  unsafe mem.w8(tagRow, pos, tag)
+  let inserted = ms.nextToUpdate
+  unsafe cstate.tset(row, pos, inserted)
+  ms.nextToUpdate = mem.a32(inserted, 1)
+  // The longest match.
+  let mut k: usize = 0
+  while k < numMatches {
+    let matchIndex = buffer[k]
+    let mIdx = mem.z(matchIndex)
+    let mut currentMl: usize = 0
+    if unsafe mem.r32(base, mem.us(mem.ua(mIdx, ml), 3)) == unsafe mem.r32(base, mem.us(mem.ua(ip, ml), 3)) {
+      currentMl = unsafe cstate.count(base, ip, base, mIdx, iLimit)
+    }
+    if currentMl > ml {
+      ml = currentMl
+      offBase = cstate.offsetToOffBase(mem.s32(curr, matchIndex))
+      if mem.ua(ip, currentMl) == iLimit { break }
+    }
+    k = k + 1
+  }
+  // The row of the dictionary, with the attempts that are left.
+  let dmsLowestIndex = d.dictLimit
+  let dmsBase = d.base
+  let dmsEnd = d.endIndex
+  let dmsIndexDelta = mem.s32(dictLimit, mem.t32(dmsEnd))
+  let dmsHead = u8.toU32(unsafe mem.r8(unsafe mem.ro(dmsTagRow), 0)) & rowMask
+  let mut dmsMatches = unsafe rowMatchMask(unsafe mem.ro(dmsTagRow), dmsTag, dmsHead, rowEntries)
+  numMatches = 0
+  while dmsMatches != 0 && nbAttempts > 0 {
+    let matchPos = mem.z(mem.a32(dmsHead, u64.trailingZeros(dmsMatches)) & rowMask)
+    dmsMatches = dmsMatches & u64.wrappingSubtract(dmsMatches, 1)
+    if matchPos == 0 { continue }
+    let matchIndex = unsafe cstate.tget(dmsRow, matchPos)
+    if matchIndex < dmsLowestIndex { break }
+    buffer[numMatches] = matchIndex
+    numMatches = numMatches + 1
+    nbAttempts = mem.s32(nbAttempts, 1)
+  }
+  k = 0
+  while k < numMatches {
+    let matchIndex = buffer[k]
+    let mIdx = mem.z(matchIndex)
+    let mut currentMl: usize = 0
+    if unsafe mem.r32(dmsBase, mIdx) == ip32 {
+      currentMl = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip, 4), iLimit, dmsBase, mem.ua(mIdx, 4), dmsEnd, dictLimitZ), 4)
+    }
+    if currentMl > ml {
+      ml = currentMl
+      offBase = cstate.offsetToOffBase(mem.s32(curr, mem.a32(matchIndex, dmsIndexDelta)))
+      if mem.ua(ip, currentMl) == iLimit { break }
+    }
+    k = k + 1
+  }
+  return pack(ml, offBase)
+}
+
+/// `ZSTD_DUBT_findBetterDictMatch`: searches the (sorted) tree of the dictionary with the
+/// compares that are left. Returns the best length and `offBase`.
+@inlineAlways
+unsafe fn dubtFindBetterDictMatch(ms: &MatchState, ip: usize, iend: usize, offBase0: u32, bestLength0: usize, nbCompares0: u32, mls: u32) -> u64 {
+  let d = unsafe lazyDmsView(&ms)
+  let base = ms.window.base
+  let h = unsafe cstate.hashPtr(base, ip, d.hashLog, mls)
+  let mut dictMatchIndex = unsafe cstate.tget(d.hashTable, h)
+  let prefixStart = mem.z(ms.window.dictLimit)
+  let curr = mem.t32(ip)
+  let dictBase = d.base
+  let dictEnd = d.endIndex
+  let dictHighLimit = mem.t32(dictEnd)
+  let dictLowLimit = d.lowLimit
+  let dictIndexDelta = mem.s32(ms.window.lowLimit, dictHighLimit)
+  let dictBt = d.chainTable
+  let btLog = mem.s32(d.chainLog, 1)
+  let btMask = mem.s32(mem.shl32(1, btLog), 1)
+  let btLow = if btMask >= mem.s32(dictHighLimit, dictLowLimit) { dictLowLimit } else { mem.s32(dictHighLimit, btMask) }
+  let mut commonLengthSmaller: usize = 0
+  let mut commonLengthLarger: usize = 0
+  let mut bestLength = bestLength0
+  let mut offBase = offBase0
+  let mut nbCompares = nbCompares0
+  while nbCompares != 0 && dictMatchIndex > dictLowLimit {
+    let nextPtr = usize.wrappingMultiply(mem.z(dictMatchIndex & btMask), 2)
+    let mut matchLength = if commonLengthSmaller < commonLengthLarger { commonLengthSmaller } else { commonLengthLarger }
+    let mut mBase = dictBase
+    let mut mPos = mem.z(dictMatchIndex)
+    matchLength = mem.ua(matchLength, unsafe cstate.count2segments(base, mem.ua(ip, matchLength), iend, dictBase, mem.ua(mPos, matchLength), dictEnd, prefixStart))
+    if mem.ua(mem.z(dictMatchIndex), matchLength) >= mem.z(dictHighLimit) {
+      // Prepare the next read of match[matchLength].
+      mBase = base
+      mPos = mem.ua(mem.z(dictMatchIndex), mem.z(dictIndexDelta))
+    }
+    if matchLength > bestLength {
+      let matchIndex = mem.a32(dictMatchIndex, dictIndexDelta)
+      if 4 * gi(mem.us(matchLength, bestLength)) > hb(mem.a32(mem.s32(curr, matchIndex), 1)) - hb(mem.a32(offBase, 1)) {
+        bestLength = matchLength
+        offBase = cstate.offsetToOffBase(mem.s32(curr, matchIndex))
+      }
+      // The end of the input: no way to know which is larger.
+      if mem.ua(ip, matchLength) == iend { break }
+    }
+    if unsafe mem.r8(mBase, mem.ua(mPos, matchLength)) < unsafe mem.r8(base, mem.ua(ip, matchLength)) {
+      if dictMatchIndex <= btLow { break }
+      commonLengthSmaller = matchLength
+      dictMatchIndex = unsafe cstate.tget(dictBt, mem.ua(nextPtr, 1))
+    } else {
+      if dictMatchIndex <= btLow { break }
+      commonLengthLarger = matchLength
+      dictMatchIndex = unsafe cstate.tget(dictBt, nextPtr)
+    }
+    nbCompares = mem.s32(nbCompares, 1)
+  }
+  return pack(bestLength, offBase)
+}
+
+/// `ZSTD_DUBT_findBestMatch` with `ZSTD_dictMatchState`.
+@inlineAlways
+unsafe fn dubtDmsFindBestMatch(ms: &mut MatchState, base: [*]const u8, ip: usize, iend: usize, mls: u32) -> u64 {
+  let hashTable = ms.hashTable
+  let hashLog = ms.cParams.hashLog
+  let h = unsafe cstate.hashPtr(base, ip, hashLog, mls)
+  let mut matchIndex = unsafe cstate.tget(hashTable, h)
+  let curr = mem.t32(ip)
+  let windowLog = ms.cParams.windowLog
+  let windowLow = cstate.getLowestMatchIndex(&ms, curr, windowLog)
+  let bt = ms.chainTable
+  let btLog = mem.s32(ms.cParams.chainLog, 1)
+  let btMask = mem.s32(mem.shl32(1, btLog), 1)
+  let btLow = if btMask >= curr { 0 } else { mem.s32(curr, btMask) }
+  let unsortLimit = if btLow > windowLow { btLow } else { windowLow }
+  let mut nextCandidate = usize.wrappingMultiply(mem.z(matchIndex & btMask), 2)
+  let mut unsortedMark = mem.ua(nextCandidate, 1)
+  let mut nbCompares = mem.shl32(1, ms.cParams.searchLog)
+  let mut nbCandidates = nbCompares
+  let mut previousCandidate: u32 = 0
+  while matchIndex > unsortLimit && unsafe cstate.tget(bt, unsortedMark) == DUBT_UNSORTED_MARK && nbCandidates > 1 {
+    unsafe cstate.tset(bt, unsortedMark, previousCandidate)
+    previousCandidate = matchIndex
+    matchIndex = unsafe cstate.tget(bt, nextCandidate)
+    nextCandidate = usize.wrappingMultiply(mem.z(matchIndex & btMask), 2)
+    unsortedMark = mem.ua(nextCandidate, 1)
+    nbCandidates = mem.s32(nbCandidates, 1)
+  }
+  if matchIndex > unsortLimit && unsafe cstate.tget(bt, unsortedMark) == DUBT_UNSORTED_MARK {
+    unsafe cstate.tset(bt, unsortedMark, 0)
+    unsafe cstate.tset(bt, nextCandidate, 0)
+  }
+  matchIndex = previousCandidate
+  while matchIndex != 0 {
+    let nextCandidateIdx = unsafe cstate.tget(bt, mem.ua(usize.wrappingMultiply(mem.z(matchIndex & btMask), 2), 1))
+    // (A dictMatchState window has one segment: the insertion is the one of noDict.)
+    unsafe insertDUBT1(&ms, matchIndex, iend, nbCandidates, unsortLimit, cstate.NO_DICT)
+    matchIndex = nextCandidateIdx
+    nbCandidates = mem.a32(nbCandidates, 1)
+  }
+  let mut commonLengthSmaller: usize = 0
+  let mut commonLengthLarger: usize = 0
+  let mut smallerPtr = usize.wrappingMultiply(mem.z(curr & btMask), 2)
+  let mut largerPtr = mem.ua(smallerPtr, 1)
+  let mut matchEndIdx = mem.a32(curr, 9)
+  let mut bestLength: usize = 0
+  let mut offBase: u32 = NO_OFFBASE
+  matchIndex = unsafe cstate.tget(hashTable, h)
+  unsafe cstate.tset(hashTable, h, curr)
+  while nbCompares != 0 && matchIndex > windowLow {
+    let nextPtr = usize.wrappingMultiply(mem.z(matchIndex & btMask), 2)
+    let mut matchLength = if commonLengthSmaller < commonLengthLarger { commonLengthSmaller } else { commonLengthLarger }
+    let mIdx = mem.z(matchIndex)
+    matchLength = mem.ua(matchLength, unsafe cstate.count(base, mem.ua(ip, matchLength), base, mem.ua(mIdx, matchLength), iend))
+    if matchLength > bestLength {
+      if matchLength > mem.z(mem.s32(matchEndIdx, matchIndex)) { matchEndIdx = mem.a32(matchIndex, mem.t32(matchLength)) }
+      if 4 * gi(mem.us(matchLength, bestLength)) > hb(mem.a32(mem.s32(curr, matchIndex), 1)) - hb(offBase) {
+        bestLength = matchLength
+        offBase = cstate.offsetToOffBase(mem.s32(curr, matchIndex))
+      }
+      if mem.ua(ip, matchLength) == iend {
+        // Also skip the search of the dictionary.
+        nbCompares = 0
+        break
+      }
+    }
+    if unsafe mem.r8(base, mem.ua(mIdx, matchLength)) < unsafe mem.r8(base, mem.ua(ip, matchLength)) {
+      unsafe cstate.tset(bt, smallerPtr, matchIndex)
+      commonLengthSmaller = matchLength
+      if matchIndex <= btLow { smallerPtr = DUMMY break }
+      smallerPtr = mem.ua(nextPtr, 1)
+      matchIndex = unsafe cstate.tget(bt, mem.ua(nextPtr, 1))
+    } else {
+      unsafe cstate.tset(bt, largerPtr, matchIndex)
+      commonLengthLarger = matchLength
+      if matchIndex <= btLow { largerPtr = DUMMY break }
+      largerPtr = nextPtr
+      matchIndex = unsafe cstate.tget(bt, nextPtr)
+    }
+    nbCompares = mem.s32(nbCompares, 1)
+  }
+  if largerPtr != DUMMY { unsafe cstate.tset(bt, largerPtr, 0) }
+  if smallerPtr != DUMMY { unsafe cstate.tset(bt, smallerPtr, 0) }
+  if nbCompares != 0 {
+    let r = unsafe dubtFindBetterDictMatch(&ms, ip, iend, offBase, bestLength, nbCompares, mls)
+    bestLength = packedLength(r)
+    offBase = packedOffBase(r)
+  }
+  ms.nextToUpdate = mem.s32(matchEndIdx, 8)
+  return pack(bestLength, offBase)
+}
+
+@inlineAlways
+unsafe fn btDmsFindBestMatch(ms: &mut MatchState, ip: usize, iLimit: usize, mls: u32) -> u64 {
+  let base = ms.window.base
+  if ip < mem.z(ms.nextToUpdate) { return pack(0, NO_OFFBASE) }
+  unsafe updateDUBT(&mut ms, base, ip, mls)
+  return unsafe dubtDmsFindBestMatch(&mut ms, base, ip, iLimit, mls)
+}
+
+@inlineNever
+unsafe fn hcDms4(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe hcDmsFindBestMatch(&mut ms, ip, iLimit, 4) }
+@inlineNever
+unsafe fn hcDms5(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe hcDmsFindBestMatch(&mut ms, ip, iLimit, 5) }
+@inlineNever
+unsafe fn hcDms6(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe hcDmsFindBestMatch(&mut ms, ip, iLimit, 6) }
+@inlineNever
+unsafe fn btDms4(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe btDmsFindBestMatch(&mut ms, ip, iLimit, 4) }
+@inlineNever
+unsafe fn btDms5(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe btDmsFindBestMatch(&mut ms, ip, iLimit, 5) }
+@inlineNever
+unsafe fn btDms6(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe btDmsFindBestMatch(&mut ms, ip, iLimit, 6) }
+@inlineNever
+unsafe fn rowDms44(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 4, 4) }
+@inlineNever
+unsafe fn rowDms45(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 4, 5) }
+@inlineNever
+unsafe fn rowDms46(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 4, 6) }
+@inlineNever
+unsafe fn rowDms54(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 5, 4) }
+@inlineNever
+unsafe fn rowDms55(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 5, 5) }
+@inlineNever
+unsafe fn rowDms56(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 5, 6) }
+@inlineNever
+unsafe fn rowDms64(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 6, 4) }
+@inlineNever
+unsafe fn rowDms65(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 6, 5) }
+@inlineNever
+unsafe fn rowDms66(ms: &mut MatchState, ip: usize, iLimit: usize) -> u64 { return unsafe rowDmsFindBestMatch(&mut ms, ip, iLimit, 6, 6) }
+
+@inlineAlways
+unsafe fn searchMaxDms(ms: &mut MatchState, ip: usize, iend: usize, mls: u32, rowLog: u32, searchMethod: u32) -> u64 {
+  if searchMethod == SEARCH_HC {
+    if mls == 4 { return unsafe hcDms4(&mut ms, ip, iend) }
+    if mls == 5 { return unsafe hcDms5(&mut ms, ip, iend) }
+    return unsafe hcDms6(&mut ms, ip, iend)
+  }
+  if searchMethod == SEARCH_BT {
+    if mls == 4 { return unsafe btDms4(&mut ms, ip, iend) }
+    if mls == 5 { return unsafe btDms5(&mut ms, ip, iend) }
+    return unsafe btDms6(&mut ms, ip, iend)
+  }
+  if mls == 4 {
+    if rowLog == 4 { return unsafe rowDms44(&mut ms, ip, iend) }
+    if rowLog == 5 { return unsafe rowDms45(&mut ms, ip, iend) }
+    return unsafe rowDms46(&mut ms, ip, iend)
+  }
+  if mls == 5 {
+    if rowLog == 4 { return unsafe rowDms54(&mut ms, ip, iend) }
+    if rowLog == 5 { return unsafe rowDms55(&mut ms, ip, iend) }
+    return unsafe rowDms56(&mut ms, ip, iend)
+  }
+  if rowLog == 4 { return unsafe rowDms64(&mut ms, ip, iend) }
+  if rowLog == 5 { return unsafe rowDms65(&mut ms, ip, iend) }
+  return unsafe rowDms66(&mut ms, ip, iend)
+}
+
+/// `ZSTD_compressBlock_lazy_generic` with `ZSTD_dictMatchState`.
+@inlineAlways
+unsafe fn lazyDmsGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize, searchMethod: u32, depth: u32) -> usize {
+  let base = ms.window.base
+  let istart = mem.us(mem.addr(src), mem.addr(base))
+  let mut ip = istart
+  let mut anchor = istart
+  let iend = mem.ua(istart, srcSize)
+  let ilimit = if searchMethod == SEARCH_ROW { mem.us(iend, 8 + ROW_CACHE_SIZE) } else { mem.us(iend, 8) }
+  let prefixLowestIndex = ms.window.dictLimit
+  let prefixLowest = mem.z(prefixLowestIndex)
+  let mls = bounded46(ms.cParams.minMatch)
+  let rowLog = bounded46(ms.cParams.searchLog)
+  let mut offset1 = unsafe mem.r32(unsafe mem.ro(rep), 0)
+  let mut offset2 = unsafe mem.r32(unsafe mem.ro(rep), 4)
+  let d = unsafe lazyDmsView(&ms)
+  let dictLowestIndex = d.dictLimit
+  let dictBase = d.base
+  let dictLowest = mem.z(dictLowestIndex)
+  let dictEnd = d.endIndex
+  let dictIndexDelta = mem.s32(prefixLowestIndex, mem.t32(dictEnd))
+  let dictAndPrefixLength = mem.t32(mem.ua(mem.us(ip, prefixLowest), mem.us(dictEnd, dictLowest)))
+  if dictAndPrefixLength == 0 { ip = mem.ua(ip, 1) }
+  ms.lazySkipping = false
+  if searchMethod == SEARCH_ROW {
+    let nextToUpdate = ms.nextToUpdate
+    unsafe rowFillHashCache(&mut ms, base, rowLog, mls, nextToUpdate, ilimit)
+  }
+  while slt(ip, ilimit) {
+    let mut matchLength: usize = 0
+    let mut offBase: u32 = cstate.REPCODE1
+    let mut start = mem.ua(ip, 1)
+    let mut found = false
+    // Check the repeat offset.
+    let repIndex = mem.s32(mem.a32(mem.t32(ip), 1), offset1)
+    let repInDict = repIndex < prefixLowestIndex
+    let repBase = if repInDict { dictBase } else { base }
+    let repPos = if repInDict { mem.z(mem.s32(repIndex, dictIndexDelta)) } else { mem.z(repIndex) }
+    if cstate.indexOverlapCheck(prefixLowestIndex, repIndex) && unsafe mem.r32(repBase, repPos) == unsafe mem.r32(base, mem.ua(ip, 1)) {
+      let repMatchEnd = if repInDict { dictEnd } else { iend }
+      matchLength = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip, 5), iend, repBase, mem.ua(repPos, 4), repMatchEnd, prefixLowest), 4)
+      if depth == 0 { found = true }
+    }
+    if !found {
+      // First search (depth 0).
+      let r0 = unsafe searchMaxDms(&mut ms, ip, iend, mls, rowLog, searchMethod)
+      if packedLength(r0) > matchLength {
+        matchLength = packedLength(r0)
+        start = ip
+        offBase = packedOffBase(r0)
+      }
+      if matchLength < 4 {
+        let step = mem.ua(mem.shrz(mem.us(ip, anchor), cstate.K_SEARCH_STRENGTH), 1)
+        ip = mem.ua(ip, step)
+        ms.lazySkipping = step > K_LAZY_SKIPPING_STEP
+        continue
+      }
+      if depth >= 1 {
+        while slt(ip, ilimit) {
+          ip = mem.ua(ip, 1)
+          let ri1 = mem.s32(mem.t32(ip), offset1)
+          let in1 = ri1 < prefixLowestIndex
+          let rb1 = if in1 { dictBase } else { base }
+          let rp1 = if in1 { mem.z(mem.s32(ri1, dictIndexDelta)) } else { mem.z(ri1) }
+          if cstate.indexOverlapCheck(prefixLowestIndex, ri1) && unsafe mem.r32(rb1, rp1) == unsafe mem.r32(base, ip) {
+            let re1 = if in1 { dictEnd } else { iend }
+            let mlRep = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip, 4), iend, rb1, mem.ua(rp1, 4), re1, prefixLowest), 4)
+            let gain2 = gi(mlRep) * 3
+            let gain1 = gi(matchLength) * 3 - hb(offBase) + 1
+            if mlRep >= 4 && gain2 > gain1 {
+              matchLength = mlRep
+              offBase = cstate.REPCODE1
+              start = ip
+            }
+          }
+          let r1 = unsafe searchMaxDms(&mut ms, ip, iend, mls, rowLog, searchMethod)
+          let ml1 = packedLength(r1)
+          if ml1 >= 4 && gi(ml1) * 4 - hb(packedOffBase(r1)) > gi(matchLength) * 4 - hb(offBase) + 4 {
+            matchLength = ml1
+            offBase = packedOffBase(r1)
+            start = ip
+            continue
+          }
+          if depth == 2 && slt(ip, ilimit) {
+            ip = mem.ua(ip, 1)
+            let ri2 = mem.s32(mem.t32(ip), offset1)
+            let in2 = ri2 < prefixLowestIndex
+            let rb2 = if in2 { dictBase } else { base }
+            let rp2 = if in2 { mem.z(mem.s32(ri2, dictIndexDelta)) } else { mem.z(ri2) }
+            if cstate.indexOverlapCheck(prefixLowestIndex, ri2) && unsafe mem.r32(rb2, rp2) == unsafe mem.r32(base, ip) {
+              let re2 = if in2 { dictEnd } else { iend }
+              let mlRep = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip, 4), iend, rb2, mem.ua(rp2, 4), re2, prefixLowest), 4)
+              let gain2 = gi(mlRep) * 4
+              let gain1 = gi(matchLength) * 4 - hb(offBase) + 1
+              if mlRep >= 4 && gain2 > gain1 {
+                matchLength = mlRep
+                offBase = cstate.REPCODE1
+                start = ip
+              }
+            }
+            let r2 = unsafe searchMaxDms(&mut ms, ip, iend, mls, rowLog, searchMethod)
+            let ml2 = packedLength(r2)
+            if ml2 >= 4 && gi(ml2) * 4 - hb(packedOffBase(r2)) > gi(matchLength) * 4 - hb(offBase) + 7 {
+              matchLength = ml2
+              offBase = packedOffBase(r2)
+              start = ip
+              continue
+            }
+          }
+          break
+        }
+      }
+      // Catch up, in the prefix or in the dictionary.
+      if offBase > cstate.REP_NUM {
+        let offset = mem.s32(offBase, cstate.REP_NUM)
+        let matchIndex = mem.s32(mem.t32(start), offset)
+        let mInDict = matchIndex < prefixLowestIndex
+        let mBase = if mInDict { dictBase } else { base }
+        let mut mPos = if mInDict { mem.z(mem.s32(matchIndex, dictIndexDelta)) } else { mem.z(matchIndex) }
+        let mStart = if mInDict { dictLowest } else { prefixLowest }
+        while start > anchor && mPos > mStart && unsafe mem.r8(base, mem.us(start, 1)) == unsafe mem.r8(mBase, mem.us(mPos, 1)) {
+          start = mem.us(start, 1)
+          mPos = mem.us(mPos, 1)
+          matchLength = mem.ua(matchLength, 1)
+        }
+        offset2 = offset1
+        offset1 = offset
+      }
+    }
+    // Store the sequence.
+    unsafe cstate.storeSeq(&mut seqStore, mem.us(start, anchor), base, anchor, iend, offBase, matchLength)
+    ip = mem.ua(start, matchLength)
+    anchor = ip
+    if ms.lazySkipping {
+      if searchMethod == SEARCH_ROW {
+        let nextToUpdate = ms.nextToUpdate
+        unsafe rowFillHashCache(&mut ms, base, rowLog, mls, nextToUpdate, ilimit)
+      }
+      ms.lazySkipping = false
+    }
+    // Check the immediate repeat offset.
+    while sle(ip, ilimit) {
+      let current2 = mem.t32(ip)
+      let ri = mem.s32(current2, offset2)
+      let inD = ri < prefixLowestIndex
+      let rb = if inD { dictBase } else { base }
+      let rp = if inD { mem.z(mem.s32(ri, dictIndexDelta)) } else { mem.z(ri) }
+      if cstate.indexOverlapCheck(prefixLowestIndex, ri) && unsafe mem.r32(rb, rp) == unsafe mem.r32(base, ip) {
+        let repEnd2 = if inD { dictEnd } else { iend }
+        matchLength = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip, 4), iend, rb, mem.ua(rp, 4), repEnd2, prefixLowest), 4)
+        let swapped = offset2
+        offset2 = offset1
+        offset1 = swapped
+        unsafe cstate.storeSeq(&mut seqStore, 0, base, anchor, iend, cstate.REPCODE1, matchLength)
+        ip = mem.ua(ip, matchLength)
+        anchor = ip
+        continue
+      }
+      break
+    }
+  }
+  // Save the repeat offsets for the next block.
+  unsafe mem.w32(rep, 0, offset1)
+  unsafe mem.w32(rep, 4, offset2)
+  return mem.us(iend, anchor)
+}
+
+/// `ZSTD_compressBlock_greedy_dictMatchState`.
+@inlineNever
+pub unsafe fn compressBlockGreedyDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_HC, 0)
+}
+/// `ZSTD_compressBlock_lazy_dictMatchState`.
+@inlineNever
+pub unsafe fn compressBlockLazyDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_HC, 1)
+}
+/// `ZSTD_compressBlock_lazy2_dictMatchState`.
+@inlineNever
+pub unsafe fn compressBlockLazy2DictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_HC, 2)
+}
+/// `ZSTD_compressBlock_btlazy2_dictMatchState`.
+@inlineNever
+pub unsafe fn compressBlockBtlazy2DictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_BT, 2)
+}
+/// `ZSTD_compressBlock_greedy_dictMatchState_row`.
+@inlineNever
+pub unsafe fn compressBlockGreedyDictMatchStateRow(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_ROW, 0)
+}
+/// `ZSTD_compressBlock_lazy_dictMatchState_row`.
+@inlineNever
+pub unsafe fn compressBlockLazyDictMatchStateRow(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_ROW, 1)
+}
+/// `ZSTD_compressBlock_lazy2_dictMatchState_row`.
+@inlineNever
+pub unsafe fn compressBlockLazy2DictMatchStateRow(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe lazyDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, SEARCH_ROW, 2)
+}
+// ---- (end of the dictMatchState section) ----

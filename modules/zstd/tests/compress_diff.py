@@ -8,6 +8,12 @@ runs are also decoded with the reference `zstd -d`. `--node` adds a comparison o
 with Node's zlib.zstdCompressSync.
 
   python3 tests/compress_diff.py [--full] [--node] [--filter SUBSTR] [-j N]
+  python3 tests/compress_diff.py --dict [--full] [--node] [--filter SUBSTR] [-j N]
+
+`--dict` runs the dictionary cases instead (ZDICT, ZRESET, ZDROP, ZMIDLOAD of tools/cli): trained
+and raw-content dictionaries of several sizes, corrupt dictionaries, inputs on both sides of the
+attach / copy cut-offs, several frames from one context. Their outputs are also decoded with
+`zstd -d -D` and with tools/dcli (ZDICT). The dictionaries are made in ZSTD_SCRATCH/dicts.
 
 Paths can be changed with ZSTD_REF (reference source tree with lib/libzstd.a and programs/zstd),
 ZSTD_CORPUS (directory of corpus files), ZSTD_NODE and ZSTD_SCRATCH.
@@ -22,6 +28,7 @@ CORPUS = os.environ.get('ZSTD_CORPUS', '/home/user/corpus')
 NODE = os.environ.get('ZSTD_NODE', '/opt/node24/bin/node')
 SCRATCH = os.environ.get('ZSTD_SCRATCH', '/home/user/zdev/agent-core/difftest')
 CLI = os.path.join(PKG, 'tools/cli/build/llvm/x86_64-unknown-linux-gnu/release/silkjs-zstd-cli')
+DCLI = os.path.join(PKG, 'tools/dcli/build/llvm/x86_64-unknown-linux-gnu/release/silkjs-zstd-dcli')
 CREF = os.path.join(SCRATCH, 'cref')
 ZSTD = os.path.join(REF, 'programs/zstd')
 
@@ -84,7 +91,7 @@ def run_case(case):
     name, path, params, mode = case['input'], case['path'], case['params'], case['mode']
     tag = hashlib.md5(json.dumps([name, params, mode]).encode()).hexdigest()[:16]
     env = dict(ZIN=path, ZPARAMS=' '.join(f'{k} {v}' for k, v in params))
-    for k in ('ZICHUNK', 'ZOCHUNK', 'ZFLUSH', 'ZPLEDGE', 'ZREPEAT'):
+    for k in ('ZICHUNK', 'ZOCHUNK', 'ZFLUSH', 'ZPLEDGE', 'ZREPEAT', 'ZDICT', 'ZRESET', 'ZDROP', 'ZMIDLOAD', 'ZLOOPS'):
         if k in mode: env[k] = str(mode[k])
     res = []
     for exe, suffix in ((CLI, 's'), (CREF, 'c')):
@@ -97,6 +104,7 @@ def run_case(case):
     if rs in (0, 1) and rc in (0, 1):
         exact = case.get('exact', True)
         a, b = open(outs, 'rb').read(), open(outc, 'rb').read()
+        case['same'] = a == b and open(trs).read() == open(trc).read()
         if exact:
             if a != b:
                 i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
@@ -106,12 +114,21 @@ def run_case(case):
                 la, lb = ta.split('\n'), tb.split('\n')
                 i = next((i for i in range(min(len(la), len(lb))) if la[i] != lb[i]), min(len(la), len(lb)))
                 problems.append(f'trace differs at call {i}: {la[i:i+1]} vs {lb[i:i+1]}')
-        if rs == 0 and mode.get('ZREPEAT', 1) == 1:
-            d = subprocess.run([ZSTD, '-d', '-c', '--no-check', outs], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if d.returncode != 0 or d.stdout != open(path, 'rb').read():
+        if rs == 0 and (mode.get('ZREPEAT', 1) == 1 or ('ZDICT' in mode and 'ZDROP' not in mode)):
+            dict_args = ['-D', mode['ZDICT']] if 'ZDICT' in mode else []
+            want = open(path, 'rb').read() * (mode.get('ZREPEAT', 1) * mode.get('ZLOOPS', 1))
+            d = subprocess.run([ZSTD, '-d', '-c', '--no-check'] + dict_args + [outs], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if d.returncode != 0 or d.stdout != want:
                 problems.append('reference decoder rejects the output or decodes other bytes: ' + d.stderr.decode()[-200:])
+            if 'ZDICT' in mode and os.path.exists(DCLI):
+                dout = outs + '.d'
+                d = subprocess.run([DCLI], env=dict(ZIN=outs, ZOUT=dout, ZDICT=mode['ZDICT']), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if d.returncode != 0 or open(dout, 'rb').read() != want:
+                    problems.append('Silk decoder (tools/dcli) rejects the output or decodes other bytes: ' + d.stdout.decode()[-200:])
+                try: os.remove(dout)
+                except OSError: pass
             if any(k == 201 and v for k, v in params):
-                d = subprocess.run([ZSTD, '-t', outs], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                d = subprocess.run([ZSTD, '-t'] + (['-D', mode['ZDICT']] if 'ZDICT' in mode else []) + [outs], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 if d.returncode != 0: problems.append('checksum rejected: ' + d.stderr.decode()[-200:])
     for f in (outs, trs, outc, trc):
         try: os.remove(f)
@@ -234,6 +251,173 @@ def cases(inputs, full):
             add(n, ps + [('level', 1)], exact=True, ZOCHUNK=500)
     return out
 
+def make_dicts():
+    """Trained dictionaries (zstd --train on samples of the corpus), raw-content ones, and corrupt
+    ones. Returns {name: path}."""
+    d = os.path.join(SCRATCH, 'dicts'); os.makedirs(d, exist_ok=True)
+    js = open(os.path.join(CORPUS, 'json.bin'), 'rb').read()
+    tx = open(os.path.join(CORPUS, 'text.bin'), 'rb').read()
+    bn = open(os.path.join(CORPUS, 'binary.bin'), 'rb').read()
+    rnd = open(os.path.join(CORPUS, 'random.bin'), 'rb').read()
+    out = {}
+    def put(name, data):
+        path = os.path.join(d, name + '.dict')
+        if not os.path.exists(path) or open(path, 'rb').read() != data: open(path, 'wb').write(data)
+        out[name] = path
+    tdir = os.path.join(d, 'train'); os.makedirs(tdir, exist_ok=True)
+    for i in range(600): open(os.path.join(tdir, f'j{i}'), 'wb').write(js[i * 3000:i * 3000 + 2000])
+    for i in range(300): open(os.path.join(tdir, f't{i}'), 'wb').write(tx[i * 5000:i * 5000 + 3000])
+    for size in (1024, 4096, 16384, 65536, 114688):
+        path = os.path.join(d, f'tr{size}.dict')
+        if not os.path.exists(path):
+            subprocess.run([ZSTD, '-q', '-f', '--train', '--maxdict=%d' % size, '-o', path] + [os.path.join(tdir, f) for f in sorted(os.listdir(tdir))], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out[f'tr{size}'] = path
+    for n in (1, 7, 8, 9, 100, 3000, 32768, 200000, 1 << 20, 3 << 20):
+        put(f'rawtext{n}', tx[5000000:5000000 + n])
+    put('rawjson50000', js[7000000:7050000]); put('rawbin65536', bn[100000:165536]); put('rawrand10000', rnd[:10000])
+    import struct
+    tr = open(out['tr4096'], 'rb').read()
+    i = tr.find(struct.pack('<III', 1, 4, 8))
+    def patch(at, data):
+        b = bytearray(tr); b[at:at + len(data)] = data; return bytes(b)
+    put('bad_magiconly', tr[:4]); put('bad_eight', tr[:8]); put('bad_trunc20', tr[:20]); put('bad_trunc200', tr[:200])
+    put('bad_hdronly', tr[:i + 12])
+    put('bad_rep0', patch(i, struct.pack('<I', 0))); put('bad_repbig', patch(i + 4, struct.pack('<I', len(tr))))
+    put('bad_repmax', patch(i + 8, struct.pack('<I', len(tr) - i - 12))); put('bad_repmax1', patch(i + 8, struct.pack('<I', len(tr) - i - 11)))
+    put('bad_huf', patch(8, b'\xff\xff')); put('bad_huf2', patch(8, bytes(32))); put('bad_fse', patch(i - 30, b'\xff' * 30))
+    return out
+
+def dict_cases(inputs, full):
+    dicts = make_dicts()
+    d = os.path.join(SCRATCH, 'in'); os.makedirs(d, exist_ok=True)
+    js = open(os.path.join(CORPUS, 'json.bin'), 'rb').read()
+    tx = open(os.path.join(CORPUS, 'text.bin'), 'rb').read()
+    def put(name, data):
+        path = os.path.join(d, name)
+        if not os.path.exists(path) or os.path.getsize(path) != len(data): open(path, 'wb').write(data)
+        inputs[name] = path
+        return name
+    sizes = [0, 100, 3000, 8191, 8192, 8193, 16384, 16385, 32768, 32769, 100000, 131071, 131072, 131073, 1 << 20]
+    if full: sizes += [5 << 20]
+    out = []
+    def add(name, dname, params=(), exact=None, **mode):
+        ps = [(P[k] if isinstance(k, str) else k, v) for k, v in params]
+        if exact is None:
+            # Level 4 is greedy for small sources and dictionaries (and the CDict has its own
+            # parameters): validity only, its identity is reported apart.
+            level = dict(ps).get(100, 3); strat = dict(ps).get(107, 0)
+            exact = (strat in (1, 2)) or (strat == 0 and level <= 3)
+        out.append(dict(input=name, path=inputs[name], params=ps, mode=dict(mode, ZDICT=dicts[dname]), exact=exact, dict=dname))
+    levels = (-5, -1, 1, 2, 3, 4)
+    good = ['tr1024', 'tr4096', 'tr16384', 'tr65536', 'tr114688', 'rawtext1', 'rawtext7', 'rawtext8', 'rawtext9', 'rawtext100', 'rawtext3000', 'rawtext32768', 'rawtext200000', 'rawjson50000', 'rawbin65536', 'rawrand10000']
+    big = ['rawtext1048576', 'rawtext3145728']
+    for n in sizes:
+        ji = put(f'dj{n}', js[9000000:9000000 + n]); ti = put(f'dt{n}', tx[9000000:9000000 + n])
+        for dn in good + (big if n in (3000, 131073, 1 << 20) else []):
+            inp = ji if (dn.startswith('tr') or 'json' in dn) else ti
+            for l in levels:
+                add(inp, dn, [('level', l)])
+                if n in (0, 3000, 32769, 131073, 1 << 20) or full:
+                    add(inp, dn, [('level', l)], ZICHUNK=50000)
+                    add(inp, dn, [('level', l)], ZICHUNK=50000, ZPLEDGE=n)
+    # 6 x dictSize +- 1 (the cut-off of the reference between the CDict parameters and a reload).
+    for dn in ('tr65536', 'tr114688', 'rawtext200000', 'rawjson50000'):
+        ds = os.path.getsize(dicts[dn])
+        for n in (6 * ds - 1, 6 * ds, 6 * ds + 1):
+            inp = put(f'dj{n}', js[9000000:9000000 + n])
+            for l in (1, 3):
+                add(inp, dn, [('level', l)]); add(inp, dn, [('level', l)], ZICHUNK=100000, ZPLEDGE=n)
+    # The attach preference (ZSTD_c_forceAttachDict, 1001), forceMaxWindow, dictIDFlag, checksum,
+    # contentSize, an explicit window smaller than the dictionary.
+    for dn in ('tr4096', 'tr114688', 'rawtext200000', 'rawtext8'):
+        for n in (3000, 32769, 131073):
+            inp = put(f'dj{n}', js[9000000:9000000 + n])
+            for pref in (0, 1, 2, 3):
+                for l in (1, 3):
+                    add(inp, dn, [('level', l), (1001, pref)])
+                    add(inp, dn, [('level', l), (1001, pref)], ZICHUNK=40000)
+            for l in (-1, 1, 2, 3):
+                add(inp, dn, [('level', l), (1000, 1)])
+                add(inp, dn, [('level', l), ('dictID', 0)]); add(inp, dn, [('level', l), ('dictID', 0)], ZICHUNK=40000)
+                add(inp, dn, [('level', l), ('checksum', 1)]); add(inp, dn, [('level', l), ('contentSize', 0)])
+                for wl in (10, 12, 14):
+                    add(inp, dn, [('level', l), ('windowLog', wl)]); add(inp, dn, [('level', l), ('windowLog', wl)], ZICHUNK=7000, ZFLUSH=2)
+            add(inp, dn, [('strategy', 1), ('minMatch', 6), ('hashLog', 12)]); add(inp, dn, [('strategy', 2), ('minMatch', 5), ('chainLog', 11)])
+            add(inp, dn, [('strategy', 2), ('minMatch', 7), ('hashLog', 24), ('chainLog', 24)])
+            add(inp, dn, [('level', 3), ('ldm', 1)], exact=False); add(inp, dn, [('level', 1), ('ldm', 1), (1001, 3)])
+    # Several frames from one context: the dictionary persists across frames and session resets;
+    # loading an empty one drops it; loading during a frame is stage_wrong.
+    for dn in ('tr4096', 'tr114688', 'rawtext32768', 'rawtext200000'):
+        for n in (3000, 32769, 131073, 1 << 20):
+            inp = put(f'dj{n}', js[9000000:9000000 + n])
+            for l in (1, 3):
+                add(inp, dn, [('level', l)], ZREPEAT=3)
+                add(inp, dn, [('level', l)], ZREPEAT=3, ZRESET=1, ZICHUNK=30000, ZFLUSH=5)
+                add(inp, dn, [('level', l)], ZREPEAT=3, ZDROP=1)
+                add(inp, dn, [('level', l)], ZREPEAT=2, ZICHUNK=1000, ZMIDLOAD=1)
+    # Streaming much more than the window: the dictionary falls out of the window.
+    for dn in ('tr16384', 'rawtext200000', 'rawtext1048576'):
+        for wl in (10, 12, 17):
+            for l in (1, 2, 3):
+                add('text1m', dn, [('level', l), ('windowLog', wl)], ZICHUNK=65536)
+                add('text1m', dn, [('level', l), ('windowLog', wl)], ZICHUNK=1000, ZFLUSH=7)
+                add('text1m', dn, [('level', l), ('windowLog', wl)], ZICHUNK=65536, ZLOOPS=3)
+    # Corrupt dictionaries: the same error at the same call.
+    for dn in sorted(k for k in dicts if k.startswith('bad_')):
+        for n in (0, 3000, 131073):
+            inp = put(f'dj{n}', js[9000000:9000000 + n])
+            for l in (1, 3, 19):
+                add(inp, dn, [('level', l)], exact=l < 4); add(inp, dn, [('level', l)], exact=l < 4, ZICHUNK=1000, ZREPEAT=2)
+    # Levels 5..22 (validity, and identity where the lazy / optimal finders are exact).
+    for dn in ('tr4096', 'tr114688', 'rawtext32768', 'rawtext200000'):
+        for n in (3000, 32769, 131073, 1 << 20):
+            inp = put(f'dj{n}', js[9000000:9000000 + n])
+            for l in (5, 6, 7, 9, 12, 13, 16, 18, 19, 22):
+                add(inp, dn, [('level', l)], exact=False); add(inp, dn, [('level', l)], exact=False, ZICHUNK=50000)
+    return out
+
+def node_dict_check(inputs, dict_cases_list):
+    """One-shot dictionary cases against Node's zlib.zstdCompressSync(buf, {dictionary, params})."""
+    jobs = []
+    for c in dict_cases_list:
+        m = c['mode']
+        if any(k in m for k in ('ZICHUNK', 'ZREPEAT', 'ZPLEDGE', 'ZOCHUNK')) or c['dict'].startswith('bad_'): continue
+        if not c['exact']: continue
+        # Node accepts only the public parameters.
+        if any(k >= 1000 for k, _ in c['params']): continue
+        jobs.append(dict(input=c['path'], dict=m['ZDICT'], params=dict(c['params']), chunkSize=16384))
+    script = r"""
+const zlib = require('zlib'), fs = require('fs'), crypto = require('crypto');
+const jobs = JSON.parse(fs.readFileSync(0));
+const out = jobs.map(j => { const params = {}; for (const k in j.params) params[k] = j.params[k];
+  try { const r = zlib.zstdCompressSync(fs.readFileSync(j.input), {params, chunkSize: j.chunkSize, dictionary: fs.readFileSync(j.dict)});
+  return crypto.createHash('md5').update(r).digest('hex'); } catch (e) { return 'error ' + e.message; } });
+console.log(JSON.stringify(out));
+"""
+    r = subprocess.run([NODE, '-e', script], input=json.dumps(jobs).encode(), stdout=subprocess.PIPE, check=True)
+    want = json.loads(r.stdout)
+    def one(i):
+        j = jobs[i]
+        o = os.path.join(SCRATCH, f'nodedict{i}.zst')
+        params = dict(j['params'])
+        if params.get(100) == -1: del params[100]
+        env = dict(ZIN=j['input'], ZOUT=o, ZDICT=j['dict'], ZPARAMS=' '.join(f'{k} {v}' for k, v in params.items()), ZOCHUNK=str(j['chunkSize']))
+        rc = subprocess.run([CLI], env=env, stdout=subprocess.DEVNULL).returncode
+        data = open(o, 'rb').read(); os.remove(o)
+        if rc != 0: return 'error'
+        if len(data) % j['chunkSize'] == 0 and len(data) > 0:
+            fhd = 0x20 | (4 if params.get(201) else 0)
+            data += bytes([0x28, 0xb5, 0x2f, 0xfd]) + (bytes([fhd, 0]) if params.get(200, 1) else bytes([fhd & ~0x20, 0x00])) + bytes([1, 0, 0])
+        return hashlib.md5(data).hexdigest()
+    with ThreadPoolExecutor(4) as ex: got = list(ex.map(one, range(len(jobs))))
+    bad = 0
+    for j, g, w in zip(jobs, got, want):
+        if g != w:
+            bad += 1
+            print('NODE MISMATCH', os.path.basename(j['input']), os.path.basename(j['dict']), j['params'], w if w.startswith('error') else '')
+    print(f'node: {len(jobs) - bad}/{len(jobs)} one-shot dictionary cases identical to zlib.zstdCompressSync')
+    return bad
+
 def node_check(inputs, full):
     """One-shot cases against Node: zstdCompressSync calls ZSTD_compressStream2(e_end) with an
     output buffer of chunkSize, as the CLI does with ZOCHUNK."""
@@ -283,13 +467,13 @@ console.log(JSON.stringify(out));
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--full', action='store_true'); ap.add_argument('--node', action='store_true')
+    ap.add_argument('--full', action='store_true'); ap.add_argument('--node', action='store_true'); ap.add_argument('--dict', action='store_true')
     ap.add_argument('--filter', default=''); ap.add_argument('-j', type=int, default=4); ap.add_argument('--no-build', action='store_true')
     a = ap.parse_args()
     if not a.no_build: build()
     inputs = make_inputs()
     seen = set(); cs = []
-    for c in cases(inputs, a.full):
+    for c in (dict_cases(inputs, a.full) if a.dict else cases(inputs, a.full)):
         key = json.dumps([c['input'], c['params'], c['mode']])
         if key in seen or a.filter not in key: continue
         seen.add(key); cs.append(c)
@@ -303,7 +487,12 @@ def main():
                 print('FAIL', case['input'], case['params'], case['mode'], 'exact' if case['exact'] else 'valid-only')
                 for p in problems: print('   ', p)
     print(f'{len(cs)} cases ({exact} compared byte for byte and call by call, {valid_only} for validity only): {bad} failed')
-    if a.node: bad += node_check(inputs, a.full)
+    same = [c for c in cs if not c['exact'] and c.get('same')]
+    print(f'of the {valid_only} validity-only cases, {len(same)} are identical to the reference anyway')
+    if a.dict:
+        for c in cs:
+            if not c['exact'] and not c.get('same', True): print('  differs (not compared):', c['input'], os.path.basename(c['mode']['ZDICT']), c['params'], {k: v for k, v in c['mode'].items() if k != 'ZDICT'})
+    if a.node: bad += node_dict_check(inputs, cs) if a.dict else node_check(inputs, a.full)
     sys.exit(1 if bad else 0)
 
 if __name__ == '__main__':

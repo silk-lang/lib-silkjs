@@ -19,13 +19,17 @@
 //!   `ZSTDMT_flushProduced` never waits for a worker;
 //! - so the reference's results of 1 ("a job is still running") become the exact number of
 //!   bytes left in the job being flushed, or 0 when everything is flushed;
-//! - the reference refuses a new job while its job table (`nbWorkers + 2` rounded up to a power
-//!   of 2) holds jobs not fully flushed; so does this port, with the same table, and since the
-//!   jobs are already compressed, the table only fills when the output buffers are not drained.
-//! The bytes would differ from those of the reference only where the reference itself depends on
-//! the timing of its threads: when a job is refused because the table is full, and the caller
-//! then gives more input before the flush is complete (the job takes the new input in); this
-//! port behaves as the reference with fast workers.
+//! - the reference takes no more input while all its workers are busy and a prepared job waits
+//!   for one (`jobReady`); its input buffer is empty then. This port, whose jobs are done at
+//!   once, takes no more input in the same state, empty input buffer, while as many jobs as the
+//!   job table of the reference holds (`nbWorkers + 2` rounded up to a power of 2) are not
+//!   fully flushed. That bounds the memory of the outputs, and never changes where a job is cut:
+//!   with `e_continue` a job is cut when it is full, with `e_flush` and `e_end` when the input of
+//!   the call is loaded, stalled or not. Unlike the reference with infinitely fast workers, a job
+//!   is never refused for a full table: such a refusal could make a full job the last one (no
+//!   empty last block), which the reference with real threads does not do.
+//! So the call-by-call consumption differs: this port consumes more slowly when the caller does
+//! not drain the output, and faster when it does.
 //!
 //! Not supported with `nbWorkers >= 1`, and refused with `parameter_unsupported`: `rsyncable`
 //! (Node does not expose it), and dictionaries and prefixes (the reference gives them to the
@@ -71,6 +75,8 @@ pub struct MtCtx {
   nbWorkers: i32,
   jobs: ?[*]mut u8,
   nbJobs: u32,
+  /// The size of the job table of the reference.
+  tableSize: u32,
   jobIDMask: u32,
   /// The context that compresses the jobs (the reference takes one from a pool).
   jobCCtx: ?[*]mut u8,
@@ -125,6 +131,7 @@ unsafe fn create() -> ?[*]mut u8 {
     nbWorkers: 0,
     jobs: mem.nullp(),
     nbJobs: 0,
+    tableSize: 0,
     jobIDMask: 0,
     jobCCtx: mem.nullp(),
     bufferSize: 0,
@@ -300,10 +307,14 @@ pub unsafe fn initCStream(c: &mut CCtx, params0: &Params, pledgedSrcSize: u64) -
   // `ZSTDMT_resize`: the job table has `nbWorkers + 2` entries, rounded up to a power of 2.
   if params.nbWorkers != mt.nbWorkers || Pointer.isNullMany<u8>(mt.jobs) {
     unsafe freeJobs(&mut mt)
-    let nbJobs = mem.shl32(1, mem.highbit32(i32.toU32(params.nbWorkers) + 2) + 1)
+    // This port keeps twice as many positions: it stalls the input at `tableSize` jobs not
+    // flushed, and can then still make a full job and a last empty one.
+    let tableSize = mem.shl32(1, mem.highbit32(i32.toU32(params.nbWorkers) + 2) + 1)
+    let nbJobs = tableSize * 2
     mt.jobs = unsafe mem.calloc(mem.z(nbJobs), Layout.of<Job>().bytes)
     if Pointer.isNullMany<u8>(mt.jobs) { return errors.err(errors.E_MEMORY_ALLOCATION) }
     mt.nbJobs = nbJobs
+    mt.tableSize = tableSize
     mt.jobIDMask = nbJobs - 1
     mt.nbWorkers = params.nbWorkers
   }
@@ -469,10 +480,9 @@ unsafe fn runJob(mt: &mut MtCtx, jobParams0: &Params, jobID: u32, lastJob: bool,
 }
 
 // `ZSTDMT_createCompressionJob`: makes a job of the `srcSize` bytes of the input buffer and
-// compresses it. Returns 0 or an error; nothing is done if the job table is full.
+// compresses it. Returns 0 or an error.
 unsafe fn createCompressionJob(mt: &mut MtCtx, srcSize: usize, endOp: i32) -> usize {
   let endFrame = endOp == compress.E_END
-  if mt.nextJobID > mem.a32(mt.doneJobID, mt.jobIDMask) { return 0 }
   let jobNb = mt.nextJobID
   let mut anchor = ()
   let job = unsafe jobAt(&mut anchor, mt.jobs, jobNb & mt.jobIDMask)
@@ -585,8 +595,10 @@ unsafe fn compressStreamGeneric(mt: &mut MtCtx, dst: [*]mut u8, dstSize: usize, 
     // The frame is being ended: only flush and end are allowed.
     return errors.err(errors.E_STAGE_WRONG)
   }
-  // Fill the input buffer.
-  if srcSize > srcPos.* {
+  // Fill the input buffer, unless it is empty and the outputs of `tableSize` jobs are pending
+  // (the reference stalls there, waiting for a worker).
+  let stalled = mt.inBuffFilled == 0 && mem.s32(mt.nextJobID, mt.doneJobID) >= mt.tableSize
+  if srcSize > srcPos.* && !stalled {
     if !mt.inBuffActive { unsafe getInputRange(&mut mt) }
     let available = srcSize - srcPos.*
     let room = mt.targetSectionSize - mt.inBuffFilled
