@@ -11,11 +11,14 @@
 //! the entries whose tag matches, which the reference build (x86-64, `BROTLI_TZCNT64`) uses at
 //! qualities up to `enc.params.MAX_SIMD_QUALITY`. The tag comparison here is the portable
 //! semantics of the SSE2 code: bit `i` of the mask is set when tag `i` of the bucket matches.
+//! (SSE2 is an optimization there; any comparison gives the same mask.)
 //!
 //! The search loops read the ring buffer without bounds checks: `findLongestMatch` first checks
 //! that every byte it can read (up to `maxLength + 8` bytes after any masked position) is inside
 //! it, and the table indexes are masked to the table sizes.
-import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.simd.mask16
+import silk.simd.u8x16
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u8
@@ -25,7 +28,7 @@ import silk.num.u64
 import silk.num.usize
 import enc.find_match_length { findMatchLengthWithLimitUnchecked }
 import enc.hash_base { DictionaryStats, checkHashable, checkReadable, signExtend, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
-import enc.memory { bytes, bytesMut, getUncheckedMut, halfwordsMut, setUnchecked, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
+import enc.memory { bytes, bytesMut, getUnchecked, getUncheckedMut, halfwordsMut, setUnchecked, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
 import enc.params { HasherParams }
 import enc.write_bits { byteUnchecked, load32Unchecked, load64Unchecked }
 
@@ -75,9 +78,11 @@ unsafe fn searchLastDistances(
 ) -> () {
   let mut bestScore = bestScoreRef.*
   let mut bestLen = bestLenRef.*
+  // At most the 16 entries of the cache.
+  let count = if numLastDistancesToCheck < 16 { numLastDistancesToCheck } else { 16 }
   let mut i: usize = 0
-  while i < numLastDistancesToCheck {
-    let backward = signExtend(distanceCache[i])
+  while i < count {
+    let backward = signExtend(unsafe getUnchecked<i32>(distanceCache, i))
     let mut prevIx = usize.wrappingSubtract(curIx, backward)
     i = i + 1
     if prevIx >= curIx {
@@ -322,17 +327,22 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
     unsafe setUnchecked<u32>(&mut bucket, bucketStart + (count & blockMask), usize.wrappingToU32(curIx))
     unsafe setUnchecked<u16>(&mut num, key, u16.wrappingAdd(usize.wrappingToU16(count), 1))
     if minScore == out.score {
-      searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
+      unsafe searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
     }
   }
 
   @inlineAlways
   fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
-    MatchFinder.storeRange(&mut self, data, mask, ix, ix + 1)
+    MatchFinder.storeEvery(&mut self, data, mask, ix, ix + 1, 1)
   }
 
   @inlineAlways
   fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
+    MatchFinder.storeEvery(&mut self, data, mask, ixStart, ixEnd, 1)
+  }
+
+  @inlineAlways
+  fn storeEvery(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize, step: usize) -> () {
     // The 8 bytes that each position hashes are inside what this checks.
     checkHashable(data, mask, ixStart, ixEnd, 8)
     let wide = HashWidth.wide(&self.width)
@@ -349,33 +359,29 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
       let offset = usize.wrappingAdd(u16.toUsize(count) & blockMask, usize.shiftLeft(key, blockBits))
       unsafe setUnchecked<u16>(&mut num, key, u16.wrappingAdd(count, 1))
       unsafe setUnchecked<u32>(&mut buckets, offset, usize.wrappingToU32(ix))
-      ix = ix + 1
+      ix = ix + step
     }
   }
 }
 
-// The bits of the zero bytes of `x`, the bit of byte `i` at bit `i`.
-@inlineAlways
-fn zeroBytes(x: u64) -> u64 {
-  let nonzero = u64.wrappingAdd(x & 0x7f7f7f7f7f7f7f7f, 0x7f7f7f7f7f7f7f7f) | x
-  let high = u64.bitNot(nonzero) & 0x8080808080808080
-  return u64.shiftRight(u64.wrappingMultiply(u64.shiftRight(high, 7), 0x0102040810204080), 56)
-}
-
 // `GetMatchingTagMask` (`matching_tag_mask.h`): bit `i` is set when `tagBucket[start + i]` is
-// `tag`, for the `16 * chunkCount` (at most 64) tags of the bucket, rotated right by `head`.
+// `tag`, for the `16 * chunkCount` (at most 64) tags of the bucket, rotated right by `head`. As
+// the SSE2 code of the reference build, 16 tags at a time.
 //
 // # Gotchas
 // The caller proves that the tags are inside `tagBucket`.
 @inlineAlways
 unsafe fn matchingTagMask(chunkCount: usize, tag: u8, tagBucket: &[u8], start: usize, head: usize) -> u64 {
-  let count = if chunkCount < 4 { 16 * chunkCount } else { 64 }
-  let splat = u64.wrappingMultiply(u8.toU64(tag), 0x0101010101010101)
+  let comparison = u8x16.splat(tag)
+  // The caller's proof implies that the slice is not empty, so its pointer is not null.
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(tagBucket))
   let mut matches: u64 = 0
   let mut i: usize = 0
-  while i < count {
-    matches = matches | u64.shiftLeft(zeroBytes(unsafe load64Unchecked(tagBucket, start + i) ^ splat), usize.toU64(i))
-    i = i + 8
+  while i < chunkCount && i < 4 {
+    let chunk = unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, start + 16 * i)))
+    let equal = u8x16.lanesEqual(chunk, comparison)
+    matches = matches | u64.shiftLeft(mask16.toBits(equal), usize.toU64(16 * i))
+    i = i + 1
   }
   if chunkCount == 1 {
     let value = u64.wrappingToU16(matches)
@@ -509,9 +515,8 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     // `key` is below the bucket size, and so are the indexes into the bucket below its size.
     let numKey = unsafe getUncheckedMut<u16>(&mut num, key)
     let head = (u16.toUsize(numKey) + 1) & blockMask
-    // The block size is 16 or more, and a multiple of 8.
-    let tags = Slice.view<u8>(bytes(&self.tags), bucketStart, blockSize)
-    let mut matches = unsafe matchingTagMask(blockSize / 16, tag, tags, 0, head)
+    // The block size is 16 or more, and a multiple of 16: the tags of the bucket are inside.
+    let mut matches = unsafe matchingTagMask(blockSize / 16, tag, bytes(&self.tags), bucketStart, head)
     // Mask off any matches from uninitialized tags.
     let n = 65535 - numKey
     let blockHasUnusedSlots: u64 = if blockSize > u16.toUsize(n) { 1 } else { 0 }
@@ -554,17 +559,22 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     unsafe setUnchecked<u8>(bytesMut(&mut self.tags), slot, tag)
     unsafe setUnchecked<u16>(&mut num, key, u16.wrappingSubtract(numKey, 1))
     if minScore == out.score {
-      searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
+      unsafe searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
     }
   }
 
   @inlineAlways
   fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
-    MatchFinder.storeRange(&mut self, data, mask, ix, ix + 1)
+    MatchFinder.storeEvery(&mut self, data, mask, ix, ix + 1, 1)
   }
 
   @inlineAlways
   fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
+    MatchFinder.storeEvery(&mut self, data, mask, ixStart, ixEnd, 1)
+  }
+
+  @inlineAlways
+  fn storeEvery(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize, step: usize) -> () {
     // The 8 bytes that each position hashes are inside what this checks.
     checkHashable(data, mask, ixStart, ixEnd, 8)
     let wide = HashWidth.wide(&self.width)
@@ -584,7 +594,7 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
       unsafe setUnchecked<u16>(&mut num, key, u16.wrappingSubtract(count, 1))
       unsafe setUnchecked<u32>(&mut buckets, offset, usize.wrappingToU32(ix))
       unsafe setUnchecked<u8>(&mut tags, offset, usize.wrappingToU8(hash & 0xff))
-      ix = ix + 1
+      ix = ix + step
     }
   }
 }

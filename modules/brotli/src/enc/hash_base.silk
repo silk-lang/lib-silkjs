@@ -12,9 +12,10 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import enc.dictionary_hash { hashLengths, hashWord, hashWordsBytes }
+import enc.dictionary_hash { hashLengths, hashWordsBytes }
 import enc.fast_log { log2FloorNonZero }
-import enc.write_bits { load32, load64 }
+import enc.memory { getUnchecked }
+import enc.write_bits { byteUnchecked, load32Unchecked, load64Unchecked }
 
 /// `kHashMul32`.
 pub const HASH_MUL_32: u32 = 0x1e35a7bd
@@ -33,15 +34,6 @@ pub const LITERAL_BYTE_SCORE: usize = 135
 pub const DISTANCE_BIT_PENALTY: usize = 30
 /// `BROTLI_SCORE_BASE`: the score must be positive after applying maximal penalty.
 pub const SCORE_BASE: usize = 1920
-
-/// `Hash14`: the bucket of the 4 bytes at `at` in the hash of the static dictionary.
-@inlineAlways
-pub fn hash14(data: &[u8], at: usize) -> u32 {
-  let h = u32.wrappingMultiply(load32(data, at), HASH_MUL_32)
-  // The higher bits contain more mixture from the multiplication, so we take our results from
-  // there.
-  return u32.shiftRight(h, 32 - 14)
-}
 
 /// `HasherSearchResult`.
 pub struct HasherSearchResult {
@@ -109,27 +101,6 @@ pub fn backwardReferencePenaltyUsingLastDistance(distanceShortCode: usize) -> us
   return 39 + (usize.shiftRight(0x1ca10, distanceShortCode & 0xe) & 0xe)
 }
 
-/// `FindMatchLengthWithLimit` between two arrays: how many bytes at `a[aAt..]` and `b[bAt..]` are
-/// equal, at most `limit`.
-@inlineAlways
-pub fn findMatchLengthBetween(a: &[u8], aAt: usize, b: &[u8], bAt: usize, limit: usize) -> usize {
-  let mut matched: usize = 0
-  let mut left = limit
-  while left >= 8 {
-    let x = load64(a, aAt + matched) ^ load64(b, bAt + matched)
-    if x != 0 {
-      return matched + u32.toUsize(u64.trailingZeros(x) / 8)
-    }
-    matched = matched + 8
-    left = left - 8
-  }
-  while left != 0 && a[aAt + matched] == b[bAt + matched] {
-    left = left - 1
-    matched = matched + 1
-  }
-  return matched
-}
-
 /// `dict_num_lookups` and `dict_num_matches` of `HasherCommon`: the statistics that switch the
 /// search in the static dictionary off when it rarely finds anything.
 pub struct DictionaryStats {
@@ -144,20 +115,48 @@ impl DictionaryStats {
   }
 }
 
+// `FindMatchLengthWithLimit` between `data[at..]` and `word[offset..]` without bounds checks.
+//
+// # Gotchas
+// The caller proves that `limit` bytes are inside both.
+@inlineAlways
+unsafe fn findMatchLengthBetweenUnchecked(data: &[u8], at: usize, word: &[u8], offset: usize, limit: usize) -> usize {
+  let mut matched: usize = 0
+  let mut left = limit
+  while left >= 8 {
+    let x = unsafe load64Unchecked(data, usize.wrappingAdd(at, matched)) ^ unsafe load64Unchecked(word, usize.wrappingAdd(offset, matched))
+    if x != 0 {
+      return usize.wrappingAdd(matched, u32.toUsize(u64.trailingZeros(x) / 8))
+    }
+    matched = usize.wrappingAdd(matched, 8)
+    left = left - 8
+  }
+  while left != 0 && unsafe byteUnchecked(data, usize.wrappingAdd(at, matched)) == unsafe byteUnchecked(word, usize.wrappingAdd(offset, matched)) {
+    left = left - 1
+    matched = usize.wrappingAdd(matched, 1)
+  }
+  return matched
+}
+
 // `TestStaticDictionaryItem` for the built-in dictionary: `data[at..]` against word `wordIdx` of
 // length `len`.
-fn testStaticDictionaryItem(len: usize, wordIdx: usize, data: &[u8], at: usize, maxLength: usize, maxBackward: usize, maxDistance: usize, out: &mut HasherSearchResult) -> bool {
+//
+// # Gotchas
+// `data` must hold `maxLength` bytes at `at`; `len` (4 to 24) and `wordIdx` must come from the
+// hash table, so that the word is inside the dictionary.
+@inlineAlways
+unsafe fn testStaticDictionaryItem(len: usize, wordIdx: usize, data: &[u8], at: usize, maxLength: usize, maxBackward: usize, maxDistance: usize, out: &mut HasherSearchResult) -> bool {
   if len > maxLength {
     return false
   }
   let offset = brotli_tables.wordOffset(len) + len * wordIdx
-  let matchlen = findMatchLengthBetween(data, at, brotli_tables.words(), offset, len)
+  let matchlen = unsafe findMatchLengthBetweenUnchecked(data, at, brotli_tables.words(), offset, len)
   if matchlen + CUTOFF_TRANSFORMS_COUNT <= len || matchlen == 0 {
     return false
   }
   let cut = len - matchlen
   let transformId = usize.shiftLeft(cut, 2) + u64.toUsize(u64.shiftRight(CUTOFF_TRANSFORMS, usize.toU64(cut * 6)) & 0x3f)
-  let backward = maxBackward + 1 + wordIdx + usize.shiftLeft(transformId, u32.toUsize(brotli_tables.wordSizeBits(len)))
+  let backward = maxBackward + 1 + wordIdx + usize.shiftLeft(transformId, u32.toUsize(brotli_tables.wordSizeBits(len)) & 63)
   if backward > maxDistance {
     return false
   }
@@ -174,20 +173,28 @@ fn testStaticDictionaryItem(len: usize, wordIdx: usize, data: &[u8], at: usize, 
 
 /// `SearchInStaticDictionary` for the built-in dictionary: tries the words whose first 4 bytes
 /// hash like `data[at..]` (one bucket if `shallow`, else both).
-pub fn searchInStaticDictionary(stats: &mut DictionaryStats, data: &[u8], at: usize, maxLength: usize, maxBackward: usize, maxDistance: usize, out: &mut HasherSearchResult, shallow: bool) -> () {
+///
+/// # Gotchas
+/// `data` must hold `maxLength` bytes (at least 4) at `at`, as the search loops of the hashers
+/// check with [`checkReadable`].
+@inlineAlways
+pub unsafe fn searchInStaticDictionary(stats: &mut DictionaryStats, data: &[u8], at: usize, maxLength: usize, maxBackward: usize, maxDistance: usize, out: &mut HasherSearchResult, shallow: bool) -> () {
   if stats.numMatches < usize.shiftRight(stats.numLookups, 7) {
     return ()
   }
-  let mut key = usize.shiftLeft(u32.toUsize(hash14(data, at)), 1)
+  let h = u32.wrappingMultiply(unsafe load32Unchecked(data, at), HASH_MUL_32)
+  // `Hash14`: the bucket pair is below `NUM_HASH_BUCKETS`.
+  let mut key = usize.shiftLeft(u32.toUsize(u32.shiftRight(h, 32 - 14)), 1)
   let lengths = hashLengths()
   let words = hashWordsBytes()
   let count: usize = if shallow { 1 } else { 2 }
   let mut i: usize = 0
   while i < count {
     stats.numLookups = stats.numLookups + 1
-    let len = u8.toUsize(lengths[key])
+    let len = u8.toUsize(unsafe getUnchecked<u8>(lengths, key))
     if len != 0 {
-      if testStaticDictionaryItem(len, hashWord(words, key), data, at, maxLength, maxBackward, maxDistance, &mut out) {
+      let wordIdx = u8.toUsize(unsafe getUnchecked<u8>(words, 2 * key)) | usize.shiftLeft(u8.toUsize(unsafe getUnchecked<u8>(words, 2 * key + 1)), 8)
+      if unsafe testStaticDictionaryItem(len, wordIdx, data, at, maxLength, maxBackward, maxDistance, &mut out) {
         stats.numMatches = stats.numMatches + 1
       }
     }
@@ -223,6 +230,9 @@ pub interface MatchFinder {
   fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> ()
   /// `StoreRange`.
   fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> ()
+  /// `Store` of every `step`-th position from `ixStart` below `ixEnd`, in order: the loops of the
+  /// reference search that skip through data without matches.
+  fn storeEvery(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize, step: usize) -> ()
 }
 
 /// Traps unless `data` holds the bytes that the search loops of the hashers read without bounds
