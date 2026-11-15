@@ -1,13 +1,9 @@
 # Brotli in Silk
 
-The runtime's Brotli is to become (`node:zlib`'s `brotliCompress`, `brotliDecompress`, their sync forms and
-streams, and through them `fetch`'s `Content-Encoding: br`, undici and `CompressionStream`) the
+The runtime's Brotli (`node:zlib`'s `brotliCompress`, `brotliDecompress`, their sync forms and
+streams, and through them `fetch`'s `Content-Encoding: br`, undici and `CompressionStream`) is the
 Silk package [`../brotli`](../brotli), a port of google/brotli v1.2.0 with upstream commit 0ed4268
-in the decoder, which is what Node 24 bundles.
-
-**State: work in progress.** The port is being written; the runtime still links the C library
-(`../native/brotli`) until the port passes the differential suites. `src/ext/compression_brotli.silk`
-is the adapter that will replace the C symbols; it is not imported or compiled yet.
+in the decoder, which is what Node 24 bundles. No Brotli C is compiled or linked.
 
 This file records what was found, what was decided and why, and what is still open.
 
@@ -80,7 +76,7 @@ It is written to be movable: nothing in it knows about Node or the runtime.
 | --- | --- | --- |
 | Decoder | Done | `modules/brotli/tests/differential.py` against the C library: `decode` 355/355 and `corrupt` 2000/2000 (new seeds), plus 939 dictionary and large-window cases; every call's result, consumed and written bytes and error code match. In the runtime, `tests/brotli/decode.cjs` (177 reference streams at every quality and window size, 2,500 corrupted ones, and a hand-built `FORMAT_BLOCK_SWITCH` stream) prints the same 2,678 lines as Node 24. Same speed and peak memory as the C library (table below). |
 | Encoder, qualities 0 to 11 | Done: the C library's bytes | `differential.py` against the C library on the whole package: `encode` at qualities 0 to 11 480/480, at 10 and 11 230/230, `params` 636/636 (every parameter and bound at the default quality 11, with and without large window), `large` 16/16 (6 to 8 MB inputs, windows of 16 to 30 bits, streamed with flushes). While porting, seeds 1 to 5 at 600 rounds for qualities 2 to 9 and at 300 rounds for 10 and 11, a parameter matrix at every quality (9,312 cases), and inputs up to 36 MB. |
-| Encoder, prepared dictionaries | Not ported yet | |
+| Encoder, prepared dictionaries | Done: the C library's bytes | `dictionary` 300/300 at every quality (seed 401; seeds 1 to 6 while porting), a stress run of 2 to 20 attached dictionaries of 0 B to 16 MiB attached before and after the stream starts (1,549/1,549 for each of four seeds), and Node 24's `brotliCompressSync(data, { dictionary })` writing the same bytes in 720/720 cases. With a 64 KiB dictionary the search adds 6 to 9 ms where C adds 4 to 6 (4 MB input at quality 5). One deliberate deviation: where C reads past an empty chunk attached after a non-empty one (undefined behaviour), the copy stops. |
 | The runtime as a whole | All non-dictionary Brotli behaviour matches Node 24 | `silk task compat` (Node 24.22.1 as the reference), 2026-11-15: 78 of 79 cases pass on the Silk Brotli build, and the 75 cases that are not about Brotli pass on both builds. `brotli-decode`, `brotli-streams` and `brotli-corrupt` pass, so every compressed digest at every quality and parameter, every stream's chunking and every decoder error matches Node; `brotli-oneshot` fails only on its dictionary lines (`ERR_ZLIB_INITIALIZATION_FAILED`, the stage still being ported). The C-library build fails `brotli-streams` on `reset()`, the bug fixed above. `tests/web-boundaries-smoke.cjs` and `tests/iterable-streams-smoke.cjs` pass on both. |
 | Runtime | Links no Brotli C | `modules/native/brotli` is gone; the release build compiles 70 fewer C objects and none of its objects defines a C Brotli function. |
 
