@@ -1,0 +1,465 @@
+//! Prepared LZ77 prefix ("raw") dictionaries and the compound dictionary of an encoder: a port of
+//! google/brotli v1.2.0 `c/enc/compound_dictionary.c` and `compound_dictionary.h`, with the
+//! compound dictionary search of `c/enc/hash.h` (`FindCompoundDictionaryMatch`,
+//! `LookupCompoundDictionaryMatch`) that the reference search of qualities 5 to 9 runs.
+//!
+//! A prepared dictionary here owns a copy of its bytes (the C "lean" dictionary refers to the
+//! caller's buffer instead); its hash tables are those of the C code, in the same sizes.
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import enc.hash_base { HasherSearchResult, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, signExtend }
+import enc.memory { bytes, uninitializedBytes, uninitializedWords, words, wordsMut, zeroedHalfwords, halfwords, halfwordsMut }
+import enc.write_bits { load32, load64 }
+
+/// `SHARED_BROTLI_MAX_COMPOUND_DICTS`: the most prepared dictionaries an encoder takes.
+pub const MAX_COMPOUND_DICTS: usize = 15
+
+/// `kPreparedDictionaryHashMul64Long`.
+pub const PREPARED_DICTIONARY_HASH_MUL_64_LONG: u64 = 0x1fe35a7bd3579bd3
+
+/// `PreparedDictionary` of `compound_dictionary.h`: the bytes of a raw dictionary and a hash
+/// table of their positions.
+///
+/// The positions with the same key (a hash of the 5 bytes there) form a bucket; buckets whose
+/// keys agree in the low `slotBits` bits share a slot. `items` holds the positions of the
+/// buckets of each slot from `slotOffsets[slot]`, most recent first, the last one of each bucket
+/// marked with bit 31; `heads[key]` is the start of the bucket inside its slot, or 0xffff for an
+/// empty bucket.
+pub struct RawPreparedDictionary {
+  pub numItems: u32,
+  pub sourceSize: u32,
+  pub hashBits: u32,
+  pub bucketBits: u32,
+  pub slotBits: u32,
+  slotOffsets: Intrinsic.RawBuffer<u32>,
+  heads: Intrinsic.RawBuffer<u16>,
+  items: Intrinsic.RawBuffer<u32>,
+  source: Intrinsic.RawBuffer<u8>,
+}
+
+// `count` 16-bit values whose content is not defined: the caller writes each before it reads it.
+effect fn uninitializedHalfwords(count: usize) -> Intrinsic.RawBuffer<u16> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocate(Layout { bytes: count * 2, alignment: 2 })
+  // The allocation holds `count` values with their alignment.
+  return unsafe RawBuffer.from<u16>(move allocation, count)
+}
+
+impl RawPreparedDictionary {
+  /// The bytes of the dictionary.
+  @inlineAlways
+  pub fn sourceBytes(self: &Self) -> &[u8] {
+    return bytes(&self.source)
+  }
+
+  /// `BrotliEncoderGetPreparedDictionarySize` of the dictionary alone: the bytes of its tables
+  /// and its source (the C structure of a dictionary that holds its own copy, 24 bytes of header).
+  pub fn memorySize(self: &Self) -> usize {
+    return 24 + u32.toUsize(self.sourceSize) + usize.shiftLeft(4, u32.toUsize(self.slotBits))
+      + usize.shiftLeft(2, u32.toUsize(self.bucketBits)) + 4 * u32.toUsize(self.numItems)
+  }
+}
+
+// `CreatePreparedDictionaryWithParams`.
+effect fn createWithParams(source: &[u8], bucketBits: u32, slotBits: u32, hashBits: u32, bucketLimit: u16) -> RawPreparedDictionary ! OutOfMemoryError ? &mut Allocator {
+  let sourceSize = source.length
+  // Step 1: create "bloated" hasher.
+  let numSlots = u32.shiftLeft(1, slotBits)
+  let numBuckets = u32.shiftLeft(1, bucketBits)
+  let hashShift = 64 - bucketBits
+  let hashMask = u64.shiftRight(0xffffffffffffffff, u32.toU64(64 - hashBits))
+  let slotMask = numSlots - 1
+  let slots = u32.toUsize(numSlots)
+  let buckets = u32.toUsize(numBuckets)
+  // `slot_size` and `slot_limit`, then `num`, `bucket_heads` and `next_bucket`: the "flat"
+  // allocation of the C code. Only `num` is cleared.
+  let mut slotSizeBuffer = run uninitializedWords(slots)
+  let mut slotLimitBuffer = run uninitializedWords(slots)
+  let mut numBuffer = run zeroedHalfwords(buckets)
+  let mut bucketHeadsBuffer = run uninitializedWords(buckets)
+  let mut nextBucketBuffer = run uninitializedWords(sourceSize)
+  let slotSize = wordsMut(&mut slotSizeBuffer)
+  let slotLimit = wordsMut(&mut slotLimitBuffer)
+  let num = halfwordsMut(&mut numBuffer)
+  let bucketHeads = wordsMut(&mut bucketHeadsBuffer)
+  let nextBucket = wordsMut(&mut nextBucketBuffer)
+
+  // The position is a 32-bit value in C.
+  let mut i: u32 = 0
+  while u32.toUsize(i) + 7 < sourceSize {
+    let h = u64.wrappingMultiply(load64(source, u32.toUsize(i)) & hashMask, PREPARED_DICTIONARY_HASH_MUL_64_LONG)
+    let key = u32.toUsize(u64.wrappingToU32(u64.shiftRight(h, u32.toU64(hashShift))))
+    let mut count = num[key]
+    nextBucket[u32.toUsize(i)] = if count == 0 { 0xffffffff } else { bucketHeads[key] }
+    bucketHeads[key] = i
+    count = count + 1
+    if count > bucketLimit { count = bucketLimit }
+    num[key] = count
+    i = i + 1
+  }
+
+  // Step 2: find slot limits.
+  let mut totalItems: u32 = 0
+  let mut s: usize = 0
+  while s < slots {
+    slotLimit[s] = u16.toU32(bucketLimit)
+    while true {
+      let limit = slotLimit[s]
+      let mut count: u32 = 0
+      let mut overflow = false
+      let mut j = s
+      while j < buckets {
+        let mut size = u16.toU32(num[j])
+        // Last chain may span behind 64K limit; overflow happens only if we are about to use
+        // 0xFFFF+ as item offset.
+        if count >= 0xffff {
+          overflow = true
+          break
+        }
+        if size > limit { size = limit }
+        count = count + size
+        j = j + slots
+      }
+      if !overflow {
+        slotSize[s] = count
+        totalItems = u32.wrappingAdd(totalItems, count)
+        break
+      }
+      slotLimit[s] = slotLimit[s] - 1
+    }
+    s = s + 1
+  }
+
+  // Step 3: transfer data to "slim" hasher.
+  let mut slotOffsetsBuffer = run uninitializedWords(slots)
+  let mut headsBuffer = run uninitializedHalfwords(buckets)
+  let mut itemsBuffer = run uninitializedWords(u32.toUsize(totalItems))
+  let slotOffsets = wordsMut(&mut slotOffsetsBuffer)
+  let heads = halfwordsMut(&mut headsBuffer)
+  let items = wordsMut(&mut itemsBuffer)
+
+  let mut total: u32 = 0
+  s = 0
+  while s < slots {
+    slotOffsets[s] = total
+    total = u32.wrappingAdd(total, slotSize[s])
+    slotSize[s] = 0
+    s = s + 1
+  }
+  let mut b: usize = 0
+  while b < buckets {
+    let slot = b & u32.toUsize(slotMask)
+    let mut count = u16.toU32(num[b])
+    let mut cursor = u32.toUsize(slotSize[slot])
+    if count > slotLimit[slot] { count = slotLimit[slot] }
+    if count == 0 {
+      heads[b] = 0xffff
+      b = b + 1
+      continue
+    }
+    heads[b] = usize.wrappingToU16(cursor)
+    cursor = cursor + u32.toUsize(slotOffsets[slot])
+    slotSize[slot] = slotSize[slot] + count
+    let mut pos = bucketHeads[b]
+    let mut j: u32 = 0
+    while j < count {
+      items[cursor] = pos
+      cursor = cursor + 1
+      // The chain holds at least `count` positions, so `pos` is one of them here.
+      pos = nextBucket[u32.toUsize(pos)]
+      j = j + 1
+    }
+    items[cursor - 1] = items[cursor - 1] | 0x80000000
+    b = b + 1
+  }
+
+  // The C code refers to the caller's bytes; this dictionary keeps a copy.
+  let mut copy = run uninitializedBytes(sourceSize)
+  if sourceSize != 0 {
+    Slice.copyInto<u8>(unsafe RawBuffer.viewMut<u8>(&mut copy, 0, sourceSize), 0, source)
+  }
+
+  // Free the "flat" allocation, as C does after building the result.
+  drop slotSizeBuffer
+  drop slotLimitBuffer
+  drop numBuffer
+  drop bucketHeadsBuffer
+  drop nextBucketBuffer
+
+  return RawPreparedDictionary {
+    numItems: totalItems,
+    sourceSize: usize.wrappingToU32(sourceSize),
+    hashBits: hashBits,
+    bucketBits: bucketBits,
+    slotBits: slotBits,
+    slotOffsets: move slotOffsetsBuffer,
+    heads: move headsBuffer,
+    items: move itemsBuffer,
+    source: move copy,
+  }
+}
+
+/// `CreatePreparedDictionary`: the dictionary of `source`, with tables tuned to its size.
+pub effect fn createPreparedDictionary(source: &[u8]) -> RawPreparedDictionary ! OutOfMemoryError ? &mut Allocator {
+  let mut bucketBits: u32 = 17
+  let mut slotBits: u32 = 7
+  let hashBits: u32 = 40
+  let bucketLimit: u16 = 32
+  let mut volume = usize.shiftLeft(16, u32.toUsize(bucketBits))
+  // Tune parameters to fit dictionary size.
+  while volume < source.length && bucketBits < 22 {
+    bucketBits = bucketBits + 1
+    slotBits = slotBits + 1
+    volume = usize.shiftLeft(volume, 1)
+  }
+  return run createWithParams(source, bucketBits, slotBits, hashBits, bucketLimit)
+}
+
+/// `CompoundDictionary`: the prepared dictionaries attached to an encoder, which it owns.
+///
+/// The chunks are one address space in the order they were attached: the bytes of chunk `d` are
+/// at `chunkOffsets[d]` up to `chunkOffsets[d + 1]` of `totalSize`; the last byte is at distance
+/// one before the start of the stream.
+pub struct CompoundDictionary {
+  /// `num_chunks`.
+  pub numChunks: usize,
+  /// `total_size`.
+  pub totalSize: usize,
+  chunks: List<RawPreparedDictionary>,
+  chunkOffsets: [usize; 16],
+}
+
+impl CompoundDictionary {
+  /// The compound dictionary of an encoder without prepared dictionaries.
+  pub fn make() -> CompoundDictionary {
+    return CompoundDictionary { numChunks: 0, totalSize: 0, chunks: List<RawPreparedDictionary>.make(), chunkOffsets: [0; 16] }
+  }
+
+  /// `AttachPreparedDictionary`: false, and the dictionary is dropped, when
+  /// `MAX_COMPOUND_DICTS` are attached already.
+  pub effect fn attach(self: &mut Self, dictionary: RawPreparedDictionary) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if self.numChunks == MAX_COMPOUND_DICTS {
+      drop dictionary
+      return false
+    }
+    // The C structure has room for all chunks; reserve it at once, so the dictionaries are never
+    // moved again.
+    if self.numChunks == 0 {
+      run List<RawPreparedDictionary>.reserveExact(&mut self.chunks, MAX_COMPOUND_DICTS)
+    }
+    let length = u32.toUsize(dictionary.sourceSize)
+    let index = self.numChunks
+    self.totalSize = self.totalSize + length
+    run List<RawPreparedDictionary>.append(&mut self.chunks, move dictionary)
+    self.chunkOffsets[index + 1] = self.totalSize
+    self.numChunks = self.numChunks + 1
+    return true
+  }
+
+  /// `chunks[index]`.
+  @inlineAlways
+  pub fn chunk(self: &Self, index: usize) -> &RawPreparedDictionary {
+    return &List<RawPreparedDictionary>.asSlice(&self.chunks)[index]
+  }
+
+  /// `chunk_offsets[index]`.
+  @inlineAlways
+  pub fn chunkOffset(self: &Self, index: usize) -> usize {
+    return self.chunkOffsets[index]
+  }
+
+  /// `chunk_source[index]`.
+  @inlineAlways
+  pub fn chunkSource(self: &Self, index: usize) -> &[u8] {
+    return RawPreparedDictionary.sourceBytes(CompoundDictionary.chunk(&self, index))
+  }
+}
+
+/// `FindMatchLengthWithLimit` between `a[aAt..]` and `b[bAt..]`.
+@inlineAlways
+pub fn matchLengthBetween(a: &[u8], aAt: usize, b: &[u8], bAt: usize, limit: usize) -> usize {
+  let mut matched: usize = 0
+  let mut left = limit
+  while left >= 8 {
+    let x = load64(b, bAt + matched) ^ load64(a, aAt + matched)
+    if x != 0 {
+      return matched + u32.toUsize(u64.trailingZeros(x) / 8)
+    }
+    matched = matched + 8
+    left = left - 8
+  }
+  while left != 0 && a[aAt + matched] == b[bAt + matched] {
+    left = left - 1
+    matched = matched + 1
+  }
+  return matched
+}
+
+/// The bucket of `data[curIxMasked..]` in `dictionary`: the index in `items` of its first
+/// position, or `none` for an empty bucket (the `head == 0xFFFF` of the C code).
+@inlineAlways
+pub fn bucketStart(dictionary: &RawPreparedDictionary, data: &[u8], curIxMasked: usize) -> usize {
+  let hashShift = 64 - dictionary.bucketBits
+  let slotMask = u32.shiftRight(0xffffffff, 32 - dictionary.slotBits)
+  let hashMask = u64.shiftRight(0xffffffffffffffff, u32.toU64(64 - dictionary.hashBits))
+  let h = u64.wrappingMultiply(load64(data, curIxMasked) & hashMask, PREPARED_DICTIONARY_HASH_MUL_64_LONG)
+  let key = u64.wrappingToU32(u64.shiftRight(h, u32.toU64(hashShift)))
+  let slot = key & slotMask
+  let head = halfwords(&dictionary.heads)[u32.toUsize(key)]
+  if head == 0xffff { return NO_BUCKET }
+  return u32.toUsize(words(&dictionary.slotOffsets)[u32.toUsize(slot)]) + u16.toUsize(head)
+}
+
+/// What [`bucketStart`] returns for an empty bucket.
+pub const NO_BUCKET: usize = 0xffffffffffffffff
+
+/// The positions of `dictionary`, as [`bucketStart`] indexes them.
+@inlineAlways
+pub fn items(dictionary: &RawPreparedDictionary) -> &[u32] {
+  return words(&dictionary.items)
+}
+
+// `FindCompoundDictionaryMatch`.
+fn findCompoundDictionaryMatch(
+  dictionary: &RawPreparedDictionary,
+  data: &[u8],
+  ringBufferMask: usize,
+  distanceCache: &[i32; 16],
+  curIx: usize,
+  maxLength: usize,
+  distanceOffset: usize,
+  maxDistance: usize,
+  out: &mut HasherSearchResult,
+) -> () {
+  let sourceSize = u32.toUsize(dictionary.sourceSize)
+  let boundary = distanceOffset - sourceSize
+  let source = bytes(&dictionary.source)
+  let curIxMasked = curIx & ringBufferMask
+  let mut bestScore = out.score
+  let mut bestLen = out.len
+  let mut index = bucketStart(dictionary, data, curIxMasked)
+  let chain = words(&dictionary.items)
+
+  let mut i: usize = 0
+  while i < 4 {
+    let distance = signExtend(distanceCache[i])
+    if distance <= boundary || distance > distanceOffset {
+      i = i + 1
+      continue
+    }
+    let offset = distanceOffset - distance
+    let mut limit = sourceSize - offset
+    limit = if limit > maxLength { maxLength } else { limit }
+    let len = matchLengthBetween(source, offset, data, curIxMasked, limit)
+    if len >= 2 {
+      let mut score = backwardReferenceScoreUsingLastDistance(len)
+      if bestScore < score {
+        if i != 0 { score = score - backwardReferencePenaltyUsingLastDistance(i) }
+        if bestScore < score {
+          bestScore = score
+          if len > bestLen { bestLen = len }
+          out.len = len
+          out.lenCodeDelta = 0
+          out.distance = distance
+          out.score = bestScore
+        }
+      }
+    }
+    i = i + 1
+  }
+  // We require matches of len >4, so increase best_len to 3, so we can compare 4 bytes all the
+  // time.
+  if bestLen < 3 {
+    bestLen = 3
+  }
+  while index != NO_BUCKET {
+    let item = chain[index]
+    index = if (item & 0x80000000) != 0 { NO_BUCKET } else { index + 1 }
+    let offset = u32.toUsize(item & 0x7fffffff)
+    let distance = distanceOffset - offset
+    let mut limit = sourceSize - offset
+    limit = if limit > maxLength { maxLength } else { limit }
+    if distance > maxDistance { continue }
+    // Compare 4 bytes ending at best_len + 1.
+    if curIxMasked + bestLen > ringBufferMask || bestLen >= limit || load32(data, curIxMasked + bestLen - 3) != load32(source, offset + bestLen - 3) {
+      continue
+    }
+    let len = matchLengthBetween(source, offset, data, curIxMasked, limit)
+    if len >= 4 {
+      let score = backwardReferenceScore(len, distance)
+      if bestScore < score {
+        bestScore = score
+        bestLen = len
+        out.len = bestLen
+        out.lenCodeDelta = 0
+        out.distance = distance
+        out.score = bestScore
+      }
+    }
+  }
+}
+
+/// `LookupCompoundDictionaryMatch`: improves `sr` with a match in the attached dictionaries.
+/// `maxRingBufferDistance` is the distance just before the first byte of the stream.
+pub fn lookupCompoundDictionaryMatch(
+  addon: &CompoundDictionary,
+  data: &[u8],
+  ringBufferMask: usize,
+  distanceCache: &[i32; 16],
+  curIx: usize,
+  maxLength: usize,
+  maxRingBufferDistance: usize,
+  maxDistance: usize,
+  sr: &mut HasherSearchResult,
+) -> () {
+  let baseOffset = maxRingBufferDistance + 1 + addon.totalSize - 1
+  let mut d: usize = 0
+  while d < addon.numChunks {
+    // Only one prepared dictionary type is currently supported.
+    findCompoundDictionaryMatch(CompoundDictionary.chunk(addon, d), data, ringBufferMask, distanceCache, curIx, maxLength, baseOffset - addon.chunkOffsets[d], maxDistance, &mut sr)
+    d = d + 1
+  }
+}
+
+/// The part of `ExtendLastCommand` that continues the copy of the last command in the compound
+/// dictionary: `cmdDist` is beyond `maxDistance`, the data before the stream. Returns how many
+/// bytes from `wrappedPosition` matched, at most `bytes`.
+pub fn extendInCompoundDictionary(addon: &CompoundDictionary, data: &[u8], mask: u64, cmdDist: u64, maxDistance: u64, lastCopyLen: u64, bytes: u32, wrappedPosition: u32) -> u32 {
+  let compoundDictionarySize = addon.totalSize
+  let mut taken: u32 = 0
+  if u64.toUsize(u64.wrappingSubtract(cmdDist - maxDistance, 1)) < compoundDictionarySize && lastCopyLen < cmdDist - maxDistance {
+    let address = compoundDictionarySize - u64.toUsize(cmdDist - maxDistance) + u64.toUsize(lastCopyLen)
+    let mut brIndex: usize = 0
+    while address >= addon.chunkOffsets[brIndex + 1] { brIndex = brIndex + 1 }
+    let mut brOffset = address - addon.chunkOffsets[brIndex]
+    let mut chunk = CompoundDictionary.chunkSource(addon, brIndex)
+    let mut chunkLength = addon.chunkOffsets[brIndex + 1] - addon.chunkOffsets[brIndex]
+    // The position is a 32-bit value in C.
+    let mut position = wrappedPosition
+    while taken != bytes && data[u64.toUsize(u32.toU64(position) & mask)] == chunk[brOffset] {
+      taken = taken + 1
+      position = u32.wrappingAdd(position, 1)
+      brOffset = brOffset + 1
+      if brOffset == chunkLength {
+        brIndex = brIndex + 1
+        brOffset = 0
+        if brIndex != addon.numChunks {
+          chunk = CompoundDictionary.chunkSource(addon, brIndex)
+          chunkLength = addon.chunkOffsets[brIndex + 1] - addon.chunkOffsets[brIndex]
+          // An empty chunk ends the copy here. (C reads the byte at its start, which is outside
+          // it, and goes on reading past it; there is nothing to match there.)
+          if chunkLength == 0 { break }
+        } else {
+          break
+        }
+      }
+    }
+  }
+  return taken
+}

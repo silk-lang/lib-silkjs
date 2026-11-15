@@ -7,15 +7,19 @@
 //! greedy meta-block builder and the context modeling decisions (`enc.metablock`, and
 //! `decideOverLiteralContextModeling` here).
 //!
+//! Prepared dictionaries (`BrotliEncoderPrepareDictionary`, `BrotliEncoderAttachPreparedDictionary`)
+//! are the raw (LZ77 prefix) dictionaries of the plain C build; see `enc.compound_dictionary`.
+//!
 //! NOT PORTED YET: qualities 10 and 11 (the Zopfli reference search, `BrotliBuildMetaBlock` with
-//! the block splitter and the clustering, and their hasher H10) and prepared dictionaries. The
-//! places where they plug in are marked `SEAM`. Until then qualities 10 and 11 run the same state
+//! the block splitter and the clustering, and their hasher H10). The places where they plug in
+//! are marked `SEAM`. Until then qualities 10 and 11 run the same state
 //! machine with a reference search that finds no match and store each meta-block uncompressed: a
 //! valid stream, but not the bytes of the C encoder.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
 import silk.mem.raw_buffer { RawBuffer }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -29,6 +33,7 @@ import enc.backward_references { createBackwardReferences }
 import enc.bit_cost { bitsEntropy }
 import enc.bit_stream { storeMetaBlock, storeMetaBlockFast, storeMetaBlockTrivial, storeUncompressedMetaBlock }
 import enc.command { Command, getLengthCode }
+import enc.compound_dictionary { CompoundDictionary, RawPreparedDictionary, createPreparedDictionary, extendInCompoundDictionary }
 import enc.compress_fragment { OnePassArena, compressFragmentFast }
 import enc.compress_fragment_two_pass { COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE, TwoPassArena, compressFragmentTwoPass }
 import enc.constants { CONTEXT_SIGNED, CONTEXT_UTF8, MAX_NDIRECT, MAX_NPOSTFIX, MAX_STATIC_CONTEXTS, MODE_FONT, WINDOW_GAP, context, contextLookupTable, maxBackwardLimit }
@@ -96,19 +101,45 @@ pub struct EncodeStep {
   pub written: usize,
 }
 
-/// A dictionary prepared for the encoder, `BrotliEncoderPreparedDictionary` of the C API.
-///
-/// NOT PORTED YET: this is the seam for `compound_dictionary.c` and `encoder_dict.c`.
+/// `BROTLI_SHARED_DICTIONARY_RAW`: an LZ77 prefix dictionary.
+pub const SHARED_DICTIONARY_RAW: u32 = 0
+/// `BROTLI_SHARED_DICTIONARY_SERIALIZED`: a serialized shared dictionary, which the C library
+/// accepts only in its `BROTLI_EXPERIMENTAL` build; this one rejects it like the plain build.
+pub const SHARED_DICTIONARY_SERIALIZED: u32 = 1
+
+/// A dictionary prepared for the encoder, `BrotliEncoderPreparedDictionary` of the C API (the
+/// `ManagedDictionary` that wraps a `PreparedDictionary`).
 pub struct PreparedDictionary {
-  kind: u32,
+  // `NULL` where `BrotliEncoderPrepareDictionary` fails.
+  prepared: Option<RawPreparedDictionary>,
 }
 
 impl PreparedDictionary {
-  /// `BrotliEncoderPrepareDictionary`. It keeps its own copy of `data`.
+  /// `BrotliEncoderPrepareDictionary`. It keeps its own copy of `data`. `quality` is the
+  /// quality the dictionary is prepared for; a raw dictionary does not depend on it.
   ///
-  /// PLACEHOLDER: the result is empty and cannot be attached.
+  /// The C function returns `NULL` for a kind other than `SHARED_DICTIONARY_RAW`; then the
+  /// result is not valid ([`PreparedDictionary.isValid`]) and attaching it fails.
   pub effect fn prepare(kind: u32, data: &[u8], quality: u32) -> PreparedDictionary ! OutOfMemoryError ? &mut Allocator {
-    return PreparedDictionary { kind: kind }
+    if kind != SHARED_DICTIONARY_RAW {
+      return PreparedDictionary { prepared: Option<RawPreparedDictionary>.none() }
+    }
+    let prepared = run createPreparedDictionary(data)
+    return PreparedDictionary { prepared: Option<RawPreparedDictionary>.some(move prepared) }
+  }
+
+  /// False where `BrotliEncoderPrepareDictionary` returns `NULL`.
+  pub fn isValid(self: &Self) -> bool {
+    return Option<RawPreparedDictionary>.isSome(&self.prepared)
+  }
+
+  /// `BrotliEncoderGetPreparedDictionarySize`, for a dictionary that holds its own copy of the
+  /// data (plus the 24 bytes of a `ManagedDictionary`), or 0 if it is not valid.
+  pub fn memorySize(self: &Self) -> usize {
+    return match &self.prepared {
+      Option<RawPreparedDictionary>.Some { value } => RawPreparedDictionary.memorySize(&value) + 24
+      Option<RawPreparedDictionary>.None => 0
+    }
   }
 }
 
@@ -570,6 +601,9 @@ struct Encoded {
 /// A streaming encoder, `BrotliEncoderState` of the C API.
 pub struct BrotliEncoder {
   params: EncoderParams,
+  // `params.dictionary.compound`: the attached prepared dictionaries, which the encoder owns.
+  // `params.dictionary.compoundTotalSize` is its `totalSize`.
+  compound: CompoundDictionary,
   inputPos: u64,
   ringbuffer: RingBuffer,
   // `commands_` and `cmd_alloc_size_`.
@@ -630,6 +664,7 @@ impl BrotliEncoder {
     let commandAllocation = run Allocator.allocate(move commandLayout)
     return BrotliEncoder {
       params: EncoderParams.make(),
+      compound: CompoundDictionary.make(),
       inputPos: 0,
       ringbuffer: run RingBuffer.make(),
       // No command is stored in an empty buffer.
@@ -715,12 +750,23 @@ impl BrotliEncoder {
     return false
   }
 
-  /// `BrotliEncoderAttachPreparedDictionary`. The encoder takes the dictionary.
-  ///
-  /// PLACEHOLDER: prepared dictionaries are not ported; nothing is attached.
+  /// `BrotliEncoderAttachPreparedDictionary`. The encoder takes the dictionary (and drops it if
+  /// it cannot be attached). False for a dictionary that is not valid and when 15 dictionaries
+  /// are attached already. As in C, a raw dictionary can be attached after the stream started;
+  /// it changes the distances of the static dictionary from then on.
   pub effect fn attachPreparedDictionary(self: &mut Self, dictionary: PreparedDictionary) -> bool ? &mut Allocator {
-    drop dictionary
-    return false
+    let prepared = match move dictionary.prepared {
+      Option<RawPreparedDictionary>.Some { value } => move value
+      Option<RawPreparedDictionary>.None => { return false }
+    }
+    // The C structure has room for all chunks, so attaching does not allocate there; here an
+    // allocation failure fails the call.
+    let attached = match move run Effect.result(CompoundDictionary.attach(&mut self.compound, move prepared)) {
+      Result<bool, OutOfMemoryError>.Success { value } => value
+      Result<bool, OutOfMemoryError>.Failure { .. } => false
+    }
+    self.params.dictionary.compoundTotalSize = self.compound.totalSize
+    return attached
   }
 
   /// `BrotliEncoderCompressStream` with `next_out` set: compresses `input` into `output` under
@@ -957,9 +1003,9 @@ impl BrotliEncoder {
           position = (position + 1) & 0xffffffff
         }
       } else {
-        // SEAM: the copy continues in an attached compound dictionary
-        // (`params.dictionary.compound`); without one, `compound.total_size` is 0 and nothing
-        // matches.
+        let extended = extendInCompoundDictionary(&self.compound, data, mask, cmdDist, maxDistance, lastCopyLen, size, wrappedLastProcessedPos)
+        commands[last].copyLen = u32.wrappingAdd(commands[last].copyLen, extended)
+        taken = extended
       }
       // The copy length is at most the metablock size, and thus expressible.
       let copyLen = commands[last].copyLen
@@ -1098,6 +1144,7 @@ impl BrotliEncoder {
       mask,
       literalContextLut,
       &self.params,
+      &self.compound,
       &mut self.hasher,
       &mut self.distCache,
       &mut self.lastInsertLen,

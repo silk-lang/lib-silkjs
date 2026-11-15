@@ -1,0 +1,179 @@
+//! The compound dictionary pieces of the Zopfli reference searches of qualities 10 and 11: a port
+//! of `FindAllCompoundDictionaryMatches` and `LookupAllCompoundDictionaryMatches` of google/brotli
+//! v1.2.0 `c/enc/hash.h`, and of `MergeMatches` and the compound dictionary branch of the
+//! distance cache search of `UpdateNodes` in `c/enc/backward_references_hq.c`.
+//!
+//! The functions are generic over the match type of the Zopfli search ([`BackwardMatchSlot`],
+//! for `BackwardMatch`), which lives with the hasher H10.
+import silk.core.ownership { Copy }
+import silk.num.u32
+import enc.compound_dictionary { CompoundDictionary, NO_BUCKET, RawPreparedDictionary, bucketStart, items, matchLengthBetween }
+
+/// What the compound dictionary search needs of `BackwardMatch`.
+pub interface BackwardMatchSlot {
+  /// `InitBackwardMatch(self, distance, length)`.
+  fn initMatch(self: &mut Self, distance: usize, length: usize) -> ()
+  /// `BackwardMatchLength(self)`.
+  fn matchLength(self: &Self) -> usize
+  /// `self->distance`.
+  fn matchDistance(self: &Self) -> u32
+}
+
+// `FindAllCompoundDictionaryMatches`: writes the matches of `data[curIx & ringBufferMask..]` in
+// `dictionary` that are longer than `minLength` and than each match before them, from
+// `matches[at]`, at most `matchLimit`. Returns their number.
+fn findAllCompoundDictionaryMatches<M: BackwardMatchSlot>(
+  dictionary: &RawPreparedDictionary,
+  data: &[u8],
+  ringBufferMask: usize,
+  curIx: usize,
+  minLength: usize,
+  maxLength: usize,
+  distanceOffset: usize,
+  maxDistance: usize,
+  matches: &mut [M],
+  at: usize,
+  matchLimit: usize,
+) -> usize {
+  let sourceSize = u32.toUsize(dictionary.sourceSize)
+  let source = RawPreparedDictionary.sourceBytes(dictionary)
+  let chain = items(dictionary)
+  let curIxMasked = curIx & ringBufferMask
+  let mut bestLen = minLength
+  let mut index = bucketStart(dictionary, data, curIxMasked)
+  let mut found: usize = 0
+  while index != NO_BUCKET {
+    let item = chain[index]
+    index = if (item & 0x80000000) != 0 { NO_BUCKET } else { index + 1 }
+    let offset = u32.toUsize(item & 0x7fffffff)
+    let distance = distanceOffset - offset
+    let mut limit = sourceSize - offset
+    limit = if limit > maxLength { maxLength } else { limit }
+    if distance > maxDistance { continue }
+    if curIxMasked + bestLen > ringBufferMask || bestLen >= limit || data[curIxMasked + bestLen] != source[offset + bestLen] {
+      continue
+    }
+    let len = matchLengthBetween(source, offset, data, curIxMasked, limit)
+    if len > bestLen {
+      bestLen = len
+      BackwardMatchSlot.initMatch(&mut matches[at + found], distance, len)
+      found = found + 1
+      if found == matchLimit { break }
+    }
+  }
+  return found
+}
+
+/// `LookupAllCompoundDictionaryMatches`: writes the matches of `data[curIx & ringBufferMask..]`
+/// in the attached dictionaries from `matches[at]`, at most `matchLimit`, in order of increasing
+/// length; each chunk adds only matches longer than the last one found. `maxRingBufferDistance`
+/// is the distance just before the first byte of the stream (`dictionary_start`). Returns their
+/// number.
+///
+/// Qualities 10 and 11 call it after `FindAllMatchesH10` when `addon.numChunks != 0`, with
+/// `minLength` 3, `matchLimit` 64 and `at` 64 entries before the matches of the hasher, which
+/// then start `MAX_NUM_MATCHES_H10 + 128` entries after the slot of the position (the
+/// `lz_matches_offset` / `shadow_matches` of the C code; 0 without a compound dictionary), and
+/// then merge both lists with [`mergeMatches`].
+pub fn lookupAllCompoundDictionaryMatches<M: BackwardMatchSlot>(
+  addon: &CompoundDictionary,
+  data: &[u8],
+  ringBufferMask: usize,
+  curIx: usize,
+  minLength: usize,
+  maxLength: usize,
+  maxRingBufferDistance: usize,
+  maxDistance: usize,
+  matches: &mut [M],
+  at: usize,
+  matchLimit: usize,
+) -> usize {
+  let baseOffset = maxRingBufferDistance + 1 + addon.totalSize - 1
+  let mut minimum = minLength
+  let mut totalFound: usize = 0
+  let mut d: usize = 0
+  while d < addon.numChunks {
+    // Only one prepared dictionary type is currently supported.
+    totalFound = totalFound + findAllCompoundDictionaryMatches(
+      CompoundDictionary.chunk(addon, d), data, ringBufferMask, curIx, minimum, maxLength,
+      baseOffset - CompoundDictionary.chunkOffset(addon, d), maxDistance, &mut matches, at + totalFound, matchLimit - totalFound,
+    )
+    if totalFound == matchLimit { break }
+    if totalFound > 0 {
+      minimum = BackwardMatchSlot.matchLength(&matches[at + totalFound - 1])
+    }
+    d = d + 1
+  }
+  return totalFound
+}
+
+/// `MergeMatches(&matches[dst], &matches[src1], len1, &matches[src2], len2)`: merges two lists
+/// sorted by length (then distance) into one at `dst`, which may start before both and overlap
+/// them as in the C callers (`dst + len1 <= src1 + len1 <= src2`, writing never overtakes
+/// reading).
+pub fn mergeMatches<M: BackwardMatchSlot + Copy>(matches: &mut [M], dst: usize, src1: usize, len1: usize, src2: usize, len2: usize) -> () {
+  let mut out = dst
+  let mut a = src1
+  let mut b = src2
+  let mut left1 = len1
+  let mut left2 = len2
+  while left1 > 0 && left2 > 0 {
+    let l1 = BackwardMatchSlot.matchLength(&matches[a])
+    let l2 = BackwardMatchSlot.matchLength(&matches[b])
+    if l1 < l2 || (l1 == l2 && BackwardMatchSlot.matchDistance(&matches[a]) < BackwardMatchSlot.matchDistance(&matches[b])) {
+      matches[out] = matches[a]
+      out = out + 1
+      a = a + 1
+      left1 = left1 - 1
+    } else {
+      matches[out] = matches[b]
+      out = out + 1
+      b = b + 1
+      left2 = left2 - 1
+    }
+  }
+  while left1 > 0 {
+    matches[out] = matches[a]
+    out = out + 1
+    a = a + 1
+    left1 = left1 - 1
+  }
+  while left2 > 0 {
+    matches[out] = matches[b]
+    out = out + 1
+    b = b + 1
+    left2 = left2 - 1
+  }
+}
+
+/// The `backward > dictionary_start` branch of the distance cache search of `UpdateNodes`: the
+/// length of the match of `ringbuffer[curIxMasked..]` at distance `backward` into the attached
+/// dictionaries, at most `maxLen`, or 0 where the C code skips the candidate (`continue`): when
+/// the match cannot be longer than `bestLen` or its byte after `bestLen` differs from
+/// `continuation`, the byte `ringbuffer[curIxMasked + bestLen]`. A length of at most `bestLen`
+/// adds no node, like the skip.
+///
+/// The caller has checked `dictionaryStart < backward <= dictionaryStart + addon.totalSize`
+/// (above that is the static dictionary, which the branch before ignores).
+pub fn compoundDistanceCacheMatchLength(
+  addon: &CompoundDictionary,
+  dictionaryStart: usize,
+  backward: usize,
+  bestLen: usize,
+  continuation: u8,
+  ringbuffer: &[u8],
+  curIxMasked: usize,
+  maxLen: usize,
+) -> usize {
+  let mut d: usize = 0
+  let mut offset = dictionaryStart + 1 + addon.totalSize - 1
+  while offset >= backward + CompoundDictionary.chunkOffset(addon, d + 1) { d = d + 1 }
+  let source = CompoundDictionary.chunkSource(addon, d)
+  offset = offset - CompoundDictionary.chunkOffset(addon, d) - backward
+  let mut limit = CompoundDictionary.chunkOffset(addon, d + 1) - CompoundDictionary.chunkOffset(addon, d) - offset
+  limit = if limit > maxLen { maxLen } else { limit }
+  if bestLen >= limit || continuation != source[offset + bestLen] {
+    return 0
+  }
+  return matchLengthBetween(source, offset, ringbuffer, curIxMasked, limit)
+}
