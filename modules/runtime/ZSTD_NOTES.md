@@ -62,23 +62,97 @@ modules is the owner's decision (see "Upstreaming").
 
 ## State
 
-First release build of the runtime on the Silk package (no `ZSTD_*` symbol is linked), against
-Node 24 with the cases of `tests/compat-zstd.mjs`:
+Everything the runtime asks of Zstandard is the Silk package; `../native/zstd`, which compiled
+the C library, is removed, and the runtime links no `ZSTD_*` symbol.
 
-| Case | C library build of `main` | Silk build |
+### Verified
+
+| What | How | Result |
 | --- | --- | --- |
-| zstd-levels-small, -fast, -lazy, -optimal (every level on 14 inputs) | pass | pass |
-| zstd-round-trips-a, -b (120 fuzzed round trips) | pass | pass |
-| zstd-parameters (bounds and errors of every parameter, overrides, pledged size, `info`) | pass | pass |
-| zstd-streams (pieces, flushes, windows, async) | fails: Node's empty trailing frame | pass |
-| zstd-decoding (skippable, concatenated, corrupt, truncated, window limits) | pass | pass |
-| zstd-dictionaries | fails: one error message | fails: the compressor has no dictionaries yet |
-| zstd-workers-ldm | pass (Node's own stream truncation excepted) | fails: 16 of 54, all `nbWorkers` > 0 |
+| Decoder | `../zstd/tests/decode_diff.py`: the bytes, the status and every `ZSTD_decompressStream` call's positions and return value, against libzstd 1.5.7 in the same call pattern; frames of every level, skippable and concatenated frames, window limits, dictionaries, 3000 mutated and truncated frames | 5351 comparisons, 0 differences |
+| Compressor, no dictionary | `../zstd/tests/compress_diff.py`: the bytes and every `ZSTD_compressStream2` call's result and positions; levels -131072 to 22, every strategy, parameter overrides and bounds, one-shot and streamed with flushes, windows smaller than the input, checksum, pledged sizes, several frames per context | 2489 cases, 0 failures |
+| Compressor, dictionaries | the same with raw, trained and corrupt dictionaries of 1 B to 3 MB, input sizes on both sides of every attach/copy/reload cut-off | 5668 cases, 0 failures (and 2739 one-shot cases identical to Node) |
+| Long-distance matching, `nbWorkers` | the ports' own harnesses against a multithreaded build of 1.5.7 | 268 and 371 cases, bytes identical (call traces differ with workers: Differences 1) |
+| Runtime against Node 24 | `silk task compat` (`tests/compat.mjs` with `tests/compat-zstd.mjs`: every level on 14 inputs, 120 fuzzed round trips, every parameter's bounds and errors, streams, async, decoding of corrupt input, dictionaries, workers, LDM) | 86 passed, 0 failed |
+| `node:zlib/iter` | `tests/iterable-streams-smoke.cjs` | ok |
 
-The compressor's own differential test (`../zstd/tests/compress_diff.py`, every call's return
-value and positions as well as the bytes) covers levels -131072 to 4 exactly; the lazy and
-optimal parsers, long-distance matching, workers and compressor dictionaries are being finished.
-`../native/zstd`, which compiled the C library, is removed: nothing links Zstandard C.
+### Measurements
+
+Release builds of `main` with the C library (`C`) and of this branch (`Silk`), interleaved in
+shuffled order, three rounds, `SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset, nothing compiling;
+`bench/scripts/zstd.cjs` (one case per process; MB/s of uncompressed data, the median of the runs
+of a case, then the median over the rounds; peak RSS of the process). Host noise is about 8%.
+
+One-shot `zstdCompressSync`/`zstdDecompressSync` with `chunkSize` 8 MiB (`ZSTD_CHUNK=8388608`),
+which shows the codec. The compressed sizes are the same in every row (the bytes are compared by
+the tests above):
+
+| case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
+| --- | --- | --- | --- | --- | --- | --- |
+| c:text:-5 | 225.4 | 220.8 | 0.98 | 136 | 139 | 5896760 / 5896760 |
+| c:text:1 | 211.1 | 186.9 | 0.89 | 123 | 123 | 3586493 / 3586493 |
+| c:text:3 | 165.8 | 162.2 | 0.98 | 124 | 127 | 3549252 / 3549252 |
+| c:text:9 | 51.0 | 39.4 | 0.77 | 116 | 119 | 2958542 / 2958542 |
+| c:text:19 | 3.1 | 2.8 | 0.90 | 116 | 119 | 447687 / 447687 |
+| c:json:-5 | 488.0 | 477.8 | 0.98 | 79 | 82 | 526950 / 526950 |
+| c:json:1 | 484.0 | 423.2 | 0.87 | 79 | 82 | 309338 / 309338 |
+| c:json:3 | 422.9 | 408.2 | 0.97 | 82 | 85 | 272294 / 272294 |
+| c:json:9 | 125.5 | 95.4 | 0.76 | 91 | 94 | 277236 / 277236 |
+| c:json:19 | 2.0 | 1.9 | 0.95 | 110 | 113 | 117074 / 117074 |
+| c:random:-5 | 302.8 | 311.0 | 1.03 | 115 | 118 | 8388810 / 8388810 |
+| c:random:1 | 287.8 | 315.7 | 1.10 | 115 | 118 | 8388810 / 8388810 |
+| c:random:3 | 321.5 | 288.5 | 0.90 | 117 | 120 | 8388810 / 8388810 |
+| c:random:9 | 214.4 | 198.9 | 0.93 | 136 | 139 | 8388810 / 8388810 |
+| c:binary:1 | 193.8 | 177.7 | 0.92 | 137 | 140 | 7954313 / 7954313 |
+| c:binary:3 | 121.6 | 130.8 | 1.08 | 135 | 138 | 6816591 / 6816591 |
+| c:binary:9 | 37.0 | 28.4 | 0.77 | 143 | 146 | 5996711 / 5996711 |
+| c:binary:19 | 3.2 | 2.9 | 0.91 | 141 | 145 | 1291911 / 1291911 |
+| d:text:1 | 365.1 | 418.7 | 1.15 | 128 | 131 | 3586493 / 3586493 |
+| d:text:3 | 381.0 | 377.2 | 0.99 | 129 | 132 | 3549252 / 3549252 |
+| d:text:19 | 390.0 | 420.1 | 1.08 | 180 | 183 | 2573302 / 2573302 |
+| d:json:3 | 1460.4 | 1556.1 | 1.07 | 129 | 132 | 272294 / 272294 |
+| d:json:19 | 1621.7 | 1588.4 | 0.98 | 164 | 167 | 191189 / 191189 |
+| d:random:3 | 534.6 | 513.3 | 0.96 | 114 | 117 | 8388810 / 8388810 |
+| d:binary:1 | 312.2 | 316.2 | 1.01 | 137 | 140 | 7954313 / 7954313 |
+| d:binary:3 | 333.3 | 332.0 | 1.00 | 134 | 137 | 6816591 / 6816591 |
+| d:binary:19 | 253.4 | 286.8 | 1.13 | 204 | 208 | 5409670 / 5409670 |
+
+Level 1 was measured before the BMI2 sequence encoder (`262f19f`), which took the compressor's
+CLI from 11-13% behind the C library to 2-6%. Level 9 (and 5 to 12) is the row match finder,
+which has no prefetch (Compiler walls 2). Peak RSS is 3 MiB higher in every case, the size of
+the package's code and tables in the executable, not of a buffer.
+
+The default `chunkSize` (16 KiB), the streams (`cs`, `ds`: 1 KiB writes) and the thread-pool
+calls (`ca`, `da`: four at a time). The one-shot rows here are dominated by the binding's cost per
+output chunk (Found in the runtime's binding, 1), for both builds alike. The 9 more bytes of the
+`cs` rows are Node's empty trailing frame, which the C build did not write:
+
+| case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
+| --- | --- | --- | --- | --- | --- | --- |
+| c:text:3 | 10.3 | 10.9 | 1.06 | 115 | 118 | 3556322 / 3556322 |
+| d:text:3 | 9.7 | 9.5 | 0.98 | 108 | 111 | 3556322 / 3556322 |
+| c:binary:1 | 4.6 | 4.6 | 1.00 | 138 | 141 | 7954313 / 7954313 |
+| d:binary:1 | 4.7 | 4.6 | 0.98 | 136 | 138 | 7954313 / 7954313 |
+| cs:text:3 | 14.9 | 13.4 | 0.90 | 77 | 80 | 655020 / 655029 |
+| ds:text:3 | 56.5 | 51.9 | 0.92 | 76 | 79 | 655024 / 655024 |
+| cs:json:3 | 18.2 | 16.5 | 0.91 | 76 | 78 | 148683 / 148692 |
+| ds:json:3 | 141.0 | 124.7 | 0.88 | 72 | 76 | 148687 / 148687 |
+| cs:binary:3 | 15.3 | 13.9 | 0.91 | 95 | 94 | 1561230 / 1561239 |
+| ds:binary:3 | 33.5 | 34.0 | 1.01 | 92 | 94 | 1561234 / 1561234 |
+| ca:text:3 | 10.3 | 10.3 | 1.00 | 305 | 301 | 3556321 / 3556321 |
+| da:text:3 | 9.1 | 9.5 | 1.04 | 229 | 232 | 3556322 / 3556322 |
+| ca:binary:1 | 4.4 | 4.4 | 1.00 | 392 | 378 | 7954312 / 7954312 |
+| da:binary:1 | 4.4 | 4.2 | 0.95 | 296 | 324 | 7954313 / 7954313 |
+
+An HTTP server that compresses each response (1 MiB at the level shown) with
+`Content-Encoding: zstd`, and a client that decodes it (`http.get` piped into
+`createZstdDecompress`, five rounds):
+
+| case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
+| --- | --- | --- | --- | --- | --- | --- |
+| http:json:3 | 65.1 | 62.3 | 0.96 | 69 | 72 | 97337 / 97337 |
+| http:text:3 | 44.1 | 40.7 | 0.92 | 72 | 74 | 194578 / 194578 |
+| http:binary:1 | 41.3 | 40.6 | 0.98 | 86 | 89 | 404568 / 404568 |
 
 ## Compiler walls
 
