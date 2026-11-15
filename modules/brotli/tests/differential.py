@@ -6,7 +6,7 @@ Both sides are the same driver (tests/tool and tests/reference/ref_tool.c): for 
 parameters and chunk sizes they must write the same bytes, exit with the same status, and report the
 same result for every library call (consumed, written, has-more-output, finished, error code).
 
-  tests/differential.py --ref REF --tool TOOL [encode|decode|corrupt|params|dictionary|all]
+  tests/differential.py --ref REF --tool TOOL [encode|decode|corrupt|params|dictionary|large|all]
                         [--seed N] [--rounds N] [--quality Q[,Q...]] [--file PATH ...] [--stop]
 
 REF is tests/reference/build.sh's output; TOOL is the build of tests/tool.
@@ -219,6 +219,30 @@ def dictionary(args, rng):
                 compare(args, f'dictionary decode without it {name} q{q}', compressed, BR_MODE=1)
 
 
+def large(args, rng):
+    """Inputs of several MB, so the ring buffer wraps, with small and large windows (up to 30 bits
+    with LARGE_WINDOW), one-shot and streamed with flushes, then decoded back by both sides."""
+    runtime = REPO / 'modules/runtime'
+    text = b''.join((runtime / f).read_bytes() for f in ['ext/node/internal/deps/undici/undici.js', 'vendor/wamr/core/iwasm/interpreter/wasm_loader.c'] if (runtime / f).exists())
+    binary = Path('/opt/node24/bin/node').read_bytes()[:6 << 20] if Path('/opt/node24/bin/node').exists() else rng.randbytes(6 << 20)
+    inputs = [('text', (text * 6)[:8 << 20]), ('binary', binary), ('mixed', (text[:1 << 20] + rng.randbytes(1 << 20) + binary[:2 << 20]) * 2)]
+    choices = qualities(args) if args.quality else [0, 1, 2, 4, 5, 7, 9]
+    for round in range(max(6, args.rounds // 20)):
+        name, data = rng.choice(inputs)
+        q = rng.choice(choices)
+        lgwin = rng.choice([16, 18, 20, 22, 24])
+        params = [f'1={q}', f'2={lgwin}']
+        if rng.random() < 0.3: params = [f'1={q}', f'2={rng.choice([25, 26, 28, 30])}', '6=1']
+        if q >= 10: data = data[:2 << 20]
+        env = dict(BR_MODE=0, BR_PARAMS=','.join(params))
+        if rng.random() < 0.5: env.update(BR_IN=rng.choice([65536, 100000, 1 << 20]), BR_FLUSH=rng.choice([0, 3, 7]))
+        status, compressed, _ = compare(args, f'large encode {name} {env}', data, **env)
+        if status == 0:
+            denv = dict(BR_MODE=1, BR_OUT=rng.choice([65536, 1 << 20]), BR_IN=rng.choice([4096, 1 << 20]))
+            if '6=1' in params: denv['BR_PARAMS'] = '1=1'
+            compare(args, f'large decode {name} {env}', compressed, **denv)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('what', nargs='?', default='all')
@@ -227,7 +251,7 @@ def main():
     parser.add_argument('--quality'); parser.add_argument('--file', action='append')
     parser.add_argument('--stop', action='store_true'); parser.add_argument('--keep', action='store_true')
     args = parser.parse_args()
-    suites = dict(encode=encode, decode=decode, corrupt=corrupt, params=params, dictionary=dictionary)
+    suites = dict(encode=encode, decode=decode, corrupt=corrupt, params=params, dictionary=dictionary, large=large)
     for name, suite in suites.items():
         if args.what in ('all', name):
             suite(args, random.Random(args.seed))
