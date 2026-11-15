@@ -105,7 +105,7 @@ pub unsafe fn createDStream() -> ?[*]mut u8 {
     llPtr: unsafe wordsRo(unsafe asWordsOptional(ll)), ofPtr: unsafe wordsRo(unsafe asWordsOptional(of)), mlPtr: unsafe wordsRo(unsafe asWordsOptional(ml)),
     hufPtr: unsafe mem.ro(unsafe nonNull(huf)),
     rep: [1, 4, 8], litEntropy: false, fseEntropy: false,
-    litBuffer: unsafe nonNull(lit), litBase: litRo, litStart: 0, litSize: 0,
+    litBuffer: unsafe nonNull(lit), litBase: litRo, litStart: 0, litSize: 0, sequenceRoom: 0,
     prefixBase: litRo, prefixStart: 0, previousDstEnd: 0, extBase: litRo, extLen: 0,
     stage: DS_GET_FRAME_HEADER_SIZE, expected: 0, blockType: BT_RESERVED, rleSize: 0, headerSize: 0,
     headerBuffer: unsafe nonNull(header),
@@ -221,7 +221,7 @@ pub unsafe fn dctxReset(raw: ?[*]mut u8, directive: i32) -> usize {
 unsafe fn loadDictEntropy(dctx: &mut Dctx, dict: [*]const u8, size: usize) -> usize {
   if size <= 8 { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
   let mut at: usize = 8
-  let hufSize = unsafe huf_decode.readTableX1(unsafe nonNull(dctx.dictHuf), dict, at, size - at)
+  let hufSize = unsafe huf_decode.readTableX2(unsafe nonNull(dctx.dictHuf), dict, at, size - at)
   if errors.isError(hufSize) { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
   at = at + hufSize
   let ofSize = unsafe decode_block.loadDictTable(unsafe asWords(unsafe wordsBytes(dctx.dictOf)), decode_block.DICT_KIND_OF, dict, at, size)
@@ -482,7 +482,7 @@ unsafe fn continueFrame(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity:
     unsafe checkContinuity(&mut dctx, out, start)
     let mut written: usize = 0
     if dctx.blockType == BT_COMPRESSED {
-      written = unsafe decode_block.decompressBlock(&mut dctx, out, start, capacity, src, at, size)
+      written = unsafe decode_block.decompressBlock(&mut dctx, out, start, capacity, src, at, size, true)
       dctx.expected = 0
     } else if dctx.blockType == BT_RAW {
       if size > capacity { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
@@ -535,6 +535,112 @@ unsafe fn continueFrame(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity:
     return 0
   }
   return errors.err(errors.E_GENERIC)
+}
+
+// ZSTD_findFrameCompressedSize: the size of the frame at `src[at..at+size]`, or an error if it is
+// not complete or not valid.
+unsafe fn findFrameCompressedSize(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usize) -> usize {
+  let start = unsafe mem.addc(src, at)
+  if size >= SKIPPABLE_HEADER_SIZE && (unsafe mem.r32(start, 0) & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START {
+    let payload = unsafe mem.r32(start, 4)
+    if u32.wrappingAdd(payload, 8) < payload { return errors.err(errors.E_FRAMEPARAMETER_UNSUPPORTED) }
+    let total = SKIPPABLE_HEADER_SIZE + u32.toUsize(payload)
+    if total > size { return errors.err(errors.E_SRCSIZE_WRONG) }
+    return total
+  }
+  // The header fields of `dctx` are read again by the caller's path, so parsing into them is
+  // harmless; they are restored from the same bytes.
+  let headerResult = unsafe getFrameHeader(&mut dctx, start, size)
+  if errors.isError(headerResult) { return headerResult }
+  if headerResult > 0 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let mut ip = dctx.headerSize
+  let mut remaining = size - dctx.headerSize
+  while true {
+    if remaining < BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let header = u16.toU32(unsafe mem.r16(start, ip)) | u32.shiftLeft(u8.toU32(unsafe mem.r8(start, ip + 2)), 16)
+    let blockType = u32.shiftRight(header, 1) & 3
+    let mut blockSize = u32.toUsize(u32.shiftRight(header, 3))
+    if blockType == BT_RLE { blockSize = 1 } else if blockType == BT_RESERVED { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    if BLOCK_HEADER_SIZE + blockSize > remaining { return errors.err(errors.E_SRCSIZE_WRONG) }
+    ip = ip + BLOCK_HEADER_SIZE + blockSize
+    remaining = remaining - (BLOCK_HEADER_SIZE + blockSize)
+    if (header & 1) == 1 { break }
+  }
+  if dctx.checksumFlag {
+    if remaining < 4 { return errors.err(errors.E_SRCSIZE_WRONG) }
+    ip = ip + 4
+  }
+  return ip
+}
+
+// ZSTD_decompress_usingDDict for one regular frame: decodes the complete frame at
+// `src[at..at+size]` straight into `dst[start..start+capacity]`. Returns the decoded size, or an
+// error.
+unsafe fn decompressFrameDirect(dctx: &mut Dctx, dst: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize) -> usize {
+  // ZSTD_decompressMultiFrame skips a skippable frame; there is then nothing else in `size`.
+  if size >= SKIPPABLE_HEADER_SIZE && (unsafe mem.r32(src, at) & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START { return 0 }
+  unsafe beginFrame(&mut dctx)
+  unsafe checkContinuity(&mut dctx, dst, start)
+  let mut ip = at
+  let mut remaining = size
+  let oend = start + capacity
+  let mut op = start
+  if remaining < 6 + BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let headerSize = unsafe frameHeaderSize(unsafe mem.addc(src, ip), FRAME_HEADER_MIN)
+  if errors.isError(headerSize) { return headerSize }
+  if remaining < headerSize + BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let parsed = unsafe getFrameHeader(&mut dctx, unsafe mem.addc(src, ip), headerSize)
+  if errors.isError(parsed) { return parsed }
+  if parsed > 0 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let accepted = unsafe acceptFrameHeader(&mut dctx)
+  if errors.isError(accepted) { return accepted }
+  ip = ip + headerSize
+  remaining = remaining - headerSize
+  if dctx.maxBlockSizeParam != 0 && dctx.maxBlockSizeParam < dctx.blockSizeMax { dctx.blockSizeMax = dctx.maxBlockSizeParam }
+  while true {
+    if remaining < BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let header = u16.toU32(unsafe mem.r16(src, ip)) | u32.shiftLeft(u8.toU32(unsafe mem.r8(src, ip + 2)), 16)
+    let lastBlock = (header & 1) == 1
+    let blockType = u32.shiftRight(header, 1) & 3
+    let mut blockSize = u32.toUsize(u32.shiftRight(header, 3))
+    let originalSize = blockSize
+    if blockType == BT_RLE { blockSize = 1 } else if blockType == BT_RESERVED { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    ip = ip + BLOCK_HEADER_SIZE
+    remaining = remaining - BLOCK_HEADER_SIZE
+    if blockSize > remaining { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let mut decoded: usize = 0
+    if blockType == BT_COMPRESSED {
+      decoded = unsafe decode_block.decompressBlock(&mut dctx, dst, op, oend - op, src, ip, blockSize, false)
+    } else if blockType == BT_RAW {
+      if blockSize > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      if blockSize != 0 { let _m = unsafe mem.memmove(unsafe mem.add(dst, op), unsafe mem.addc(src, ip), blockSize) }
+      decoded = blockSize
+    } else {
+      if originalSize > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      if originalSize != 0 { let _s = unsafe mem.memset(unsafe mem.add(dst, op), u8.toI32(unsafe mem.r8(src, ip)), originalSize) }
+      decoded = originalSize
+    }
+    if errors.isError(decoded) { return decoded }
+    if dctx.validateChecksum { unsafe xxh64.update(&mut dctx.hash, unsafe mem.ro(dst), op, decoded) }
+    op = op + decoded
+    dctx.previousDstEnd = op
+    ip = ip + blockSize
+    remaining = remaining - blockSize
+    if lastBlock { break }
+  }
+  if dctx.frameContentSize != CONTENTSIZE_UNKNOWN && usize.toU64(op - start) != dctx.frameContentSize {
+    return errors.err(errors.E_CORRUPTION_DETECTED)
+  }
+  if dctx.checksumFlag {
+    if remaining < 4 { return errors.err(errors.E_CHECKSUM_WRONG) }
+    if !dctx.forceIgnoreChecksum {
+      let computed = u64.wrappingToU32(xxh64.digest(&dctx.hash))
+      if unsafe mem.r32(src, ip) != computed { return errors.err(errors.E_CHECKSUM_WRONG) }
+    }
+    remaining = remaining - 4
+  }
+  if remaining != 0 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  return op - start
 }
 
 // ZSTD_decompressContinueStream: decodes into the stream's own buffer and moves to the stage
@@ -610,8 +716,9 @@ pub unsafe fn decompressStream(raw: ?[*]mut u8, dst: [*]mut u8, dstSize: usize, 
           let partial = dctx.lhSize
           let early = unsafe getFrameHeader(&mut dctx, unsafe mem.ro(header), partial)
           if errors.isError(early) { return early }
+          // ZSTD_FRAMEHEADERSIZE_MIN is 6: the 5 bytes read first and one more.
           let mut wanted = hSize
-          if wanted < FRAME_HEADER_MIN { wanted = FRAME_HEADER_MIN }
+          if wanted < 6 { wanted = 6 }
           return wanted - dctx.lhSize + BLOCK_HEADER_SIZE
         }
         let _c = unsafe mem.memcpy(unsafe mem.add(header, dctx.lhSize), unsafe mem.addc(src, ip), toLoad)
@@ -619,7 +726,25 @@ pub unsafe fn decompressStream(raw: ?[*]mut u8, dst: [*]mut u8, dstSize: usize, 
         ip = ip + toLoad
         continue
       }
-      // The header is complete.
+      // The header is complete. When the whole frame is in the input and the output has room for
+      // its content, decode it in one pass straight into the output.
+      if dctx.frameContentSize != CONTENTSIZE_UNKNOWN && dctx.frameType != FRAME_SKIPPABLE && usize.toU64(oend - op) >= dctx.frameContentSize {
+        let cSize = unsafe findFrameCompressedSize(&mut dctx, src, istart, iend - istart)
+        // The header buffer is the source of the frame fields; read them again from it.
+        let complete = dctx.lhSize
+        let _again = unsafe getFrameHeader(&mut dctx, unsafe mem.ro(header), complete)
+        if cSize <= iend - istart {
+          let decompressed = unsafe decompressFrameDirect(&mut dctx, dst, op, oend - op, src, istart, cSize)
+          if errors.isError(decompressed) { return decompressed }
+          ip = istart + cSize
+          op = op + decompressed
+          dctx.expected = 0
+          dctx.stage = DS_GET_FRAME_HEADER_SIZE
+          dctx.streamStage = ZDSS_INIT
+          someMoreWork = false
+          continue
+        }
+      }
       unsafe beginFrame(&mut dctx)
       if (unsafe mem.r32(unsafe mem.ro(header), 0) & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START {
         dctx.expected = u32.toUsize(unsafe mem.r32(unsafe mem.ro(header), 4))

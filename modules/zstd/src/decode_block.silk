@@ -75,6 +75,9 @@ pub struct Dctx {
   pub litBase: [*]const u8,
   pub litStart: usize,
   pub litSize: usize,
+  // The most bytes the sequences of the block may write: the room, or less when the reference
+  // would keep the literals in the output buffer after the block.
+  pub sequenceRoom: usize,
   // The window: the prefix is `prefixBase[prefixStart..previousDstEnd]`, the external segment is
   // `extBase[0..extLen]`.
   pub prefixBase: [*]const u8,
@@ -323,7 +326,8 @@ unsafe fn decodeSeqHeaders(dctx: &mut Dctx, sequenceCount: &mut usize, src: [*]c
 }
 
 // ZSTD_decodeLiteralsBlock. Returns the size of the literals section, or an error.
-unsafe fn decodeLiterals(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usize, dstCapacity: usize) -> usize {
+unsafe fn decodeLiterals(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usize, dstCapacity: usize, streaming: bool) -> usize {
+  dctx.sequenceRoom = dstCapacity
   if size < 2 { return errors.err(errors.E_CORRUPTION_DETECTED) }
   let first = u8.toU32(unsafe mem.r8(src, at))
   let encoding = first & 3
@@ -357,25 +361,27 @@ unsafe fn decodeLiterals(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usi
     if !singleStream && litSize < 6 { return errors.err(errors.E_LITERALS_HEADERWRONG) }
     if litCSize + headerSize > size { return errors.err(errors.E_CORRUPTION_DETECTED) }
     if expectedWriteSize < litSize { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+    if !streaming && dstCapacity > blockSizeMax + WILDCOPY + litSize + WILDCOPY { dctx.sequenceRoom = blockSizeMax + WILDCOPY }
     let mut result: usize = 0
     let body = at + headerSize
     if encoding == 3 {
       if singleStream {
-        result = unsafe huf_decode.decompress1X1(dctx.litBuffer, 0, litSize, src, body, litCSize, dctx.hufPtr)
+        result = unsafe huf_decode.decompress1X(dctx.litBuffer, 0, litSize, src, body, litCSize, dctx.hufPtr)
       } else {
-        result = unsafe huf_decode.decompress4X1(dctx.litBuffer, 0, litSize, src, body, litCSize, dctx.hufPtr)
+        result = unsafe huf_decode.decompress4X(dctx.litBuffer, 0, litSize, src, body, litCSize, dctx.hufPtr)
       }
-    } else {
+    } else if singleStream {
+      // HUF_decompress1X1_DCtx_wksp
       let tableSize = unsafe huf_decode.readTableX1(dctx.hufSpace, src, body, litCSize)
       if errors.isError(tableSize) {
         result = tableSize
       } else if tableSize >= litCSize {
         result = errors.err(errors.E_SRCSIZE_WRONG)
-      } else if singleStream {
-        result = unsafe huf_decode.decompress1X1(dctx.litBuffer, 0, litSize, src, body + tableSize, litCSize - tableSize, unsafe mem.ro(dctx.hufSpace))
       } else {
-        result = unsafe huf_decode.decompress4X1(dctx.litBuffer, 0, litSize, src, body + tableSize, litCSize - tableSize, unsafe mem.ro(dctx.hufSpace))
+        result = unsafe huf_decode.decompress1X1(dctx.litBuffer, 0, litSize, src, body + tableSize, litCSize - tableSize, unsafe mem.ro(dctx.hufSpace))
       }
+    } else {
+      result = unsafe huf_decode.decompress4XWithTable(dctx.hufSpace, dctx.litBuffer, 0, litSize, src, body, litCSize)
     }
     if errors.isError(result) { return errors.err(errors.E_CORRUPTION_DETECTED) }
     dctx.litBase = unsafe mem.ro(dctx.litBuffer)
@@ -399,11 +405,13 @@ unsafe fn decodeLiterals(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usi
   }
   if litSize > blockSizeMax { return errors.err(errors.E_CORRUPTION_DETECTED) }
   if expectedWriteSize < litSize { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  let inDst = !streaming && dstCapacity > blockSizeMax + WILDCOPY + litSize + WILDCOPY
   if encoding == 0 {
     // set_basic: raw literals
     if headerSize + litSize + WILDCOPY > size {
       if litSize + headerSize > size { return errors.err(errors.E_CORRUPTION_DETECTED) }
       if litSize != 0 { let _c = unsafe mem.memcpy(dctx.litBuffer, unsafe mem.addc(src, at + headerSize), litSize) }
+      if inDst { dctx.sequenceRoom = blockSizeMax + WILDCOPY }
       dctx.litBase = unsafe mem.ro(dctx.litBuffer)
       dctx.litStart = 0
       dctx.litSize = litSize
@@ -415,6 +423,7 @@ unsafe fn decodeLiterals(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usi
     return headerSize + litSize
   }
   // set_rle
+  if inDst { dctx.sequenceRoom = blockSizeMax + WILDCOPY }
   if litSize != 0 { let _s = unsafe mem.memset(dctx.litBuffer, u8.toI32(unsafe mem.r8(src, at + headerSize)), litSize) }
   dctx.litBase = unsafe mem.ro(dctx.litBuffer)
   dctx.litStart = 0
@@ -707,15 +716,17 @@ unsafe fn decompressSequences(dctx: &mut Dctx, out: [*]mut u8, start: usize, cap
 }
 
 /// Decodes the compressed block at `src[at..at+size]` into `out[start..start+capacity]`
-/// (`ZSTD_decompressBlock_internal`). Returns the number of bytes written, or an error.
-pub unsafe fn decompressBlock(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize) -> usize {
+/// (`ZSTD_decompressBlock_internal`). `streaming` is false when the whole frame is decoded in one
+/// call into the caller's buffer. Returns the number of bytes written, or an error.
+pub unsafe fn decompressBlock(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, streaming: bool) -> usize {
   if size > dctx.blockSizeMax { return errors.err(errors.E_SRCSIZE_WRONG) }
-  let literalsSize = unsafe decodeLiterals(&mut dctx, src, at, size, capacity)
+  let literalsSize = unsafe decodeLiterals(&mut dctx, src, at, size, capacity, streaming)
   if errors.isError(literalsSize) { return literalsSize }
   let mut sequenceCount: usize = 0
   let headersSize = unsafe decodeSeqHeaders(&mut dctx, &mut sequenceCount, src, at + literalsSize, size - literalsSize)
   if errors.isError(headersSize) { return headersSize }
   if capacity == 0 && sequenceCount > 0 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
   let consumed = literalsSize + headersSize
-  return unsafe decompressSequences(&mut dctx, out, start, capacity, src, at + consumed, size - consumed, sequenceCount)
+  let room = dctx.sequenceRoom
+  return unsafe decompressSequences(&mut dctx, out, start, room, src, at + consumed, size - consumed, sequenceCount)
 }
