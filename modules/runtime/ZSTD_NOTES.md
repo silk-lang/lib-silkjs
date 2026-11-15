@@ -62,7 +62,23 @@ modules is the owner's decision (see "Upstreaming").
 
 ## State
 
-(filled in as parts land)
+First release build of the runtime on the Silk package (no `ZSTD_*` symbol is linked), against
+Node 24 with the cases of `tests/compat-zstd.mjs`:
+
+| Case | C library build of `main` | Silk build |
+| --- | --- | --- |
+| zstd-levels-small, -fast, -lazy, -optimal (every level on 14 inputs) | pass | pass |
+| zstd-round-trips-a, -b (120 fuzzed round trips) | pass | pass |
+| zstd-parameters (bounds and errors of every parameter, overrides, pledged size, `info`) | pass | pass |
+| zstd-streams (pieces, flushes, windows, async) | fails: Node's empty trailing frame | pass |
+| zstd-decoding (skippable, concatenated, corrupt, truncated, window limits) | pass | pass |
+| zstd-dictionaries | fails: one error message | fails: the compressor has no dictionaries yet |
+| zstd-workers-ldm | pass (Node's own stream truncation excepted) | fails: 16 of 54, all `nbWorkers` > 0 |
+
+The compressor's own differential test (`../zstd/tests/compress_diff.py`, every call's return
+value and positions as well as the bytes) covers levels -131072 to 4 exactly; the lazy and
+optimal parsers, long-distance matching, workers and compressor dictionaries are being finished.
+The C library stays in `../native/zstd` until those pass.
 
 ## Compiler walls
 
