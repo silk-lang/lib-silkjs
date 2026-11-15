@@ -307,4 +307,28 @@ export function register(file, cases, directory) {
   add('zstd-decoding', decoding);
   add('zstd-dictionaries', dictionaries.replace('TRAINED', JSON.stringify(trained)));
   add('zstd-workers-ldm', workers);
+  add('zstd-fetch-content-encoding', String.raw`const http = require('node:http'), zlib = require('node:zlib'), crypto = require('node:crypto');
+const { records } = require('./zstd-common.cjs');
+const body = records(300000, 81);
+const encode = { zstd: (b) => zlib.zstdCompressSync(b), 'zstd-chunked': (b) => zlib.zstdCompressSync(b), 'gzip, zstd': (b) => zlib.zstdCompressSync(zlib.gzipSync(b)), broken: (b) => zlib.zstdCompressSync(b).subarray(0, 2000) };
+const server = http.createServer((request, response) => {
+  const name = decodeURIComponent(request.url.slice(1));
+  const encoded = encode[name](body);
+  const header = name === 'zstd-chunked' || name === 'broken' ? 'zstd' : name;
+  response.writeHead(200, { 'content-encoding': header, ...(name === 'zstd-chunked' ? {} : { 'content-length': encoded.length }), 'x-accept': String(request.headers['accept-encoding']) });
+  if (name === 'zstd-chunked') { for (let at = 0; at < encoded.length; at += 777) response.write(encoded.subarray(at, at + 777)); response.end(); } else response.end(encoded);
+});
+server.listen(0, '127.0.0.1', async () => {
+  const out = [];
+  for (const name of Object.keys(encode)) {
+    try {
+      const response = await fetch('http://127.0.0.1:' + server.address().port + '/' + encodeURIComponent(name));
+      const bytes = Buffer.from(await response.arrayBuffer());
+      out.push([name, response.headers.get('x-accept'), bytes.length, crypto.createHash('sha1').update(bytes).digest('hex').slice(0, 16)]);
+    } catch (error) { out.push([name, 'error', error.name, error.cause && error.cause.code]); }
+  }
+  console.log(JSON.stringify(out));
+  server.close();
+});
+`);
 }

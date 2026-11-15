@@ -40,11 +40,14 @@ class Inflate extends Transform {
 // coding is one it passes through as is.
 function decoders(value) {
   const coding = value.toLowerCase().split(',').map(item => item.trim()).filter(Boolean);
-  if (!coding.every(item => ['gzip', 'x-gzip', 'deflate', 'x-deflate', 'br', 'identity'].includes(item))) return null;
+  if (!coding.every(item => ['gzip', 'x-gzip', 'deflate', 'x-deflate', 'br', 'zstd', 'identity'].includes(item))) return null;
   const result = [];
   for (const item of coding.reverse()) {
     if (item === 'identity') continue;
+    // Node's fetch (undici) decodes zstd with these flushes too; it does not ask for it in
+    // Accept-Encoding.
     result.push(item === 'br' ? lazyZlib().createBrotliDecompress({ flush: constants.BROTLI_OPERATION_FLUSH, finishFlush: constants.BROTLI_OPERATION_FLUSH })
+      : item === 'zstd' ? lazyZlib().createZstdDecompress({ flush: constants.ZSTD_e_continue, finishFlush: constants.ZSTD_e_end })
       : item === 'deflate' || item === 'x-deflate' ? new Inflate() : lazyZlib().createGunzip(inflateOptions));
   }
   return result.length ? result : null;
