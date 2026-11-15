@@ -164,6 +164,8 @@ class CompressionHandle {
         state.written += result.output.length;
       }
       state.consumed += result.consumed;
+      state.finished = result.finished;
+      state.again = result.again;
       if (result.status !== 0) { done(result.status, result.message); return; }
       const progressed = result.consumed !== 0 || result.output.length !== 0;
       if (result.again && progressed && state.written < state.outLength && this._id) {
@@ -183,8 +185,23 @@ class CompressionHandle {
   _write(sync, flush, input, inOffset, inLength, out, outOffset, outLength) {
     this._check(sync ? 'writeSync' : 'write');
     if (!Number.isInteger(flush)) throw new ERR_INVALID_ARG_TYPE('flush', 'number', flush);
-    const source = input === undefined || input === null ? new ArrayBuffer(0) :
-      snapshot(byteView(input, 'in'), inOffset, inLength, 'in');
+    // The codec keeps the input it has not consumed (compression_native.silk, execute). zlib.js
+    // writes again with that same remainder each time an output chunk fills; passing nothing
+    // then continues from the retained copy instead of copying the remainder once per chunk.
+    const view = input === undefined || input === null ? undefined : byteView(input, 'in');
+    const retained = this._retained;
+    this._retained = undefined;
+    let source;
+    let continued = false;
+    if (view !== undefined && retained !== undefined && Number.isInteger(inOffset) && Number.isInteger(inLength) &&
+      inOffset >= 0 && inLength > 0) {
+      const bytes = range(view);
+      continued = bytes.buffer === retained.buffer && bytes.offset + inOffset === retained.start &&
+        inLength === retained.length && inOffset + inLength <= bytes.length;
+    }
+    if (!continued) {
+      source = view === undefined ? new ArrayBuffer(0) : snapshot(view, inOffset, inLength, 'in');
+    }
     out = byteView(out, 'out');
     const target = range(out);
     if (!Number.isInteger(outOffset) || outOffset < 0 || outOffset > target.length) {
@@ -194,15 +211,21 @@ class CompressionHandle {
       throw new ERR_OUT_OF_RANGE('out_len', `>= 1 && <= ${target.length - outOffset}`, outLength);
     }
     const state = {
-      input: source, flush, consumed: 0, written: 0,
+      input: source, flush, consumed: 0, written: 0, finished: false, again: false,
       out: new Uint8Array(target.buffer, target.offset, target.length), outOffset, outLength,
     };
-    const inBefore = source.byteLength;
+    const inBefore = continued ? inLength : source.byteLength;
     this._writeInProgress = true;
     this._step(sync, state, (status, message) => {
       this._writeInProgress = false;
       this._writeState[0] = outLength - state.written;
       this._writeState[1] = inBefore - state.consumed;
+      // What the codec still holds: the unconsumed rest of this input, unless it failed or
+      // finished (then it dropped its copy).
+      if (status === 0 && view !== undefined && state.consumed < inBefore && !(state.finished && !state.again)) {
+        const bytes = range(view);
+        this._retained = { buffer: bytes.buffer, start: bytes.offset + inOffset + state.consumed, length: inBefore - state.consumed };
+      }
       if (this._pendingClose) this.close();
       if (status !== 0) { this._error(status, message); return; }
       if (!sync) this._callback.call(this);
@@ -220,6 +243,7 @@ class CompressionHandle {
   reset() {
     if (this._writeInProgress) throw new Error('Cannot reset zlib stream while a write is in progress');
     this._check('reset');
+    this._retained = undefined;
     const result = decode(call('reset', [this._id]));
     if (result.status !== 0) this._error(result.status, 'Failed to reset stream');
   }
@@ -243,6 +267,8 @@ class Zlib extends CompressionHandle {
 
   params(level, strategy) {
     this._check('params');
+    // deflateParams can consume retained input; the next write sends its input again.
+    this._retained = undefined;
     // Inflate modes have no parameters to change (node_zlib.cc SetParams).
     if (this._kind !== DEFLATE && this._kind !== GZIP && this._kind !== DEFLATERAW) return;
     const result = decode(call('params', [this._id, undefined, level, strategy]));
