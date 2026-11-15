@@ -8,7 +8,7 @@ products, split the way Node and V8 are:
 - **SilkJS Engine** is the embeddable JavaScript engine, a native Silk port of QuickJS, with its
   embedding API. It has no event loop and no Node or web APIs.
 
-[Silk UI](https://github.com/silk-lang/lib-ui) embeds either one to run JavaScript apps.
+[Silk UI](https://github.com/silk-lang/silkui) embeds either one to run JavaScript apps.
 
 | Module | Package | What it is |
 | --- | --- | --- |
