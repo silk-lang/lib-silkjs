@@ -110,6 +110,37 @@ Each is reduced to what the port needed. None was worked around with C.
 7. **The check server replays stale diagnostics** (silk-lang/silk#3116): `silk check` kept
    reporting an unused import after the file changed; `--no-server` is right.
 
+## Found in the runtime's binding, not in the codec
+
+Seen while measuring the build of `main` with the C library; they are in
+`ext/node/internal/compression/handle.js` and `src/ext/compression_native.silk`, which zlib and
+Brotli share.
+
+1. **The default chunk size costs about 2 ms per output chunk, for every codec.** 16 MiB of text,
+   release build of `main`, `SILKJS_PREPARSE_THREADS=0`:
+
+   | Call | `chunkSize` 16384 (default) | `chunkSize` 1 MiB | Node 24, default |
+   | --- | --- | --- | --- |
+   | `zstdDecompressSync` | 2308 ms | 74 ms | 48 ms |
+   | `zstdCompressSync`, level 3 | 2300 ms | 142 ms | 88 ms |
+   | `gzipSync` level 1 + `gunzipSync` | 5193 ms | | 254 ms |
+
+   The time grows with input size times the number of output chunks. The likely cause, not yet
+   verified: `_write()` in `handle.js` takes a snapshot of the remaining input on every write, and
+   `zlib.js` writes again each time the 16 KiB output buffer fills. Not fixed here: it is shared
+   with the zlib and Brotli work. Until it is, a codec's speed shows through the runtime only at
+   slow levels or with a large `chunkSize`; the benchmark table gives both.
+2. **Node appends an empty frame** (9 bytes; 13 with a dictionary identifier) when a
+   `ZstdCompress` stream's last chunk is written after `end()` was called: the chunk goes out with
+   `ZSTD_e_end`, then `_flush` asks for `ZSTD_e_end` again and libzstd starts and ends a new
+   frame. The binding held a finished compressor back and did not. Fixed in
+   `compression_native.silk`.
+3. **A rejected Zstandard dictionary** reported "Initialization failed" where Node reports
+   "Failed to load zstd dictionary". Fixed in `handle.js`.
+4. **Node loses output with `ZSTD_c_nbWorkers` on a stream**: `ZSTD_compressStream2` returns
+   before the workers finish and Node's stream stops asking, so the result is cut short or empty,
+   depending on timing. The runtime gives the whole frame, and keeps doing so.
+
 ## Differences from the C library
 
 (filled in as parts land)

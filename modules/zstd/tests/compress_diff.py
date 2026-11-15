@@ -223,7 +223,9 @@ def cases(inputs, full):
         add(n, [('ldm', 1)])
         add(n, [('ldm', 1), ('level', 1), ('windowLog', 20)], ZICHUNK=70000)
     # 10. stable buffer modes (ZSTD_c_stableInBuffer / ZSTD_c_stableOutBuffer), and their errors.
-    for n in ('text1000', 'text131073', 'mixed', 'text1m'):
+    # (Inputs smaller than a block are left out: with a stable input the final call of the
+    # harness would make the library read before the buffer, in the reference too.)
+    for n in ('text131073', 'mixed', 'text1m'):
         for ps in ([(1006, 1)], [(1007, 1)], [(1006, 1), (1007, 1)]):
             add(n, ps + [('level', 1)], exact=True, ZOCHUNK=1 << 21)
             add(n, ps + [('level', 3)], exact=True, ZOCHUNK=1 << 21, ZICHUNK=1 << 21)
