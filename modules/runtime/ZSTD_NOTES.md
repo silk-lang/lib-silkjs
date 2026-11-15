@@ -162,7 +162,21 @@ Brotli share.
 
 ## Differences from the C library
 
-(filled in as parts land)
+1. **`ZSTD_c_nbWorkers` >= 1 runs the jobs on the calling thread.** The C build is
+   multithreaded; its output depends only on the parameters, the input and where the caller's
+   flushes fall, not on thread timing (checked: six runs each at levels 1 to 19 with 2 and 4
+   workers gave the same bytes, also between 2 and 4 workers). The port cuts the same jobs,
+   with the same overlap, round buffer, serial XXH64 and serial long-distance matching, and
+   compresses each job in the call that creates it, so the frame is the same bytes. What each
+   call consumes, writes and returns is not: the threaded library returns 1 ("a job is
+   running") where the port can already return what is left to flush. The async API still runs
+   on the runtime's thread pool, so a worker setting never blocks the loop; it only does not
+   make one call faster. Measured with 4 workers on 41 MB: level 3 242 ms (zstd -T4: 88 ms),
+   level 19 21.8 s (14.9 s). Using real threads needs a thread pool inside the package; the job
+   code is already separate (`../zstd/src/zmt.silk`), so that is a contained change.
+2. **Row match finder levels (5 to 12) are 18 to 30% slower** than the C library, for want of a
+   prefetch (Compiler walls).
+
 
 ## Upstreaming
 
