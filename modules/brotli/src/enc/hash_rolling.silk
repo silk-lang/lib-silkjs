@@ -1,0 +1,234 @@
+//! The large-window match finders: a port of google/brotli v1.2.0 `c/enc/hash_rolling_inc.h`
+//! (HROLLING and HROLLING_FAST) and `c/enc/hash_composite_inc.h` (H35, H55 and H65 combine them
+//! with H3, H54 and H6), with the parameters that `c/enc/hash.h` instantiates them with.
+//!
+//! The rolling hash is for long distance long string matches. It stores one position per bucket;
+//! the bucket key is computed over a long region (`CHUNKLEN` bytes, every `JUMP`-th position).
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import enc.find_match_length { findMatchLengthWithLimit }
+import enc.hash_base { HasherSearchResult, MatchFinder, backwardReferenceScore }
+import enc.memory { uninitializedWords, wordsMut }
+
+// `CHUNKLEN`.
+const CHUNKLEN: usize = 32
+// `NUMBUCKETS`.
+const NUMBUCKETS: usize = 16777216
+// `MASK`: `NUMBUCKETS / (MASK + 1)` is the probability of storing and using a hash code.
+const MASK: u32 = 0x3fffffff
+// `kRollingHashMul32`.
+const ROLLING_HASH_MUL_32: u32 = 69069
+// `kInvalidPos`.
+const INVALID_POS: u32 = 0xffffffff
+
+// `HashByte`: computes a code from a single byte. A lookup table of 256 values could be used, but
+// simply adding 1 works about as good.
+@inlineAlways
+fn hashByte(byte: u8) -> u32 {
+  return u8.toU32(byte) + 1
+}
+
+/// `HashRolling`. `jump` is `JUMP`: 4 for HROLLING_FAST, 1 for HROLLING.
+pub struct HashRolling {
+  jump: usize,
+  state: u32,
+  /// `uint32_t[NUMBUCKETS]`.
+  table: Intrinsic.RawBuffer<u32>,
+  nextIx: usize,
+  factor: u32,
+  factorRemove: u32,
+}
+
+impl HashRolling {
+  /// `HashMemAllocInBytes` and the allocation of `HasherSetup`. The table is filled by
+  /// `initialize`.
+  pub effect fn make(jump: usize) -> HashRolling ! OutOfMemoryError ? &mut Allocator {
+    return HashRolling { jump: jump, state: 0, table: run uninitializedWords(NUMBUCKETS), nextIx: 0, factor: 0, factorRemove: 0 }
+  }
+}
+
+impl MatchFinder for HashRolling {
+  // This hasher uses a longer forward length, but returning a higher value here will hurt
+  // compression by the main hasher when combined with a composite hasher. The hasher tests for
+  // forward itself instead.
+  @inlineAlways
+  fn hashTypeLength(self: &Self) -> usize { return 4 }
+  @inlineAlways
+  fn storeLookahead(self: &Self) -> usize { return 4 }
+
+  // `Initialize`.
+  fn initialize(self: &mut Self) -> () {
+    self.state = 0
+    self.nextIx = 0
+    self.factor = ROLLING_HASH_MUL_32
+    // Compute the factor of the oldest byte to remove: factor**steps modulo 0xffffffff (the
+    // multiplications rely on 32-bit overflow).
+    self.factorRemove = 1
+    let mut i: usize = 0
+    while i < CHUNKLEN {
+      self.factorRemove = u32.wrappingMultiply(self.factorRemove, self.factor)
+      i = i + self.jump
+    }
+    let table = wordsMut(&mut self.table)
+    i = 0
+    while i < NUMBUCKETS {
+      table[i] = INVALID_POS
+      i = i + 1
+    }
+  }
+
+  fn prepare(self: &mut Self, oneShot: bool, inputSize: usize, data: &[u8]) -> () {
+    // Too small size, cannot use this hasher.
+    if inputSize < CHUNKLEN { return () }
+    self.state = 0
+    let mut i: usize = 0
+    while i < CHUNKLEN {
+      // `HashRollingFunctionInitial`.
+      self.state = u32.wrappingAdd(u32.wrappingMultiply(self.factor, self.state), hashByte(data[i]))
+      i = i + self.jump
+    }
+  }
+
+  fn stitchToPreviousBlock(self: &mut Self, numBytes: usize, positionIn: usize, ringbuffer: &[u8], ringBufferMask: usize) -> () {
+    // In this case we must re-initialize the hasher from scratch from the current position.
+    let mut position = positionIn
+    let mut available = numBytes
+    if (position & (self.jump - 1)) != 0 {
+      let diff = self.jump - (position & (self.jump - 1))
+      available = if diff > available { 0 } else { available - diff }
+      position = position + diff
+    }
+    let positionMasked = position & ringBufferMask
+    // Wrapping around ringbuffer not handled.
+    if available > ringBufferMask - positionMasked {
+      available = ringBufferMask - positionMasked
+    }
+    MatchFinder.prepare(&mut self, false, available, Slice.view<u8>(ringbuffer, positionMasked, ringbuffer.length - positionMasked))
+    self.nextIx = position
+  }
+
+  @inlineAlways
+  fn prepareDistanceCache(self: &Self, distanceCache: &mut [i32; 16]) -> () {}
+
+  // This hasher does not search in the dictionary. It is used as backup-hasher, the main hasher
+  // already searches in it.
+  @inlineAlways
+  fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
+    let curIxMasked = curIx & ringBufferMask
+    if (curIx & (self.jump - 1)) != 0 { return () }
+    // Not enough lookahead.
+    if maxLength < CHUNKLEN { return () }
+    let table = wordsMut(&mut self.table)
+    let mut pos = self.nextIx
+    while pos <= curIx {
+      let code = self.state & MASK
+      let rem = data[pos & ringBufferMask]
+      let add = data[(pos + CHUNKLEN) & ringBufferMask]
+      // `HashRollingFunction`.
+      self.state = u32.wrappingSubtract(u32.wrappingAdd(u32.wrappingMultiply(self.factor, self.state), hashByte(add)), u32.wrappingMultiply(self.factorRemove, hashByte(rem)))
+      if u32.toUsize(code) < NUMBUCKETS {
+        let foundIx = table[u32.toUsize(code)]
+        table[u32.toUsize(code)] = usize.wrappingToU32(pos)
+        if pos == curIx && foundIx != INVALID_POS {
+          // The cast to 32-bit makes backward distances up to 4GB work even if curIx is above
+          // 4GB, despite using 32-bit values in the table.
+          let backward = u32.toUsize(u32.wrappingSubtract(usize.wrappingToU32(curIx), foundIx))
+          if backward <= maxBackward {
+            let foundIxMasked = u32.toUsize(foundIx) & ringBufferMask
+            let len = findMatchLengthWithLimit(data, foundIxMasked, curIxMasked, maxLength)
+            if len >= 4 && len > out.len {
+              let score = backwardReferenceScore(len, backward)
+              if score > out.score {
+                out.len = len
+                out.distance = backward
+                out.score = score
+                out.lenCodeDelta = 0
+              }
+            }
+          }
+        }
+      }
+      pos = pos + self.jump
+    }
+    self.nextIx = curIx + self.jump
+  }
+
+  @inlineAlways
+  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {}
+
+  @inlineAlways
+  fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {}
+}
+
+/// `HashComposite`: combines two other hashers, `A` and `B`.
+pub struct HashComposite<A, B> {
+  ha: A,
+  hb: B,
+  fresh: bool,
+}
+
+impl<A: MatchFinder, B: MatchFinder> HashComposite<A, B> {
+  /// `Initialize`. The initialization of the two hashers is deferred to the first `prepare`.
+  pub fn make(ha: A, hb: B) -> HashComposite<A, B> {
+    return HashComposite<A, B> { ha: move ha, hb: move hb, fresh: true }
+  }
+}
+
+impl<A: MatchFinder, B: MatchFinder> MatchFinder for HashComposite<A, B> {
+  @inlineAlways
+  fn hashTypeLength(self: &Self) -> usize {
+    let a = MatchFinder.hashTypeLength(&self.ha)
+    let b = MatchFinder.hashTypeLength(&self.hb)
+    return if a > b { a } else { b }
+  }
+
+  @inlineAlways
+  fn storeLookahead(self: &Self) -> usize {
+    let a = MatchFinder.storeLookahead(&self.ha)
+    let b = MatchFinder.storeLookahead(&self.hb)
+    return if a > b { a } else { b }
+  }
+
+  fn initialize(self: &mut Self) -> () {}
+
+  fn prepare(self: &mut Self, oneShot: bool, inputSize: usize, data: &[u8]) -> () {
+    if self.fresh {
+      self.fresh = false
+      MatchFinder.initialize(&mut self.ha)
+      MatchFinder.initialize(&mut self.hb)
+    }
+    MatchFinder.prepare(&mut self.ha, oneShot, inputSize, data)
+    MatchFinder.prepare(&mut self.hb, oneShot, inputSize, data)
+  }
+
+  fn stitchToPreviousBlock(self: &mut Self, numBytes: usize, position: usize, ringbuffer: &[u8], ringBufferMask: usize) -> () {
+    MatchFinder.stitchToPreviousBlock(&mut self.ha, numBytes, position, ringbuffer, ringBufferMask)
+    MatchFinder.stitchToPreviousBlock(&mut self.hb, numBytes, position, ringbuffer, ringBufferMask)
+  }
+
+  @inlineAlways
+  fn prepareDistanceCache(self: &Self, distanceCache: &mut [i32; 16]) -> () {
+    MatchFinder.prepareDistanceCache(&self.ha, &mut distanceCache)
+    MatchFinder.prepareDistanceCache(&self.hb, &mut distanceCache)
+  }
+
+  @inlineAlways
+  fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
+    MatchFinder.findLongestMatch(&mut self.ha, data, ringBufferMask, distanceCache, curIx, maxLength, maxBackward, dictionaryDistance, maxDistance, &mut out)
+    MatchFinder.findLongestMatch(&mut self.hb, data, ringBufferMask, distanceCache, curIx, maxLength, maxBackward, dictionaryDistance, maxDistance, &mut out)
+  }
+
+  @inlineAlways
+  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
+    MatchFinder.store(&mut self.ha, data, mask, ix)
+    MatchFinder.store(&mut self.hb, data, mask, ix)
+  }
+
+  fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
+    MatchFinder.storeRange(&mut self.ha, data, mask, ixStart, ixEnd)
+    MatchFinder.storeRange(&mut self.hb, data, mask, ixStart, ixEnd)
+  }
+}

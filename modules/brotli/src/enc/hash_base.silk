@@ -1,0 +1,223 @@
+//! What all match finders ("hashers") of the encoder share: a port of google/brotli v1.2.0
+//! `c/enc/hash_base.h` and of the common part of `c/enc/hash.h` (the search result, the scores of
+//! a backward reference, the distance cache candidates and the search in the static dictionary
+//! with its lookup statistics).
+//!
+//! Each hasher is a type that implements [`MatchFinder`]; the reference search of
+//! `enc.backward_references` is generic over it, as the C code instantiates it once per hasher.
+import silk.compress.brotli_tables
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import enc.dictionary_hash { hashLengths, hashWord, hashWordsBytes }
+import enc.fast_log { log2FloorNonZero }
+import enc.write_bits { load32, load64 }
+
+/// `kHashMul32`.
+pub const HASH_MUL_32: u32 = 0x1e35a7bd
+/// `kHashMul64`.
+pub const HASH_MUL_64: u64 = 0x1fe35a7bd3579bd3
+
+/// `kCutoffTransformsCount`: the number of transforms that cut the end of a dictionary word, in
+/// the order of `kCutoffTransforms`.
+pub const CUTOFF_TRANSFORMS_COUNT: usize = 10
+/// `kCutoffTransforms`: for each cut of 0 to 9 bytes, the 6-bit transform id after `cut * 4`.
+pub const CUTOFF_TRANSFORMS: u64 = 0x071b520ada2d3200
+
+/// `BROTLI_LITERAL_BYTE_SCORE`.
+pub const LITERAL_BYTE_SCORE: usize = 135
+/// `BROTLI_DISTANCE_BIT_PENALTY`.
+pub const DISTANCE_BIT_PENALTY: usize = 30
+/// `BROTLI_SCORE_BASE`: the score must be positive after applying maximal penalty.
+pub const SCORE_BASE: usize = 1920
+
+/// `Hash14`: the bucket of the 4 bytes at `at` in the hash of the static dictionary.
+@inlineAlways
+pub fn hash14(data: &[u8], at: usize) -> u32 {
+  let h = u32.wrappingMultiply(load32(data, at), HASH_MUL_32)
+  // The higher bits contain more mixture from the multiplication, so we take our results from
+  // there.
+  return u32.shiftRight(h, 32 - 14)
+}
+
+/// `HasherSearchResult`.
+pub struct HasherSearchResult {
+  pub len: usize,
+  pub distance: usize,
+  pub score: usize,
+  /// `len_code - len`.
+  pub lenCodeDelta: i32,
+}
+
+/// `PrepareDistanceCache`: the candidates around the last two distances, after the last four.
+@inlineAlways
+pub fn prepareDistanceCache(distanceCache: &mut [i32; 16], numDistances: i32) -> () {
+  if numDistances > 4 {
+    let lastDistance = distanceCache[0]
+    distanceCache[4] = i32.wrappingSubtract(lastDistance, 1)
+    distanceCache[5] = i32.wrappingAdd(lastDistance, 1)
+    distanceCache[6] = i32.wrappingSubtract(lastDistance, 2)
+    distanceCache[7] = i32.wrappingAdd(lastDistance, 2)
+    distanceCache[8] = i32.wrappingSubtract(lastDistance, 3)
+    distanceCache[9] = i32.wrappingAdd(lastDistance, 3)
+    if numDistances > 10 {
+      let nextLastDistance = distanceCache[1]
+      distanceCache[10] = i32.wrappingSubtract(nextLastDistance, 1)
+      distanceCache[11] = i32.wrappingAdd(nextLastDistance, 1)
+      distanceCache[12] = i32.wrappingSubtract(nextLastDistance, 2)
+      distanceCache[13] = i32.wrappingAdd(nextLastDistance, 2)
+      distanceCache[14] = i32.wrappingSubtract(nextLastDistance, 3)
+      distanceCache[15] = i32.wrappingAdd(nextLastDistance, 3)
+    }
+  }
+}
+
+/// `BackwardReferenceScore`.
+///
+/// Usually, we always choose the longest backward reference. This function allows for the
+/// exception of that rule.
+///
+/// If we choose a backward reference that is further away, it will usually be coded with more
+/// bits. We approximate this by assuming log2(distance). If the distance can be expressed in terms
+/// of the last four distances, we use some heuristic constants to estimate the bits cost. For the
+/// first up to four literals we use the bit cost of the literals from the literal cost model,
+/// after that we use the average bit cost of the cost model.
+///
+/// This function is used to sometimes discard a longer backward reference when it is not much
+/// longer and the bit cost for encoding it is more than the saved literals.
+///
+/// `backwardReferenceOffset` must be positive.
+@inlineAlways
+pub fn backwardReferenceScore(copyLength: usize, backwardReferenceOffset: usize) -> usize {
+  return SCORE_BASE + LITERAL_BYTE_SCORE * copyLength - DISTANCE_BIT_PENALTY * u32.toUsize(log2FloorNonZero(backwardReferenceOffset))
+}
+
+/// `BackwardReferenceScoreUsingLastDistance`.
+@inlineAlways
+pub fn backwardReferenceScoreUsingLastDistance(copyLength: usize) -> usize {
+  return LITERAL_BYTE_SCORE * copyLength + SCORE_BASE + 15
+}
+
+/// `BackwardReferencePenaltyUsingLastDistance`.
+@inlineAlways
+pub fn backwardReferencePenaltyUsingLastDistance(distanceShortCode: usize) -> usize {
+  return 39 + (usize.shiftRight(0x1ca10, distanceShortCode & 0xe) & 0xe)
+}
+
+/// `FindMatchLengthWithLimit` between two arrays: how many bytes at `a[aAt..]` and `b[bAt..]` are
+/// equal, at most `limit`.
+@inlineAlways
+pub fn findMatchLengthBetween(a: &[u8], aAt: usize, b: &[u8], bAt: usize, limit: usize) -> usize {
+  let mut matched: usize = 0
+  let mut left = limit
+  while left >= 8 {
+    let x = load64(a, aAt + matched) ^ load64(b, bAt + matched)
+    if x != 0 {
+      return matched + u32.toUsize(u64.trailingZeros(x) / 8)
+    }
+    matched = matched + 8
+    left = left - 8
+  }
+  while left != 0 && a[aAt + matched] == b[bAt + matched] {
+    left = left - 1
+    matched = matched + 1
+  }
+  return matched
+}
+
+/// `dict_num_lookups` and `dict_num_matches` of `HasherCommon`: the statistics that switch the
+/// search in the static dictionary off when it rarely finds anything.
+pub struct DictionaryStats {
+  pub numLookups: usize,
+  pub numMatches: usize,
+}
+
+impl DictionaryStats {
+  /// The statistics of a hasher that `HasherSetup` has just set up.
+  pub fn make() -> DictionaryStats {
+    return DictionaryStats { numLookups: 0, numMatches: 0 }
+  }
+}
+
+// `TestStaticDictionaryItem` for the built-in dictionary: `data[at..]` against word `wordIdx` of
+// length `len`.
+fn testStaticDictionaryItem(len: usize, wordIdx: usize, data: &[u8], at: usize, maxLength: usize, maxBackward: usize, maxDistance: usize, out: &mut HasherSearchResult) -> bool {
+  if len > maxLength {
+    return false
+  }
+  let offset = brotli_tables.wordOffset(len) + len * wordIdx
+  let matchlen = findMatchLengthBetween(data, at, brotli_tables.words(), offset, len)
+  if matchlen + CUTOFF_TRANSFORMS_COUNT <= len || matchlen == 0 {
+    return false
+  }
+  let cut = len - matchlen
+  let transformId = usize.shiftLeft(cut, 2) + u64.toUsize(u64.shiftRight(CUTOFF_TRANSFORMS, usize.toU64(cut * 6)) & 0x3f)
+  let backward = maxBackward + 1 + wordIdx + usize.shiftLeft(transformId, u32.toUsize(brotli_tables.wordSizeBits(len)))
+  if backward > maxDistance {
+    return false
+  }
+  let score = backwardReferenceScore(matchlen, backward)
+  if score < out.score {
+    return false
+  }
+  out.len = matchlen
+  out.lenCodeDelta = usize.toI32(len) - usize.toI32(matchlen)
+  out.distance = backward
+  out.score = score
+  return true
+}
+
+/// `SearchInStaticDictionary` for the built-in dictionary: tries the words whose first 4 bytes
+/// hash like `data[at..]` (one bucket if `shallow`, else both).
+pub fn searchInStaticDictionary(stats: &mut DictionaryStats, data: &[u8], at: usize, maxLength: usize, maxBackward: usize, maxDistance: usize, out: &mut HasherSearchResult, shallow: bool) -> () {
+  if stats.numMatches < usize.shiftRight(stats.numLookups, 7) {
+    return ()
+  }
+  let mut key = usize.shiftLeft(u32.toUsize(hash14(data, at)), 1)
+  let lengths = hashLengths()
+  let words = hashWordsBytes()
+  let count: usize = if shallow { 1 } else { 2 }
+  let mut i: usize = 0
+  while i < count {
+    stats.numLookups = stats.numLookups + 1
+    let len = u8.toUsize(lengths[key])
+    if len != 0 {
+      if testStaticDictionaryItem(len, hashWord(words, key), data, at, maxLength, maxBackward, maxDistance, &mut out) {
+        stats.numMatches = stats.numMatches + 1
+      }
+    }
+    i = i + 1
+    key = key + 1
+  }
+}
+
+/// A hasher: the functions of `hash_*_inc.h` that the reference search of
+/// `backward_references_inc.h` calls, and those that `HasherSetup` and
+/// `InitOrStitchToPreviousBlock` of `hash.h` call.
+pub interface MatchFinder {
+  /// `HashTypeLength`: the number of bytes the hash function reads.
+  fn hashTypeLength(self: &Self) -> usize
+  /// `StoreLookahead`: the number of bytes after a position that `store` reads.
+  fn storeLookahead(self: &Self) -> usize
+  /// What `Initialize` does besides setting up the tables: called once before the first
+  /// `prepare` of a hasher inside a composite hasher (the others do it when they are created).
+  fn initialize(self: &mut Self) -> ()
+  /// `Prepare`: clears the tables for new input, all of them or (when the whole input is
+  /// `data[0..inputSize]`, `oneShot`) only the buckets of that input.
+  fn prepare(self: &mut Self, oneShot: bool, inputSize: usize, data: &[u8]) -> ()
+  /// `StitchToPreviousBlock`.
+  fn stitchToPreviousBlock(self: &mut Self, numBytes: usize, position: usize, ringbuffer: &[u8], ringbufferMask: usize) -> ()
+  /// `PrepareDistanceCache`.
+  fn prepareDistanceCache(self: &Self, distanceCache: &mut [i32; 16]) -> ()
+  /// `FindLongestMatch`: finds a longest backward match of `data[curIx & ringBufferMask]` up to
+  /// `maxLength` bytes and stores the position `curIx` in the hash table. Does not look for
+  /// matches further away than `maxBackward`. Writes the best match into `out`; `out.score` is
+  /// updated only if a better match is found.
+  fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> ()
+  /// `Store`: looks at the bytes at `data[ix & mask]` and stores `ix` under their hash.
+  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> ()
+  /// `StoreRange`.
+  fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> ()
+}

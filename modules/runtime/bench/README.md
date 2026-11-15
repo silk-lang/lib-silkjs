@@ -87,7 +87,7 @@ silk task offline-deps --from DIR     # or SILKJS_OFFLINE_DEPS=DIR
 
 It unpacks `runtime-native-prefix.tgz`, `runtime-sqlite-amalgamation.tgz`,
 `runtime-zstd-nghttp2-system.tgz` (into `/usr`, as root) and `runtime-build-deps.tgz` from `DIR`,
-fetches Brotli and libuv with git at the revisions `../native/*/silk.toml` pin, writes
+fetches libuv with git at the revisions `../native/*/silk.toml` pin, writes
 `~/.silk/native-overrides.toml` and prints the build command. The tasks themselves are built with
 the runtime's C libraries, so on such a network the first `silk task offline-deps` needs the
 overrides already: write `native-overrides.toml` by hand once, or run the task from a checkout

@@ -1,0 +1,302 @@
+//! The match finders H40, H41 and H42 for small windows: a port of google/brotli v1.2.0
+//! `c/enc/hash_forgetful_chain_inc.h` with the parameters that `c/enc/hash.h` instantiates it
+//! with.
+//!
+//! A (forgetful) hash table to the data seen by the compressor, to help create backward
+//! references to previous data. Hashes are stored in chains which are bucketed to groups. Group of
+//! chains share a storage "bank". When more than "bank size" chain nodes are added, oldest nodes
+//! are replaced; this way several chains may share a tail.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import enc.find_match_length { findMatchLengthWithLimit }
+import enc.hash_base { DictionaryStats, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
+import enc.memory { bytesMut, halfwordsMut, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
+import enc.write_bits { load32 }
+
+// `BUCKET_BITS`: the number of hash buckets is `1 << BUCKET_BITS`.
+const BUCKET_BITS: u32 = 15
+const BUCKET_SIZE: usize = 32768
+
+/// The template parameters of `hash_forgetful_chain_inc.h`.
+pub interface ForgetfulChainConfig {
+  /// `NUM_LAST_DISTANCES_TO_CHECK`.
+  fn numLastDistancesToCheck(self: &Self) -> usize
+  /// `NUM_BANKS`.
+  fn numBanks(self: &Self) -> usize
+  /// `BANK_BITS`.
+  fn bankBits(self: &Self) -> usize
+}
+
+/// The parameters of H40.
+pub struct H40Config {}
+impl ForgetfulChainConfig for H40Config {
+  @inlineAlways
+  fn numLastDistancesToCheck(self: &Self) -> usize { return 4 }
+  @inlineAlways
+  fn numBanks(self: &Self) -> usize { return 1 }
+  @inlineAlways
+  fn bankBits(self: &Self) -> usize { return 16 }
+}
+
+/// The parameters of H41.
+pub struct H41Config {}
+impl ForgetfulChainConfig for H41Config {
+  @inlineAlways
+  fn numLastDistancesToCheck(self: &Self) -> usize { return 10 }
+  @inlineAlways
+  fn numBanks(self: &Self) -> usize { return 1 }
+  @inlineAlways
+  fn bankBits(self: &Self) -> usize { return 16 }
+}
+
+/// The parameters of H42.
+pub struct H42Config {}
+impl ForgetfulChainConfig for H42Config {
+  @inlineAlways
+  fn numLastDistancesToCheck(self: &Self) -> usize { return 16 }
+  @inlineAlways
+  fn numBanks(self: &Self) -> usize { return 512 }
+  @inlineAlways
+  fn bankBits(self: &Self) -> usize { return 9 }
+}
+
+/// `HashForgetfulChain`.
+pub struct HashForgetfulChain<C> {
+  config: C,
+  stats: DictionaryStats,
+  /// `free_slot_idx`: `uint16_t[NUM_BANKS]`.
+  freeSlotIdx: List<u16>,
+  maxHops: usize,
+  /// `uint32_t addr[BUCKET_SIZE]`.
+  addr: Intrinsic.RawBuffer<u32>,
+  /// `uint16_t head[BUCKET_SIZE]`.
+  head: Intrinsic.RawBuffer<u16>,
+  /// `uint8_t tiny_hash[65536]`: truncated hash used for quick rejection of "distance cache"
+  /// candidates.
+  tinyHash: Intrinsic.RawBuffer<u8>,
+  /// `FN(Bank) banks[NUM_BANKS]`: the slots of each bank, each `delta | next << 16`.
+  banks: Intrinsic.RawBuffer<u32>,
+}
+
+impl<C: ForgetfulChainConfig> HashForgetfulChain<C> {
+  /// `HashMemAllocInBytes`, the allocation of `HasherSetup` and `Initialize`.
+  pub effect fn make(config: C, quality: i32) -> HashForgetfulChain<C> ! OutOfMemoryError ? &mut Allocator {
+    let numBanks = ForgetfulChainConfig.numBanks(&config)
+    let bankSize = usize.shiftLeft(1, ForgetfulChainConfig.bankBits(&config))
+    let mut freeSlotIdx = List<u16>.make()
+    run List<u16>.appendRepeated(&mut freeSlotIdx, 0, numBanks)
+    let hops: usize = if quality > 6 { 7 } else { 8 }
+    return HashForgetfulChain<C> {
+      config: move config,
+      stats: DictionaryStats.make(),
+      freeSlotIdx: move freeSlotIdx,
+      maxHops: usize.shiftLeft(hops, i32.toUsize(quality - 4)),
+      addr: run zeroedWords(BUCKET_SIZE),
+      head: run zeroedHalfwords(BUCKET_SIZE),
+      tinyHash: run zeroedBytes(65536),
+      banks: run zeroedWords(numBanks * bankSize),
+    }
+  }
+
+  // `HashBytes`.
+  @inlineAlways
+  fn hashBytes(data: &[u8], at: usize) -> usize {
+    let h = u32.wrappingMultiply(load32(data, at), HASH_MUL_32)
+    // The higher bits contain more mixture from the multiplication, so we take our results from
+    // there.
+    return u32.toUsize(u32.shiftRight(h, 32 - BUCKET_BITS))
+  }
+}
+
+impl<C: ForgetfulChainConfig> MatchFinder for HashForgetfulChain<C> {
+  @inlineAlways
+  fn hashTypeLength(self: &Self) -> usize { return 4 }
+  @inlineAlways
+  fn storeLookahead(self: &Self) -> usize { return 4 }
+
+  fn initialize(self: &mut Self) -> () {}
+
+  fn prepare(self: &mut Self, oneShot: bool, inputSize: usize, data: &[u8]) -> () {
+    let addr = wordsMut(&mut self.addr)
+    let head = halfwordsMut(&mut self.head)
+    // Partial preparation is 100 times slower (per socket).
+    let partialPrepareThreshold = usize.shiftRight(BUCKET_SIZE, 6)
+    if oneShot && inputSize <= partialPrepareThreshold {
+      let mut i: usize = 0
+      while i < inputSize {
+        let bucket = HashForgetfulChain<C>.hashBytes(data, i)
+        // See the comment below.
+        addr[bucket] = 0xcccccccc
+        head[bucket] = 0xcccc
+        i = i + 1
+      }
+    } else {
+      // Fill `addr` array with 0xCCCCCCCC value. Because of wrapping, position processed by hasher
+      // never reaches 3GB + 64M; this makes all new chains to be terminated after the first node.
+      let mut i: usize = 0
+      while i < BUCKET_SIZE {
+        addr[i] = 0xcccccccc
+        head[i] = 0
+        i = i + 1
+      }
+    }
+    let tinyHash = bytesMut(&mut self.tinyHash)
+    let mut i: usize = 0
+    while i < 65536 {
+      tinyHash[i] = 0
+      i = i + 1
+    }
+    let free = List<u16>.asMutSlice(&mut self.freeSlotIdx)
+    i = 0
+    while i < free.length {
+      free[i] = 0
+      i = i + 1
+    }
+  }
+
+  fn stitchToPreviousBlock(self: &mut Self, numBytes: usize, position: usize, ringbuffer: &[u8], ringbufferMask: usize) -> () {
+    if numBytes >= 4 - 1 && position >= 3 {
+      // Prepare the hashes for three last bytes of the last write. These could not be calculated
+      // before, since they require knowledge of both the previous and the current block.
+      MatchFinder.store(&mut self, ringbuffer, ringbufferMask, position - 3)
+      MatchFinder.store(&mut self, ringbuffer, ringbufferMask, position - 2)
+      MatchFinder.store(&mut self, ringbuffer, ringbufferMask, position - 1)
+    }
+  }
+
+  @inlineAlways
+  fn prepareDistanceCache(self: &Self, distanceCache: &mut [i32; 16]) -> () {
+    prepareDistanceCache(&mut distanceCache, usize.toI32(ForgetfulChainConfig.numLastDistancesToCheck(&self.config)))
+  }
+
+  // REQUIRES: `prepareDistanceCache` must be invoked for current distance cache values; if this
+  // method is invoked repeatedly with the same distance cache values, it is enough to invoke
+  // `prepareDistanceCache` once.
+  @inlineAlways
+  fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
+    let curIxMasked = curIx & ringBufferMask
+    // Don't accept a short copy from far away.
+    let minScore = out.score
+    let mut bestScore = out.score
+    let mut bestLen = out.len
+    let key = HashForgetfulChain<C>.hashBytes(data, curIxMasked)
+    let tinyHash = usize.wrappingToU8(key & 0xff)
+    out.len = 0
+    out.lenCodeDelta = 0
+
+    // Try last distance first.
+    let tinyHashes = bytesMut(&mut self.tinyHash)
+    let numLast = ForgetfulChainConfig.numLastDistancesToCheck(&self.config)
+    let mut i: usize = 0
+    while i < numLast {
+      let backward = i32.wrappingToUsize(distanceCache[i])
+      let mut prevIx = usize.wrappingSubtract(curIx, backward)
+      let index = i
+      i = i + 1
+      // For distance code 0 we want to consider 2-byte matches.
+      if index > 0 && tinyHashes[prevIx & 0xffff] != tinyHash {
+        continue
+      }
+      if prevIx >= curIx || backward > maxBackward {
+        continue
+      }
+      prevIx = prevIx & ringBufferMask
+      let len = findMatchLengthWithLimit(data, prevIx, curIxMasked, maxLength)
+      if len >= 2 {
+        let mut score = backwardReferenceScoreUsingLastDistance(len)
+        if bestScore < score {
+          if index != 0 {
+            score = score - backwardReferencePenaltyUsingLastDistance(index)
+          }
+          if bestScore < score {
+            bestScore = score
+            bestLen = len
+            out.len = bestLen
+            out.distance = backward
+            out.score = bestScore
+          }
+        }
+      }
+    }
+    // We require matches of len > 4, so increase bestLen to 3, so we can compare 4 bytes all the
+    // time.
+    if bestLen < 3 {
+      bestLen = 3
+    }
+    let bankMask = ForgetfulChainConfig.numBanks(&self.config) - 1
+    let bankBase = usize.shiftLeft(key & bankMask, ForgetfulChainConfig.bankBits(&self.config))
+    let banks = wordsMut(&mut self.banks)
+    let mut backward: usize = 0
+    let mut hops = self.maxHops
+    let mut delta = usize.wrappingSubtract(curIx, u32.toUsize(wordsMut(&mut self.addr)[key]))
+    let mut slot = u16.toUsize(halfwordsMut(&mut self.head)[key])
+    while hops != 0 {
+      hops = hops - 1
+      let last = slot
+      backward = usize.wrappingAdd(backward, delta)
+      if backward > maxBackward {
+        break
+      }
+      let prevIx = usize.wrappingSubtract(curIx, backward) & ringBufferMask
+      let node = banks[bankBase + last]
+      slot = u32.toUsize(u32.shiftRight(node, 16))
+      delta = u32.toUsize(node & 0xffff)
+      // Compare 4 bytes ending at bestLen + 1.
+      if curIxMasked + bestLen > ringBufferMask || prevIx + bestLen > ringBufferMask || load32(data, curIxMasked + bestLen - 3) != load32(data, prevIx + bestLen - 3) {
+        continue
+      }
+      let len = findMatchLengthWithLimit(data, prevIx, curIxMasked, maxLength)
+      if len >= 4 {
+        // Comparing for >= 3 does not change the semantics, but just saves for a few unnecessary
+        // binary logarithms in backward reference score, since we are not interested in such
+        // short matches.
+        let score = backwardReferenceScore(len, backward)
+        if bestScore < score {
+          bestScore = score
+          bestLen = len
+          out.len = bestLen
+          out.distance = backward
+          out.score = bestScore
+        }
+      }
+    }
+    MatchFinder.store(&mut self, data, ringBufferMask, curIx)
+    if out.score == minScore {
+      searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
+    }
+  }
+
+  // Looks at 4 bytes at `data[ix & mask]`. Computes a hash from these, and prepends a node to the
+  // corresponding chain; also updates `tinyHash` for the current position.
+  @inlineAlways
+  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
+    let key = HashForgetfulChain<C>.hashBytes(data, ix & mask)
+    let bank = key & (ForgetfulChainConfig.numBanks(&self.config) - 1)
+    let bankBits = ForgetfulChainConfig.bankBits(&self.config)
+    let free = List<u16>.asMutSlice(&mut self.freeSlotIdx)
+    let idx = u16.toUsize(free[bank]) & (usize.shiftLeft(1, bankBits) - 1)
+    free[bank] = u16.wrappingAdd(free[bank], 1)
+    let addr = wordsMut(&mut self.addr)
+    let head = halfwordsMut(&mut self.head)
+    let mut delta = usize.wrappingSubtract(ix, u32.toUsize(addr[key]))
+    bytesMut(&mut self.tinyHash)[ix & 0xffff] = usize.wrappingToU8(key & 0xff)
+    if delta > 0xffff {
+      delta = 0xffff
+    }
+    wordsMut(&mut self.banks)[usize.shiftLeft(bank, bankBits) + idx] = usize.wrappingToU32(delta) | u32.shiftLeft(u16.toU32(head[key]), 16)
+    addr[key] = usize.wrappingToU32(ix)
+    head[key] = usize.wrappingToU16(idx)
+  }
+
+  fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
+    let mut i = ixStart
+    while i < ixEnd {
+      MatchFinder.store(&mut self, data, mask, i)
+      i = i + 1
+    }
+  }
+}

@@ -1,14 +1,46 @@
-//! The match finders ("hashers") of the encoder: the interface of google/brotli v1.2.0
-//! `c/enc/hash.h`.
+//! The match finders ("hashers") of the encoder: a port of the hasher dispatch of google/brotli
+//! v1.2.0 `c/enc/hash.h` (`Hasher`, `HasherSetup`, `HasherSize`, `HasherReset`,
+//! `InitOrStitchToPreviousBlock`) over the hashers of qualities 2 to 9: H2, H3, H4 and H54
+//! (`enc.hash_quickly`), H5, H6, H58 and H68 (`enc.hash_longest_match`), H40, H41 and H42
+//! (`enc.hash_forgetful_chain`), and H35, H55 and H65 (`enc.hash_rolling`).
 //!
-//! NOT PORTED YET: the hashers themselves (`hash_*_inc.h`). This is the seam for them. The
-//! functions below have the names and the arguments of the C interface and do what it does up to
-//! the point where a hasher would be set up, so the encoder state machine calls them where the C
-//! code does.
+//! NOT PORTED YET: H10 (`hash_to_binary_tree_inc.h`, qualities 10 and 11); its place is marked
+//! `SEAM`. Without it those qualities set up no hasher. `HasherPrependCustomDictionary` is not
+//! needed while no prepared dictionary can be attached.
+//!
+//! The memory of a hasher is allocated by `HasherSetup` in the sizes `HasherSize` gives, the
+//! first time the encoder needs it, as in C.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import enc.hash_forgetful_chain { H40Config, H41Config, H42Config, HashForgetfulChain }
+import enc.hash_longest_match { HashLongestMatch, HashLongestMatchSimd }
+import enc.hash_quickly { H2Config, H3Config, H4Config, H54Config, HashQuickly }
+import enc.hash_rolling { HashComposite, HashRolling }
+import enc.hash_base { MatchFinder }
 import enc.params { EncoderParams, HasherParams, chooseHasher }
 
-/// `Hasher`: `HasherCommon` without the hasher-specific state.
+/// The state of the hasher that `common.params.type` selects (the `privat` union of the C
+/// `Hasher`).
+pub union HasherKernel {
+  /// Not set up yet, or a hasher that is not ported.
+  None,
+  H2 { h: HashQuickly<H2Config> },
+  H3 { h: HashQuickly<H3Config> },
+  H4 { h: HashQuickly<H4Config> },
+  H54 { h: HashQuickly<H54Config> },
+  H5 { h: HashLongestMatch },
+  H6 { h: HashLongestMatch },
+  H58 { h: HashLongestMatchSimd },
+  H68 { h: HashLongestMatchSimd },
+  H40 { h: HashForgetfulChain<H40Config> },
+  H41 { h: HashForgetfulChain<H41Config> },
+  H42 { h: HashForgetfulChain<H42Config> },
+  H35 { h: HashComposite<HashQuickly<H3Config>, HashRolling> },
+  H55 { h: HashComposite<HashQuickly<H54Config>, HashRolling> },
+  H65 { h: HashComposite<HashLongestMatch, HashRolling> },
+  // SEAM: `H10 { h: HashToBinaryTree }` (qualities 10 and 11) goes here.
+}
+
+/// `Hasher`.
 pub struct Hasher {
   /// `common.is_setup_`.
   pub isSetup: bool,
@@ -16,12 +48,105 @@ pub struct Hasher {
   pub isPrepared: bool,
   /// `common.params`.
   pub params: HasherParams,
+  /// `privat`. Each hasher keeps its own `dict_num_lookups` and `dict_num_matches`.
+  pub kernel: HasherKernel,
+}
+
+// `HasherSize`, the allocation of `HasherSetup` and `InitializeH*`.
+effect fn makeKernel(params: &EncoderParams) -> HasherKernel ! OutOfMemoryError ? &mut Allocator {
+  let kind = params.hasher.kind
+  if kind == 2 {
+    return HasherKernel.H2 { h: run HashQuickly<H2Config>.make(H2Config {}) }
+  } else if kind == 3 {
+    return HasherKernel.H3 { h: run HashQuickly<H3Config>.make(H3Config {}) }
+  } else if kind == 4 {
+    return HasherKernel.H4 { h: run HashQuickly<H4Config>.make(H4Config {}) }
+  } else if kind == 54 {
+    return HasherKernel.H54 { h: run HashQuickly<H54Config>.make(H54Config {}) }
+  } else if kind == 5 {
+    return HasherKernel.H5 { h: run HashLongestMatch.make(&params.hasher, false) }
+  } else if kind == 6 {
+    return HasherKernel.H6 { h: run HashLongestMatch.make(&params.hasher, true) }
+  } else if kind == 58 {
+    return HasherKernel.H58 { h: run HashLongestMatchSimd.make(&params.hasher, false) }
+  } else if kind == 68 {
+    return HasherKernel.H68 { h: run HashLongestMatchSimd.make(&params.hasher, true) }
+  } else if kind == 40 {
+    return HasherKernel.H40 { h: run HashForgetfulChain<H40Config>.make(H40Config {}, params.quality) }
+  } else if kind == 41 {
+    return HasherKernel.H41 { h: run HashForgetfulChain<H41Config>.make(H41Config {}, params.quality) }
+  } else if kind == 42 {
+    return HasherKernel.H42 { h: run HashForgetfulChain<H42Config>.make(H42Config {}, params.quality) }
+  } else if kind == 35 {
+    // The memory of both hashers is allocated here (`extra[0..1]` for A, `extra[2..3]` for B);
+    // they are initialized by the first `prepare`.
+    let a = run HashQuickly<H3Config>.make(H3Config {})
+    let b = run HashRolling.make(4)
+    return HasherKernel.H35 { h: HashComposite<HashQuickly<H3Config>, HashRolling>.make(move a, move b) }
+  } else if kind == 55 {
+    let a = run HashQuickly<H54Config>.make(H54Config {})
+    let b = run HashRolling.make(4)
+    return HasherKernel.H55 { h: HashComposite<HashQuickly<H54Config>, HashRolling>.make(move a, move b) }
+  } else if kind == 65 {
+    let a = run HashLongestMatch.make(&params.hasher, true)
+    let b = run HashRolling.make(1)
+    return HasherKernel.H65 { h: HashComposite<HashLongestMatch, HashRolling>.make(move a, move b) }
+  }
+  // SEAM: H10 (`HashToBinaryTree`) for qualities 10 and 11.
+  return HasherKernel.None
+}
+
+// `PrepareH*(one_shot, input_size, data)`.
+fn prepareKernel(kernel: &mut HasherKernel, oneShot: bool, inputSize: usize, data: &[u8]) -> () {
+  match &mut kernel {
+    HasherKernel.None => {}
+    HasherKernel.H2 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H3 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H4 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H54 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H5 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H6 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H58 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H68 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H40 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H41 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H42 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H35 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H55 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+    HasherKernel.H65 { h } => { MatchFinder.prepare(&mut h, oneShot, inputSize, data) }
+  }
+}
+
+// `StitchToPreviousBlockH*(input_size, position, data, mask)`.
+fn stitchKernel(kernel: &mut HasherKernel, inputSize: usize, position: usize, data: &[u8], mask: usize) -> () {
+  match &mut kernel {
+    HasherKernel.None => {}
+    HasherKernel.H2 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H3 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H4 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H54 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H5 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H6 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H58 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H68 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H40 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H41 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H42 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H35 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H55 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+    HasherKernel.H65 { h } => { MatchFinder.stitchToPreviousBlock(&mut h, inputSize, position, data, mask) }
+  }
 }
 
 impl Hasher {
   /// `HasherInit`. Must be invoked before any other method.
   pub fn make() -> Hasher {
-    return Hasher { isSetup: false, isPrepared: false, params: HasherParams { kind: 0, bucketBits: 0, blockBits: 0, numLastDistancesToCheck: 0 } }
+    return Hasher {
+      isSetup: false,
+      isPrepared: false,
+      params: HasherParams { kind: 0, bucketBits: 0, blockBits: 0, numLastDistancesToCheck: 0 },
+      kernel: HasherKernel.None,
+    }
   }
 
   /// `HasherReset`.
@@ -29,19 +154,20 @@ impl Hasher {
     self.isPrepared = false
   }
 
-  // `HasherSetup`, up to the allocation and initialization of the hasher's tables.
+  // `HasherSetup`.
   effect fn setup(self: &mut Self, params: &mut EncoderParams, data: &[u8], position: usize, inputSize: usize, isLast: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let oneShot = position == 0 && isLast
     if !self.isSetup {
       let mut chosen = HasherParams { kind: params.hasher.kind, bucketBits: params.hasher.bucketBits, blockBits: params.hasher.blockBits, numLastDistancesToCheck: params.hasher.numLastDistancesToCheck }
       chooseHasher(&params, &mut chosen)
       self.params = HasherParams { kind: chosen.kind, bucketBits: chosen.bucketBits, blockBits: chosen.blockBits, numLastDistancesToCheck: chosen.numLastDistancesToCheck }
       params.hasher = move chosen
-      // SEAM: `HasherSize`, the allocation of `common.extra` and `InitializeH*` go here.
+      self.kernel = run makeKernel(&params)
       Hasher.reset(&mut self)
       self.isSetup = true
     }
     if !self.isPrepared {
-      // SEAM: `PrepareH*(one_shot = position == 0 && is_last, input_size, data)` goes here.
+      prepareKernel(&mut self.kernel, oneShot, inputSize, data)
       self.isPrepared = true
     }
   }
@@ -49,6 +175,6 @@ impl Hasher {
   /// `InitOrStitchToPreviousBlock`.
   pub effect fn initOrStitchToPreviousBlock(self: &mut Self, data: &[u8], mask: usize, params: &mut EncoderParams, position: usize, inputSize: usize, isLast: bool) -> () ! OutOfMemoryError ? &mut Allocator {
     run Hasher.setup(&mut self, &mut params, data, position, inputSize, isLast)
-    // SEAM: `StitchToPreviousBlockH*(input_size, position, data, mask)` goes here.
+    stitchKernel(&mut self.kernel, inputSize, position, data, mask)
   }
 }
