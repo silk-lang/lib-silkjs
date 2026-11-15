@@ -125,6 +125,74 @@ misses and branch mispredictions are the same or fewer. What is left is spread o
 and overflow checks of ordinary arithmetic, loop invariants reloaded after stores the compiler
 cannot prove do not alias, and the walls below.
 
+## Runtime measurements (before and after)
+
+`bench/brotli/compare.py --a <runtime on the C library> --b <runtime on this package> --rounds 5`,
+Linux x86-64, 4 CPUs, 2026-11-15, nothing else running; medians of 5 interleaved rounds; MB/s of
+input (compress) or output (decompress); `SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset. The
+compressed output was byte-identical in every case. These numbers are from before the speed work
+that follows the port; see below for that.
+
+| Case | Input | Quality | C MB/s | Silk MB/s | Silk/C | C peak MiB | Silk peak MiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| compress | text | 1 | 150.1 | 106.6 | 0.71 | 45 | 48 |
+| compress | text | 4 | 63.0 | 58.5 | 0.93 | 52 | 54 |
+| compress | text | 6 | 36.2 | 32.4 | 0.89 | 53 | 56 |
+| compress | text | 9 | 17.6 | 16.6 | 0.95 | 81 | 83 |
+| compress | text | 11 | 0.6 | 0.6 | 1.00 | 66 | 69 |
+| decompress | text | 5 | 347.2 | 277.2 | 0.80 | 51 | 53 |
+| compress | html | 1 | 172.9 | 167.8 | 0.97 | 51 | 53 |
+| compress | html | 4 | 70.0 | 69.8 | 1.00 | 60 | 63 |
+| compress | html | 6 | 41.3 | 31.7 | 0.77 | 61 | 64 |
+| compress | html | 9 | 18.0 | 19.0 | 1.06 | 87 | 90 |
+| compress | html | 11 | 0.6 | 0.6 | 0.95 | 81 | 83 |
+| decompress | html | 5 | 423.1 | 397.4 | 0.94 | 59 | 62 |
+| compress | json | 1 | 148.4 | 153.0 | 1.03 | 53 | 56 |
+| compress | json | 4 | 68.3 | 65.2 | 0.95 | 62 | 65 |
+| compress | json | 6 | 42.8 | 36.6 | 0.86 | 63 | 66 |
+| compress | json | 9 | 19.8 | 17.0 | 0.86 | 89 | 92 |
+| compress | json | 11 | 0.6 | 0.5 | 0.93 | 81 | 84 |
+| decompress | json | 5 | 448.8 | 409.4 | 0.91 | 61 | 64 |
+| compress | random | 1 | 186.0 | 187.5 | 1.01 | 50 | 52 |
+| compress | random | 4 | 106.4 | 101.7 | 0.96 | 55 | 58 |
+| compress | random | 6 | 91.6 | 87.3 | 0.95 | 56 | 59 |
+| compress | random | 9 | 48.3 | 41.5 | 0.86 | 84 | 86 |
+| compress | random | 11 | 2.1 | 2.0 | 0.93 | 60 | 62 |
+| decompress | random | 5 | 526.2 | 420.2 | 0.80 | 56 | 58 |
+| compress | binary (16 MB) | 1 | 6.0 | 5.9 | 0.98 | 109 | 112 |
+| compress | binary | 4 | 6.6 | 6.1 | 0.93 | 121 | 123 |
+| compress | binary | 6 | 7.3 | 6.9 | 0.94 | 119 | 122 |
+| compress | binary | 9 | 3.5 | 3.5 | 1.01 | 145 | 148 |
+| compress | binary | 11 | 0.5 | 0.5 | 0.96 | 127 | 130 |
+| decompress | binary | 5 | 7.6 | 7.5 | 0.99 | 116 | 119 |
+| compress, 4 KiB writes | text | 1 / 4 / 6 / 9 | 29.5 / 27.6 / 16.0 / 12.1 | 28.6 / 31.2 / 15.3 / 11.2 | 0.97 / 1.13 / 0.96 / 0.92 | 46–81 | 48–84 |
+| compress, 4 KiB writes | html | 11 | 0.6 | 0.5 | 0.96 | 81 | 84 |
+| decompress, 1 KiB writes | text / binary | 5 | 45.9 / 29.5 | 42.8 / 27.2 | 0.93 / 0.92 | 51 / 116 | 53 / 119 |
+| compress, 8 at once on the pool | json q5 / text q9 | | 130.4 / 53.0 | 116.5 / 50.1 | 0.89 / 0.95 | 133 / 336 | 134 / 339 |
+| `fetch` of a `Content-Encoding: br` response, 40 times | html | 5 | 109.1 | 106.3 | 0.97 | 72 | 77 |
+
+Reading it:
+
+- Host noise is about 8%. Several rows are within it. Real gaps, confirmed by instruction counts:
+  the **decoder** executes 14 to 25% more instructions than C on literal- and command-heavy
+  streams (768 KB of JavaScript: 17.5M against 15.3M at quality 1, 13.8M against 11.5M at 5,
+  12.9M against 10.3M at 11; in the runtime, `processCommands` 255M against C's `ProcessCommands`
+  198M for 20 decodes). The earlier tool-level comparison showed parity because its input was one
+  file repeated 40 times, which decodes mostly as long copies. In the encoder, the gaps measured by
+  the porting runs above.
+- **Peak RSS is 2 to 3 MiB higher in every row, and already at a bare start** (`-e 0`: 34.5 MiB on
+  the C library, 37.1 to 37.5 MiB on the port, stable to 0.1 MiB). It is not allocation: the
+  executable is 467 KB larger (`.text` +277 KB, `.rodata` +193 KB, `.data` unchanged), and the
+  resident pages of a start, counted per section from `/proc/self/pagemap`, are `.text` 22.9 MiB
+  against 21.5, `.rodata` 2.9 against 2.5, the writable image 11.7 against 11.2. A start already
+  keeps two thirds of the 32 MiB code section resident in both builds because the startup
+  function order that `tools/build.py` hands the linker is stale: only 38 of the 896 Silk names in
+  `tools/startup-order.txt` exist in either executable. With the startup code scattered, the new
+  code changes which pages a start touches. Regenerating the order is a change for the whole
+  runtime and is left to a separate task.
+- The asynchronous form still runs on the thread pool (`compress, 8 at once on the pool`): eight
+  compressions at once go at the same rate as with the C library.
+
 ## Compiler walls
 
 Each one was checked on a minimal case compiled with `silk build --release` (Silk
