@@ -18,8 +18,10 @@ import cstate
 import cstate { MatchState, Cwksp }
 import cctx
 import cctx { CCtx }
+import cdict
 import presplit
 import csplit
+import zmt
 import silk.mem.pointer { Pointer }
 import silk.num.u8
 import silk.num.i32
@@ -52,7 +54,10 @@ pub fn compressBound(srcSize: usize) -> usize { return cparams.compressBound(src
 pub fn createCCtx() -> ?[*]mut u8 { return unsafe cctx.create() }
 
 /// `ZSTD_freeCCtx`. `c` is a context of [`createCCtx`] that is not used again, or null.
-pub unsafe fn freeCCtx(c: ?[*]mut u8) -> () { unsafe cctx.destroy(c) }
+pub unsafe fn freeCCtx(c: ?[*]mut u8) -> () {
+  unsafe zmt.freeOf(c)
+  unsafe cctx.destroy(c)
+}
 
 fn resetImpl(c: &mut CCtx, directive: i32) -> usize {
   if directive == RESET_SESSION_ONLY || directive == RESET_SESSION_AND_PARAMETERS {
@@ -97,18 +102,22 @@ pub unsafe fn cctxSetPledgedSrcSize(c: [*]mut u8, pledgedSrcSize: u64) -> usize 
   return 0
 }
 
-/// `ZSTD_CCtx_loadDictionary`. An empty dictionary clears the dictionaries of the context.
-///
-/// TODO(dictionaries): a non-empty dictionary is not supported yet and fails with
-/// `parameter_unsupported`. The port will copy it into `localDictBuffer` here, and
-/// `initCompressStream2` will load it (`ZSTD_compress_insertDictionary`) or attach it.
+/// `ZSTD_CCtx_loadDictionary`: the context keeps a copy of `dict[0..dictSize]`, and the next
+/// frames are compressed with it (`cdict.silk`). An empty dictionary clears the dictionaries of
+/// the context.
 pub unsafe fn cctxLoadDictionary(c: [*]mut u8, dict: ?[*]const u8, dictSize: usize) -> usize {
   let mut anchor = ()
   let ctx = unsafe cctx.of(&mut anchor, c)
   if ctx.streamStage != cctx.ZCSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
   unsafe cctx.clearAllDicts(&mut ctx)
   if Pointer.isNullMany<u8>(dict) || dictSize == 0 { return 0 }
-  return errors.err(errors.E_PARAMETER_UNSUPPORTED)
+  // Copy the dictionary, to own its lifetime.
+  let buffer = unsafe mem.malloc(dictSize)
+  if Pointer.isNullMany<u8>(buffer) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  unsafe mem.copyBytes(unsafe mem.nn(buffer), unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(dict), dictSize)
+  ctx.localDictBuffer = buffer
+  ctx.localDictSize = dictSize
+  return 0
 }
 
 // ---- Frame. ----
@@ -299,7 +308,7 @@ unsafe fn compressFrameChunk(c: &mut CCtx, dst: [*]mut u8, dstCapacity0: usize, 
 }
 
 // `ZSTD_compressContinue_internal` with `frame = 1`.
-unsafe fn compressContinueInternal(c: &mut CCtx, dst0: [*]mut u8, dstCapacity0: usize, src: [*]const u8, srcSize: usize, lastFrameChunk: bool) -> usize {
+pub unsafe fn compressContinueInternal(c: &mut CCtx, dst0: [*]mut u8, dstCapacity0: usize, src: [*]const u8, srcSize: usize, lastFrameChunk: bool) -> usize {
   let mut fhSize: usize = 0
   let mut dst = dst0
   let mut dstCapacity = dstCapacity0
@@ -363,7 +372,7 @@ unsafe fn writeEpilogue(c: &mut CCtx, dst: [*]mut u8, dstCapacity0: usize) -> us
 }
 
 // `ZSTD_compressEnd_public`.
-unsafe fn compressEnd(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize) -> usize {
+pub unsafe fn compressEnd(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize) -> usize {
   let cSize = unsafe compressContinueInternal(&mut c, dst, dstCapacity, src, srcSize, true)
   if errors.isError(cSize) { return cSize }
   let endResult = unsafe writeEpilogue(&mut c, unsafe mem.add(dst, cSize), dstCapacity - cSize)
@@ -380,6 +389,9 @@ unsafe fn compressEnd(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, src: [*]
 // `ZSTD_CCtx_init_compressStream2`: applies the requested parameters and starts a frame.
 unsafe fn initCompressStream2(c: &mut CCtx, endOp: i32, inSize: usize) -> usize {
   let mut params = c.requestedParams
+  // `ZSTD_initLocalDict`: build the CDict of the dictionary, if not done yet.
+  let le = unsafe cdict.initLocalDict(&mut c)
+  if errors.isError(le) { return le }
   let prefixDictSize: usize = if Pointer.isNullMany<u8>(c.prefixDict) { 0 } else { c.prefixDictSize }
   // A prefix is for one frame only.
   c.prefixDict = mem.nullp()
@@ -389,21 +401,24 @@ unsafe fn initCompressStream2(c: &mut CCtx, endOp: i32, inSize: usize) -> usize 
   let pledgedSrcSize = u64.wrappingSubtract(c.pledgedSrcSizePlusOne, 1)
   // Hook (dictionaries): with a CDict the mode can be `CPM_ATTACH_DICT`, and the level is the
   // one of the CDict.
-  params.cParams = cparams.getCParamsFromCCtxParams(&params, pledgedSrcSize, prefixDictSize, cparams.CPM_NO_ATTACH_DICT)
+  params.cParams = unsafe cdict.frameCParams(&c, &params, pledgedSrcSize, prefixDictSize)
   let cp = params.cParams
   params.postBlockSplitter = cparams.resolveBlockSplitterMode(params.postBlockSplitter, &cp)
   params.ldmParams.enableLdm = cparams.resolveEnableLdm(params.ldmParams.enableLdm, &cp)
   params.useRowMatchFinder = cparams.resolveRowMatchFinderMode(params.useRowMatchFinder, &cp)
   params.maxBlockSize = cparams.resolveMaxBlockSize(params.maxBlockSize)
   params.searchForExternalRepcodes = cparams.resolveExternalRepcodeSearch(params.searchForExternalRepcodes, params.compressionLevel)
-  // The reference compresses on worker threads when `nbWorkers > 0` and the source is larger
-  // than `ZSTDMT_JOBSIZE_MIN`, which gives other bytes. This port always uses this thread.
-  params.nbWorkers = 0
+  // Do not invoke multithreading when the source is small. Else the output of the workers is
+  // made on this thread (`zmt.silk`).
+  if pledgedSrcSize <= i32.toU64(cparams.JOBSIZE_MIN) { params.nbWorkers = 0 }
+  if params.nbWorkers > 0 {
+    if prefixDictSize != 0 || !Pointer.isNullMany<u8>(c.localCDict) { return errors.err(errors.E_PARAMETER_UNSUPPORTED) }
+    return unsafe zmt.initCStream(&mut c, &params, pledgedSrcSize)
+  }
   // `ZSTD_compressBegin_internal`, without a dictionary.
-  let e = unsafe cctx.resetInternal(&mut c, &params, pledgedSrcSize, 0, true, true)
+  // (With the CDict of the dictionary: attached, copied or reloaded, `cdict.silk`.)
+  let e = unsafe cdict.compressBegin(&mut c, &params, pledgedSrcSize)
   if errors.isError(e) { return e }
-  // Hook (dictionaries): `ZSTD_compress_insertDictionary` loads the prefix or the dictionary
-  // into the match state here, and sets `c.dictID` and `c.dictContentSize`.
   c.inToCompress = 0
   c.inBuffPos = 0
   if c.appliedParams.inBufferMode == 0 {
@@ -630,6 +645,7 @@ pub unsafe fn compressStream2(c: [*]mut u8, dst: [*]mut u8, dstSize: usize, dstP
     if ctx.expectedOutBufferSize != dstSize - dstPos.* { return errors.err(errors.E_STABILITYCONDITION_NOTRESPECTED) }
   }
   // Compression stage.
+  if ctx.appliedParams.nbWorkers > 0 { return unsafe zmt.compressStream2(&mut ctx, dst, dstSize, &mut dstPos, src, srcSize, &mut srcPos, endOp) }
   let r = unsafe compressStreamGeneric(&mut ctx, dst, dstSize, &mut dstPos, src, srcSize, &mut srcPos, endOp)
   if errors.isError(r) { return r }
   if ctx.appliedParams.inBufferMode == 1 {

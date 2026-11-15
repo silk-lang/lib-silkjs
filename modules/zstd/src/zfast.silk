@@ -14,6 +14,7 @@ import cstate { MatchState, SeqStore }
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+import silk.mem.pointer { Pointer }
 
 /// `ZSTD_dtlm_fast`: when loading a dictionary, insert one position out of three.
 pub const DTLM_FAST: u32 = 0
@@ -391,4 +392,194 @@ pub unsafe fn compressBlockFastExtDict(ms: &mut MatchState, seqStore: &mut SeqSt
   if mls == 6 { return unsafe fastExtDict6(&mut ms, &mut seqStore, rep, src, srcSize) }
   if mls == 7 { return unsafe fastExtDict7(&mut ms, &mut seqStore, rep, src, srcSize) }
   return unsafe fastExtDict4(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+// ---- `dictMatchState` (`ZSTD_compressBlock_fast_dictMatchState`): an attached CDict, whose
+// hash table has short cache tags (`cdict.silk`). ----
+
+/// The fields of an attached dictionary that the `dictMatchState` compressors read.
+pub struct DmsView {
+  pub hashTable: [*]mut u8,
+  pub chainTable: [*]mut u8,
+  pub hashLog: u32,
+  pub chainLog: u32,
+  /// `dms.window.base`.
+  pub base: [*]const u8,
+  /// `dms.window.dictLimit`.
+  pub startIndex: u32,
+  /// `dms.window.nextSrc - dms.window.base`.
+  pub endIndex: usize,
+}
+
+/// Reads the attached dictionary of `ms`, which must have one.
+pub unsafe fn dmsView(ms: &MatchState) -> DmsView {
+  let anchor = ()
+  let dms = unsafe Pointer.borrow<(), MatchState>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut MatchState, *const MatchState>(ms.dictMatchState))
+  return DmsView {
+    hashTable: dms.hashTable, chainTable: dms.chainTable, hashLog: dms.cParams.hashLog, chainLog: dms.cParams.chainLog,
+    base: dms.window.base, startIndex: dms.window.dictLimit, endIndex: mem.us(mem.addr(dms.window.nextSrc), mem.addr(dms.window.base)),
+  }
+}
+
+// `ZSTD_compressBlock_fast_dictMatchState_generic`.
+@inlineAlways
+unsafe fn fastDmsGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize, mls: u32) -> usize {
+  let hashTable = ms.hashTable
+  let hlog = ms.cParams.hashLog
+  let targetLength = ms.cParams.targetLength
+  // Support a step size of 0.
+  let stepSize: usize = mem.z(targetLength) + (if targetLength == 0 { 1 } else { 0 })
+  let base = ms.window.base
+  let istart = mem.us(mem.addr(src), mem.addr(base))
+  let mut ip0 = istart
+  let mut ip1 = mem.ua(ip0, stepSize)
+  let mut anchor = istart
+  let prefixStartIndex = ms.window.dictLimit
+  let prefixStart = mem.z(prefixStartIndex)
+  let iend = mem.ua(istart, srcSize)
+  let ilimit = mem.us(iend, cstate.HASH_READ_SIZE)
+  let mut offset1 = unsafe mem.r32(unsafe mem.ro(rep), 0)
+  let mut offset2 = unsafe mem.r32(unsafe mem.ro(rep), 4)
+  let d = unsafe dmsView(&ms)
+  let dictHashTable = d.hashTable
+  let dictStartIndex = d.startIndex
+  let dictBase = d.base
+  let dictStart = mem.z(dictStartIndex)
+  let dictEnd = d.endIndex
+  let dictIndexDelta = mem.s32(prefixStartIndex, mem.t32(dictEnd))
+  let dictAndPrefixLength = mem.t32(mem.ua(mem.us(istart, prefixStart), mem.us(dictEnd, dictStart)))
+  let dictHBits = d.hashLog + 8
+  let kStepIncr: usize = 256
+  if dictAndPrefixLength == 0 { ip0 = mem.ua(ip0, 1) }
+  // Outer search loop.
+  while ip1 <= ilimit {
+    let mut mLength: usize = 0
+    let mut hash0 = unsafe cstate.hashPtr(base, ip0, hlog, mls)
+    let dictHashAndTag0 = unsafe cstate.hashPtr(base, ip0, dictHBits, mls)
+    let mut dictMatchIndexAndTag = unsafe cstate.tget(dictHashTable, usize.shiftRight(dictHashAndTag0, 8))
+    let mut dictTagsMatch = (dictMatchIndexAndTag & 255) == (mem.t32(dictHashAndTag0) & 255)
+    let mut matchIndex = unsafe cstate.tget(hashTable, hash0)
+    let mut curr = mem.t32(ip0)
+    let mut step = stepSize
+    let mut nextStep = mem.ua(ip0, kStepIncr)
+    let mut stop = false
+    // Inner search loop.
+    while true {
+      let match_ = mem.z(matchIndex)
+      let repIndex = mem.s32(mem.a32(curr, 1), offset1)
+      let repInDict = repIndex < prefixStartIndex
+      let repBase = if repInDict { dictBase } else { base }
+      let repPos = if repInDict { mem.z(mem.s32(repIndex, dictIndexDelta)) } else { mem.z(repIndex) }
+      let hash1 = unsafe cstate.hashPtr(base, ip1, hlog, mls)
+      let dictHashAndTag1 = unsafe cstate.hashPtr(base, ip1, dictHBits, mls)
+      // Update the hash table.
+      unsafe cstate.tset(hashTable, hash0, curr)
+      if cstate.indexOverlapCheck(prefixStartIndex, repIndex) && unsafe mem.r32(repBase, repPos) == unsafe mem.r32(base, mem.ua(ip0, 1)) {
+        let repMatchEnd = if repInDict { dictEnd } else { iend }
+        mLength = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip0, 5), iend, repBase, mem.ua(repPos, 4), repMatchEnd, prefixStart), 4)
+        ip0 = mem.ua(ip0, 1)
+        unsafe cstate.storeSeq(&mut seqStore, mem.us(ip0, anchor), base, anchor, iend, cstate.REPCODE1, mLength)
+        break
+      }
+      if dictTagsMatch {
+        // A possible match in the dictionary.
+        let dictMatchIndex = mem.shr32(dictMatchIndexAndTag, 8)
+        if dictMatchIndex > dictStartIndex && unsafe mem.r32(dictBase, mem.z(dictMatchIndex)) == unsafe mem.r32(base, ip0) {
+          // As the extDict parser: use a dictionary match only when the regular one is invalid.
+          if matchIndex <= prefixStartIndex {
+            let offset = mem.s32(mem.s32(curr, dictMatchIndex), dictIndexDelta)
+            let mut dictMatch = mem.z(dictMatchIndex)
+            mLength = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip0, 4), iend, dictBase, mem.ua(dictMatch, 4), dictEnd, prefixStart), 4)
+            // Catch up.
+            while ip0 > anchor && dictMatch > dictStart && unsafe mem.r8(base, mem.us(ip0, 1)) == unsafe mem.r8(dictBase, mem.us(dictMatch, 1)) {
+              ip0 = mem.us(ip0, 1) dictMatch = mem.us(dictMatch, 1) mLength = mem.ua(mLength, 1)
+            }
+            offset2 = offset1
+            offset1 = offset
+            unsafe cstate.storeSeq(&mut seqStore, mem.us(ip0, anchor), base, anchor, iend, cstate.offsetToOffBase(offset), mLength)
+            break
+          }
+        }
+      }
+      if matchIndex >= prefixStartIndex && unsafe mem.r32(base, ip0) == unsafe mem.r32(base, match_) {
+        // A regular match of 4 bytes or more.
+        let offset = mem.t32(mem.us(ip0, match_))
+        let mut m = match_
+        mLength = mem.ua(unsafe cstate.count(base, mem.ua(ip0, 4), base, mem.ua(m, 4), iend), 4)
+        // Catch up.
+        while ip0 > anchor && m > prefixStart && unsafe mem.r8(base, mem.us(ip0, 1)) == unsafe mem.r8(base, mem.us(m, 1)) {
+          ip0 = mem.us(ip0, 1) m = mem.us(m, 1) mLength = mem.ua(mLength, 1)
+        }
+        offset2 = offset1
+        offset1 = offset
+        unsafe cstate.storeSeq(&mut seqStore, mem.us(ip0, anchor), base, anchor, iend, cstate.offsetToOffBase(offset), mLength)
+        break
+      }
+      // Prepare for the next iteration.
+      dictMatchIndexAndTag = unsafe cstate.tget(dictHashTable, usize.shiftRight(dictHashAndTag1, 8))
+      dictTagsMatch = (dictMatchIndexAndTag & 255) == (mem.t32(dictHashAndTag1) & 255)
+      matchIndex = unsafe cstate.tget(hashTable, hash1)
+      if ip1 >= nextStep {
+        step = mem.ua(step, 1)
+        nextStep = mem.ua(nextStep, kStepIncr)
+      }
+      ip0 = ip1
+      ip1 = mem.ua(ip1, step)
+      if ip1 > ilimit { stop = true break }
+      curr = mem.t32(ip0)
+      hash0 = hash1
+    }
+    if stop { break }
+    // A match was found.
+    ip0 = mem.ua(ip0, mLength)
+    anchor = ip0
+    if ip0 <= ilimit {
+      // Fill the table.
+      unsafe cstate.tset(hashTable, unsafe cstate.hashPtr(base, mem.ua(mem.z(curr), 2), hlog, mls), mem.a32(curr, 2))
+      unsafe cstate.tset(hashTable, unsafe cstate.hashPtr(base, mem.us(ip0, 2), hlog, mls), mem.t32(mem.us(ip0, 2)))
+      // Check for an immediate repeat code.
+      while ip0 <= ilimit {
+        let current2 = mem.t32(ip0)
+        let repIndex2 = mem.s32(current2, offset2)
+        let inDict2 = repIndex2 < prefixStartIndex
+        let repBase2 = if inDict2 { dictBase } else { base }
+        let repPos2 = if inDict2 { mem.z(mem.s32(repIndex2, dictIndexDelta)) } else { mem.z(repIndex2) }
+        if cstate.indexOverlapCheck(prefixStartIndex, repIndex2) && unsafe mem.r32(repBase2, repPos2) == unsafe mem.r32(base, ip0) {
+          let repEnd2 = if inDict2 { dictEnd } else { iend }
+          let repLength2 = mem.ua(unsafe cstate.count2segments(base, mem.ua(ip0, 4), iend, repBase2, mem.ua(repPos2, 4), repEnd2, prefixStart), 4)
+          let tmpOffset = offset2 offset2 = offset1 offset1 = tmpOffset
+          unsafe cstate.storeSeq(&mut seqStore, 0, base, anchor, iend, cstate.REPCODE1, repLength2)
+          unsafe cstate.tset(hashTable, unsafe cstate.hashPtr(base, ip0, hlog, mls), current2)
+          ip0 = mem.ua(ip0, repLength2)
+          anchor = ip0
+          continue
+        }
+        break
+      }
+    }
+    ip1 = mem.ua(ip0, stepSize)
+  }
+  // Save the repeat offsets for the next block.
+  unsafe mem.w32(rep, 0, offset1)
+  unsafe mem.w32(rep, 4, offset2)
+  return mem.us(iend, anchor)
+}
+
+@inlineNever
+unsafe fn fastDms4(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize { return unsafe fastDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 4) }
+@inlineNever
+unsafe fn fastDms5(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize { return unsafe fastDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 5) }
+@inlineNever
+unsafe fn fastDms6(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize { return unsafe fastDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 6) }
+@inlineNever
+unsafe fn fastDms7(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize { return unsafe fastDmsGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 7) }
+
+/// `ZSTD_compressBlock_fast_dictMatchState`: the block compressor of `fast` with an attached
+/// dictionary.
+pub unsafe fn compressBlockFastDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  let mls = ms.cParams.minMatch
+  if mls == 5 { return unsafe fastDms5(&mut ms, &mut seqStore, rep, src, srcSize) }
+  if mls == 6 { return unsafe fastDms6(&mut ms, &mut seqStore, rep, src, srcSize) }
+  if mls == 7 { return unsafe fastDms7(&mut ms, &mut seqStore, rep, src, srcSize) }
+  return unsafe fastDms4(&mut ms, &mut seqStore, rep, src, srcSize)
 }
