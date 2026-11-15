@@ -1,0 +1,323 @@
+//! The meta-block builder of qualities 10 and 11: a port of google/brotli v1.2.0
+//! `c/enc/metablock.c` (`BrotliBuildMetaBlock` with `ComputeDistanceCost` and
+//! `RecomputeDistancePrefixes`) and `c/enc/histogram.c` (`BrotliBuildHistogramsWithContext`).
+//!
+//! It uses the slow shortest-path block splitter (`enc.block_splitter`) and does context
+//! clustering (`enc.cluster`). The distance parameters are selected for the commands of the
+//! meta-block, and the commands are recomputed under the chosen parameters.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import enc.bit_cost { populationCostDistance }
+import enc.block_splitter { BlockSplit, splitBlock }
+import enc.cluster { HistogramOps, clearedHistograms, clusterHistograms, filledWords }
+import enc.command { Command, prefixEncodeCopyDistance }
+import enc.constants { DISTANCE_CONTEXT_BITS, LITERAL_CONTEXT_BITS, MAX_NPOSTFIX, context, contextLookupTable }
+import enc.encoder_dict { SharedEncoderDictionary }
+import enc.histogram { HistogramCommand, HistogramDistance, HistogramLiteral }
+import enc.metablock { MetaBlockSplit }
+import enc.params { DistanceParams, EncoderParams, HasherParams, initDistanceParams }
+
+// Histogram ids need to fit in one byte.
+const MAX_NUMBER_OF_HISTOGRAMS: usize = 256
+
+/// A copy of `dist`.
+pub fn copyDistanceParams(dist: &DistanceParams) -> DistanceParams {
+  return DistanceParams {
+    distancePostfixBits: dist.distancePostfixBits,
+    numDirectDistanceCodes: dist.numDirectDistanceCodes,
+    alphabetSizeMax: dist.alphabetSizeMax,
+    alphabetSizeLimit: dist.alphabetSizeLimit,
+    maxDistance: dist.maxDistance,
+  }
+}
+
+/// A copy of `params`: `BrotliEncoderParams block_params = *params` of `WriteMetaBlockInternal`.
+pub fn copyEncoderParams(params: &EncoderParams) -> EncoderParams {
+  return EncoderParams {
+    mode: params.mode,
+    quality: params.quality,
+    lgwin: params.lgwin,
+    lgblock: params.lgblock,
+    streamOffset: params.streamOffset,
+    sizeHint: params.sizeHint,
+    disableLiteralContextModeling: params.disableLiteralContextModeling,
+    largeWindow: params.largeWindow,
+    hasher: HasherParams { kind: params.hasher.kind, bucketBits: params.hasher.bucketBits, blockBits: params.hasher.blockBits, numLastDistancesToCheck: params.hasher.numLastDistancesToCheck },
+    dist: copyDistanceParams(&params.dist),
+    dictionary: SharedEncoderDictionary { compoundTotalSize: params.dictionary.compoundTotalSize, maxQuality: params.dictionary.maxQuality },
+  }
+}
+
+// `RecomputeDistancePrefixes`.
+fn recomputeDistancePrefixes(cmds: &mut [Command], numCommands: usize, origParams: &DistanceParams, newParams: &DistanceParams) -> () {
+  if origParams.distancePostfixBits == newParams.distancePostfixBits && origParams.numDirectDistanceCodes == newParams.numDirectDistanceCodes {
+    return ()
+  }
+  let mut i: usize = 0
+  while i < numCommands {
+    let cmd = cmds[i]
+    if Command.copyLength(&cmd) != 0 && cmd.cmdPrefix >= 128 {
+      let encoded = prefixEncodeCopyDistance(u32.toUsize(Command.restoreDistanceCode(&cmd, origParams)), u32.toUsize(newParams.numDirectDistanceCodes), u32.toUsize(newParams.distancePostfixBits))
+      cmds[i].distPrefix = u64.wrappingToU16(encoded)
+      cmds[i].distExtra = u64.wrappingToU32(u64.shiftRight(encoded, 16))
+    }
+    i = i + 1
+  }
+}
+
+// `ComputeDistanceCost`: the cost of the distances of the commands under `newParams` in `cost`,
+// or false if a distance does not fit them.
+fn computeDistanceCost(cmds: &[Command], numCommands: usize, origParams: &DistanceParams, newParams: &DistanceParams, cost: &mut f64, tmp: &mut HistogramDistance) -> bool {
+  let mut equalParams = false
+  let mut extraBits: f64 = 0.0
+  HistogramDistance.clear(&mut tmp)
+  if origParams.distancePostfixBits == newParams.distancePostfixBits && origParams.numDirectDistanceCodes == newParams.numDirectDistanceCodes {
+    equalParams = true
+  }
+  let mut i: usize = 0
+  while i < numCommands {
+    let cmd = cmds[i]
+    if Command.copyLength(&cmd) != 0 && cmd.cmdPrefix >= 128 {
+      let mut distPrefix: u16 = 0
+      if equalParams {
+        distPrefix = cmd.distPrefix
+      } else {
+        let distance = Command.restoreDistanceCode(&cmd, origParams)
+        if u32.toUsize(distance) > newParams.maxDistance {
+          return false
+        }
+        distPrefix = u64.wrappingToU16(prefixEncodeCopyDistance(u32.toUsize(distance), u32.toUsize(newParams.numDirectDistanceCodes), u32.toUsize(newParams.distancePostfixBits)))
+      }
+      HistogramDistance.add(&mut tmp, u16.toUsize(distPrefix & 0x3ff))
+      extraBits = extraBits + u16.toF64(u16.shiftRight(distPrefix, 10))
+    }
+    i = i + 1
+  }
+  cost.* = populationCostDistance(&tmp) + extraBits
+  return true
+}
+
+// `BlockSplitIterator` of histogram.c.
+struct BlockSplitIterator {
+  idx: usize,
+  kind: usize,
+  length: usize,
+}
+
+impl BlockSplitIterator {
+  // `InitBlockSplitIterator`.
+  fn make(split: &BlockSplit) -> BlockSplitIterator {
+    let lengths = List<u32>.asSlice(&split.lengths)
+    return BlockSplitIterator { idx: 0, kind: 0, length: if lengths.length == 0 { 0 } else { u32.toUsize(lengths[0]) } }
+  }
+
+  // `BlockSplitIteratorNext`.
+  @inlineAlways
+  fn next(self: &mut Self, split: &BlockSplit) -> () {
+    if self.length == 0 {
+      self.idx = self.idx + 1
+      self.kind = u8.toUsize(List<u8>.asSlice(&split.types)[self.idx])
+      self.length = u32.toUsize(List<u32>.asSlice(&split.lengths)[self.idx])
+    }
+    self.length = self.length - 1
+  }
+}
+
+/// `BrotliBuildHistogramsWithContext`. Without `contextModes` (`context_modes == NULL`) the
+/// literal histogram is the block type alone; with them every block type has the same mode,
+/// `literalContextMode`.
+pub fn buildHistogramsWithContext(
+  cmds: &[Command],
+  numCommands: usize,
+  literalSplit: &BlockSplit,
+  insertAndCopySplit: &BlockSplit,
+  distSplit: &BlockSplit,
+  ringbuffer: &[u8],
+  startPos: usize,
+  mask: usize,
+  prevByteIn: u8,
+  prevByte2In: u8,
+  contextModes: bool,
+  literalContextMode: u32,
+  literalHistograms: &mut [HistogramLiteral],
+  insertAndCopyHistograms: &mut [HistogramCommand],
+  copyDistHistograms: &mut [HistogramDistance],
+) -> () {
+  let mut pos = startPos
+  let mut prevByte = prevByteIn
+  let mut prevByte2 = prevByte2In
+  let lookup = contextLookupTable()
+  let lut = usize.shiftLeft(u32.toUsize(literalContextMode), 9)
+  let mut literalIt = BlockSplitIterator.make(literalSplit)
+  let mut insertAndCopyIt = BlockSplitIterator.make(insertAndCopySplit)
+  let mut distIt = BlockSplitIterator.make(distSplit)
+  let mut i: usize = 0
+  while i < numCommands {
+    let cmd = cmds[i]
+    BlockSplitIterator.next(&mut insertAndCopyIt, insertAndCopySplit)
+    HistogramCommand.add(&mut insertAndCopyHistograms[insertAndCopyIt.kind], u16.toUsize(cmd.cmdPrefix))
+    // TODO(eustas): unwrap iterator blocks.
+    let mut j = cmd.insertLen
+    while j != 0 {
+      BlockSplitIterator.next(&mut literalIt, literalSplit)
+      let mut ctx = literalIt.kind
+      if contextModes {
+        ctx = usize.shiftLeft(ctx, LITERAL_CONTEXT_BITS) + u8.toUsize(context(lookup, lut, prevByte, prevByte2))
+      }
+      let literal = ringbuffer[pos & mask]
+      HistogramLiteral.add(&mut literalHistograms[ctx], u8.toUsize(literal))
+      prevByte2 = prevByte
+      prevByte = literal
+      pos = pos + 1
+      j = j - 1
+    }
+    let copyLen = u32.toUsize(Command.copyLength(&cmd))
+    pos = pos + copyLen
+    if copyLen != 0 {
+      prevByte2 = ringbuffer[(pos - 2) & mask]
+      prevByte = ringbuffer[(pos - 1) & mask]
+      if cmd.cmdPrefix >= 128 {
+        BlockSplitIterator.next(&mut distIt, distSplit)
+        let ctx = usize.shiftLeft(distIt.kind, DISTANCE_CONTEXT_BITS) + u32.toUsize(Command.distanceContext(&cmd))
+        HistogramDistance.add(&mut copyDistHistograms[ctx], u16.toUsize(cmd.distPrefix & 0x3ff))
+      }
+    }
+    i = i + 1
+  }
+}
+
+/// `BrotliBuildMetaBlock`: builds `mb` for the commands with the slow shortest-path block
+/// splitter and context clustering. The distance parameters are chosen for the commands and
+/// stored into `params.dist`; the distance codes of the commands are recomputed for them.
+pub effect fn buildMetaBlock(
+  ringbuffer: &[u8],
+  pos: usize,
+  mask: usize,
+  params: &mut EncoderParams,
+  prevByte: u8,
+  prevByte2: u8,
+  cmds: &mut [Command],
+  numCommands: usize,
+  literalContextMode: u32,
+  mb: &mut MetaBlockSplit,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut literalContextMultiplier: usize = 1
+  let mut ndirectMsb: u32 = 0
+  let mut checkOrig = true
+  let mut bestDistCost: f64 = 1e99
+  let origParams = copyDistanceParams(&params.dist)
+  let mut newParams = copyDistanceParams(&params.dist)
+  let mut tmp = HistogramDistance.make()
+
+  let mut npostfix: u32 = 0
+  while npostfix <= MAX_NPOSTFIX {
+    while ndirectMsb < 16 {
+      let ndirect = u32.shiftLeft(ndirectMsb, npostfix)
+      let mut distCost: f64 = 0.0
+      initDistanceParams(&mut newParams, npostfix, ndirect, params.largeWindow)
+      if npostfix == origParams.distancePostfixBits && ndirect == origParams.numDirectDistanceCodes {
+        checkOrig = false
+      }
+      let skip = !computeDistanceCost(&cmds, numCommands, &origParams, &newParams, &mut distCost, &mut tmp)
+      if skip || distCost > bestDistCost {
+        break
+      }
+      bestDistCost = distCost
+      params.dist = copyDistanceParams(&newParams)
+      ndirectMsb = ndirectMsb + 1
+    }
+    if ndirectMsb > 0 { ndirectMsb = ndirectMsb - 1 }
+    ndirectMsb = ndirectMsb / 2
+    npostfix = npostfix + 1
+  }
+  if checkOrig {
+    let mut distCost: f64 = 0.0
+    drop computeDistanceCost(&cmds, numCommands, &origParams, &origParams, &mut distCost, &mut tmp)
+    if distCost < bestDistCost {
+      // NB: currently unused; uncomment when more param tuning is added.
+      // best_dist_cost = dist_cost;
+      params.dist = copyDistanceParams(&origParams)
+    }
+  }
+  recomputeDistancePrefixes(&mut cmds, numCommands, &origParams, &params.dist)
+
+  run splitBlock(&cmds, numCommands, ringbuffer, pos, mask, &params, &mut mb.literalSplit, &mut mb.commandSplit, &mut mb.distanceSplit)
+
+  let contextModes = !params.disableLiteralContextModeling
+  if contextModes {
+    literalContextMultiplier = usize.shiftLeft(1, LITERAL_CONTEXT_BITS)
+  }
+
+  let literalHistogramsSize = mb.literalSplit.numTypes * literalContextMultiplier
+  let mut literalHistogramsList = run clearedHistograms<HistogramLiteral>(literalHistogramsSize)
+
+  let distanceHistogramsSize = usize.shiftLeft(mb.distanceSplit.numTypes, DISTANCE_CONTEXT_BITS)
+  let mut distanceHistogramsList = run clearedHistograms<HistogramDistance>(distanceHistogramsSize)
+
+  mb.commandHistograms = run clearedHistograms<HistogramCommand>(mb.commandSplit.numTypes)
+
+  buildHistogramsWithContext(
+    &cmds,
+    numCommands,
+    &mb.literalSplit,
+    &mb.commandSplit,
+    &mb.distanceSplit,
+    ringbuffer,
+    pos,
+    mask,
+    prevByte,
+    prevByte2,
+    contextModes,
+    literalContextMode,
+    List<HistogramLiteral>.asMutSlice(&mut literalHistogramsList),
+    List<HistogramCommand>.asMutSlice(&mut mb.commandHistograms),
+    List<HistogramDistance>.asMutSlice(&mut distanceHistogramsList),
+  )
+
+  let literalContextMapSize = usize.shiftLeft(mb.literalSplit.numTypes, LITERAL_CONTEXT_BITS)
+  mb.literalContextMap = run filledWords(0, literalContextMapSize)
+  // C allocates `literal_context_map_size` histograms, but the clustering writes only the first
+  // `literal_histograms_size` of them (fewer without context modeling): only those are made.
+  mb.literalHistograms = run clearedHistograms<HistogramLiteral>(literalHistogramsSize)
+  let literalOut = run clusterHistograms<HistogramLiteral>(
+    List<HistogramLiteral>.asSlice(&literalHistogramsList),
+    literalHistogramsSize,
+    MAX_NUMBER_OF_HISTOGRAMS,
+    List<HistogramLiteral>.asMutSlice(&mut mb.literalHistograms),
+    List<u32>.asMutSlice(&mut mb.literalContextMap),
+  )
+  List<HistogramLiteral>.truncate(&mut mb.literalHistograms, literalOut)
+  drop literalHistogramsList
+
+  if params.disableLiteralContextModeling {
+    // Distribute assignment to all contexts.
+    let map = List<u32>.asMutSlice(&mut mb.literalContextMap)
+    let mut i = mb.literalSplit.numTypes
+    while i != 0 {
+      i = i - 1
+      let mut j: usize = 0
+      while j < usize.shiftLeft(1, LITERAL_CONTEXT_BITS) {
+        map[usize.shiftLeft(i, LITERAL_CONTEXT_BITS) + j] = map[i]
+        j = j + 1
+      }
+    }
+  }
+
+  let distanceContextMapSize = usize.shiftLeft(mb.distanceSplit.numTypes, DISTANCE_CONTEXT_BITS)
+  mb.distanceContextMap = run filledWords(0, distanceContextMapSize)
+  mb.distanceHistograms = run clearedHistograms<HistogramDistance>(distanceContextMapSize)
+  let distanceOut = run clusterHistograms<HistogramDistance>(
+    List<HistogramDistance>.asSlice(&distanceHistogramsList),
+    distanceContextMapSize,
+    MAX_NUMBER_OF_HISTOGRAMS,
+    List<HistogramDistance>.asMutSlice(&mut mb.distanceHistograms),
+    List<u32>.asMutSlice(&mut mb.distanceContextMap),
+  )
+  List<HistogramDistance>.truncate(&mut mb.distanceHistograms, distanceOut)
+}

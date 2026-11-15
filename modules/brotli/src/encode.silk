@@ -2,19 +2,16 @@
 //! same parameters and the same calls it writes the same bytes as the C library.
 //!
 //! PORTED: the encoder state, the parameters, the stream state machine with all four operations,
-//! qualities 0 and 1 (`enc.compress_fragment`, `enc.compress_fragment_two_pass`), and qualities 2
+//! qualities 0 and 1 (`enc.compress_fragment`, `enc.compress_fragment_two_pass`), qualities 2
 //! to 9: the match finders (`enc.hash`), the reference search (`enc.backward_references`), the
 //! greedy meta-block builder and the context modeling decisions (`enc.metablock`, and
-//! `decideOverLiteralContextModeling` here).
+//! `decideOverLiteralContextModeling` here), and qualities 10 and 11: the Zopfli reference search
+//! with the H10 hasher (`enc.backward_references_hq`, `enc.hash_to_binary_tree`) and
+//! `BrotliBuildMetaBlock` with the block splitter and the clustering (`enc.metablock_hq`).
 //!
 //! Prepared dictionaries (`BrotliEncoderPrepareDictionary`, `BrotliEncoderAttachPreparedDictionary`)
 //! are the raw (LZ77 prefix) dictionaries of the plain C build; see `enc.compound_dictionary`.
-//!
-//! NOT PORTED YET: qualities 10 and 11 (the Zopfli reference search, `BrotliBuildMetaBlock` with
-//! the block splitter and the clustering, and their hasher H10). The places where they plug in
-//! are marked `SEAM`. Until then qualities 10 and 11 run the same state
-//! machine with a reference search that finds no match and store each meta-block uncompressed: a
-//! valid stream, but not the bytes of the C encoder.
+//! Qualities 10 and 11 do not search them yet (`enc.compound_dictionary_hq` is not wired in).
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
 import silk.mem.raw_buffer { RawBuffer }
@@ -30,6 +27,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import enc.backward_references { createBackwardReferences }
+import enc.backward_references_hq { createHqZopfliBackwardReferences, createZopfliBackwardReferences }
 import enc.bit_cost { bitsEntropy }
 import enc.bit_stream { storeMetaBlock, storeMetaBlockFast, storeMetaBlockTrivial, storeUncompressedMetaBlock }
 import enc.command { Command, getLengthCode }
@@ -39,9 +37,11 @@ import enc.compress_fragment_two_pass { COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE, T
 import enc.constants { CONTEXT_SIGNED, CONTEXT_UTF8, MAX_NDIRECT, MAX_NPOSTFIX, MAX_STATIC_CONTEXTS, MODE_FONT, WINDOW_GAP, context, contextLookupTable, maxBackwardLimit }
 import enc.fast_log { fastLog2, fastLog2u32, log2FloorNonZero32 }
 import enc.hash { Hasher }
+import enc.hash_to_binary_tree { HashToBinaryTree }
 import enc.memory { bytes, bytesMut, uninitializedBytes, uninitializedWords, wordsMut, zeroedWords }
 import enc.metablock { MetaBlockSplit, buildMetaBlockGreedy, optimizeHistograms }
-import enc.params { EncoderParams, FAST_ONE_PASS_COMPRESSION_QUALITY, FAST_TWO_PASS_COMPRESSION_QUALITY, MAX_NUM_DELAYED_SYMBOLS, MAX_QUALITY_FOR_STATIC_ENTROPY_CODES, MIN_QUALITY_FOR_BLOCK_SPLIT, MIN_QUALITY_FOR_CONTEXT_MODELING, MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING, MIN_QUALITY_FOR_HQ_CONTEXT_MODELING, MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS, MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS, computeLgBlock, initDistanceParams, maxHashTableSize, maxMetablockSize, sanitizeParams }
+import enc.metablock_hq { buildMetaBlock, copyEncoderParams }
+import enc.params { EncoderParams, FAST_ONE_PASS_COMPRESSION_QUALITY, FAST_TWO_PASS_COMPRESSION_QUALITY, MAX_NUM_DELAYED_SYMBOLS, MAX_QUALITY_FOR_STATIC_ENTROPY_CODES, MIN_QUALITY_FOR_BLOCK_SPLIT, MIN_QUALITY_FOR_CONTEXT_MODELING, MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING, MIN_QUALITY_FOR_HQ_CONTEXT_MODELING, MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS, MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS, HQ_ZOPFLIFICATION_QUALITY, ZOPFLIFICATION_QUALITY, computeLgBlock, initDistanceParams, maxHashTableSize, maxMetablockSize, sanitizeParams }
 import enc.ringbuffer { RingBuffer }
 import enc.utf8_util { MIN_UTF8_RATIO, isMostlyUtf8 }
 import enc.write_bits { writeBits }
@@ -483,7 +483,7 @@ effect fn writeMetaBlockInternal(
   prevByte2: u8,
   numLiterals: usize,
   numCommands: usize,
-  commands: &[Command],
+  commands: &mut [Command],
   savedDistCache: &[i32; 4],
   distCache: &mut [i32; 16],
   storageIx: &mut usize,
@@ -507,13 +507,15 @@ effect fn writeMetaBlockInternal(
 
   let lastBytes = u16.shiftLeft(u8.toU16(storage[1]), 8) | u8.toU16(storage[0])
   let lastBytesBits = storageIx.*
-  let mut stored = true
   if params.quality <= MAX_QUALITY_FOR_STATIC_ENTROPY_CODES {
-    storeMetaBlockFast(data, wrappedLastFlushPos, size, mask, isLast, params, commands, numCommands, &mut storageIx, &mut storage)
+    storeMetaBlockFast(data, wrappedLastFlushPos, size, mask, isLast, params, &commands, numCommands, &mut storageIx, &mut storage)
   } else if params.quality < MIN_QUALITY_FOR_BLOCK_SPLIT {
-    storeMetaBlockTrivial(data, wrappedLastFlushPos, size, mask, isLast, params, commands, numCommands, &mut storageIx, &mut storage)
+    storeMetaBlockTrivial(data, wrappedLastFlushPos, size, mask, isLast, params, &commands, numCommands, &mut storageIx, &mut storage)
   } else {
     let mut mb = MetaBlockSplit.make()
+    // `BrotliBuildMetaBlock` may change the distance parameters of `block_params`, a copy of
+    // `params` that `BrotliStoreMetaBlock` takes; the greedy builder leaves them as they are.
+    let mut blockParams = copyEncoderParams(params)
     if params.quality < MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING {
       let mut model = LiteralContextModel { numLiteralContexts: 1, literalContextMap: CONTEXT_MAP_NONE }
       if !params.disableLiteralContextModeling {
@@ -529,26 +531,18 @@ effect fn writeMetaBlockInternal(
       } else {
         &STATIC_CONTEXT_MAP_COMPLEX_UTF8
       }
-      run buildMetaBlockGreedy(data, wrappedLastFlushPos, mask, prevByte, prevByte2, literalContextLut, model.numLiteralContexts, staticContextMap, commands, numCommands, &mut mb)
+      run buildMetaBlockGreedy(data, wrappedLastFlushPos, mask, prevByte, prevByte2, literalContextLut, model.numLiteralContexts, staticContextMap, &commands, numCommands, &mut mb)
     } else {
-      // SEAM: `BrotliBuildMetaBlock(m, data, wrapped_last_flush_pos, mask, &block_params,
-      // prev_byte, prev_byte2, commands, num_commands, literal_context_mode, &mb)` (qualities 10
-      // and 11) goes here; it may change the distance parameters of `block_params`, a copy of
-      // `params` that `BrotliStoreMetaBlock` then takes.
-      stored = false
+      run buildMetaBlock(data, wrappedLastFlushPos, mask, &mut blockParams, prevByte, prevByte2, &mut commands, numCommands, literalContextMode, &mut mb)
     }
-    if stored {
-      if params.quality >= MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS {
-        // The number of distance symbols effectively used for distance histograms. It might be
-        // less than distance alphabet size for "Large Window Brotli" (32-bit).
-        optimizeHistograms(params.dist.alphabetSizeLimit, &mut mb)
-      }
-      run storeMetaBlock(data, wrappedLastFlushPos, size, mask, prevByte, prevByte2, isLast, params, literalContextMode, commands, numCommands, &mb, &mut storageIx, &mut storage)
+    if params.quality >= MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS {
+      // The number of distance symbols effectively used for distance histograms. It might be
+      // less than distance alphabet size for "Large Window Brotli" (32-bit).
+      optimizeHistograms(blockParams.dist.alphabetSizeLimit, &mut mb)
     }
+    run storeMetaBlock(data, wrappedLastFlushPos, size, mask, prevByte, prevByte2, isLast, &blockParams, literalContextMode, &commands, numCommands, &mb, &mut storageIx, &mut storage)
   }
-  // PLACEHOLDER: a meta-block of quality 10 or 11, which cannot be built until
-  // `BrotliBuildMetaBlock` is ported, is stored uncompressed, like one that did not shrink.
-  if !stored || size + 4 < usize.shiftRight(storageIx.*, 3) {
+  if size + 4 < usize.shiftRight(storageIx.*, 3) {
     // Restore the distance cache and last byte.
     restoreDistCache(&mut distCache, savedDistCache)
     storage[0] = u16.wrappingToU8(lastBytes)
@@ -1132,26 +1126,53 @@ impl BrotliEncoder {
       wrappedLastProcessedPos = u32.wrappingAdd(wrappedLastProcessedPos, taken)
     }
 
-    // SEAM: `BrotliCreateZopfliBackwardReferences` at quality 10 and
-    // `BrotliCreateHqZopfliBackwardReferences` at quality 11 take the same arguments; both are
-    // served by the placeholder until they are ported.
     let allocated = self.cmdAllocSize
     let first = self.numCommands
-    createBackwardReferences(
-      u32.toUsize(size),
-      u32.toUsize(wrappedLastProcessedPos),
-      RingBuffer.buffer(&self.ringbuffer),
-      mask,
-      literalContextLut,
-      &self.params,
-      &self.compound,
-      &mut self.hasher,
-      &mut self.distCache,
-      &mut self.lastInsertLen,
-      unsafe RawBuffer.viewMut<Command>(&mut self.commands, first, allocated - first),
-      &mut self.numCommands,
-      &mut self.numLiterals,
-    )
+    if self.params.quality == ZOPFLIFICATION_QUALITY {
+      run createZopfliBackwardReferences(
+        u32.toUsize(size),
+        u32.toUsize(wrappedLastProcessedPos),
+        RingBuffer.buffer(&self.ringbuffer),
+        mask,
+        &self.params,
+        &mut List<HashToBinaryTree>.asMutSlice(&mut self.hasher.h10)[0],
+        &mut self.distCache,
+        &mut self.lastInsertLen,
+        unsafe RawBuffer.viewMut<Command>(&mut self.commands, first, allocated - first),
+        &mut self.numCommands,
+        &mut self.numLiterals,
+      )
+    } else if self.params.quality == HQ_ZOPFLIFICATION_QUALITY {
+      run createHqZopfliBackwardReferences(
+        u32.toUsize(size),
+        u32.toUsize(wrappedLastProcessedPos),
+        RingBuffer.buffer(&self.ringbuffer),
+        mask,
+        &self.params,
+        &mut List<HashToBinaryTree>.asMutSlice(&mut self.hasher.h10)[0],
+        &mut self.distCache,
+        &mut self.lastInsertLen,
+        unsafe RawBuffer.viewMut<Command>(&mut self.commands, first, allocated - first),
+        &mut self.numCommands,
+        &mut self.numLiterals,
+      )
+    } else {
+      createBackwardReferences(
+        u32.toUsize(size),
+        u32.toUsize(wrappedLastProcessedPos),
+        RingBuffer.buffer(&self.ringbuffer),
+        mask,
+        literalContextLut,
+        &self.params,
+        &self.compound,
+        &mut self.hasher,
+        &mut self.distCache,
+        &mut self.lastInsertLen,
+        unsafe RawBuffer.viewMut<Command>(&mut self.commands, first, allocated - first),
+        &mut self.numCommands,
+        &mut self.numLiterals,
+      )
+    }
 
     let maxLength = maxMetablockSize(&self.params)
     let maxLiterals = maxLength / 8
@@ -1201,7 +1222,7 @@ impl BrotliEncoder {
       self.prevByte2,
       self.numLiterals,
       self.numCommands,
-      unsafe RawBuffer.view<Command>(&self.commands, 0, self.numCommands),
+      unsafe RawBuffer.viewMut<Command>(&mut self.commands, 0, self.numCommands),
       &self.savedDistCache,
       &mut self.distCache,
       &mut storageIx,

@@ -1,0 +1,980 @@
+//! The backward reference search of qualities 10 and 11 ("Zopfli"): a port of google/brotli
+//! v1.2.0 `c/enc/backward_references_hq.h` and `backward_references_hq.c`.
+//!
+//! The costs are `float` (`f32`) as in C, computed in the same order. The `union` of `ZopfliNode`
+//! is a 32-bit field read as a cost or as an integer.
+//!
+//! Prepared (compound) dictionaries are not supported: the encoder has none, so
+//! `params.dictionary.compound` has no chunks and its total size (the "gap") is 0.
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import enc.command { Command, INS_EXTRA, getInsertLengthCode }
+import enc.constants { NUM_COMMAND_SYMBOLS, NUM_DISTANCE_SHORT_CODES, NUM_LITERAL_SYMBOLS, maxBackwardLimit }
+import enc.fast_log { fastLog2, log2FloorNonZero }
+import enc.hash_to_binary_tree { BackwardMatch, HASH_TYPE_LENGTH_H10, HashToBinaryTree, MAX_NUM_MATCHES_H10, STORE_LOOKAHEAD_H10, matchLength }
+import enc.literal_cost { estimateBitCostsForLiterals }
+import enc.params { EncoderParams, LONG_COPY_QUICK_STEP, MAX_ZOPFLI_LEN_QUALITY_11, maxZopfliCandidates, maxZopfliLen }
+
+/// `BROTLI_MAX_EFFECTIVE_DISTANCE_ALPHABET_SIZE`:
+/// `BrotliCalculateDistanceCodeLimit(BROTLI_MAX_ALLOWED_DISTANCE, 3, 120)`.
+const MAX_EFFECTIVE_DISTANCE_ALPHABET_SIZE: usize = 544
+
+// `kInfinity` (`1.7e38f`, about 2^127).
+const INFINITY_BITS: u32 = 0x7effc99e
+
+const UINT32_MAX: u32 = 0xffffffff
+
+const DISTANCE_CACHE_INDEX: [usize; 16] = [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+const DISTANCE_CACHE_OFFSET: [i32; 16] = [0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3]
+
+/// `ZopfliNode`.
+pub struct ZopfliNode {
+  /// Best length to get up to this byte (not including this byte itself) highest 7 bit is used to
+  /// reconstruct the length code.
+  pub length: u32,
+  /// Distance associated with the length.
+  pub distance: u32,
+  /// Number of literal inserts before this copy; highest 5 bits contain distance short code + 1
+  /// (or zero if no short code).
+  pub dcodeInsertLength: u32,
+  /// The union of C: during forward pass the `cost` (the bits of an `f32`) is used to store the
+  /// goal function. When node is processed its cost is invalidated in favor of `shortcut`, the
+  /// node position that provides next distance for distance cache. On path back-tracing pass
+  /// `next` is assigned the offset to next node on the path.
+  pub u: u32,
+}
+
+impl Copy for ZopfliNode {}
+
+@inlineAlways
+fn nodeCost(node: &ZopfliNode) -> f32 {
+  return f32.fromBits(node.u)
+}
+
+// `values[index]` without a bounds check.
+//
+// # Gotchas
+// The caller must prove that `index` is less than `values.length`.
+@inlineAlways
+unsafe fn readAt<T: Copy>(values: &[T], index: usize) -> T {
+  unsafe {
+    // The caller's proof implies that the slice is not empty, so its pointer is not null.
+    let base = Intrinsic.pointerRequalify<?[*]const T, [*]const T>(Pointer.fromSlice<T>(values))
+    return Pointer.read<T>(Pointer.at<T>(base, index))
+  }
+}
+
+// The cost of `nodes[index]` without a bounds check.
+//
+// # Gotchas
+// The caller must prove that `index` is less than `nodes.length`.
+@inlineAlways
+unsafe fn costAt(nodes: &[ZopfliNode], index: usize) -> f32 {
+  let node = unsafe readAt<ZopfliNode>(nodes, index)
+  return f32.fromBits(node.u)
+}
+
+// `kBrotliCopyExtra` as costs, `(float)GetCopyExtra(code)`.
+const COPY_EXTRA_COST: [f32; 24] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 24.0]
+
+// `GetCopyLengthCode` for a length of at least 2, as an index. The shifts stay below the width.
+@inlineAlways
+fn copyLengthCode(copylen: usize) -> usize {
+  if copylen < 10 {
+    return copylen - 2
+  } else if copylen < 134 {
+    let nbits = u32.toUsize(log2FloorNonZero(copylen - 6)) - 1
+    return usize.shiftLeft(nbits, 1) + usize.shiftRight(copylen - 6, nbits & 63) + 4
+  } else if copylen < 2118 {
+    return u32.toUsize(log2FloorNonZero(copylen - 70)) + 12
+  }
+  return 23
+}
+
+// `CombineLengthCodes` of an insert code and a copy code (both at most 23), as an index below
+// `BROTLI_NUM_COMMAND_SYMBOLS`.
+@inlineAlways
+fn combineCodes(inscode: usize, copycode: usize, useLastDistance: bool) -> usize {
+  let bits64 = (copycode & 0x7) | usize.shiftLeft(inscode & 0x7, 3)
+  if useLastDistance && inscode < 8 && copycode < 16 {
+    if copycode < 8 { return bits64 }
+    return bits64 | 64
+  }
+  // Specification: 5 Encoding of ... (last table)
+  // offset = 2 * index, where index is in range [0..8]
+  let offset = 2 * (usize.shiftRight(copycode, 3) + 3 * usize.shiftRight(inscode, 3))
+  // All values in specification are K * 64,
+  // where   K = [2, 3, 6, 4, 5, 8, 7, 9, 10],
+  //     i + 1 = [1, 2, 3, 4, 5, 6, 7, 8,  9],
+  // K - i - 1 = [1, 1, 3, 0, 0, 2, 0, 1,  2] = D.
+  // All values in D require only 2 bits to encode.
+  // Magic constant is shifted 6 bits left, to avoid final multiplication.
+  return (usize.shiftLeft(offset, 5) + 0x40 + (usize.shiftRight(0x520d40, offset & 31) & 0xc0)) | bits64
+}
+
+// The code (`dist_symbol`) of `PrefixEncodeCopyDistance` with the number of extra bits in its
+// high 6 bits, for the distance code of a match (at least `NUM_DISTANCE_SHORT_CODES`), with
+// wrapping arithmetic and masked shifts in place of checked ones; for these arguments neither
+// wraps.
+@inlineAlways
+fn distanceSymbol(distanceCode: usize, numDirectCodes: usize, postfixBits: usize) -> u16 {
+  let shortCodes = u32.toUsize(NUM_DISTANCE_SHORT_CODES)
+  if distanceCode < shortCodes + numDirectCodes {
+    return usize.wrappingToU16(distanceCode)
+  }
+  let pb = postfixBits & 63
+  let dist = usize.wrappingAdd(usize.shiftLeft(1, (pb + 2) & 63), usize.wrappingSubtract(distanceCode, shortCodes + numDirectCodes))
+  // `Log2FloorNonZero` truncates to 32 bits, as in C.
+  let bucket = usize.wrappingSubtract(u32.toUsize(log2FloorNonZero(dist)), 1)
+  let postfixMask = usize.wrappingSubtract(usize.shiftLeft(1, pb), 1)
+  let postfix = dist & postfixMask
+  let prefix = usize.shiftRight(dist, bucket & 63) & 1
+  let nbits = usize.wrappingSubtract(bucket, pb)
+  let code = usize.shiftLeft(nbits, 10) | usize.wrappingAdd(usize.wrappingAdd(shortCodes + numDirectCodes, usize.shiftLeft(usize.wrappingAdd(2 * usize.wrappingSubtract(nbits, 1), prefix), pb)), postfix)
+  return usize.wrappingToU16(code)
+}
+
+// `ZopfliNodeCopyLength`.
+@inlineAlways
+fn nodeCopyLength(node: &ZopfliNode) -> u32 {
+  return node.length & 0x1ffffff
+}
+
+// `ZopfliNodeLengthCode`.
+@inlineAlways
+fn nodeLengthCode(node: &ZopfliNode) -> u32 {
+  let modifier = u32.shiftRight(node.length, 25)
+  return u32.wrappingSubtract(nodeCopyLength(node) + 9, modifier)
+}
+
+// `ZopfliNodeDistanceCode`.
+@inlineAlways
+fn nodeDistanceCode(node: &ZopfliNode) -> u32 {
+  let shortCode = u32.shiftRight(node.dcodeInsertLength, 27)
+  if shortCode == 0 {
+    return u32.wrappingAdd(node.distance, NUM_DISTANCE_SHORT_CODES - 1)
+  }
+  return shortCode - 1
+}
+
+// `ZopfliNodeCommandLength`.
+@inlineAlways
+fn nodeCommandLength(node: &ZopfliNode) -> u32 {
+  return nodeCopyLength(node) + (node.dcodeInsertLength & 0x7ffffff)
+}
+
+/// `BrotliInitZopfliNodes`: `length` nodes, all with infinite cost.
+pub effect fn makeZopfliNodes(length: usize) -> List<ZopfliNode> ! OutOfMemoryError ? &mut Allocator {
+  let mut nodes = List<ZopfliNode>.make()
+  run List<ZopfliNode>.reserveExact(&mut nodes, length)
+  run List<ZopfliNode>.appendRepeated(&mut nodes, ZopfliNode { length: 1, distance: 0, dcodeInsertLength: 0, u: INFINITY_BITS }, length)
+  return move nodes
+}
+
+// `BrotliInitZopfliNodes` over nodes that exist.
+fn initZopfliNodes(nodes: &mut [ZopfliNode]) -> () {
+  let stub = ZopfliNode { length: 1, distance: 0, dcodeInsertLength: 0, u: INFINITY_BITS }
+  let mut i: usize = 0
+  while i < nodes.length {
+    nodes[i] = stub
+    i = i + 1
+  }
+}
+
+// `ZopfliCostModel`: histogram based cost model for zopflification. The temporary data of the C
+// structure (a union of `literal_histograms` and `ZopfliCostModelArena`) are separate fields.
+struct ZopfliCostModel {
+  // The insert and copy length symbols.
+  costCmd: [f32; 704],
+  costDist: List<f32>,
+  distanceHistogramSize: u32,
+  // Cumulative costs of literals per position in the stream.
+  literalCosts: List<f32>,
+  minCostCmd: f32,
+  numBytes: usize,
+  literalHistograms: [usize; 768],
+  histogramLiteral: [u32; 256],
+  histogramCmd: [u32; 704],
+  histogramDist: [u32; 544],
+  costLiteral: [f32; 256],
+}
+
+impl ZopfliCostModel {
+  // `InitZopfliCostModel`. As with `malloc`, the costs are written before they are read.
+  effect fn make(alphabetSizeLimit: u32, numBytes: usize) -> ZopfliCostModel ! OutOfMemoryError ? &mut Allocator {
+    let mut literalCosts = List<f32>.make()
+    run List<f32>.reserveExact(&mut literalCosts, numBytes + 2)
+    run List<f32>.appendRepeated(&mut literalCosts, 0.0, numBytes + 2)
+    let mut costDist = List<f32>.make()
+    let distSize = u32.toUsize(alphabetSizeLimit)
+    run List<f32>.reserveExact(&mut costDist, distSize)
+    run List<f32>.appendRepeated(&mut costDist, 0.0, distSize)
+    return ZopfliCostModel {
+      costCmd: [0.0; 704],
+      costDist: move costDist,
+      distanceHistogramSize: alphabetSizeLimit,
+      literalCosts: move literalCosts,
+      minCostCmd: 0.0,
+      numBytes: numBytes,
+      literalHistograms: [0; 768],
+      histogramLiteral: [0; 256],
+      histogramCmd: [0; 704],
+      histogramDist: [0; 544],
+      costLiteral: [0.0; 256],
+    }
+  }
+
+  // `ZopfliCostModelSetFromCommands`.
+  fn setFromCommands(self: &mut Self, position: usize, ringbuffer: &[u8], ringbufferMask: usize, commands: &[Command], numCommands: usize, lastInsertLen: usize) -> () {
+    let mut pos = position - lastInsertLen
+    let mut minCostCmd = f32.fromBits(INFINITY_BITS)
+    let mut i: usize = 0
+    while i < 256 {
+      self.histogramLiteral[i] = 0
+      i = i + 1
+    }
+    i = 0
+    while i < 704 {
+      self.histogramCmd[i] = 0
+      i = i + 1
+    }
+    i = 0
+    while i < MAX_EFFECTIVE_DISTANCE_ALPHABET_SIZE {
+      self.histogramDist[i] = 0
+      i = i + 1
+    }
+
+    i = 0
+    while i < numCommands {
+      let inslength = u32.toUsize(commands[i].insertLen)
+      let copylength = u32.toUsize(Command.copyLength(&commands[i]))
+      let distcode = u16.toUsize(commands[i].distPrefix & 0x3ff)
+      let cmdcode = u16.toUsize(commands[i].cmdPrefix)
+      self.histogramCmd[cmdcode] = self.histogramCmd[cmdcode] + 1
+      if cmdcode >= 128 {
+        self.histogramDist[distcode] = self.histogramDist[distcode] + 1
+      }
+      let mut j: usize = 0
+      while j < inslength {
+        let c = u8.toUsize(ringbuffer[(pos + j) & ringbufferMask])
+        self.histogramLiteral[c] = self.histogramLiteral[c] + 1
+        j = j + 1
+      }
+      pos = pos + inslength + copylength
+      i = i + 1
+    }
+
+    setCost(&self.histogramLiteral, NUM_LITERAL_SYMBOLS, true, &mut self.costLiteral)
+    setCost(&self.histogramCmd, NUM_COMMAND_SYMBOLS, false, &mut self.costCmd)
+    let distSize = u32.toUsize(self.distanceHistogramSize)
+    setCost(&self.histogramDist, distSize, false, List<f32>.asMutSlice(&mut self.costDist))
+
+    i = 0
+    while i < NUM_COMMAND_SYMBOLS {
+      // `BROTLI_MIN(float, ...)`: the first argument unless the second is smaller.
+      if self.costCmd[i] < minCostCmd {
+        minCostCmd = self.costCmd[i]
+      }
+      i = i + 1
+    }
+    self.minCostCmd = minCostCmd
+
+    let literalCosts = List<f32>.asMutSlice(&mut self.literalCosts)
+    let mut literalCarry: f32 = 0.0
+    let numBytes = self.numBytes
+    literalCosts[0] = 0.0
+    i = 0
+    while i < numBytes {
+      literalCarry = literalCarry + self.costLiteral[u8.toUsize(ringbuffer[(position + i) & ringbufferMask])]
+      literalCosts[i + 1] = literalCosts[i] + literalCarry
+      literalCarry = literalCarry - (literalCosts[i + 1] - literalCosts[i])
+      i = i + 1
+    }
+  }
+
+  // `ZopfliCostModelSetFromLiteralCosts`.
+  fn setFromLiteralCosts(self: &mut Self, position: usize, ringbuffer: &[u8], ringbufferMask: usize) -> () {
+    let numBytes = self.numBytes
+    let literalCosts = List<f32>.asMutSlice(&mut self.literalCosts)
+    estimateBitCostsForLiterals(position, numBytes, ringbufferMask, ringbuffer, &mut self.literalHistograms, &mut literalCosts, 1)
+    let mut literalCarry: f32 = 0.0
+    literalCosts[0] = 0.0
+    let mut i: usize = 0
+    while i < numBytes {
+      literalCarry = literalCarry + literalCosts[i + 1]
+      literalCosts[i + 1] = literalCosts[i] + literalCarry
+      literalCarry = literalCarry - (literalCosts[i + 1] - literalCosts[i])
+      i = i + 1
+    }
+    i = 0
+    while i < NUM_COMMAND_SYMBOLS {
+      self.costCmd[i] = f64.toF32(fastLog2(11 + i))
+      i = i + 1
+    }
+    let costDist = List<f32>.asMutSlice(&mut self.costDist)
+    i = 0
+    while i < u32.toUsize(self.distanceHistogramSize) {
+      costDist[i] = f64.toF32(fastLog2(20 + i))
+      i = i + 1
+    }
+    self.minCostCmd = f64.toF32(fastLog2(11))
+  }
+}
+
+// `SetCost`.
+fn setCost(histogram: &[u32], histogramSize: usize, literalHistogram: bool, cost: &mut [f32]) -> () {
+  let mut sum: usize = 0
+  let mut i: usize = 0
+  while i < histogramSize {
+    sum = sum + u32.toUsize(histogram[i])
+    i = i + 1
+  }
+  let log2sum = f64.toF32(fastLog2(sum))
+  let mut missingSymbolSum = sum
+  if !literalHistogram {
+    i = 0
+    while i < histogramSize {
+      if histogram[i] == 0 { missingSymbolSum = missingSymbolSum + 1 }
+      i = i + 1
+    }
+  }
+  let missingSymbolCost = f64.toF32(fastLog2(missingSymbolSum)) + 2.0
+  i = 0
+  while i < histogramSize {
+    if histogram[i] == 0 {
+      cost[i] = missingSymbolCost
+    } else {
+      // Shannon bits for this symbol.
+      cost[i] = log2sum - f64.toF32(fastLog2(u32.toUsize(histogram[i])))
+      // Cannot be coded with less than 1 bit
+      if cost[i] < 1.0 { cost[i] = 1.0 }
+    }
+    i = i + 1
+  }
+}
+
+// `ZopfliCostModelGetLiteralCosts`.
+@inlineAlways
+fn literalCostsBetween(literalCosts: &[f32], from: usize, to: usize) -> f32 {
+  return literalCosts[to] - literalCosts[from]
+}
+
+// `UpdateZopfliNode`.
+// REQUIRES: len >= 2, start_pos <= pos
+// REQUIRES: cost < kInfinity, nodes[start_pos].cost < kInfinity
+// Maintains the "ZopfliNode array invariant".
+@inlineAlways
+fn updateZopfliNode(nodes: &mut [ZopfliNode], pos: usize, startPos: usize, len: usize, lenCode: usize, dist: usize, shortCode: usize, cost: f32) -> () {
+  nodes[pos + len] = ZopfliNode {
+    length: usize.wrappingToU32(len | usize.shiftLeft(len + 9 - lenCode, 25)),
+    distance: usize.wrappingToU32(dist),
+    dcodeInsertLength: usize.wrappingToU32(usize.shiftLeft(shortCode, 27) | (pos - startPos)),
+    u: f32.toBits(cost),
+  }
+}
+
+// `PosData`.
+struct PosData {
+  pos: usize,
+  distanceCache: [i32; 4],
+  costdiff: f32,
+  cost: f32,
+}
+
+impl Copy for PosData {}
+
+// `StartPosQueue`: maintains the smallest 8 cost difference together with their positions.
+struct StartPosQueue {
+  q: [PosData; 8],
+  idx: usize,
+}
+
+impl StartPosQueue {
+  // `InitStartPosQueue`.
+  fn make() -> StartPosQueue {
+    let empty = PosData { pos: 0, distanceCache: [0; 4], costdiff: 0.0, cost: 0.0 }
+    return StartPosQueue { q: [empty; 8], idx: 0 }
+  }
+
+  // `StartPosQueueSize`.
+  @inlineAlways
+  fn size(self: &Self) -> usize {
+    return if self.idx < 8 { self.idx } else { 8 }
+  }
+
+  // `StartPosQueuePush`.
+  fn push(self: &mut Self, posdata: &PosData) -> () {
+    let mut offset = usize.bitNot(self.idx) & 7
+    self.idx = self.idx + 1
+    let len = StartPosQueue.size(&self)
+    self.q[offset] = posdata.*
+    // Restore the sorted order. In the list of |len| items at most |len - 1| adjacent element
+    // comparisons / swaps are required.
+    let mut i: usize = 1
+    while i < len {
+      let a = offset & 7
+      let b = (offset + 1) & 7
+      if self.q[a].costdiff > self.q[b].costdiff {
+        let t = self.q[a]
+        self.q[a] = self.q[b]
+        self.q[b] = t
+      }
+      offset = offset + 1
+      i = i + 1
+    }
+  }
+
+  // `StartPosQueueAt`.
+  @inlineAlways
+  fn at(self: &Self, k: usize) -> PosData {
+    return self.q[usize.wrappingSubtract(k, self.idx) & 7]
+  }
+}
+
+// `ComputeMinimumCopyLength`: the minimum possible copy length that can improve the cost of any
+// future position.
+fn computeMinimumCopyLength(startCost: f32, nodes: &[ZopfliNode], numBytes: usize, pos: usize) -> usize {
+  // Compute the minimum possible cost of reaching any future position.
+  let mut minCost = startCost
+  let mut len: usize = 2
+  let mut nextLenBucket: usize = 4
+  let mut nextLenOffset: usize = 10
+  while pos + len <= numBytes && nodeCost(&nodes[pos + len]) <= minCost {
+    // We already reached (pos + len) with no more cost than the minimum possible cost of reaching
+    // anything from this pos, so there is no point in looking for lengths <= len.
+    len = len + 1
+    if len == nextLenOffset {
+      // We reached the next copy length code bucket, so we add one more extra bit to the minimum
+      // cost.
+      minCost = minCost + 1.0
+      nextLenOffset = nextLenOffset + nextLenBucket
+      nextLenBucket = nextLenBucket * 2
+    }
+  }
+  return len
+}
+
+// `ComputeDistanceShortcut`.
+// REQUIRES: nodes[pos].cost < kInfinity
+// REQUIRES: nodes[0..pos] satisfies that "ZopfliNode array invariant".
+@inlineAlways
+fn computeDistanceShortcut(blockStart: usize, pos: usize, maxBackwardLimit: usize, gap: usize, nodes: &[ZopfliNode]) -> u32 {
+  let cLen = u32.toUsize(nodeCopyLength(&nodes[pos]))
+  let iLen = u32.toUsize(nodes[pos].dcodeInsertLength & 0x7ffffff)
+  let dist = u32.toUsize(nodes[pos].distance)
+  // Since |block_start + pos| is the end position of the command, the copy part starts from
+  // |block_start + pos - c_len|. Distances that are greater than this or greater than
+  // |max_backward_limit| + |gap| are static dictionary references, and do not update the last
+  // distances. Also distance code 0 (last distance) does not update the last distances.
+  if pos == 0 {
+    return 0
+  } else if dist + cLen <= blockStart + pos + gap && dist <= maxBackwardLimit + gap && nodeDistanceCode(&nodes[pos]) > 0 {
+    return usize.wrappingToU32(pos)
+  }
+  return nodes[pos - cLen - iLen].u
+}
+
+// `ComputeDistanceCache`: fills in dist_cache[0..3] with the last four distances (as defined by
+// Section 4. of the Spec) that would be used at (block_start + pos) if we used the shortest path
+// of commands from block_start, computed from nodes[0..pos]. The last four distances at
+// block_start are in starting_dist_cache[0..3].
+// REQUIRES: nodes[pos].cost < kInfinity
+// REQUIRES: nodes[0..pos] satisfies that "ZopfliNode array invariant".
+@inlineAlways
+fn computeDistanceCache(pos: usize, startingDistCache: &[i32; 16], nodes: &[ZopfliNode], distCache: &mut [i32; 4]) -> () {
+  let mut idx: usize = 0
+  let mut p = u32.toUsize(nodes[pos].u)
+  while idx < 4 && p > 0 {
+    let iLen = u32.toUsize(nodes[p].dcodeInsertLength & 0x7ffffff)
+    let cLen = u32.toUsize(nodeCopyLength(&nodes[p]))
+    let dist = nodes[p].distance
+    distCache[idx] = u32.wrappingToI32(dist)
+    idx = idx + 1
+    // Because of prerequisite, p >= c_len + i_len >= 2.
+    p = u32.toUsize(nodes[p - cLen - iLen].u)
+  }
+  let mut k: usize = 0
+  while idx < 4 {
+    distCache[idx] = startingDistCache[k]
+    k = k + 1
+    idx = idx + 1
+  }
+}
+
+// `EvaluateNode`: maintains "ZopfliNode array invariant" and pushes node to the queue, if it is
+// eligible.
+@inlineAlways
+fn evaluateNode(blockStart: usize, pos: usize, maxBackwardLimit: usize, gap: usize, startingDistCache: &[i32; 16], literalCosts: &[f32], queue: &mut StartPosQueue, nodes: &mut [ZopfliNode]) -> () {
+  // Save cost, because ComputeDistanceCache invalidates it.
+  let nodeCostValue = nodeCost(&nodes[pos])
+  nodes[pos].u = computeDistanceShortcut(blockStart, pos, maxBackwardLimit, gap, &nodes)
+  if nodeCostValue <= literalCostsBetween(literalCosts, 0, pos) {
+    let mut posdata = PosData { pos: pos, distanceCache: [0; 4], costdiff: nodeCostValue - literalCostsBetween(literalCosts, 0, pos), cost: nodeCostValue }
+    computeDistanceCache(pos, startingDistCache, &nodes, &mut posdata.distanceCache)
+    StartPosQueue.push(&mut queue, &posdata)
+  }
+}
+
+// `UpdateNodes`: returns longest copy length.
+fn updateNodes(
+  numBytes: usize,
+  blockStart: usize,
+  pos: usize,
+  ringbuffer: &[u8],
+  ringbufferMask: usize,
+  params: &EncoderParams,
+  maxBackwardLimit: usize,
+  startingDistCache: &[i32; 16],
+  numMatches: usize,
+  matches: &[BackwardMatch],
+  matchesAt: usize,
+  model: &ZopfliCostModel,
+  queue: &mut StartPosQueue,
+  nodes: &mut [ZopfliNode],
+) -> usize {
+  let streamOffset = params.streamOffset
+  let curIx = blockStart + pos
+  let curIxMasked = curIx & ringbufferMask
+  let maxDistance = if curIx < maxBackwardLimit { curIx } else { maxBackwardLimit }
+  let dictionaryStart = if curIx + streamOffset < maxBackwardLimit { curIx + streamOffset } else { maxBackwardLimit }
+  let maxLen = numBytes - pos
+  let maxZopfli = maxZopfliLen(params)
+  let maxIters = maxZopfliCandidates(params)
+  let mut result: usize = 0
+  let gap = params.dictionary.compoundTotalSize
+  let literalCosts = List<f32>.asSlice(&model.literalCosts)
+  let costDist = List<f32>.asSlice(&model.costDist)
+  let numDirect = u32.toUsize(params.dist.numDirectDistanceCodes)
+  let postfixBits = u32.toUsize(params.dist.distancePostfixBits)
+
+  evaluateNode(blockStart + streamOffset, pos, maxBackwardLimit, gap, startingDistCache, literalCosts, &mut queue, &mut nodes)
+
+  let first = StartPosQueue.at(&queue, 0)
+  let minCost = first.cost + model.minCostCmd + literalCostsBetween(literalCosts, first.pos, pos)
+  let minLen = computeMinimumCopyLength(minCost, &nodes, numBytes, pos)
+
+  // Go over the command starting positions in order of increasing cost difference.
+  let mut k: usize = 0
+  while k < maxIters && k < StartPosQueue.size(&queue) {
+    let posdata = StartPosQueue.at(&queue, k)
+    let start = posdata.pos
+    let inscode = u16.toUsize(getInsertLengthCode(pos - start))
+    let startCostdiff = posdata.costdiff
+    let baseCost = startCostdiff + u32.toF32(INS_EXTRA[inscode]) + literalCostsBetween(literalCosts, 0, pos)
+
+    // Look for last distance matches using the distance cache from this starting position.
+    let mut bestLen = minLen - 1
+    let mut j: usize = 0
+    while j < 16 && bestLen < maxLen {
+      // `j < 16` and the indexes of `DISTANCE_CACHE_INDEX` are below 4.
+      let idx = unsafe readAt<usize>(&DISTANCE_CACHE_INDEX, j)
+      let backward = i32.wrappingToUsize(i32.wrappingAdd(unsafe readAt<i32>(&posdata.distanceCache, idx), unsafe readAt<i32>(&DISTANCE_CACHE_OFFSET, j)))
+      let mut prevIx = usize.wrappingSubtract(curIx, backward)
+      let mut len: usize = 0
+      // C reads `continuation` before this test; the read has no effect, so it follows the test
+      // here, where the index is known to be inside the ring buffer.
+      if usize.wrappingAdd(curIxMasked, bestLen) > ringbufferMask {
+        break
+      }
+      let continuation = unsafe readAt<u8>(ringbuffer, curIxMasked + bestLen)
+      if backward > usize.wrappingAdd(dictionaryStart, gap) {
+        // Word dictionary -> ignore.
+        j = j + 1
+        continue
+      }
+      if backward <= maxDistance {
+        // Regular backward reference.
+        if prevIx >= curIx {
+          j = j + 1
+          continue
+        }
+        prevIx = prevIx & ringbufferMask
+        // `prevIx + bestLen <= ringbufferMask` is inside the ring buffer.
+        if usize.wrappingAdd(prevIx, bestLen) > ringbufferMask || continuation != unsafe readAt<u8>(ringbuffer, prevIx + bestLen) {
+          j = j + 1
+          continue
+        }
+        len = matchLength(ringbuffer, prevIx, curIxMasked, maxLen)
+      } else {
+        // SEAM: with a compound dictionary (gap > 0) the distances in
+        // (dictionary_start, dictionary_start + gap] address its chunks. Otherwise this is the
+        // "gray" area: it is addressable by decoder, but this encoder instance does not have that
+        // data -> should not touch it.
+        j = j + 1
+        continue
+      }
+      // The distance alphabet has at least the 16 short codes.
+      let distCost = baseCost + unsafe readAt<f32>(costDist, j)
+      let mut l = bestLen + 1
+      while l <= len {
+        // `l <= len <= maxLen = numBytes - pos`, and there are `numBytes + 1` nodes.
+        let copycode = copyLengthCode(l)
+        let cmdcode = combineCodes(inscode, copycode, j == 0)
+        let cost = (if cmdcode < 128 { baseCost } else { distCost }) + unsafe readAt<f32>(&COPY_EXTRA_COST, copycode) + unsafe readAt<f32>(&model.costCmd, cmdcode)
+        if cost < unsafe costAt(&nodes, pos + l) {
+          updateZopfliNode(&mut nodes, pos, start, l, l, backward, j + 1, cost)
+          if l > result { result = l }
+        }
+        bestLen = l
+        l = l + 1
+      }
+      j = j + 1
+    }
+
+    // At higher iterations look only for new last distance matches, since looking only for new
+    // command start positions with the same distances does not help much.
+    if k >= 2 {
+      k = k + 1
+      continue
+    }
+
+    // Loop through all possible copy lengths at this position.
+    let mut len = minLen
+    j = 0
+    while j < numMatches {
+      let candidate = matches[matchesAt + j]
+      let dist = u32.toUsize(candidate.distance)
+      let isDictionaryMatch = dist > dictionaryStart + gap
+      // We already tried all possible last distance matches, so we can use normal distance code
+      // here.
+      let distCode = dist + u32.toUsize(NUM_DISTANCE_SHORT_CODES) - 1
+      let distSymbol = distanceSymbol(distCode, numDirect, postfixBits)
+      let distnumextra = u16.toU32(u16.shiftRight(distSymbol, 10))
+      let distCost = baseCost + u32.toF32(distnumextra) + costDist[u16.toUsize(distSymbol & 0x3ff)]
+
+      // Try all copy lengths up until the maximum copy length corresponding to this distance. If
+      // the distance refers to the static dictionary, or the maximum length is long enough, try
+      // only one maximum length.
+      let maxMatchLen = BackwardMatch.length(&candidate)
+      if len < maxMatchLen && (isDictionaryMatch || maxMatchLen > maxZopfli) {
+        len = maxMatchLen
+      }
+      let lengthCode = BackwardMatch.lengthCode(&candidate)
+      while len <= maxMatchLen {
+        // `len <= maxMatchLen <= maxLen = numBytes - pos`, and there are `numBytes + 1` nodes.
+        let lenCode = if isDictionaryMatch { lengthCode } else { len }
+        let copycode = copyLengthCode(lenCode)
+        let cmdcode = combineCodes(inscode, copycode, false)
+        let cost = distCost + unsafe readAt<f32>(&COPY_EXTRA_COST, copycode) + unsafe readAt<f32>(&model.costCmd, cmdcode)
+        if cost < unsafe costAt(&nodes, pos + len) {
+          updateZopfliNode(&mut nodes, pos, start, len, lenCode, dist, 0, cost)
+          if len > result { result = len }
+        }
+        len = len + 1
+      }
+      j = j + 1
+    }
+    k = k + 1
+  }
+  return result
+}
+
+// `ComputeShortestPathFromNodes`.
+fn computeShortestPathFromNodes(numBytes: usize, nodes: &mut [ZopfliNode]) -> usize {
+  let mut index = numBytes
+  let mut numCommands: usize = 0
+  while (nodes[index].dcodeInsertLength & 0x7ffffff) == 0 && nodes[index].length == 1 {
+    index = index - 1
+  }
+  nodes[index].u = UINT32_MAX
+  while index != 0 {
+    let len = nodeCommandLength(&nodes[index])
+    index = index - u32.toUsize(len)
+    nodes[index].u = len
+    numCommands = numCommands + 1
+  }
+  return numCommands
+}
+
+/// `BrotliZopfliCreateCommands`.
+/// REQUIRES: nodes != NULL and len(nodes) >= num_bytes + 1
+pub fn zopfliCreateCommands(numBytes: usize, blockStart: usize, nodes: &[ZopfliNode], distCache: &mut [i32; 16], lastInsertLen: &mut usize, params: &EncoderParams, commands: &mut [Command], numLiterals: &mut usize) -> () {
+  let streamOffset = params.streamOffset
+  let maxBackward = maxBackwardLimit(i32.toU32(params.lgwin))
+  let mut pos: usize = 0
+  let mut offset = nodes[0].u
+  let gap = params.dictionary.compoundTotalSize
+  let mut i: usize = 0
+  while offset != UINT32_MAX {
+    let next = nodes[pos + u32.toUsize(offset)]
+    let copyLength = u32.toUsize(nodeCopyLength(&next))
+    let mut insertLength = u32.toUsize(next.dcodeInsertLength & 0x7ffffff)
+    pos = pos + insertLength
+    offset = next.u
+    if i == 0 {
+      insertLength = insertLength + lastInsertLen.*
+      lastInsertLen.* = 0
+    }
+    let distance = u32.toUsize(next.distance)
+    let lenCode = u32.toUsize(nodeLengthCode(&next))
+    let dictionaryStart = if blockStart + pos + streamOffset < maxBackward { blockStart + pos + streamOffset } else { maxBackward }
+    let isDictionary = distance > dictionaryStart + gap
+    let distCode = u32.toUsize(nodeDistanceCode(&next))
+    commands[i] = Command.make(&params.dist, insertLength, copyLength, i32.wrappingSubtract(usize.wrappingToI32(lenCode), usize.wrappingToI32(copyLength)), distCode)
+    if !isDictionary && distCode > 0 {
+      distCache[3] = distCache[2]
+      distCache[2] = distCache[1]
+      distCache[1] = distCache[0]
+      distCache[0] = usize.wrappingToI32(distance)
+    }
+    numLiterals.* = numLiterals.* + insertLength
+    pos = pos + copyLength
+    i = i + 1
+  }
+  lastInsertLen.* = lastInsertLen.* + (numBytes - pos)
+}
+
+// `ZopfliIterate`.
+fn zopfliIterate(
+  numBytes: usize,
+  position: usize,
+  ringbuffer: &[u8],
+  ringbufferMask: usize,
+  params: &EncoderParams,
+  gap: usize,
+  distCache: &[i32; 16],
+  model: &ZopfliCostModel,
+  numMatches: &[u32],
+  matches: &[BackwardMatch],
+  nodes: &mut [ZopfliNode],
+) -> usize {
+  let streamOffset = params.streamOffset
+  let maxBackward = maxBackwardLimit(i32.toU32(params.lgwin))
+  let maxZopfli = maxZopfliLen(params)
+  let literalCosts = List<f32>.asSlice(&model.literalCosts)
+  let mut queue = StartPosQueue.make()
+  let mut curMatchPos: usize = 0
+  nodes[0].length = 0
+  nodes[0].u = f32.toBits(0.0)
+  let mut i: usize = 0
+  while i + 3 < numBytes {
+    let mut skip = updateNodes(numBytes, position, i, ringbuffer, ringbufferMask, params, maxBackward, distCache, u32.toUsize(numMatches[i]), matches, curMatchPos, model, &mut queue, &mut nodes)
+    if skip < LONG_COPY_QUICK_STEP { skip = 0 }
+    curMatchPos = curMatchPos + u32.toUsize(numMatches[i])
+    if numMatches[i] == 1 && BackwardMatch.length(&matches[curMatchPos - 1]) > maxZopfli {
+      let l = BackwardMatch.length(&matches[curMatchPos - 1])
+      if l > skip { skip = l }
+    }
+    if skip > 1 {
+      skip = skip - 1
+      while skip != 0 {
+        i = i + 1
+        if i + 3 >= numBytes { break }
+        evaluateNode(position + streamOffset, i, maxBackward, gap, distCache, literalCosts, &mut queue, &mut nodes)
+        curMatchPos = curMatchPos + u32.toUsize(numMatches[i])
+        skip = skip - 1
+      }
+    }
+    i = i + 1
+  }
+  return computeShortestPathFromNodes(numBytes, &mut nodes)
+}
+
+/// `BrotliZopfliComputeShortestPath`: computes the shortest path of commands from position to at
+/// most position + num_bytes, and returns the number of commands.
+///
+/// On return, the nodes[0..num_bytes] array will have the following "ZopfliNode array
+/// invariant": For each i in [1..num_bytes], if nodes[i].cost < kInfinity, then
+///   (1) nodes[i].copy_length() >= 2
+///   (2) nodes[i].command_length() <= i and
+///   (3) nodes[i - nodes[i].command_length()].cost < kInfinity
+/// REQUIRES: nodes != NULL and len(nodes) >= num_bytes + 1
+pub effect fn zopfliComputeShortestPath(
+  numBytes: usize,
+  position: usize,
+  ringbuffer: &[u8],
+  ringbufferMask: usize,
+  params: &EncoderParams,
+  distCache: &[i32; 16],
+  hasher: &mut HashToBinaryTree,
+  nodes: &mut [ZopfliNode],
+) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let streamOffset = params.streamOffset
+  let maxBackward = maxBackwardLimit(i32.toU32(params.lgwin))
+  let maxZopfli = maxZopfliLen(params)
+  let mut queue = StartPosQueue.make()
+  let mut matchList = List<BackwardMatch>.make()
+  run List<BackwardMatch>.reserveExact(&mut matchList, 2 * (MAX_NUM_MATCHES_H10 + 64))
+  run List<BackwardMatch>.appendRepeated(&mut matchList, BackwardMatch { distance: 0, lengthAndCode: 0 }, 2 * (MAX_NUM_MATCHES_H10 + 64))
+  let matches = List<BackwardMatch>.asMutSlice(&mut matchList)
+  let storeEnd = if numBytes >= STORE_LOOKAHEAD_H10 { position + numBytes - STORE_LOOKAHEAD_H10 + 1 } else { position }
+  let gap = params.dictionary.compoundTotalSize
+  nodes[0].length = 0
+  nodes[0].u = f32.toBits(0.0)
+  let mut model = run ZopfliCostModel.make(params.dist.alphabetSizeLimit, numBytes)
+  ZopfliCostModel.setFromLiteralCosts(&mut model, position, ringbuffer, ringbufferMask)
+  let mut i: usize = 0
+  while i + HASH_TYPE_LENGTH_H10 - 1 < numBytes {
+    let pos = position + i
+    let maxDistance = if pos < maxBackward { pos } else { maxBackward }
+    let dictionaryStart = if pos + streamOffset < maxBackward { pos + streamOffset } else { maxBackward }
+    let mut numMatches = HashToBinaryTree.findAllMatches(&mut hasher, ringbuffer, ringbufferMask, pos, numBytes - i, maxDistance, dictionaryStart + gap, params, &mut matches, 0)
+    if numMatches > 0 && BackwardMatch.length(&matches[numMatches - 1]) > maxZopfli {
+      matches[0] = matches[numMatches - 1]
+      numMatches = 1
+    }
+    let mut skip = updateNodes(numBytes, position, i, ringbuffer, ringbufferMask, params, maxBackward, distCache, numMatches, &matches, 0, &model, &mut queue, &mut nodes)
+    if skip < LONG_COPY_QUICK_STEP { skip = 0 }
+    if numMatches == 1 && BackwardMatch.length(&matches[0]) > maxZopfli {
+      let l = BackwardMatch.length(&matches[0])
+      if l > skip { skip = l }
+    }
+    if skip > 1 {
+      // Add the tail of the copy to the hasher.
+      let tailEnd = if pos + skip < storeEnd { pos + skip } else { storeEnd }
+      HashToBinaryTree.storeRange(&mut hasher, ringbuffer, ringbufferMask, pos + 1, tailEnd)
+      skip = skip - 1
+      while skip != 0 {
+        i = i + 1
+        if i + HASH_TYPE_LENGTH_H10 - 1 >= numBytes { break }
+        evaluateNode(position + streamOffset, i, maxBackward, gap, distCache, List<f32>.asSlice(&model.literalCosts), &mut queue, &mut nodes)
+        skip = skip - 1
+      }
+    }
+    i = i + 1
+  }
+  return computeShortestPathFromNodes(numBytes, &mut nodes)
+}
+
+/// `BrotliCreateZopfliBackwardReferences`: the backward references of quality 10, with the same
+/// arguments as `BrotliCreateBackwardReferences`.
+pub effect fn createZopfliBackwardReferences(
+  numBytes: usize,
+  position: usize,
+  ringbuffer: &[u8],
+  ringbufferMask: usize,
+  params: &EncoderParams,
+  hasher: &mut HashToBinaryTree,
+  distCache: &mut [i32; 16],
+  lastInsertLen: &mut usize,
+  commands: &mut [Command],
+  numCommands: &mut usize,
+  numLiterals: &mut usize,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut nodeList = run makeZopfliNodes(numBytes + 1)
+  let nodes = List<ZopfliNode>.asMutSlice(&mut nodeList)
+  let found = run zopfliComputeShortestPath(numBytes, position, ringbuffer, ringbufferMask, params, &distCache, &mut hasher, &mut nodes)
+  numCommands.* = numCommands.* + found
+  zopfliCreateCommands(numBytes, position, &nodes, &mut distCache, &mut lastInsertLen, params, &mut commands, &mut numLiterals)
+}
+
+// `count` matches whose content is not defined, like `malloc`.
+effect fn uninitializedMatches(count: usize) -> Intrinsic.RawBuffer<BackwardMatch> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocate(Layout { bytes: count * 8, alignment: 4 })
+  // The allocation holds `count` matches with their alignment; each is written before it is read.
+  return unsafe RawBuffer.from<BackwardMatch>(move allocation, count)
+}
+
+/// `BrotliCreateHqZopfliBackwardReferences`: the backward references of quality 11, with the same
+/// arguments as `BrotliCreateBackwardReferences`.
+pub effect fn createHqZopfliBackwardReferences(
+  numBytes: usize,
+  position: usize,
+  ringbuffer: &[u8],
+  ringbufferMask: usize,
+  params: &EncoderParams,
+  hasher: &mut HashToBinaryTree,
+  distCache: &mut [i32; 16],
+  lastInsertLen: &mut usize,
+  commands: &mut [Command],
+  numCommands: &mut usize,
+  numLiterals: &mut usize,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let streamOffset = params.streamOffset
+  let maxBackward = maxBackwardLimit(i32.toU32(params.lgwin))
+  let numMatchesAllocation = run Allocator.allocate(Layout { bytes: numBytes * 4, alignment: 4 })
+  // Each count is written before it is read.
+  let mut numMatchesBuffer = unsafe RawBuffer.from<u32>(move numMatchesAllocation, numBytes)
+  let numMatches = unsafe RawBuffer.viewMut<u32>(&mut numMatchesBuffer, 0, numBytes)
+  let mut matchesSize = 4 * numBytes
+  let storeEnd = if numBytes >= STORE_LOOKAHEAD_H10 { position + numBytes - STORE_LOOKAHEAD_H10 + 1 } else { position }
+  let mut curMatchPos: usize = 0
+  let mut matchesBuffer = run uninitializedMatches(matchesSize)
+  let gap = params.dictionary.compoundTotalSize
+  let mut i: usize = 0
+  while i + HASH_TYPE_LENGTH_H10 - 1 < numBytes {
+    let pos = position + i
+    let maxDistance = if pos < maxBackward { pos } else { maxBackward }
+    let dictionaryStart = if pos + streamOffset < maxBackward { pos + streamOffset } else { maxBackward }
+    let maxLength = numBytes - i
+    // Ensure that we have enough free slots (`BROTLI_ENSURE_CAPACITY`).
+    let required = curMatchPos + MAX_NUM_MATCHES_H10
+    if matchesSize < required {
+      let mut newSize = if matchesSize == 0 { required } else { matchesSize }
+      while newSize < required { newSize = newSize * 2 }
+      let mut grown = run uninitializedMatches(newSize)
+      if matchesSize != 0 {
+        Slice.copyInto<BackwardMatch>(unsafe RawBuffer.viewMut<BackwardMatch>(&mut grown, 0, newSize), 0, unsafe RawBuffer.view<BackwardMatch>(&matchesBuffer, 0, curMatchPos))
+      }
+      matchesBuffer = move grown
+      matchesSize = newSize
+    }
+    let matches = unsafe RawBuffer.viewMut<BackwardMatch>(&mut matchesBuffer, 0, matchesSize)
+    let numFoundMatches = HashToBinaryTree.findAllMatches(&mut hasher, ringbuffer, ringbufferMask, pos, maxLength, maxDistance, dictionaryStart + gap, params, &mut matches, curMatchPos)
+    let curMatchEnd = curMatchPos + numFoundMatches
+    numMatches[i] = usize.wrappingToU32(numFoundMatches)
+    if numFoundMatches > 0 {
+      let matchLen = BackwardMatch.length(&matches[curMatchEnd - 1])
+      if matchLen > MAX_ZOPFLI_LEN_QUALITY_11 {
+        let skip = matchLen - 1
+        matches[curMatchPos] = matches[curMatchEnd - 1]
+        curMatchPos = curMatchPos + 1
+        numMatches[i] = 1
+        // Add the tail of the copy to the hasher.
+        let tailEnd = if pos + matchLen < storeEnd { pos + matchLen } else { storeEnd }
+        HashToBinaryTree.storeRange(&mut hasher, ringbuffer, ringbufferMask, pos + 1, tailEnd)
+        let mut k: usize = 0
+        while k < skip {
+          numMatches[i + 1 + k] = 0
+          k = k + 1
+        }
+        i = i + skip
+      } else {
+        curMatchPos = curMatchEnd
+      }
+    }
+    i = i + 1
+  }
+  let origNumLiterals = numLiterals.*
+  let origLastInsertLen = lastInsertLen.*
+  let origDistCache: [i32; 4] = [distCache[0], distCache[1], distCache[2], distCache[3]]
+  let origNumCommands = numCommands.*
+  let mut nodeList = run makeZopfliNodes(numBytes + 1)
+  let nodes = List<ZopfliNode>.asMutSlice(&mut nodeList)
+  let mut model = run ZopfliCostModel.make(params.dist.alphabetSizeLimit, numBytes)
+  let matches = unsafe RawBuffer.view<BackwardMatch>(&matchesBuffer, 0, matchesSize)
+  let mut pass: usize = 0
+  while pass < 2 {
+    if pass != 0 {
+      // The first pass initialized the nodes as `makeZopfliNodes` does.
+      initZopfliNodes(&mut nodes)
+    }
+    if pass == 0 {
+      ZopfliCostModel.setFromLiteralCosts(&mut model, position, ringbuffer, ringbufferMask)
+    } else {
+      ZopfliCostModel.setFromCommands(&mut model, position, ringbuffer, ringbufferMask, &commands, numCommands.* - origNumCommands, origLastInsertLen)
+    }
+    numCommands.* = origNumCommands
+    numLiterals.* = origNumLiterals
+    lastInsertLen.* = origLastInsertLen
+    distCache[0] = origDistCache[0]
+    distCache[1] = origDistCache[1]
+    distCache[2] = origDistCache[2]
+    distCache[3] = origDistCache[3]
+    numCommands.* = numCommands.* + zopfliIterate(numBytes, position, ringbuffer, ringbufferMask, params, gap, &distCache, &model, &numMatches, matches, &mut nodes)
+    zopfliCreateCommands(numBytes, position, &nodes, &mut distCache, &mut lastInsertLen, params, &mut commands, &mut numLiterals)
+    pass = pass + 1
+  }
+}
