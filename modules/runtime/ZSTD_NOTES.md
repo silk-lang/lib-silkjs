@@ -93,7 +93,10 @@ Each is reduced to what the port needed. None was worked around with C.
    `Pointer.offset<T>(pointer: [*]const T, delta: isize) -> [*]const T` documented as plain address
    arithmetic (no in-bounds assumption).
 2. **No prefetch.** The reference prefetches hash rows, the match candidate of the next position
-   and, in the decoder, far match sources. Proposed: `Intrinsic.prefetch(pointer: ?*const u8,
+   and, in the decoder, far match sources. Measured cost: the row match finder (levels 5 to 12) is 1.18 to 1.30 times
+   the C library's time; the reference itself built with `NO_PREFETCH` is 1.27 times slower at level
+   9 (321 to 331 ms against 250 to 256 ms), which accounts for the gap. A dummy read of the row a few
+   positions ahead (`rowTouch` in `../zstd/src/zlazy.silk`) brought level 9 from 1.5 to 1.2 times. Proposed: `Intrinsic.prefetch(pointer: ?*const u8,
    locality: u32) -> ()`, a no-op where the target has none.
 3. **No branch hints.** `LIKELY`/`UNLIKELY` shape the reference's hot loops (sequence execution,
    the lazy parser). `@cold` on a function exists; a hint on a condition does not. Proposed:
