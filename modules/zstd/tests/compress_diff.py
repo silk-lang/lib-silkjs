@@ -302,11 +302,8 @@ def dict_cases(inputs, full):
     out = []
     def add(name, dname, params=(), exact=None, **mode):
         ps = [(P[k] if isinstance(k, str) else k, v) for k, v in params]
-        if exact is None:
-            # Level 4 is greedy for small sources and dictionaries (and the CDict has its own
-            # parameters): validity only, its identity is reported apart.
-            level = dict(ps).get(100, 3); strat = dict(ps).get(107, 0)
-            exact = (strat in (1, 2)) or (strat == 0 and level <= 3)
+        # Every strategy has its dictionary variants: every case is compared byte for byte.
+        exact = True
         out.append(dict(input=name, path=inputs[name], params=ps, mode=dict(mode, ZDICT=dicts[dname]), exact=exact, dict=dname))
     levels = (-5, -1, 1, 2, 3, 4)
     good = ['tr1024', 'tr4096', 'tr16384', 'tr65536', 'tr114688', 'rawtext1', 'rawtext7', 'rawtext8', 'rawtext9', 'rawtext100', 'rawtext3000', 'rawtext32768', 'rawtext200000', 'rawjson50000', 'rawbin65536', 'rawrand10000']
@@ -368,7 +365,27 @@ def dict_cases(inputs, full):
             inp = put(f'dj{n}', js[9000000:9000000 + n])
             for l in (1, 3, 19):
                 add(inp, dn, [('level', l)], exact=l < 4); add(inp, dn, [('level', l)], exact=l < 4, ZICHUNK=1000, ZREPEAT=2)
-    # Levels 5..22 (validity, and identity where the lazy / optimal finders are exact).
+    # greedy .. btlazy2 (levels 4 to 11, and the strategies with and without the row match finder).
+    for dn in ('tr1024', 'tr16384', 'tr65536', 'rawtext9', 'rawtext3000', 'rawtext200000', 'rawjson50000', 'rawtext1048576'):
+        for n in (100, 3000, 16385, 32769, 131073, 1 << 20):
+            inp = put(f'dj{n}', js[9000000:9000000 + n]) if (dn.startswith('tr') or 'json' in dn) else put(f'dt{n}', tx[9000000:9000000 + n])
+            for l in range(4, 12):
+                add(inp, dn, [('level', l)], exact=True)
+                if n in (3000, 131073): add(inp, dn, [('level', l)], exact=True, ZICHUNK=20000, ZFLUSH=2)
+            for strat in (3, 4, 5, 6):
+                for row in (0, 1, 2):
+                    add(inp, dn, [('strategy', strat), (1011, row)], exact=True)
+                    if n == 32769: add(inp, dn, [('strategy', strat), (1011, row), ('searchLog', 7), ('minMatch', 6)], exact=True, ZICHUNK=10000)
+    # btopt .. btultra2 (levels 12 to 22 with every dictionary, and the strategies).
+    for dn in ('tr1024', 'tr16384', 'tr65536', 'rawtext9', 'rawtext3000', 'rawtext200000', 'rawjson50000'):
+        for n in (100, 3000, 32769, 131073):
+            inp = put(f'dj{n}', js[9000000:9000000 + n]) if (dn.startswith('tr') or 'json' in dn) else put(f'dt{n}', tx[9000000:9000000 + n])
+            for l in (12, 14, 16, 17, 18, 19, 20, 22):
+                add(inp, dn, [('level', l)])
+                if n == 131073: add(inp, dn, [('level', l)], ZICHUNK=40000)
+            for strat in (7, 8, 9):
+                add(inp, dn, [('strategy', strat)]); add(inp, dn, [('strategy', strat), ('minMatch', 3)], ZICHUNK=10000)
+    # Levels 5..22.
     for dn in ('tr4096', 'tr114688', 'rawtext32768', 'rawtext200000'):
         for n in (3000, 32769, 131073, 1 << 20):
             inp = put(f'dj{n}', js[9000000:9000000 + n])

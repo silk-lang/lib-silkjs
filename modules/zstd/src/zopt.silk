@@ -493,7 +493,8 @@ unsafe fn insertBtAndGetAllMatches(matches: [*]mut u8, ms: &mut MatchState, next
   let mut mnum: u32 = 0
   let mut nbCompares = mem.shl32(1, ms.cParams.searchLog)
   let minMatchZ = mem.z(minMatch)
-  // dictMatchState: the `dms*` values of the reference are set here.
+  // dictMatchState: the `dms*` values of the reference (`optDmsView`, at the end of the file).
+  let dv = unsafe optDmsView(&ms, dictMode == cstate.DICT_MATCH_STATE, windowLow)
   let mut bestLength: usize = mem.z(mem.s32(lengthToBeat, 1))
 
   // Check the repeat offsets.
@@ -517,7 +518,13 @@ unsafe fn insertBtAndGetAllMatches(matches: [*]mut u8, ms: &mut MatchState, next
         && unsafe readMinMatch(base, ip, minMatch) == unsafe readMinMatch(dictBase, mem.z(repIndex), minMatch) {
         repLen = mem.a32(mem.t32(unsafe cstate.count2segments(base, mem.ua(ip, minMatchZ), iLimit, dictBase, mem.ua(mem.z(repIndex), minMatchZ), dictLimitZ, dictLimitZ)), minMatch)
       }
-      // dictMatchState: the repeat match inside the dictionary is checked here.
+      // dictMatchState: the repeat match inside the dictionary.
+      if dictMode == cstate.DICT_MATCH_STATE
+        && mem.s32(repOffset, 1) < mem.s32(curr, mem.a32(dv.lowLimit, dv.indexDelta))
+        && cstate.indexOverlapCheck(dictLimit, repIndex)
+        && unsafe readMinMatch(base, ip, minMatch) == unsafe readMinMatch(dv.base, mem.z(mem.s32(repIndex, dv.indexDelta)), minMatch) {
+        repLen = mem.a32(mem.t32(unsafe cstate.count2segments(base, mem.ua(ip, minMatchZ), iLimit, dv.base, mem.ua(mem.z(mem.s32(repIndex, dv.indexDelta)), minMatchZ), mem.z(dv.highLimit), dictLimitZ)), minMatch)
+      }
     }
     // Save the longer solution.
     if mem.z(repLen) > bestLength {
@@ -580,7 +587,8 @@ unsafe fn insertBtAndGetAllMatches(matches: [*]mut u8, ms: &mut MatchState, next
       mnum = mem.a32(mnum, 1)
       if matchLength > mem.z(OPT_NUM) || mem.ua(ip, matchLength) == iLimit {
         // Equal: no way to know if inf or sup. Drop, to preserve the consistency of the tree.
-        // dictMatchState: `nbCompares = 0` here, to skip the search of the dictionary too.
+        // dictMatchState: skip the search of the dictionary too.
+        if dictMode == cstate.DICT_MATCH_STATE { nbCompares = 0 }
         break
       }
     }
@@ -604,7 +612,10 @@ unsafe fn insertBtAndGetAllMatches(matches: [*]mut u8, ms: &mut MatchState, next
   if smallerPtr != DUMMY { unsafe cstate.tset(bt, smallerPtr, 0) }
   if largerPtr != DUMMY { unsafe cstate.tset(bt, largerPtr, 0) }
 
-  // dictMatchState: the search of the tree of the dictionary goes here, while `nbCompares != 0`.
+  // dictMatchState: the search of the tree of the dictionary, with the compares that are left.
+  if dictMode == cstate.DICT_MATCH_STATE && nbCompares != 0 {
+    mnum = unsafe optDmsSearchTree(matches, &ms, &dv, ip, iLimit, mls, nbCompares, mnum, &mut bestLength, &mut matchEndIdx)
+  }
 
   // Skip repetitive patterns.
   ms.nextToUpdate = mem.s32(matchEndIdx, 8)
@@ -657,6 +668,13 @@ unsafe fn btGetAllMatchesExtDict6(matches: [*]mut u8, ms: &mut MatchState, nextT
 // `BOUNDED(3, minMatch, 6)`.
 @inlineAlways
 unsafe fn getAllMatches(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32, dictMode: u32, mls: u32) -> u32 {
+  if dictMode == cstate.DICT_MATCH_STATE {
+    // (`optDms*`, at the end of the file.)
+    if mls == 3 { return unsafe btGetAllMatchesDms3(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    if mls == 4 { return unsafe btGetAllMatchesDms4(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    if mls == 5 { return unsafe btGetAllMatchesDms5(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    return unsafe btGetAllMatchesDms6(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat)
+  }
   if dictMode == cstate.EXT_DICT {
     if mls == 3 { return unsafe btGetAllMatchesExtDict3(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
     if mls == 4 { return unsafe btGetAllMatchesExtDict4(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
@@ -1236,3 +1254,125 @@ pub unsafe fn compressBlockBtoptExtDict(ms: &mut MatchState, seqStore: &mut SeqS
 pub unsafe fn compressBlockBtultraExtDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
   return unsafe compressBlockOpt2ExtDict(&mut ms, &mut seqStore, rep, src, srcSize)
 }
+
+// =================================================================================================
+// ---- `dictMatchState`: an attached CDict (`cdict.silk`). Added by the dictionary port: the
+// dictionary parts of `ZSTD_insertBtAndGetAllMatches` (called at the places marked
+// `dictMatchState:` above) and the `_dictMatchState` block compressors. ----
+// =================================================================================================
+
+/// The `dms*` values of `ZSTD_insertBtAndGetAllMatches`.
+struct OptDms {
+  hashTable: [*]mut u8,
+  bt: [*]mut u8,
+  base: [*]const u8,
+  hashLog: u32,
+  /// `dmsHighLimit`: `dms.window.nextSrc - dms.window.base`.
+  highLimit: u32,
+  /// `dmsLowLimit`.
+  lowLimit: u32,
+  /// `dmsIndexDelta`: `windowLow - dmsHighLimit`.
+  indexDelta: u32,
+  btMask: u32,
+  btLow: u32,
+}
+
+/// The `dms*` values, or placeholders when `on` is false (there is no attached dictionary).
+@inlineAlways
+unsafe fn optDmsView(ms: &MatchState, on: bool, windowLow: u32) -> OptDms {
+  if !on {
+    return OptDms { hashTable: ms.hashTable, bt: ms.chainTable, base: ms.window.base, hashLog: 0, highLimit: 0, lowLimit: 0, indexDelta: 0, btMask: 0, btLow: 0 }
+  }
+  let anchor = ()
+  let dms = unsafe Pointer.borrow<(), MatchState>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut MatchState, *const MatchState>(ms.dictMatchState))
+  let highLimit = mem.t32(mem.us(mem.addr(dms.window.nextSrc), mem.addr(dms.window.base)))
+  let lowLimit = dms.window.lowLimit
+  let btMask = mem.s32(mem.shl32(1, mem.s32(dms.cParams.chainLog, 1)), 1)
+  let btLow = if btMask < mem.s32(highLimit, lowLimit) { mem.s32(highLimit, btMask) } else { lowLimit }
+  return OptDms {
+    hashTable: dms.hashTable, bt: dms.chainTable, base: dms.window.base, hashLog: dms.cParams.hashLog,
+    highLimit: highLimit, lowLimit: lowLimit, indexDelta: mem.s32(windowLow, highLimit), btMask: btMask, btLow: btLow,
+  }
+}
+
+/// The search of the tree of the dictionary in `ZSTD_insertBtAndGetAllMatches`: appends the
+/// matches found to `matches[mnum..]` and returns the new number of matches.
+@inlineAlways
+unsafe fn optDmsSearchTree(matches: [*]mut u8, ms: &MatchState, dv: &OptDms, ip: usize, iLimit: usize, mls: u32, nbCompares0: u32, mnum0: u32, bestLength: &mut usize, matchEndIdx: &mut u32) -> u32 {
+  let base = ms.window.base
+  let prefixStart = mem.z(ms.window.dictLimit)
+  let curr = mem.t32(ip)
+  let dmsEnd = mem.z(dv.highLimit)
+  let mut nbCompares = nbCompares0
+  let mut mnum = mnum0
+  let mut dictMatchIndex = unsafe cstate.tget(dv.hashTable, unsafe cstate.hashPtr(base, ip, dv.hashLog, mls))
+  let mut commonLengthSmaller: usize = 0
+  let mut commonLengthLarger: usize = 0
+  while nbCompares != 0 && dictMatchIndex > dv.lowLimit {
+    let nextPtr = usize.wrappingMultiply(mem.z(dictMatchIndex & dv.btMask), 2)
+    let mut matchLength = if commonLengthSmaller < commonLengthLarger { commonLengthSmaller } else { commonLengthLarger }
+    let mut mBase = dv.base
+    let mut mPos = mem.z(dictMatchIndex)
+    matchLength = mem.ua(matchLength, unsafe cstate.count2segments(base, mem.ua(ip, matchLength), iLimit, dv.base, mem.ua(mPos, matchLength), dmsEnd, prefixStart))
+    if mem.ua(mem.z(dictMatchIndex), matchLength) >= dmsEnd {
+      // Prepare the next read of match[matchLength].
+      mBase = base
+      mPos = mem.ua(mem.z(dictMatchIndex), mem.z(dv.indexDelta))
+    }
+    if matchLength > bestLength.* {
+      let matchIndex = mem.a32(dictMatchIndex, dv.indexDelta)
+      if matchLength > mem.z(mem.s32(matchEndIdx.*, matchIndex)) { matchEndIdx.* = mem.a32(matchIndex, mem.t32(matchLength)) }
+      bestLength.* = matchLength
+      unsafe setMatch(matches, mnum, cstate.offsetToOffBase(mem.s32(curr, matchIndex)), mem.t32(matchLength))
+      mnum = mem.a32(mnum, 1)
+      if matchLength > mem.z(OPT_NUM) || mem.ua(ip, matchLength) == iLimit { break }
+    }
+    if dictMatchIndex <= dv.btLow { break }
+    if unsafe mem.r8(mBase, mem.ua(mPos, matchLength)) < unsafe mem.r8(base, mem.ua(ip, matchLength)) {
+      commonLengthSmaller = matchLength
+      dictMatchIndex = unsafe cstate.tget(dv.bt, mem.ua(nextPtr, 1))
+    } else {
+      commonLengthLarger = matchLength
+      dictMatchIndex = unsafe cstate.tget(dv.bt, nextPtr)
+    }
+    nbCompares = mem.s32(nbCompares, 1)
+  }
+  return mnum
+}
+
+@inlineNever
+unsafe fn btGetAllMatchesDms3(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 3)
+}
+@inlineNever
+unsafe fn btGetAllMatchesDms4(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 4)
+}
+@inlineNever
+unsafe fn btGetAllMatchesDms5(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 5)
+}
+@inlineNever
+unsafe fn btGetAllMatchesDms6(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 6)
+}
+
+@inlineNever
+unsafe fn compressBlockOpt0Dms(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 0, cstate.DICT_MATCH_STATE)
+}
+@inlineNever
+unsafe fn compressBlockOpt2Dms(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 2, cstate.DICT_MATCH_STATE)
+}
+
+/// `ZSTD_compressBlock_btopt_dictMatchState`.
+pub unsafe fn compressBlockBtoptDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt0Dms(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+/// `ZSTD_compressBlock_btultra_dictMatchState`. `btultra2` uses it too, as in the reference.
+pub unsafe fn compressBlockBtultraDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt2Dms(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+// ---- (end of the dictMatchState section) ----
