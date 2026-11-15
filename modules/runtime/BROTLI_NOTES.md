@@ -179,8 +179,7 @@ Reading it:
   12.9M against 10.3M at 11; in the runtime, `processCommands` 255M against C's `ProcessCommands`
   198M for 20 decodes). The earlier tool-level comparison showed parity because its input was one
   file repeated 40 times, which decodes mostly as long copies. In the encoder, the gaps measured by
-  the porting runs above. The decoder gap was then closed (next section); the encoder's is being
-  worked on.
+  the porting runs above. Both gaps were then closed (next sections).
 - **Peak RSS is 2 to 3 MiB higher in every row, and already at a bare start** (`-e 0`: 34.5 MiB on
   the C library, 37.1 to 37.5 MiB on the port, stable to 0.1 MiB). It is not allocation: the
   executable is 467 KB larger (`.text` +277 KB, `.rodata` +193 KB, `.data` unchanged), and the
@@ -201,6 +200,16 @@ against Silk: 768 KB of JavaScript at quality 1, 5, 11: 15.3M / 14.8M, 11.6M / 1
 10.5M; 2 MB of JSON at 5 and 11: 48.0M / 48.4M, 46.5M / 45.6M; 2 MB of HTML: 44.9M / 44.9M,
 42.6M / 42.7M; 16 MB binary at 5: 398M / 416M (+4.6%, mostly reading and building Huffman
 tables). Wall time 0.95 to 1.04 of C on all of these; peak RSS unchanged.
+
+### After the encoder's speed work
+
+Instruction counts against the C library (the differential tools, whole process): quality 1 on
+the runtime benchmark's text 27.5M against 26.8M (was 1.29x, now 1.03x), quality 6 1.01x,
+quality 10 1.04x; across qualities 0 to 9 on text, JSON, HTML, random and binary, and 10 and 11
+on HTML, random and binary, 0.91 to 1.02x, except qualities 2 to 5 on binary (1.03 to 1.08x) and
+3 and 5 on text and JSON (1.03 to 1.06x). Time follows the instruction counts within this host's
+noise, except binary at quality 6 (equal instructions and simulated cache behaviour, about 6%
+slower; see the `Slice.copyInto` wall). Peak RSS equal within 0.3 to 2.2 MB.
 
 ## Compiler walls
 
@@ -248,3 +257,18 @@ together they are most of the encoder's remaining time gap.
   branch, and `Intrinsic.expect(condition: bool, likely: bool) -> bool` (branch weights), to fix
   block frequencies in state machines like this one, which is what C's `BROTLI_PREDICT_FALSE`
   does in the same function.
+- **A standalone Silk program binds an old libm `log2`.** A Silk executable that declares
+  `unsafe extern "C" fn log2(value: f64) -> f64` binds `log2@GLIBC_2.2.5`, glibc's compatibility
+  entry with its errno wrapper (about 5 instructions more per call), where a C program binds
+  `log2@GLIBC_2.29` (`objdump -T`). The runtime executable binds `GLIBC_2.29`, the same as C, so
+  this costs the runtime nothing; it showed in the standalone differential tool (0.2 to 0.7% at
+  qualities 10 and 11). Proposed: link against the default symbol version, or let an extern
+  declaration name one.
+- **A loop-invariant local can make LLVM rotate registers every iteration.** In the H6 bucket
+  loop (two back edges), keeping the 4-byte comparison word in a local compiled to about ten
+  register-to-register moves per iteration; reloading it each time, as C does, avoids it. Not
+  reduced to a small case; the port keeps the reload.
+- **`Slice.copyInto` is a 16-byte move loop.** For copies of megabytes (the encoder's ring buffer)
+  it does not call `memcpy`, whose ERMS path may be faster at that size. Not measured precisely:
+  it is about 10% of sampled time on binary input at quality 6, where the encoder is 6% slower
+  than C with the same instruction count.
