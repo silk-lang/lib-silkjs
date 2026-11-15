@@ -254,4 +254,15 @@ Brotli share.
 
 ## Upstreaming
 
-(filled in at the end)
+No standard library file was copied or changed, so there is nothing to upstream as a fix and no
+pull request on silk-lang/silk. The pinned `silk.compress.zstd`, `zstd_block`, `zstd_encode` and
+`zstd_checksum` are correct as far as tried; they are slower than the C library and the encoder
+does not write its bytes, by design (What the pinned standard library has).
+
+`../zstd` is a complete port of Zstandard 1.5.7 that could replace them: it has no dependency on
+the runtime or on Node (only the C allocator and `memcpy`/`memmove`/`memset`), its API is the
+reference's (`ZSTD_compressStream2`, `ZSTD_decompressStream`, parameters, dictionaries, error
+codes), and its tests compare it with the reference library call by call. Moving it into the
+standard library would need its API wrapped in the standard library's style (effects, `Result`,
+an `Allocator` in place of `calloc`) and its tests turned into that repository's tests. Whether
+to do that is the owner's decision; nothing here depends on it.
