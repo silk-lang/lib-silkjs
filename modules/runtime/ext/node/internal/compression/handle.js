@@ -123,7 +123,9 @@ class CompressionHandle {
       dictionary && snapshot(dictionary, 0, range(dictionary).length, 'dictionary'), params, strict ? 1 : 0]);
     if (id < 1) {
       // -3002: a parameter value was rejected (node_zlib.cc words it this way for zstd).
-      throw initializationFailed(id === -3002 && this._kind >= ZSTD_COMPRESS ? 'Setting parameter failed' : undefined);
+      // -2 from a Zstandard codec: its dictionary was rejected (node_zlib.cc's message).
+      throw initializationFailed(id === -3002 && this._kind >= ZSTD_COMPRESS ? 'Setting parameter failed' :
+        id === -2 && this._kind >= ZSTD_COMPRESS ? 'Failed to load zstd dictionary' : undefined);
     }
     this._id = id;
     this._writeState = writeState;
