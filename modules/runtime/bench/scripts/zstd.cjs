@@ -35,8 +35,12 @@ function cases() {
   return out;
 }
 
+// ZSTD_CHUNK sets the chunkSize of the one-shot calls: the runtime's binding costs about 2 ms per
+// output chunk (ZSTD_NOTES.md), which hides the codec at the default 16 KiB.
+const CHUNK = process.env.ZSTD_CHUNK ? { chunkSize: Number(process.env.ZSTD_CHUNK) } : {};
+
 function params(level) {
-  return { params: { [zlib.constants.ZSTD_c_compressionLevel]: level } };
+  return { params: { [zlib.constants.ZSTD_c_compressionLevel]: level }, ...CHUNK };
 }
 
 function chunked(buffer, size) {
@@ -102,11 +106,11 @@ async function main() {
     compressed = frame.length;
     const run = {
       c: () => zlib.zstdCompressSync(data, params(level)).length,
-      d: () => zlib.zstdDecompressSync(frame).length,
+      d: () => zlib.zstdDecompressSync(frame, CHUNK).length,
       cs: () => through(chunked(data, 1024), zlib.createZstdCompress(params(level))),
-      ds: () => through(chunked(frame, 1024), zlib.createZstdDecompress()),
+      ds: () => through(chunked(frame, 1024), zlib.createZstdDecompress(CHUNK)),
       ca: () => Promise.all([0, 1, 2, 3].map(() => new Promise((resolve, reject) => zlib.zstdCompress(data, params(level), (error, out) => (error ? reject(error) : resolve(out.length)))))).then((sizes) => sizes[0]),
-      da: () => Promise.all([0, 1, 2, 3].map(() => new Promise((resolve, reject) => zlib.zstdDecompress(frame, (error, out) => (error ? reject(error) : resolve(out.length)))))).then((sizes) => sizes[0]),
+      da: () => Promise.all([0, 1, 2, 3].map(() => new Promise((resolve, reject) => zlib.zstdDecompress(frame, CHUNK, (error, out) => (error ? reject(error) : resolve(out.length)))))).then((sizes) => sizes[0]),
     }[operation];
     if (!run) throw new Error(`unknown case ${name}`);
     // A stream does not know the size of its input, so its frame is not the one-shot frame;
