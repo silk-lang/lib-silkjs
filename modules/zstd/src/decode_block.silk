@@ -9,6 +9,8 @@ import errors
 import entropy
 import huf_decode
 import xxh64 { Xxh64 }
+import silk.simd.cpu { CpuFeatures }
+import silk.core.target { Arch, Target }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
@@ -179,18 +181,43 @@ pub unsafe fn buildFseTable(table: [*]mut u8, norm: &[i32; 256], maxSymbol: u32,
   }
   let tableMask = tableSize - 1
   let step = entropy.tableStep(tableSize)
-  let mut position: u32 = 0
-  symbol = 0
-  while symbol <= maxSymbol {
-    let count = norm[u32.toUsize(symbol)]
-    let mut placed: i32 = 0
-    while placed < count {
-      unsafe mem.w64(bytes, u32.toUsize(position + 1) * 8, u64.shiftLeft(u32.toU64(symbol), 32))
-      position = (position + step) & tableMask
-      while position > highThreshold { position = (position + step) & tableMask }
-      placed = placed + 1
+  if highThreshold == tableSize - 1 {
+    // No symbol of probability "less than one": lay the symbols down in order, then spread them
+    // with a fixed stride, as the reference does to avoid a data-dependent inner loop.
+    let mut spread: [u8; 528] = [0; 528]
+    let mut filled: usize = 0
+    symbol = 0
+    while symbol <= maxSymbol {
+      let count = i32.toUsize(norm[u32.toUsize(symbol)])
+      let mut placed: usize = 0
+      while placed < count {
+        spread[filled + placed] = u32.wrappingToU8(symbol)
+        placed = placed + 1
+      }
+      filled = filled + count
+      symbol = symbol + 1
     }
-    symbol = symbol + 1
+    let mut position: u32 = 0
+    let mut index: u32 = 0
+    while index < tableSize {
+      unsafe mem.w64(bytes, u32.toUsize(position + 1) * 8, u64.shiftLeft(u8.toU64(spread[u32.toUsize(index)]), 32))
+      position = u32.wrappingAdd(position, step) & tableMask
+      index = index + 1
+    }
+  } else {
+    let mut position: u32 = 0
+    symbol = 0
+    while symbol <= maxSymbol {
+      let count = norm[u32.toUsize(symbol)]
+      let mut placed: i32 = 0
+      while placed < count {
+        unsafe mem.w64(bytes, u32.toUsize(position + 1) * 8, u64.shiftLeft(u32.toU64(symbol), 32))
+        position = (position + step) & tableMask
+        while position > highThreshold { position = (position + step) & tableMask }
+        placed = placed + 1
+      }
+      symbol = symbol + 1
+    }
   }
   let mut cell: u32 = 0
   while cell < tableSize {
@@ -579,9 +606,29 @@ unsafe fn execSequenceEnd(out: [*]mut u8, op: usize, oend: usize, litLength: usi
   return sequenceLength
 }
 
-// Decodes the sequences of a block and executes them (ZSTD_decompressSequences_body). Returns
-// the number of bytes written at `out[start..]`, or an error.
+// Decodes the sequences of a block and executes them (ZSTD_decompressSequences). Returns the
+// number of bytes written at `out[start..]`, or an error. Where the CPU has BMI2, it runs the
+// body compiled for it, as the reference does: the bit reads become single instructions.
 unsafe fn decompressSequences(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, sequenceCount: usize) -> usize {
+  static if Target.arch() == Arch.X86_64 {
+    if CpuFeatures.available("bmi2") {
+      return unsafe decompressSequencesBmi2(&mut dctx, out, start, capacity, src, at, size, sequenceCount)
+    }
+  }
+  return unsafe decompressSequencesBody(&mut dctx, out, start, capacity, src, at, size, sequenceCount)
+}
+
+static if Target.arch() == Arch.X86_64 {
+  @features("bmi2")
+  @inlineNever
+  unsafe fn decompressSequencesBmi2(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, sequenceCount: usize) -> usize {
+    return unsafe decompressSequencesBody(&mut dctx, out, start, capacity, src, at, size, sequenceCount)
+  }
+}
+
+// ZSTD_decompressSequences_body.
+@inlineAlways
+unsafe fn decompressSequencesBody(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, sequenceCount: usize) -> usize {
   let oend = start + capacity
   let mut op = start
   let lit = dctx.litBase
@@ -680,10 +727,10 @@ unsafe fn decompressSequences(dctx: &mut Dctx, out: [*]mut u8, start: usize, cap
           if back > extLen { return errors.err(errors.E_CORRUPTION_DETECTED) }
           let from = extLen - back
           if back >= left {
-            let _m = unsafe mem.memmove(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), left)
+            unsafe mem.moveBytes(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), left)
             done = true
           } else {
-            let _m = unsafe mem.memmove(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), back)
+            unsafe mem.moveBytes(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), back)
             target = oLitEnd + back
             left = left - back
             matchPos = prefixStart
@@ -709,7 +756,7 @@ unsafe fn decompressSequences(dctx: &mut Dctx, out: [*]mut u8, start: usize, cap
   let lastLiterals = litLimit - litPos
   if lastLiterals > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
   if lastLiterals != 0 {
-    let _c = unsafe mem.memcpy(unsafe mem.add(out, op), unsafe mem.addc(lit, litPos), lastLiterals)
+    unsafe mem.copyBytes(unsafe mem.add(out, op), unsafe mem.addc(lit, litPos), lastLiterals)
     op = op + lastLiterals
   }
   return op - start
