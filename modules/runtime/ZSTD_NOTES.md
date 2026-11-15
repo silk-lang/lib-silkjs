@@ -84,43 +84,44 @@ shuffled order, three rounds, `SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset,
 of a case, then the median over the rounds; peak RSS of the process). Host noise is about 8%.
 
 One-shot `zstdCompressSync`/`zstdDecompressSync` with `chunkSize` 8 MiB (`ZSTD_CHUNK=8388608`),
-which shows the codec. The compressed sizes are the same in every row (the bytes are compared by
-the tests above):
+which shows the codec, on the final build (`cde7a51`; decompression rows from a second run of five
+rounds). The compressed sizes are the same in every row (the bytes are compared by the tests
+above):
 
 | case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
 | --- | --- | --- | --- | --- | --- | --- |
-| c:text:-5 | 225.4 | 220.8 | 0.98 | 136 | 139 | 5896760 / 5896760 |
-| c:text:1 | 211.1 | 186.9 | 0.89 | 123 | 123 | 3586493 / 3586493 |
-| c:text:3 | 165.8 | 162.2 | 0.98 | 124 | 127 | 3549252 / 3549252 |
-| c:text:9 | 51.0 | 39.4 | 0.77 | 116 | 119 | 2958542 / 2958542 |
-| c:text:19 | 3.1 | 2.8 | 0.90 | 116 | 119 | 447687 / 447687 |
-| c:json:-5 | 488.0 | 477.8 | 0.98 | 79 | 82 | 526950 / 526950 |
-| c:json:1 | 484.0 | 423.2 | 0.87 | 79 | 82 | 309338 / 309338 |
-| c:json:3 | 422.9 | 408.2 | 0.97 | 82 | 85 | 272294 / 272294 |
-| c:json:9 | 125.5 | 95.4 | 0.76 | 91 | 94 | 277236 / 277236 |
-| c:json:19 | 2.0 | 1.9 | 0.95 | 110 | 113 | 117074 / 117074 |
-| c:random:-5 | 302.8 | 311.0 | 1.03 | 115 | 118 | 8388810 / 8388810 |
-| c:random:1 | 287.8 | 315.7 | 1.10 | 115 | 118 | 8388810 / 8388810 |
-| c:random:3 | 321.5 | 288.5 | 0.90 | 117 | 120 | 8388810 / 8388810 |
-| c:random:9 | 214.4 | 198.9 | 0.93 | 136 | 139 | 8388810 / 8388810 |
-| c:binary:1 | 193.8 | 177.7 | 0.92 | 137 | 140 | 7954313 / 7954313 |
-| c:binary:3 | 121.6 | 130.8 | 1.08 | 135 | 138 | 6816591 / 6816591 |
-| c:binary:9 | 37.0 | 28.4 | 0.77 | 143 | 146 | 5996711 / 5996711 |
-| c:binary:19 | 3.2 | 2.9 | 0.91 | 141 | 145 | 1291911 / 1291911 |
-| d:text:1 | 365.1 | 418.7 | 1.15 | 128 | 131 | 3586493 / 3586493 |
-| d:text:3 | 381.0 | 377.2 | 0.99 | 129 | 132 | 3549252 / 3549252 |
-| d:text:19 | 390.0 | 420.1 | 1.08 | 180 | 183 | 2573302 / 2573302 |
-| d:json:3 | 1460.4 | 1556.1 | 1.07 | 129 | 132 | 272294 / 272294 |
-| d:json:19 | 1621.7 | 1588.4 | 0.98 | 164 | 167 | 191189 / 191189 |
-| d:random:3 | 534.6 | 513.3 | 0.96 | 114 | 117 | 8388810 / 8388810 |
-| d:binary:1 | 312.2 | 316.2 | 1.01 | 137 | 140 | 7954313 / 7954313 |
-| d:binary:3 | 333.3 | 332.0 | 1.00 | 134 | 137 | 6816591 / 6816591 |
-| d:binary:19 | 253.4 | 286.8 | 1.13 | 204 | 208 | 5409670 / 5409670 |
+| c:text:-5 | 190.8 | 192.9 | 1.01 | 131 | 124 | 5896760 / 5896760 |
+| c:text:1 | 189.1 | 186.5 | 0.99 | 121 | 115 | 3586493 / 3586493 |
+| c:text:3 | 166.7 | 163.0 | 0.98 | 124 | 118 | 3549252 / 3549252 |
+| c:text:9 | 47.7 | 38.4 | 0.81 | 116 | 110 | 2958542 / 2958542 |
+| c:text:19 | 2.7 | 2.6 | 0.96 | 116 | 110 | 447687 / 447687 |
+| c:json:1 | 477.4 | 438.3 | 0.92 | 79 | 72 | 309338 / 309338 |
+| c:json:3 | 433.8 | 409.8 | 0.94 | 83 | 77 | 272294 / 272294 |
+| c:json:9 | 113.1 | 86.3 | 0.76 | 91 | 85 | 277236 / 277236 |
+| c:binary:1 | 134.8 | 162.3 | 1.20 | 137 | 132 | 7954313 / 7954313 |
+| c:binary:3 | 123.9 | 114.5 | 0.92 | 135 | 130 | 6816591 / 6816591 |
+| c:binary:9 | 35.9 | 24.0 | 0.67 | 143 | 138 | 5996711 / 5996711 |
+| c:binary:19 | 2.7 | 2.8 | 1.04 | 142 | 136 | 1291911 / 1291911 |
+| d:text:1 | 513.1 | 380.5 | 0.74 | 133 | 122 | 3586493 / 3586493 |
+| d:text:3 | 476.5 | 366.0 | 0.77 | 133 | 124 | 3549252 / 3549252 |
+| d:text:19 | 413.4 | 381.1 | 0.92 | 180 | 174 | 2573302 / 2573302 |
+| d:json:3 | 1353.5 | 1334.4 | 0.99 | 129 | 124 | 272294 / 272294 |
+| d:binary:1 | 417.2 | 285.8 | 0.69 | 145 | 132 | 7954313 / 7954313 |
+| d:binary:3 | 332.8 | 290.5 | 0.87 | 142 | 129 | 6816591 / 6816591 |
+| d:binary:19 | 249.6 | 253.6 | 1.02 | 199 | 192 | 5409670 / 5409670 |
 
-Level 1 was measured before the BMI2 sequence encoder (`262f19f`), which took the compressor's
-CLI from 11-13% behind the C library to 2-6%. Level 9 (and 5 to 12) is the row match finder,
-which has no prefetch (Compiler walls 2). Peak RSS is 3 MiB higher in every case, the size of
-the package's code and tables in the executable, not of a buffer.
+- Compression: levels -5 to 3 and 19 are level with the C library (0.92 to 1.20). Level 9 is
+  0.67 to 0.81: the row match finder (levels 5 to 12) has no prefetch (Compiler walls 2).
+- Decompression: 0.69 to 1.02. **Not resolved:** frames of levels 1 and 3 decode at 0.69 to 0.87
+  of the C library inside the runtime, although the standalone decoder (`../zstd/tools/dcli`
+  against the same calls on libzstd) is within 2 to 15% on the same frames, and callgrind counts
+  3% more instructions for the whole runtime process (875 M against 851 M for two 16 MB frames;
+  the sequence decoder 204 M against 222 M, Huffman 114 M against 122 M). So the gap is not in
+  the instructions run; it looks like memory traffic. One known difference: the reference keeps
+  a block's literals at the end of the output buffer when they fit (`ZSTD_allocateLiteralsBuffer`
+  `ZSTD_in_dst`/`ZSTD_split`), and the port always decodes them into a separate 128 KiB buffer.
+  That is where to look next.
+- Peak RSS is 5 to 13 MiB lower than the C build's in every row, mostly from the start (below).
 
 The default `chunkSize` (16 KiB), the streams (`cs`, `ds`: 1 KiB writes) and the thread-pool
 calls (`ca`, `da`: four at a time). The one-shot rows here are dominated by the binding's cost per
@@ -153,6 +154,23 @@ An HTTP server that compresses each response (1 MiB at the level shown) with
 | http:json:3 | 65.1 | 62.3 | 0.96 | 69 | 72 | 97337 / 97337 |
 | http:text:3 | 44.1 | 40.7 | 0.92 | 72 | 74 | 194578 / 194578 |
 | http:binary:1 | 41.3 | 40.6 | 0.98 | 86 | 89 | 404568 / 404568 |
+
+### Start-up memory: the function order was stale
+
+An idle start of the runtime (`-e 0`) had 33.8 MiB peak RSS on `main` and 37.5 MiB on this
+branch. It was code pages: `tools/startup-order.txt` names the functions a start runs, by the hash
+of what each is, for the linker to place together, and only 38 of its 896 names existed in this
+branch's executable (it also had gone stale on `main`). Regenerated with `tools/startup_order.py`
+(the server list keeps the committed entries this run does not produce, from its profiles of
+servers under load), median of 30 interleaved starts and peak RSS:
+
+| Build | Start | Idle peak RSS | HTTP server case peak RSS |
+| --- | --- | --- | --- |
+| `main`, C library | 5.0 ms | 33.8 MiB | 68.6 MiB |
+| this branch, old order | 4.4 ms | 37.5 MiB | 72.2 MiB |
+| this branch, regenerated order | 4.0 ms | 19.8 MiB | 63.8 MiB |
+
+Sibling branches will want to regenerate it again after merging; the lists are generated files.
 
 ## Compiler walls
 
