@@ -38,6 +38,14 @@ const viaCallback = (bytes, options) => new Promise(resolve => zlib.brotliDecomp
     line.push(await viaStream(entry.bytes, 1 + next() % 300, { ...options, chunkSize: 64 + next() % 4000 }));
     out.push(line);
   }
+  // BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH (upstream 0ed4268): a command of 2^24 + 1 zero-bit
+  // literals in a meta-block with one literal block type runs out the block length; it needs a
+  // large window and no ring buffer reallocation, or the ring buffer wraps first.
+  {
+    const bytes = Buffer.from('115a00000080080bfc02e0f7f41f', 'hex');
+    const fixed = { params: { [C.BROTLI_DECODER_PARAM_LARGE_WINDOW]: 1, [C.BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION]: 1 } };
+    out.push(['block switch', sync(bytes, fixed), sync(bytes, large), sync(bytes), await viaCallback(bytes, fixed), await viaStream(bytes, 3, fixed)]);
+  }
   for (let round = 0; round < 2500; round++) {
     const entry = streams[next() % streams.length];
     let bad = Buffer.from(entry.bytes);
