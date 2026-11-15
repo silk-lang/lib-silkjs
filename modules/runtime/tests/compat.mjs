@@ -385,11 +385,14 @@ await tick(); await tick();
 console.log(log.join('\n'));
 `);
 cases.push({ name: 'promise-combinators-mixed', args: [join(directory, 'promise-combinators-mixed.mjs')] });
+// Brotli (tests/brotli): digests of what node:zlib's Brotli writes and reports, one-shot and as
+// streams at every quality and parameter, and the decoder on reference streams and corrupt input.
+for (const name of ['decode', 'oneshot', 'streams', 'corrupt']) cases.push({ name: 'brotli-' + name, timeout: 300000, args: [resolve(dirname(new URL(import.meta.url).pathname), 'brotli', name + '.cjs')] });
 let passed = 0, failed = 0;
 try {
   if (!cases.some(item => filter.test(item.name))) throw new Error('No compatibility scenarios match ' + filter);
   for (const scenario of cases.filter(item => filter.test(item.name))) {
-    const options = { cwd: directory, encoding: 'utf8', timeout: 15000, env: { ...process.env, NODE_REFERENCE: reference, NO_COLOR: '1', NODE_DEBUG: '' } };
+    const options = { cwd: directory, encoding: 'utf8', timeout: scenario.timeout || 15000, env: { ...process.env, NODE_REFERENCE: reference, NO_COLOR: '1', NODE_DEBUG: '' } };
     const expected = spawnSync(reference, scenario.args, options);
     const actual = spawnSync(runtime, scenario.args, options);
     try {

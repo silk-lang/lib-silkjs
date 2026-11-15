@@ -1,11 +1,27 @@
-//! The entropy model of a meta-block: the data structure of google/brotli v1.2.0
-//! `c/enc/metablock.h`.
+//! The entropy model of a meta-block: a port of google/brotli v1.2.0 `c/enc/metablock.h`,
+//! `metablock_inc.h` and the greedy builder of `metablock.c` (`BrotliBuildMetaBlockGreedy`, used
+//! by qualities 4 to 9) with `BrotliOptimizeHistograms`. `BrotliInitDistanceParams` of
+//! `metablock.c` is in `enc.params`.
 //!
-//! NOT PORTED YET: the builders of `metablock.c` and `metablock_inc.h` (`BrotliBuildMetaBlock`,
-//! `BrotliBuildMetaBlockGreedy`, `BrotliOptimizeHistograms`). The structure is here because the
-//! bit stream writer reads it. `BrotliInitDistanceParams` of `metablock.c` is in `enc.params`.
+//! Differences in structure: the block splitters do not keep pointers to the block split and the
+//! histograms they fill (these are passed to each call), and the histograms of a split are
+//! created when the C code first clears them, so a list holds the ones that C has written.
+//!
+//! NOT PORTED YET: `BrotliBuildMetaBlock` (qualities 10 and 11, with the block splitter of
+//! `block_splitter.c` and the clustering of `cluster.c`); its place in `encode.silk` is marked
+//! `SEAM`.
 import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import enc.bit_cost { bitsEntropy }
 import enc.block_splitter { BlockSplit }
+import enc.command { Command }
+import enc.constants { LITERAL_CONTEXT_BITS, MAX_NUMBER_OF_BLOCK_TYPES, NUM_COMMAND_SYMBOLS, context, contextLookupTable }
+import enc.entropy_encode { optimizeHuffmanCountsForRle }
 import enc.histogram { HistogramCommand, HistogramDistance, HistogramLiteral }
 
 /// `MetaBlockSplit`. The sizes of the C structure are the lengths of the lists.
@@ -36,6 +52,620 @@ impl MetaBlockSplit {
   }
 }
 
-/// Whether the meta-block builders are ported. While they are not, the encoder stores the
-/// meta-blocks of qualities 4 to 11 uncompressed.
-pub const BUILDERS_PORTED: bool = false
+/// A histogram type of `metablock_inc.h`'s template parameter `FN`: `HistogramLiteral`,
+/// `HistogramCommand` or `HistogramDistance`.
+pub interface SplitHistogram {
+  /// `HistogramClear`.
+  fn clearCounts(self: &mut Self) -> ()
+  /// `HistogramAdd`.
+  fn addSymbol(self: &mut Self, symbol: usize) -> ()
+  /// `HistogramAddHistogram`.
+  fn addCounts(self: &mut Self, other: &Self) -> ()
+  /// `data_`.
+  fn counts(self: &Self) -> &[u32]
+  /// `data_`, to change.
+  fn countsMut(self: &mut Self) -> &mut [u32]
+}
+
+impl SplitHistogram for HistogramLiteral {
+  @inlineAlways
+  fn clearCounts(self: &mut Self) -> () { HistogramLiteral.clear(&mut self) }
+  @inlineAlways
+  fn addSymbol(self: &mut Self, symbol: usize) -> () { HistogramLiteral.add(&mut self, symbol) }
+  @inlineAlways
+  fn addCounts(self: &mut Self, other: &Self) -> () { HistogramLiteral.addHistogram(&mut self, other) }
+  @inlineAlways
+  fn counts(self: &Self) -> &[u32] { return &self.data }
+  @inlineAlways
+  fn countsMut(self: &mut Self) -> &mut [u32] { return &mut self.data }
+}
+
+impl SplitHistogram for HistogramCommand {
+  @inlineAlways
+  fn clearCounts(self: &mut Self) -> () { HistogramCommand.clear(&mut self) }
+  @inlineAlways
+  fn addSymbol(self: &mut Self, symbol: usize) -> () { HistogramCommand.add(&mut self, symbol) }
+  @inlineAlways
+  fn addCounts(self: &mut Self, other: &Self) -> () { HistogramCommand.addHistogram(&mut self, other) }
+  @inlineAlways
+  fn counts(self: &Self) -> &[u32] { return &self.data }
+  @inlineAlways
+  fn countsMut(self: &mut Self) -> &mut [u32] { return &mut self.data }
+}
+
+impl SplitHistogram for HistogramDistance {
+  @inlineAlways
+  fn clearCounts(self: &mut Self) -> () { HistogramDistance.clear(&mut self) }
+  @inlineAlways
+  fn addSymbol(self: &mut Self, symbol: usize) -> () { HistogramDistance.add(&mut self, symbol) }
+  @inlineAlways
+  fn addCounts(self: &mut Self, other: &Self) -> () { HistogramDistance.addHistogram(&mut self, other) }
+  @inlineAlways
+  fn counts(self: &Self) -> &[u32] { return &self.data }
+  @inlineAlways
+  fn countsMut(self: &mut Self) -> &mut [u32] { return &mut self.data }
+}
+
+// `HistogramClear(&histograms[index])` for a histogram that may not have been created yet: the
+// lists are created with the capacity of the C allocation and grow to `index + 1` here.
+@inlineAlways
+fn clearHistogramAt<H: SplitHistogram + Copy>(histograms: &mut List<H>, index: usize, blank: &H) -> () {
+  if index < List<H>.length(&histograms) {
+    SplitHistogram.clearCounts(&mut List<H>.asMutSlice(&mut histograms)[index])
+  } else {
+    // `index` is the length: histograms are cleared in order. The capacity is reserved.
+    drop List<H>.appendWithinCapacity(&mut histograms, blank.*)
+  }
+}
+
+/// `FN(BlockSplitter)`: the greedy block splitter for one block category (literal, command or
+/// distance).
+pub struct BlockSplitter<H> {
+  /// Alphabet size of particular block category.
+  alphabetSize: usize,
+  /// We collect at least this many symbols for each block.
+  minBlockSize: usize,
+  /// We merge histograms A and B if entropy(A+B) < entropy(A) + entropy(B) + splitThreshold,
+  /// where A is the current histogram and B is the histogram of the last or the second last block
+  /// type.
+  splitThreshold: f64,
+  numBlocks: usize,
+  /// `*histograms_size_`.
+  histogramsSize: usize,
+  /// Temporary storage for `finishBlock`.
+  combined0: H,
+  combined1: H,
+  /// A cleared histogram.
+  blank: H,
+  /// The number of symbols that we want to collect before deciding on whether or not to merge
+  /// the block with a previous one or emit a new block.
+  targetBlockSize: usize,
+  /// The number of symbols in the current histogram.
+  blockSize: usize,
+  /// Offset of the current histogram.
+  currHistogramIx: usize,
+  /// Offset of the histograms of the previous two block types.
+  lastHistogramIx: [usize; 2],
+  /// Entropy of the previous two block types.
+  lastEntropy: [f64; 2],
+  /// The number of times we merged the current block with the last one.
+  mergeLastCount: usize,
+}
+
+impl<H: SplitHistogram + Copy> BlockSplitter<H> {
+  /// `FN(InitBlockSplitter)`. `blank` is a cleared histogram.
+  pub effect fn make(blank: H, alphabetSize: usize, minBlockSize: usize, splitThreshold: f64, numSymbols: usize, split: &mut BlockSplit, histograms: &mut List<H>) -> BlockSplitter<H> ! OutOfMemoryError ? &mut Allocator {
+    let maxNumBlocks = numSymbols / minBlockSize + 1
+    // We have to allocate one more histogram than the maximum number of block types for the
+    // current histogram when the meta-block is too big.
+    let maxNumTypes = if maxNumBlocks < MAX_NUMBER_OF_BLOCK_TYPES + 1 { maxNumBlocks } else { MAX_NUMBER_OF_BLOCK_TYPES + 1 }
+    run ensureBlockSplitCapacity(&mut split, maxNumBlocks)
+    split.numBlocks = maxNumBlocks
+    histograms.* = run List<H>.makeWithCapacity(maxNumTypes)
+    // Clear only current histogram.
+    clearHistogramAt(&mut histograms, 0, &blank)
+    return BlockSplitter<H> {
+      alphabetSize: alphabetSize,
+      minBlockSize: minBlockSize,
+      splitThreshold: splitThreshold,
+      numBlocks: 0,
+      histogramsSize: maxNumTypes,
+      combined0: blank,
+      combined1: blank,
+      blank: blank,
+      targetBlockSize: minBlockSize,
+      blockSize: 0,
+      currHistogramIx: 0,
+      lastHistogramIx: [0, 0],
+      lastEntropy: [0.0, 0.0],
+      mergeLastCount: 0,
+    }
+  }
+
+  /// `FN(BlockSplitterFinishBlock)`: does either of three things: (1) emits the current block
+  /// with a new block type; (2) emits the current block with the type of the second last block;
+  /// (3) merges the current block with the last block.
+  pub fn finishBlock(self: &mut Self, split: &mut BlockSplit, histogramList: &mut List<H>, isFinal: bool) -> () {
+    if self.blockSize < self.minBlockSize {
+      self.blockSize = self.minBlockSize
+    }
+    let types = List<u8>.asMutSlice(&mut split.types)
+    let lengths = List<u32>.asMutSlice(&mut split.lengths)
+    if self.numBlocks == 0 {
+      // Create first block.
+      lengths[0] = usize.wrappingToU32(self.blockSize)
+      types[0] = 0
+      self.lastEntropy[0] = bitsEntropy(SplitHistogram.counts(&List<H>.asSlice(&histogramList)[0]), self.alphabetSize)
+      self.lastEntropy[1] = self.lastEntropy[0]
+      self.numBlocks = self.numBlocks + 1
+      split.numTypes = split.numTypes + 1
+      self.currHistogramIx = self.currHistogramIx + 1
+      if self.currHistogramIx < self.histogramsSize {
+        clearHistogramAt(&mut histogramList, self.currHistogramIx, &self.blank)
+      }
+      self.blockSize = 0
+    } else if self.blockSize > 0 {
+      let histograms = List<H>.asMutSlice(&mut histogramList)
+      let entropy = bitsEntropy(SplitHistogram.counts(&histograms[self.currHistogramIx]), self.alphabetSize)
+      self.combined0 = histograms[self.currHistogramIx]
+      SplitHistogram.addCounts(&mut self.combined0, &histograms[self.lastHistogramIx[0]])
+      let combinedEntropy0 = bitsEntropy(SplitHistogram.counts(&self.combined0), self.alphabetSize)
+      let diff0 = combinedEntropy0 - entropy - self.lastEntropy[0]
+      self.combined1 = histograms[self.currHistogramIx]
+      SplitHistogram.addCounts(&mut self.combined1, &histograms[self.lastHistogramIx[1]])
+      let combinedEntropy1 = bitsEntropy(SplitHistogram.counts(&self.combined1), self.alphabetSize)
+      let diff1 = combinedEntropy1 - entropy - self.lastEntropy[1]
+
+      if split.numTypes < MAX_NUMBER_OF_BLOCK_TYPES && diff0 > self.splitThreshold && diff1 > self.splitThreshold {
+        // Create new block.
+        lengths[self.numBlocks] = usize.wrappingToU32(self.blockSize)
+        types[self.numBlocks] = usize.wrappingToU8(split.numTypes)
+        self.lastHistogramIx[1] = self.lastHistogramIx[0]
+        self.lastHistogramIx[0] = split.numTypes & 0xff
+        self.lastEntropy[1] = self.lastEntropy[0]
+        self.lastEntropy[0] = entropy
+        self.numBlocks = self.numBlocks + 1
+        split.numTypes = split.numTypes + 1
+        self.currHistogramIx = self.currHistogramIx + 1
+        if self.currHistogramIx < self.histogramsSize {
+          clearHistogramAt(&mut histogramList, self.currHistogramIx, &self.blank)
+        }
+        self.blockSize = 0
+        self.mergeLastCount = 0
+        self.targetBlockSize = self.minBlockSize
+      } else if diff1 < diff0 - 20.0 {
+        // Combine this block with second last block.
+        lengths[self.numBlocks] = usize.wrappingToU32(self.blockSize)
+        types[self.numBlocks] = types[self.numBlocks - 2]
+        let swapped = self.lastHistogramIx[0]
+        self.lastHistogramIx[0] = self.lastHistogramIx[1]
+        self.lastHistogramIx[1] = swapped
+        histograms[self.lastHistogramIx[0]] = self.combined1
+        self.lastEntropy[1] = self.lastEntropy[0]
+        self.lastEntropy[0] = combinedEntropy1
+        self.numBlocks = self.numBlocks + 1
+        self.blockSize = 0
+        SplitHistogram.clearCounts(&mut histograms[self.currHistogramIx])
+        self.mergeLastCount = 0
+        self.targetBlockSize = self.minBlockSize
+      } else {
+        // Combine this block with last block.
+        lengths[self.numBlocks - 1] = u32.wrappingAdd(lengths[self.numBlocks - 1], usize.wrappingToU32(self.blockSize))
+        histograms[self.lastHistogramIx[0]] = self.combined0
+        self.lastEntropy[0] = combinedEntropy0
+        if split.numTypes == 1 {
+          self.lastEntropy[1] = self.lastEntropy[0]
+        }
+        self.blockSize = 0
+        SplitHistogram.clearCounts(&mut histograms[self.currHistogramIx])
+        self.mergeLastCount = self.mergeLastCount + 1
+        if self.mergeLastCount > 1 {
+          self.targetBlockSize = self.targetBlockSize + self.minBlockSize
+        }
+      }
+    }
+    if isFinal {
+      self.histogramsSize = split.numTypes
+      List<H>.truncate(&mut histogramList, split.numTypes)
+      split.numBlocks = self.numBlocks
+    }
+  }
+
+  /// `FN(BlockSplitterAddSymbol)`: adds the next symbol to the current histogram. When the
+  /// current histogram reaches the target size, decides on merging the block.
+  @inlineAlways
+  pub fn addSymbol(self: &mut Self, split: &mut BlockSplit, histograms: &mut List<H>, symbol: usize) -> () {
+    SplitHistogram.addSymbol(&mut List<H>.asMutSlice(&mut histograms)[self.currHistogramIx], symbol)
+    self.blockSize = self.blockSize + 1
+    if self.blockSize == self.targetBlockSize {
+      BlockSplitter<H>.finishBlock(&mut self, &mut split, &mut histograms, false)
+    }
+  }
+}
+
+// `BROTLI_ENSURE_CAPACITY` of the types and lengths of a block split.
+effect fn ensureBlockSplitCapacity(split: &mut BlockSplit, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let haveTypes = List<u8>.length(&split.types)
+  if haveTypes < count {
+    run List<u8>.appendRepeated(&mut split.types, 0, count - haveTypes)
+  }
+  let haveLengths = List<u32>.length(&split.lengths)
+  if haveLengths < count {
+    run List<u32>.appendRepeated(&mut split.lengths, 0, count - haveLengths)
+  }
+}
+
+/// `ContextBlockSplitter`: the greedy block splitter for literals that gathers histograms for all
+/// context buckets.
+pub struct ContextBlockSplitter {
+  /// Alphabet size of particular block category.
+  alphabetSize: usize,
+  numContexts: usize,
+  maxBlockTypes: usize,
+  /// We collect at least this many symbols for each block.
+  minBlockSize: usize,
+  /// We merge histograms A and B if entropy(A+B) < entropy(A) + entropy(B) + splitThreshold,
+  /// where A is the current histogram and B is the histogram of the last or the second last block
+  /// type.
+  splitThreshold: f64,
+  numBlocks: usize,
+  /// `*histograms_size_`.
+  histogramsSize: usize,
+  /// The number of symbols that we want to collect before deciding on whether or not to merge
+  /// the block with a previous one or emit a new block.
+  targetBlockSize: usize,
+  /// The number of symbols in the current histogram.
+  blockSize: usize,
+  /// Offset of the current histogram.
+  currHistogramIx: usize,
+  /// Offset of the histograms of the previous two block types.
+  lastHistogramIx: [usize; 2],
+  /// Entropy of the previous two block types.
+  lastEntropy: [f64; 26],
+  /// The number of times we merged the current block with the last one.
+  mergeLastCount: usize,
+  /// `combined_histo` of `ContextBlockSplitterFinishBlock`: `2 * numContexts` histograms.
+  combinedHisto: List<HistogramLiteral>,
+}
+
+impl ContextBlockSplitter {
+  /// `InitContextBlockSplitter`.
+  pub effect fn make(alphabetSize: usize, numContexts: usize, minBlockSize: usize, splitThreshold: f64, numSymbols: usize, split: &mut BlockSplit, histograms: &mut List<HistogramLiteral>) -> ContextBlockSplitter ! OutOfMemoryError ? &mut Allocator {
+    let maxNumBlocks = numSymbols / minBlockSize + 1
+    let maxBlockTypes = MAX_NUMBER_OF_BLOCK_TYPES / numContexts
+    // We have to allocate one more histogram than the maximum number of block types for the
+    // current histogram when the meta-block is too big.
+    let maxNumTypes = if maxNumBlocks < maxBlockTypes + 1 { maxNumBlocks } else { maxBlockTypes + 1 }
+    run ensureBlockSplitCapacity(&mut split, maxNumBlocks)
+    split.numBlocks = maxNumBlocks
+    let histogramsSize = maxNumTypes * numContexts
+    histograms.* = run List<HistogramLiteral>.makeWithCapacity(histogramsSize)
+    // Clear only current histogram.
+    let blank = HistogramLiteral.make()
+    let mut i: usize = 0
+    while i < numContexts {
+      clearHistogramAt(&mut histograms, i, &blank)
+      i = i + 1
+    }
+    let mut combinedHisto = List<HistogramLiteral>.make()
+    run List<HistogramLiteral>.appendRepeated(&mut combinedHisto, blank, 2 * numContexts)
+    return ContextBlockSplitter {
+      alphabetSize: alphabetSize,
+      numContexts: numContexts,
+      maxBlockTypes: maxBlockTypes,
+      minBlockSize: minBlockSize,
+      splitThreshold: splitThreshold,
+      numBlocks: 0,
+      histogramsSize: histogramsSize,
+      targetBlockSize: minBlockSize,
+      blockSize: 0,
+      currHistogramIx: 0,
+      lastHistogramIx: [0, 0],
+      lastEntropy: [0.0; 26],
+      mergeLastCount: 0,
+      combinedHisto: move combinedHisto,
+    }
+  }
+
+  // `ClearHistogramsLiteral(&histograms[currHistogramIx], numContexts)`.
+  fn clearCurrent(self: &mut Self, histograms: &mut List<HistogramLiteral>) -> () {
+    let blank = HistogramLiteral.make()
+    let mut i: usize = 0
+    while i < self.numContexts {
+      clearHistogramAt(&mut histograms, self.currHistogramIx + i, &blank)
+      i = i + 1
+    }
+  }
+
+  /// `ContextBlockSplitterFinishBlock`: does either of three things: (1) emits the current block
+  /// with a new block type; (2) emits the current block with the type of the second last block;
+  /// (3) merges the current block with the last block.
+  pub fn finishBlock(self: &mut Self, split: &mut BlockSplit, histogramList: &mut List<HistogramLiteral>, isFinal: bool) -> () {
+    let numContexts = self.numContexts
+    if self.blockSize < self.minBlockSize {
+      self.blockSize = self.minBlockSize
+    }
+    if self.numBlocks == 0 {
+      // Create first block.
+      let lengths = List<u32>.asMutSlice(&mut split.lengths)
+      lengths[0] = usize.wrappingToU32(self.blockSize)
+      let types = List<u8>.asMutSlice(&mut split.types)
+      types[0] = 0
+      let histograms = List<HistogramLiteral>.asSlice(&histogramList)
+      let mut i: usize = 0
+      while i < numContexts {
+        self.lastEntropy[i] = bitsEntropy(&histograms[i].data, self.alphabetSize)
+        self.lastEntropy[numContexts + i] = self.lastEntropy[i]
+        i = i + 1
+      }
+      self.numBlocks = self.numBlocks + 1
+      split.numTypes = split.numTypes + 1
+      self.currHistogramIx = self.currHistogramIx + numContexts
+      if self.currHistogramIx < self.histogramsSize {
+        ContextBlockSplitter.clearCurrent(&mut self, &mut histogramList)
+      }
+      self.blockSize = 0
+    } else if self.blockSize > 0 {
+      // Try merging the set of histograms for the current block type with the respective set of
+      // histograms for the last and second last block types. Decide over the split based on the
+      // total reduction of entropy across all contexts.
+      let mut entropy: [f64; 13] = [0.0; 13]
+      let mut combinedEntropy: [f64; 26] = [0.0; 26]
+      let mut diff: [f64; 2] = [0.0, 0.0]
+      let histograms = List<HistogramLiteral>.asMutSlice(&mut histogramList)
+      let combined = List<HistogramLiteral>.asMutSlice(&mut self.combinedHisto)
+      let mut i: usize = 0
+      while i < numContexts {
+        let currHistoIx = self.currHistogramIx + i
+        entropy[i] = bitsEntropy(&histograms[currHistoIx].data, self.alphabetSize)
+        let mut j: usize = 0
+        while j < 2 {
+          let jx = j * numContexts + i
+          let lastHistogramIx = self.lastHistogramIx[j] + i
+          combined[jx] = histograms[currHistoIx]
+          HistogramLiteral.addHistogram(&mut combined[jx], &histograms[lastHistogramIx])
+          combinedEntropy[jx] = bitsEntropy(&combined[jx].data, self.alphabetSize)
+          diff[j] = diff[j] + (combinedEntropy[jx] - entropy[i] - self.lastEntropy[jx])
+          j = j + 1
+        }
+        i = i + 1
+      }
+
+      let types = List<u8>.asMutSlice(&mut split.types)
+      let lengths = List<u32>.asMutSlice(&mut split.lengths)
+      if split.numTypes < self.maxBlockTypes && diff[0] > self.splitThreshold && diff[1] > self.splitThreshold {
+        // Create new block.
+        lengths[self.numBlocks] = usize.wrappingToU32(self.blockSize)
+        types[self.numBlocks] = usize.wrappingToU8(split.numTypes)
+        self.lastHistogramIx[1] = self.lastHistogramIx[0]
+        self.lastHistogramIx[0] = split.numTypes * numContexts
+        i = 0
+        while i < numContexts {
+          self.lastEntropy[numContexts + i] = self.lastEntropy[i]
+          self.lastEntropy[i] = entropy[i]
+          i = i + 1
+        }
+        self.numBlocks = self.numBlocks + 1
+        split.numTypes = split.numTypes + 1
+        self.currHistogramIx = self.currHistogramIx + numContexts
+        if self.currHistogramIx < self.histogramsSize {
+          ContextBlockSplitter.clearCurrent(&mut self, &mut histogramList)
+        }
+        self.blockSize = 0
+        self.mergeLastCount = 0
+        self.targetBlockSize = self.minBlockSize
+      } else if diff[1] < diff[0] - 20.0 {
+        // Combine this block with second last block.
+        lengths[self.numBlocks] = usize.wrappingToU32(self.blockSize)
+        types[self.numBlocks] = types[self.numBlocks - 2]
+        let swapped = self.lastHistogramIx[0]
+        self.lastHistogramIx[0] = self.lastHistogramIx[1]
+        self.lastHistogramIx[1] = swapped
+        i = 0
+        while i < numContexts {
+          histograms[self.lastHistogramIx[0] + i] = combined[numContexts + i]
+          self.lastEntropy[numContexts + i] = self.lastEntropy[i]
+          self.lastEntropy[i] = combinedEntropy[numContexts + i]
+          HistogramLiteral.clear(&mut histograms[self.currHistogramIx + i])
+          i = i + 1
+        }
+        self.numBlocks = self.numBlocks + 1
+        self.blockSize = 0
+        self.mergeLastCount = 0
+        self.targetBlockSize = self.minBlockSize
+      } else {
+        // Combine this block with last block.
+        lengths[self.numBlocks - 1] = u32.wrappingAdd(lengths[self.numBlocks - 1], usize.wrappingToU32(self.blockSize))
+        i = 0
+        while i < numContexts {
+          histograms[self.lastHistogramIx[0] + i] = combined[i]
+          self.lastEntropy[i] = combinedEntropy[i]
+          if split.numTypes == 1 {
+            self.lastEntropy[numContexts + i] = self.lastEntropy[i]
+          }
+          HistogramLiteral.clear(&mut histograms[self.currHistogramIx + i])
+          i = i + 1
+        }
+        self.blockSize = 0
+        self.mergeLastCount = self.mergeLastCount + 1
+        if self.mergeLastCount > 1 {
+          self.targetBlockSize = self.targetBlockSize + self.minBlockSize
+        }
+      }
+    }
+    if isFinal {
+      self.histogramsSize = split.numTypes * numContexts
+      List<HistogramLiteral>.truncate(&mut histogramList, self.histogramsSize)
+      split.numBlocks = self.numBlocks
+    }
+  }
+
+  /// `ContextBlockSplitterAddSymbol`: adds the next symbol to the current block type and context.
+  /// When the current block reaches the target size, decides on merging the block.
+  @inlineAlways
+  pub fn addSymbol(self: &mut Self, split: &mut BlockSplit, histograms: &mut List<HistogramLiteral>, symbol: usize, contextValue: usize) -> () {
+    HistogramLiteral.add(&mut List<HistogramLiteral>.asMutSlice(&mut histograms)[self.currHistogramIx + contextValue], symbol)
+    self.blockSize = self.blockSize + 1
+    if self.blockSize == self.targetBlockSize {
+      ContextBlockSplitter.finishBlock(&mut self, &mut split, &mut histograms, false)
+    }
+  }
+}
+
+// `MapStaticContexts`.
+effect fn mapStaticContexts(numContexts: usize, staticContextMap: &[u32], mb: &mut MetaBlockSplit) -> () ! OutOfMemoryError ? &mut Allocator {
+  let size = usize.shiftLeft(mb.literalSplit.numTypes, LITERAL_CONTEXT_BITS)
+  mb.literalContextMap = run List<u32>.makeWithCapacity(size)
+  let mut i: usize = 0
+  while i < mb.literalSplit.numTypes {
+    let offset = usize.wrappingToU32(i * numContexts)
+    let mut j: usize = 0
+    while j < usize.shiftLeft(1, LITERAL_CONTEXT_BITS) {
+      run List<u32>.append(&mut mb.literalContextMap, u32.wrappingAdd(offset, staticContextMap[j]))
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+// The literal block splitter of `BrotliBuildMetaBlockGreedyInternal`: `BlockSplitterLiteral`
+// for one literal context, `ContextBlockSplitter` for more.
+interface LiteralBlocks {
+  fn addLiteral(self: &mut Self, mb: &mut MetaBlockSplit, literal: u8, prevByte: u8, prevByte2: u8) -> ()
+  fn finishLiterals(self: &mut Self, mb: &mut MetaBlockSplit) -> ()
+}
+
+impl LiteralBlocks for BlockSplitter<HistogramLiteral> {
+  @inlineAlways
+  fn addLiteral(self: &mut Self, mb: &mut MetaBlockSplit, literal: u8, prevByte: u8, prevByte2: u8) -> () {
+    BlockSplitter<HistogramLiteral>.addSymbol(&mut self, &mut mb.literalSplit, &mut mb.literalHistograms, u8.toUsize(literal))
+  }
+
+  fn finishLiterals(self: &mut Self, mb: &mut MetaBlockSplit) -> () {
+    BlockSplitter<HistogramLiteral>.finishBlock(&mut self, &mut mb.literalSplit, &mut mb.literalHistograms, true)
+  }
+}
+
+// `ContextBlockSplitter` with the context of the literals.
+struct ContextLiteralBlocks<'a> {
+  splitter: ContextBlockSplitter,
+  lookup: &'a [u8],
+  literalContextLut: usize,
+  staticContextMap: &'a [u32],
+}
+
+impl<'a> LiteralBlocks for ContextLiteralBlocks<'a> {
+  @inlineAlways
+  fn addLiteral(self: &mut Self, mb: &mut MetaBlockSplit, literal: u8, prevByte: u8, prevByte2: u8) -> () {
+    let contextValue = u8.toUsize(context(self.lookup, self.literalContextLut, prevByte, prevByte2))
+    ContextBlockSplitter.addSymbol(&mut self.splitter, &mut mb.literalSplit, &mut mb.literalHistograms, u8.toUsize(literal), u32.toUsize(self.staticContextMap[contextValue]))
+  }
+
+  fn finishLiterals(self: &mut Self, mb: &mut MetaBlockSplit) -> () {
+    ContextBlockSplitter.finishBlock(&mut self.splitter, &mut mb.literalSplit, &mut mb.literalHistograms, true)
+  }
+}
+
+// `BrotliBuildMetaBlockGreedyInternal` after the initialization of the literal block splitter.
+effect fn buildMetaBlockGreedyInternal<L: LiteralBlocks>(
+  literalBlocks: &mut L,
+  ringbuffer: &[u8],
+  posIn: usize,
+  mask: usize,
+  prevByteIn: u8,
+  prevByte2In: u8,
+  commands: &[Command],
+  nCommands: usize,
+  mb: &mut MetaBlockSplit,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut pos = posIn
+  let mut prevByte = prevByteIn
+  let mut prevByte2 = prevByte2In
+  let mut commandBlocks = run BlockSplitter<HistogramCommand>.make(HistogramCommand.make(), NUM_COMMAND_SYMBOLS, 1024, 500.0, nCommands, &mut mb.commandSplit, &mut mb.commandHistograms)
+  let mut distanceBlocks = run BlockSplitter<HistogramDistance>.make(HistogramDistance.make(), 64, 512, 100.0, nCommands, &mut mb.distanceSplit, &mut mb.distanceHistograms)
+
+  let mut i: usize = 0
+  while i < nCommands {
+    let cmd = commands[i]
+    BlockSplitter<HistogramCommand>.addSymbol(&mut commandBlocks, &mut mb.commandSplit, &mut mb.commandHistograms, u16.toUsize(cmd.cmdPrefix))
+    let mut j = cmd.insertLen
+    while j != 0 {
+      let literal = ringbuffer[pos & mask]
+      LiteralBlocks.addLiteral(&mut literalBlocks, &mut mb, literal, prevByte, prevByte2)
+      prevByte2 = prevByte
+      prevByte = literal
+      pos = pos + 1
+      j = j - 1
+    }
+    let copyLen = u32.toUsize(Command.copyLength(&cmd))
+    pos = pos + copyLen
+    if copyLen != 0 {
+      prevByte2 = ringbuffer[(pos - 2) & mask]
+      prevByte = ringbuffer[(pos - 1) & mask]
+      if cmd.cmdPrefix >= 128 {
+        BlockSplitter<HistogramDistance>.addSymbol(&mut distanceBlocks, &mut mb.distanceSplit, &mut mb.distanceHistograms, u16.toUsize(cmd.distPrefix & 0x3ff))
+      }
+    }
+    i = i + 1
+  }
+
+  LiteralBlocks.finishLiterals(&mut literalBlocks, &mut mb)
+  BlockSplitter<HistogramCommand>.finishBlock(&mut commandBlocks, &mut mb.commandSplit, &mut mb.commandHistograms, true)
+  BlockSplitter<HistogramDistance>.finishBlock(&mut distanceBlocks, &mut mb.distanceSplit, &mut mb.distanceHistograms, true)
+}
+
+/// `BrotliBuildMetaBlockGreedy`: uses a fast greedy block splitter that tries to merge current
+/// block with the last or the second last block and uses a static context clustering which is
+/// the same for all block types. `staticContextMap` is read only when `numContexts` is above 1.
+pub effect fn buildMetaBlockGreedy(
+  ringbuffer: &[u8],
+  pos: usize,
+  mask: usize,
+  prevByte: u8,
+  prevByte2: u8,
+  literalContextLut: usize,
+  numContexts: usize,
+  staticContextMap: &[u32],
+  commands: &[Command],
+  nCommands: usize,
+  mb: &mut MetaBlockSplit,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut numLiterals: usize = 0
+  let mut i: usize = 0
+  while i < nCommands {
+    numLiterals = numLiterals + u32.toUsize(commands[i].insertLen)
+    i = i + 1
+  }
+  if numContexts == 1 {
+    let mut literalBlocks = run BlockSplitter<HistogramLiteral>.make(HistogramLiteral.make(), 256, 512, 400.0, numLiterals, &mut mb.literalSplit, &mut mb.literalHistograms)
+    run buildMetaBlockGreedyInternal(&mut literalBlocks, ringbuffer, pos, mask, prevByte, prevByte2, commands, nCommands, &mut mb)
+  } else {
+    let splitter = run ContextBlockSplitter.make(256, numContexts, 512, 400.0, numLiterals, &mut mb.literalSplit, &mut mb.literalHistograms)
+    let mut literalBlocks = ContextLiteralBlocks { splitter: move splitter, lookup: contextLookupTable(), literalContextLut: literalContextLut, staticContextMap: staticContextMap }
+    run buildMetaBlockGreedyInternal(&mut literalBlocks, ringbuffer, pos, mask, prevByte, prevByte2, commands, nCommands, &mut mb)
+    run mapStaticContexts(numContexts, staticContextMap, &mut mb)
+  }
+}
+
+/// `BrotliOptimizeHistograms`.
+pub fn optimizeHistograms(numDistanceCodes: u32, mb: &mut MetaBlockSplit) -> () {
+  let mut goodForRle: [u8; 704] = [0; 704]
+  let literals = List<HistogramLiteral>.asMutSlice(&mut mb.literalHistograms)
+  let mut i: usize = 0
+  while i < literals.length {
+    optimizeHuffmanCountsForRle(256, &mut literals[i].data, &mut goodForRle)
+    i = i + 1
+  }
+  let commands = List<HistogramCommand>.asMutSlice(&mut mb.commandHistograms)
+  i = 0
+  while i < commands.length {
+    optimizeHuffmanCountsForRle(NUM_COMMAND_SYMBOLS, &mut commands[i].data, &mut goodForRle)
+    i = i + 1
+  }
+  let distances = List<HistogramDistance>.asMutSlice(&mut mb.distanceHistograms)
+  i = 0
+  while i < distances.length {
+    optimizeHuffmanCountsForRle(u32.toUsize(numDistanceCodes), &mut distances[i].data, &mut goodForRle)
+    i = i + 1
+  }
+}

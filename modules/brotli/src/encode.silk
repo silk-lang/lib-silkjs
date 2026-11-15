@@ -24,7 +24,7 @@ import silk.num.u64
 import silk.num.usize
 import enc.backward_references { createBackwardReferences }
 import enc.bit_cost { bitsEntropy }
-import enc.bit_stream { storeMetaBlockFast, storeMetaBlockTrivial, storeUncompressedMetaBlock }
+import enc.bit_stream { storeMetaBlock, storeMetaBlockFast, storeMetaBlockTrivial, storeUncompressedMetaBlock }
 import enc.command { Command, getLengthCode }
 import enc.compress_fragment { OnePassArena, compressFragmentFast }
 import enc.compress_fragment_two_pass { COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE, TwoPassArena, compressFragmentTwoPass }
@@ -32,8 +32,8 @@ import enc.constants { CONTEXT_SIGNED, CONTEXT_UTF8, MAX_NDIRECT, MAX_NPOSTFIX, 
 import enc.fast_log { fastLog2, fastLog2u32, log2FloorNonZero32 }
 import enc.hash { Hasher }
 import enc.memory { bytes, bytesMut, uninitializedBytes, uninitializedWords, wordsMut, zeroedWords }
-import enc.metablock { BUILDERS_PORTED }
-import enc.params { EncoderParams, FAST_ONE_PASS_COMPRESSION_QUALITY, FAST_TWO_PASS_COMPRESSION_QUALITY, MAX_NUM_DELAYED_SYMBOLS, MAX_QUALITY_FOR_STATIC_ENTROPY_CODES, MIN_QUALITY_FOR_BLOCK_SPLIT, MIN_QUALITY_FOR_CONTEXT_MODELING, MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING, MIN_QUALITY_FOR_HQ_CONTEXT_MODELING, MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS, computeLgBlock, initDistanceParams, maxHashTableSize, maxMetablockSize, sanitizeParams }
+import enc.metablock { MetaBlockSplit, buildMetaBlockGreedy, optimizeHistograms }
+import enc.params { EncoderParams, FAST_ONE_PASS_COMPRESSION_QUALITY, FAST_TWO_PASS_COMPRESSION_QUALITY, MAX_NUM_DELAYED_SYMBOLS, MAX_QUALITY_FOR_STATIC_ENTROPY_CODES, MIN_QUALITY_FOR_BLOCK_SPLIT, MIN_QUALITY_FOR_CONTEXT_MODELING, MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING, MIN_QUALITY_FOR_HQ_CONTEXT_MODELING, MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS, MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS, computeLgBlock, initDistanceParams, maxHashTableSize, maxMetablockSize, sanitizeParams }
 import enc.ringbuffer { RingBuffer }
 import enc.utf8_util { MIN_UTF8_RATIO, isMostlyUtf8 }
 import enc.write_bits { writeBits }
@@ -479,6 +479,7 @@ effect fn writeMetaBlockInternal(
   } else if params.quality < MIN_QUALITY_FOR_BLOCK_SPLIT {
     storeMetaBlockTrivial(data, wrappedLastFlushPos, size, mask, isLast, params, commands, numCommands, &mut storageIx, &mut storage)
   } else {
+    let mut mb = MetaBlockSplit.make()
     if params.quality < MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING {
       let mut model = LiteralContextModel { numLiteralContexts: 1, literalContextMap: CONTEXT_MAP_NONE }
       if !params.disableLiteralContextModeling {
@@ -486,23 +487,33 @@ effect fn writeMetaBlockInternal(
         run List<u32>.appendRepeated(&mut arena, 0, 32 * (MAX_STATIC_CONTEXTS + 1))
         decideOverLiteralContextModeling(data, wrappedLastFlushPos, size, mask, params.quality, params.sizeHint, &mut model, List<u32>.asMutSlice(&mut arena))
       }
-      // SEAM: `BrotliBuildMetaBlockGreedy(m, data, wrapped_last_flush_pos, mask, prev_byte,
-      // prev_byte2, literal_context_lut, model.numLiteralContexts, model.literalContextMap,
-      // commands, num_commands, &mb)` goes here.
-      stored = BUILDERS_PORTED && model.numLiteralContexts != 0
+      let literalContextLut = usize.shiftLeft(u32.toUsize(literalContextMode), 9)
+      let staticContextMap: &[u32] = if model.literalContextMap == CONTEXT_MAP_CONTINUATION {
+        &STATIC_CONTEXT_MAP_CONTINUATION
+      } else if model.literalContextMap == CONTEXT_MAP_SIMPLE_UTF8 {
+        &STATIC_CONTEXT_MAP_SIMPLE_UTF8
+      } else {
+        &STATIC_CONTEXT_MAP_COMPLEX_UTF8
+      }
+      run buildMetaBlockGreedy(data, wrappedLastFlushPos, mask, prevByte, prevByte2, literalContextLut, model.numLiteralContexts, staticContextMap, commands, numCommands, &mut mb)
     } else {
       // SEAM: `BrotliBuildMetaBlock(m, data, wrapped_last_flush_pos, mask, &block_params,
-      // prev_byte, prev_byte2, commands, num_commands, literal_context_mode, &mb)` goes here.
-      stored = BUILDERS_PORTED && literalContextMode != 0 && prevByte == prevByte2
+      // prev_byte, prev_byte2, commands, num_commands, literal_context_mode, &mb)` (qualities 10
+      // and 11) goes here; it may change the distance parameters of `block_params`, a copy of
+      // `params` that `BrotliStoreMetaBlock` then takes.
+      stored = false
     }
-    // SEAM: for quality >= MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS,
-    // `BrotliOptimizeHistograms(block_params.dist.alphabet_size_limit, &mb)`, and then
-    // `enc.bit_stream.storeMetaBlock(data, wrapped_last_flush_pos, bytes, mask, prev_byte,
-    // prev_byte2, is_last, &block_params, literal_context_mode, commands, num_commands, &mb,
-    // storage_ix, storage)` go here.
+    if stored {
+      if params.quality >= MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS {
+        // The number of distance symbols effectively used for distance histograms. It might be
+        // less than distance alphabet size for "Large Window Brotli" (32-bit).
+        optimizeHistograms(params.dist.alphabetSizeLimit, &mut mb)
+      }
+      run storeMetaBlock(data, wrappedLastFlushPos, size, mask, prevByte, prevByte2, isLast, params, literalContextMode, commands, numCommands, &mb, &mut storageIx, &mut storage)
+    }
   }
-  // PLACEHOLDER: a meta-block that could not be built is stored uncompressed, like one that did
-  // not shrink.
+  // PLACEHOLDER: a meta-block of quality 10 or 11, which cannot be built until
+  // `BrotliBuildMetaBlock` is ported, is stored uncompressed, like one that did not shrink.
   if !stored || size + 4 < usize.shiftRight(storageIx.*, 3) {
     // Restore the distance cache and last byte.
     restoreDistCache(&mut distCache, savedDistCache)

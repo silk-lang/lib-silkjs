@@ -1,24 +1,191 @@
-//! Finding the backward references of the input: the interface of google/brotli v1.2.0
-//! `c/enc/backward_references.h` and `backward_references_hq.h`.
+//! Finding the backward references of the input: a port of google/brotli v1.2.0
+//! `c/enc/backward_references.c` and `backward_references_inc.h` (`BrotliCreateBackwardReferences`,
+//! qualities 2 to 9).
 //!
-//! NOT PORTED YET: the reference search (`backward_references.c`, `backward_references_inc.h`,
-//! `backward_references_hq.c`). This is the seam for it: `createBackwardReferences` has the
-//! arguments of the C function and reports that it found no match, which is always a valid
-//! answer. The output is then a valid stream, but not the bytes that the C encoder writes at
-//! these qualities.
+//! The search is generic over the hasher ([`MatchFinder`]), as the C code instantiates
+//! `backward_references_inc.h` once per hasher.
+//!
+//! NOT PORTED YET: the search with an attached compound dictionary (the `D` instances of the C
+//! code, `LookupCompoundDictionaryMatch`), which needs prepared dictionaries; contextual static
+//! dictionaries, which only a custom shared dictionary sets up; and the Zopfli searches of
+//! qualities 10 and 11 (`backward_references_hq.c`). Their places are marked `SEAM`.
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
 import enc.command { Command }
-import enc.hash { Hasher }
-import enc.params { EncoderParams }
+import enc.constants { NUM_DISTANCE_SHORT_CODES, maxBackwardLimit }
+import enc.hash { Hasher, HasherKernel }
+import enc.hash_base { HasherSearchResult, MatchFinder, SCORE_BASE }
+import enc.params { EncoderParams, MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH, literalSpreeLengthForSparseSearch }
 
-/// `BrotliCreateBackwardReferences` (and, until they are ported,
-/// `BrotliCreateZopfliBackwardReferences` and `BrotliCreateHqZopfliBackwardReferences`).
+// `ComputeDistanceCode`: the distance code of `distance`, a short code where the distance cache
+// allows one.
+@inlineAlways
+fn computeDistanceCode(distance: usize, maxDistance: usize, distCache: &[i32; 16]) -> usize {
+  if distance <= maxDistance {
+    let distancePlus3 = distance + 3
+    let cache0 = i32.wrappingToUsize(distCache[0])
+    let cache1 = i32.wrappingToUsize(distCache[1])
+    let offset0 = usize.wrappingSubtract(distancePlus3, cache0)
+    let offset1 = usize.wrappingSubtract(distancePlus3, cache1)
+    if distance == cache0 {
+      return 0
+    } else if distance == cache1 {
+      return 1
+    } else if offset0 < 7 {
+      return usize.shiftRight(0x9750468, 4 * offset0) & 0xf
+    } else if offset1 < 7 {
+      return usize.shiftRight(0xfdb1ace, 4 * offset1) & 0xf
+    } else if distance == i32.wrappingToUsize(distCache[2]) {
+      return 2
+    } else if distance == i32.wrappingToUsize(distCache[3]) {
+      return 3
+    }
+  }
+  return distance + u32.toUsize(NUM_DISTANCE_SHORT_CODES) - 1
+}
+
+// `CreateBackwardReferencesNH*` of `backward_references_inc.h`.
+fn createBackwardReferencesWith<H: MatchFinder>(
+  hasher: &mut H,
+  numBytes: usize,
+  positionIn: usize,
+  ringbuffer: &[u8],
+  ringbufferMask: usize,
+  params: &EncoderParams,
+  distCache: &mut [i32; 16],
+  lastInsertLen: &mut usize,
+  commands: &mut [Command],
+  numCommands: &mut usize,
+  numLiterals: &mut usize,
+) -> () {
+  // Set maximum distance, see section 9.1. of the spec.
+  let maxBackwardLimit = maxBackwardLimit(i32.toU32(params.lgwin))
+  let positionOffset = params.streamOffset
+  let mut position = positionIn
+  let mut written: usize = 0
+  let mut insertLength = lastInsertLen.*
+  let posEnd = position + numBytes
+  let storeLookahead = MatchFinder.storeLookahead(&hasher)
+  let hashTypeLength = MatchFinder.hashTypeLength(&hasher)
+  let storeEnd = if numBytes >= storeLookahead { position + numBytes - storeLookahead + 1 } else { position }
+
+  // For speed up heuristics for random data.
+  let randomHeuristicsWindowSize = literalSpreeLengthForSparseSearch(&params)
+  let mut applyRandomHeuristics = position + randomHeuristicsWindowSize
+  let gap = params.dictionary.compoundTotalSize
+
+  // Minimum score to accept a backward reference.
+  let minScore = SCORE_BASE + 100
+
+  MatchFinder.prepareDistanceCache(&hasher, &mut distCache)
+
+  while position + hashTypeLength < posEnd {
+    let mut maxLength = posEnd - position
+    let mut maxDistance = if position < maxBackwardLimit { position } else { maxBackwardLimit }
+    let mut dictionaryStart = if position + positionOffset < maxBackwardLimit { position + positionOffset } else { maxBackwardLimit }
+    // SEAM: with a contextual static dictionary (`params.dictionary.contextual.context_based`),
+    // the dictionary is chosen by the context of the last two bytes.
+    let mut sr = HasherSearchResult { len: 0, distance: 0, score: minScore, lenCodeDelta: 0 }
+    MatchFinder.findLongestMatch(&mut hasher, ringbuffer, ringbufferMask, &distCache.*, position, maxLength, maxDistance, dictionaryStart + gap, params.dist.maxDistance, &mut sr)
+    // SEAM: `LookupCompoundDictionaryMatch` with an attached compound dictionary.
+    if sr.score > minScore {
+      // Found a match. Let's look for something even better ahead.
+      let mut delayedBackwardReferencesInRow: i32 = 0
+      maxLength = maxLength - 1
+      while true {
+        let costDiffLazy: usize = 175
+        let mut sr2 = HasherSearchResult {
+          len: if params.quality < MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH { (if sr.len - 1 < maxLength { sr.len - 1 } else { maxLength }) } else { 0 },
+          distance: 0,
+          score: minScore,
+          lenCodeDelta: 0,
+        }
+        maxDistance = if position + 1 < maxBackwardLimit { position + 1 } else { maxBackwardLimit }
+        dictionaryStart = if position + 1 + positionOffset < maxBackwardLimit { position + 1 + positionOffset } else { maxBackwardLimit }
+        MatchFinder.findLongestMatch(&mut hasher, ringbuffer, ringbufferMask, &distCache.*, position + 1, maxLength, maxDistance, dictionaryStart + gap, params.dist.maxDistance, &mut sr2)
+        if sr2.score >= sr.score + costDiffLazy {
+          // Ok, let's just write one byte for now and start a match from the next byte.
+          position = position + 1
+          insertLength = insertLength + 1
+          sr = sr2
+          delayedBackwardReferencesInRow = delayedBackwardReferencesInRow + 1
+          if delayedBackwardReferencesInRow < 4 && position + hashTypeLength < posEnd {
+            maxLength = maxLength - 1
+            continue
+          }
+        }
+        break
+      }
+      applyRandomHeuristics = position + 2 * sr.len + randomHeuristicsWindowSize
+      dictionaryStart = if position + positionOffset < maxBackwardLimit { position + positionOffset } else { maxBackwardLimit }
+      // The first 16 codes are special short-codes, and the minimum offset is 1.
+      let distanceCode = computeDistanceCode(sr.distance, dictionaryStart + gap, &distCache.*)
+      if sr.distance <= dictionaryStart + gap && distanceCode > 0 {
+        distCache[3] = distCache[2]
+        distCache[2] = distCache[1]
+        distCache[1] = distCache[0]
+        distCache[0] = usize.wrappingToI32(sr.distance)
+        MatchFinder.prepareDistanceCache(&hasher, &mut distCache)
+      }
+      commands[written] = Command.make(&params.dist, insertLength, sr.len, sr.lenCodeDelta, distanceCode)
+      written = written + 1
+      numLiterals.* = numLiterals.* + insertLength
+      insertLength = 0
+      // Put the hash keys into the table, if there are enough bytes left. Depending on the hasher
+      // implementation, it can push all positions in the given range or only a subset of them.
+      // Avoid hash poisoning with RLE data.
+      let mut rangeStart = position + 2
+      let rangeEnd = if position + sr.len < storeEnd { position + sr.len } else { storeEnd }
+      if sr.distance < usize.shiftRight(sr.len, 2) {
+        let candidate = position + sr.len - usize.shiftLeft(sr.distance, 2)
+        let atLeast = if rangeStart > candidate { rangeStart } else { candidate }
+        rangeStart = if rangeEnd < atLeast { rangeEnd } else { atLeast }
+      }
+      MatchFinder.storeRange(&mut hasher, ringbuffer, ringbufferMask, rangeStart, rangeEnd)
+      position = position + sr.len
+    } else {
+      insertLength = insertLength + 1
+      position = position + 1
+      // If we have not seen matches for a long time, we can skip some match lookups. Unsuccessful
+      // match lookups are very very expensive and this kind of a heuristic speeds up compression
+      // quite a lot.
+      if position > applyRandomHeuristics {
+        // Going through uncompressible data, jump.
+        if position > applyRandomHeuristics + 4 * randomHeuristicsWindowSize {
+          // It is quite a long time since we saw a copy, so we assume that this data is not
+          // compressible, and store hashes less often. Hashes of non compressible data are less
+          // likely to turn out to be useful in the future, too, so we store less of them to not
+          // to flood out the hash table of good compressible data.
+          let kMargin = if storeLookahead - 1 > 4 { storeLookahead - 1 } else { 4 }
+          let posJump = if position + 16 < usize.wrappingSubtract(posEnd, kMargin) { position + 16 } else { usize.wrappingSubtract(posEnd, kMargin) }
+          while position < posJump {
+            MatchFinder.store(&mut hasher, ringbuffer, ringbufferMask, position)
+            insertLength = insertLength + 4
+            position = position + 4
+          }
+        } else {
+          let kMargin = if storeLookahead - 1 > 2 { storeLookahead - 1 } else { 2 }
+          let posJump = if position + 8 < usize.wrappingSubtract(posEnd, kMargin) { position + 8 } else { usize.wrappingSubtract(posEnd, kMargin) }
+          while position < posJump {
+            MatchFinder.store(&mut hasher, ringbuffer, ringbufferMask, position)
+            insertLength = insertLength + 2
+            position = position + 2
+          }
+        }
+      }
+    }
+  }
+  insertLength = insertLength + (posEnd - position)
+  lastInsertLen.* = insertLength
+  numCommands.* = numCommands.* + written
+}
+
+/// `BrotliCreateBackwardReferences`.
 ///
 /// `commands` is the storage from the next command to write, `numCommands` is initially the
 /// total amount of commands output by previous calls and must be incremented by the amount
 /// written by this call.
-///
-/// PLACEHOLDER: finds nothing. All `numBytes` are added to the pending insert length, as the C
-/// function does with the bytes after its last match.
 pub fn createBackwardReferences(
   numBytes: usize,
   position: usize,
@@ -33,5 +200,29 @@ pub fn createBackwardReferences(
   numCommands: &mut usize,
   numLiterals: &mut usize,
 ) -> () {
-  lastInsertLen.* = lastInsertLen.* + numBytes
+  // SEAM: with an attached compound dictionary (`params.dictionary.compound.num_chunks != 0`) the
+  // C code runs the `CreateBackwardReferencesDH*` instances.
+  match &mut hasher.kernel {
+    HasherKernel.H2 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H3 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H4 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H54 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H5 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H6 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H58 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H68 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H40 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H41 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H42 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H35 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H55 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.H65 { h } => { createBackwardReferencesWith(&mut h, numBytes, position, ringbuffer, ringbufferMask, params, &mut distCache, &mut lastInsertLen, &mut commands, &mut numCommands, &mut numLiterals) }
+    HasherKernel.None => {
+      // SEAM: `BrotliCreateZopfliBackwardReferences` (quality 10) and
+      // `BrotliCreateHqZopfliBackwardReferences` (quality 11) take the same arguments. Until they
+      // are ported they find no match: all bytes are added to the pending insert length, as the
+      // C functions do with the bytes after their last match.
+      lastInsertLen.* = lastInsertLen.* + numBytes
+    }
+  }
 }
