@@ -137,8 +137,14 @@ impl Drop for BufferLease {
 /// A synchronous native reader of an ordinary, engine-owned buffer. It survives
 /// detach/resize and forces subsequent worker transfers to copy, so a receiver
 /// cannot race the native caller's plain reads. JavaScript callbacks may mutate
-/// the bytes only on this thread while the native caller is paused. Never send
-/// this lease to another thread or publish a shared alias while it is alive.
+/// the bytes only on this thread while the native caller is paused. Never publish
+/// a shared alias while it is alive; another thread may only pass the bytes to a
+/// system call (the blocking pool's read and write), never touch them itself.
+///
+/// The lease does not publish the bytes as shared: the buffer's views keep their
+/// private fast paths, so taking and releasing a lease costs the same however many
+/// views the buffer has. The backing record that keeps the bytes alive carries
+/// physical capacity zero until a generic lease (leaseBacking) publishes it.
 pub struct BufferReadLease { lease: BufferLease }
 impl BufferReadLease {
   pub fn data(self: &Self) -> ?*mut u8 { return self.lease.bytes }
@@ -163,10 +169,11 @@ pub unsafe fn canLeaseReadBacking(object: *mut HeapHeader) -> bool {
   return match &buffer.backing { Backing.Owned { .. } => true Backing.Shared { .. } => true _ => false }
 }
 /// The caller snapshots shared, borrowed, external and Wasm inputs instead.
+/// Constant time: no view of the buffer is refreshed.
 pub unsafe effect fn leaseReadBacking(object: *mut HeapHeader) -> BufferReadLease
   ! OutOfMemoryError ? &mut Allocator {
   if !unsafe canLeaseReadBacking(object) { invariant() }
-  let lease = run unsafe leaseBacking(object)
+  let lease = run unsafe retainBacking(object, false)
   let owner = match lease.owner { LeaseOwner.Shared { owner } => owner _ => invariant() }
   let _ignored = unsafe Atomic.fetchAdd<usize>(unsafe readerCounter(owner), 1, MemoryOrder.Relaxed)
   return BufferReadLease { lease: move lease }
@@ -182,11 +189,13 @@ pub unsafe fn releaseReadBacking(object: *mut HeapHeader, lease: BufferReadLease
 /// Turns shared backing that no other owner holds back into private storage. The bytes stay
 /// where they are, so views keep their pointers. Only the buffer's own thread calls this: an
 /// owner with one reference is reachable only through this buffer, so no thread can retain it
-/// meanwhile.
+/// meanwhile. The views are refreshed only when the backing was published as shared (a read
+/// lease never publishes it), so ending a read lease is constant time.
 pub unsafe fn reclaimPrivateBacking(object: *mut HeapHeader) -> () {
   let cell = unsafe payload(object)
   let anchor = () let buffer = unsafe HeapCell.payload<BufferData, ()>(&anchor, cell)
   if buffer.state.shared || buffer.state.detached || buffer.wasm { return () }
+  let published = buffer.state.physicalCapacity != 0
   let existing: ?*mut SharedBacking = match &buffer.backing {
     Backing.Shared { owner } => owner
     _ => Pointer.null<SharedBacking>()
@@ -201,7 +210,7 @@ pub unsafe fn reclaimPrivateBacking(object: *mut HeapHeader) -> () {
   let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
   p.backing = Backing.Owned { bytes: move bytes } p.state.physicalCapacity = 0 drop p
   drop metadata
-  unsafe refresh(object)
+  if published { unsafe refresh(object) }
 }
 unsafe fn hasNativeReaders(object: *mut HeapHeader) -> bool {
   let anchor = ()
@@ -996,8 +1005,28 @@ pub unsafe fn setSharedPhysicalCapacity(object: *mut HeapHeader, capacity: u64) 
 }
 /// Retains native-owned ordinary or shared storage without copying. External
 /// storage requires an independently rooted pin and borrowed wrappers instead.
+/// The lease may reach other threads, so an ordinary buffer's bytes are published
+/// as shared: its views move to the canonical shared accesses (one refresh).
 pub unsafe effect fn leaseBacking(object: *mut HeapHeader) -> BufferLease ! OutOfMemoryError ? &mut Allocator {
-  let state = unsafe snapshot(object)
+  return run unsafe retainBacking(object, true)
+}
+/// Whether the views must see the bytes as shared: when the backing is not yet
+/// published, it is published now. An ordinary buffer read-leased before keeps
+/// its backing record with physical capacity zero (unpublished) until then.
+unsafe fn publishBacking(object: *mut HeapHeader, owner: *mut SharedBacking) -> u64 {
+  let anchor = () let shared = unsafe Pointer.borrow<(), SharedBacking>(&anchor, owner)
+  // Only a read lease leaves a record unpublished, and its record holds the buffer's
+  // own allocation (separate metadata), so the bytes start at the data pointer.
+  if shared.metadata.isNone() { invariant() }
+  let capacity = usize.toU64(RawBuffer.count<u8>(&shared.bytes)) drop shared
+  let mut mutable = () let buffer = (unsafe bufferCell(object)).getMut(&mut mutable)
+  buffer.state.physicalCapacity = capacity drop buffer
+  unsafe refresh(object)
+  return capacity
+}
+/// leaseBacking, publishing an ordinary buffer's bytes as shared only when `publish`.
+unsafe effect fn retainBacking(object: *mut HeapHeader, publish: bool) -> BufferLease ! OutOfMemoryError ? &mut Allocator {
+  let mut state = unsafe snapshot(object)
   if state.detached { invariant() }
   let anchor = () let buffer = (unsafe bufferCell(object)).get(&anchor)
   match &buffer.backing {
@@ -1019,6 +1048,7 @@ pub unsafe effect fn leaseBacking(object: *mut HeapHeader) -> BufferLease ! OutO
   drop buffer
   if !Pointer.isNull<SharedBacking>(existing) {
     let owner = present(existing)
+    if publish && state.physicalCapacity == 0 { state.physicalCapacity = unsafe publishBacking(object, owner) }
     unsafe retainSharedOwner(owner)
     return BufferLease { owner: LeaseOwner.Shared { owner: owner }, bytes: state.data, byteLength: state.byteLength,
       capacity: state.physicalCapacity, maximum: state.maxByteLength }
@@ -1042,8 +1072,10 @@ pub unsafe effect fn leaseBacking(object: *mut HeapHeader) -> BufferLease ! OutO
     metadata: Option<Intrinsic.RawBuffer<u8>>.some(move metadata) })
   let published = (unsafe bufferCell(object)).getMut(&mut mutable)
   published.backing = Backing.Shared { owner: owner }
-  published.state.data = data published.state.physicalCapacity = capacity drop published
-  unsafe refresh(object)
+  published.state.data = data
+  if publish { published.state.physicalCapacity = capacity }
+  drop published
+  if publish { unsafe refresh(object) }
   return BufferLease { owner: LeaseOwner.Shared { owner: owner }, bytes: data,
     byteLength: state.byteLength, capacity: capacity, maximum: state.maxByteLength }
 }
