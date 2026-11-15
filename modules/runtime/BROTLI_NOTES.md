@@ -211,6 +211,65 @@ on HTML, random and binary, 0.91 to 1.02x, except qualities 2 to 5 on binary (1.
 noise, except binary at quality 6 (equal instructions and simulated cache behaviour, about 6%
 slower; see the `Slice.copyInto` wall). Peak RSS equal within 0.3 to 2.2 MB.
 
+### After the speed work (final build)
+
+The same comparison, 7 interleaved rounds, on the build with both speed fixes (compat 79/79).
+Median Silk/C 0.98; compressed bytes identical in every row.
+
+| Case | Input | Quality | C MB/s | Silk MB/s | Silk/C | C peak MiB | Silk peak MiB | Output bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| compress | text | 1 | 153.7 | 155.3 | 1.01 | 45 | 48 | 304301 |
+| compress | text | 4 | 52.0 | 56.9 | 1.09 | 52 | 54 | 258264 |
+| compress | text | 6 | 36.2 | 27.0 | 0.75 | 53 | 56 | 231045 |
+| compress | text | 9 | 16.1 | 17.1 | 1.06 | 81 | 83 | 224322 |
+| compress | text | 11 | 0.6 | 0.6 | 1.11 | 66 | 69 | 138079 |
+| decompress | text | 5 | 299.9 | 293.1 | 0.98 | 51 | 54 | 67414426 |
+| compress | html | 1 | 171.5 | 178.5 | 1.04 | 51 | 53 | 390413 |
+| compress | html | 4 | 72.0 | 63.1 | 0.88 | 60 | 63 | 325421 |
+| compress | html | 6 | 42.0 | 33.8 | 0.80 | 61 | 64 | 282756 |
+| compress | html | 9 | 18.3 | 18.1 | 0.99 | 87 | 90 | 262555 |
+| compress | html | 11 | 0.6 | 0.6 | 1.05 | 81 | 84 | 117158 |
+| decompress | html | 5 | 425.5 | 414.1 | 0.97 | 59 | 62 | 67114368 |
+| compress | json | 1 | 159.7 | 149.5 | 0.94 | 53 | 56 | 374985 |
+| compress | json | 4 | 69.8 | 65.1 | 0.93 | 62 | 65 | 312685 |
+| compress | json | 6 | 41.5 | 35.1 | 0.85 | 63 | 66 | 299438 |
+| compress | json | 9 | 20.4 | 18.1 | 0.89 | 89 | 92 | 292556 |
+| compress | json | 11 | 0.5 | 0.6 | 1.02 | 81 | 84 | 126513 |
+| decompress | json | 5 | 433.6 | 408.4 | 0.94 | 61 | 64 | 67112256 |
+| compress | random | 1 | 185.7 | 179.4 | 0.97 | 50 | 52 | 2097157 |
+| compress | random | 4 | 106.5 | 102.1 | 0.96 | 55 | 58 | 2097157 |
+| compress | random | 6 | 84.1 | 84.9 | 1.01 | 57 | 59 | 2097157 |
+| compress | random | 9 | 41.4 | 43.0 | 1.04 | 83 | 86 | 2097160 |
+| compress | random | 11 | 2.1 | 2.3 | 1.10 | 60 | 62 | 1048581 |
+| decompress | random | 5 | 528.2 | 470.2 | 0.89 | 56 | 58 | 67108864 |
+| compress | binary | 1 | 5.4 | 5.7 | 1.04 | 110 | 112 | 7085509 |
+| compress | binary | 4 | 6.3 | 6.0 | 0.95 | 121 | 123 | 6095026 |
+| compress | binary | 6 | 7.0 | 6.3 | 0.91 | 119 | 122 | 5512274 |
+| compress | binary | 9 | 3.1 | 3.5 | 1.11 | 145 | 148 | 5372112 |
+| compress | binary | 11 | 0.5 | 0.5 | 1.04 | 127 | 130 | 981881 |
+| decompress | binary | 5 | 7.2 | 7.0 | 0.98 | 116 | 119 | 67108864 |
+| compress-stream | text | 1 | 31.8 | 31.8 | 1.00 | 46 | 48 | 459538 |
+| compress-stream | text | 4 | 28.6 | 25.3 | 0.88 | 49 | 52 | 261613 |
+| compress-stream | text | 6 | 20.2 | 17.9 | 0.89 | 51 | 54 | 232872 |
+| compress-stream | text | 9 | 10.5 | 11.2 | 1.06 | 81 | 84 | 223614 |
+| compress-stream | html | 11 | 0.6 | 0.6 | 0.98 | 81 | 84 | 117158 |
+| decompress-stream | text | 5 | 43.2 | 44.0 | 1.02 | 51 | 54 | 1465531 |
+| decompress-stream | binary | 5 | 29.7 | 27.1 | 0.91 | 116 | 119 | 16777216 |
+| compress-async | json | 5 | 127.6 | 120.1 | 0.94 | 132 | 134 | 2432592 |
+| compress-async | text | 9 | 54.2 | 52.5 | 0.97 | 336 | 338 | 1794576 |
+| fetch | html | 5 | 110.8 | 111.5 | 1.01 | 74 | 75 | 83892960 |
+
+- Decompression is at the C library's speed (0.89 to 1.02; the lowest row, stored random data,
+  is within this host's noise for a memory-bound copy).
+- Compression at qualities 1, 9 and 11 and on random and binary input is within noise.
+- **Quality 6 is slower: text 0.75, HTML 0.80, JSON 0.85.** Measured alone (best of 15
+  interleaved runs), text at quality 6 takes 44.7 ms against 38.8 ms in the runtime and 44.6
+  against 39.5 in the standalone tools, about 15%, with only 1 to 3% more instructions and the
+  same simulated cache misses and branch mispredictions (cachegrind: 226.2M against 223.9M
+  instructions, 3.95M D1 misses on both, 1.36M against 1.38M mispredictions). Under
+  investigation; recorded here until it is resolved.
+- Peak RSS is 2 to 3 MiB higher in every row: the startup cost described above.
+
 ## Compiler walls
 
 Each one was checked on a minimal case compiled with `silk build --release` (Silk
