@@ -179,7 +179,8 @@ Reading it:
   12.9M against 10.3M at 11; in the runtime, `processCommands` 255M against C's `ProcessCommands`
   198M for 20 decodes). The earlier tool-level comparison showed parity because its input was one
   file repeated 40 times, which decodes mostly as long copies. In the encoder, the gaps measured by
-  the porting runs above.
+  the porting runs above. The decoder gap was then closed (next section); the encoder's is being
+  worked on.
 - **Peak RSS is 2 to 3 MiB higher in every row, and already at a bare start** (`-e 0`: 34.5 MiB on
   the C library, 37.1 to 37.5 MiB on the port, stable to 0.1 MiB). It is not allocation: the
   executable is 467 KB larger (`.text` +277 KB, `.rodata` +193 KB, `.data` unchanged), and the
@@ -192,6 +193,14 @@ Reading it:
   runtime and is left to a separate task.
 - The asynchronous form still runs on the thread pool (`compress, 8 at once on the pool`): eight
   compressions at once go at the same rate as with the C library.
+
+### After the decoder's speed work
+
+Instruction counts of the decoder (the differential tools, whole process, 16 KiB outputs), C
+against Silk: 768 KB of JavaScript at quality 1, 5, 11: 15.3M / 14.8M, 11.6M / 11.8M, 10.3M /
+10.5M; 2 MB of JSON at 5 and 11: 48.0M / 48.4M, 46.5M / 45.6M; 2 MB of HTML: 44.9M / 44.9M,
+42.6M / 42.7M; 16 MB binary at 5: 398M / 416M (+4.6%, mostly reading and building Huffman
+tables). Wall time 0.95 to 1.04 of C on all of these; peak RSS unchanged.
 
 ## Compiler walls
 
@@ -226,3 +235,16 @@ together they are most of the encoder's remaining time gap.
   and traps on every shift; the port masks counts (`& 31`, `& 63`) where C relies on them being in range.
   Proposed: an unchecked shift (`unsafe fn shiftLeftUnchecked`), or dropping the check when the
   count is provably in range.
+- **No way to state a fact the optimizer can use, or to weight a branch.** The decoder's
+  `processCommands` is one large state machine, as in C. Its instruction count moves by 5 to 9%
+  on edits that change nothing (replacing a checked subtraction with `usize.wrappingSubtract`,
+  marking the block-switch functions cold), because register allocation in it is unstable: in
+  the bad variants the state pointer itself spills, and field addresses (`&s.distRb`) are hoisted
+  out of the loop and spilled where the good ones fold them into the address. A length test made
+  at entry (`src.length >= 8`) is not reused by the inlined refills inside the loop. Neither
+  reduced to a small case (small functions of the same shape fold correctly); the evidence is the
+  disassembly of `processCommands` in several variants, kept with the port's scratch notes.
+  Proposed: `Intrinsic.assume(condition: bool)` (LLVM `assume`), to state such facts without a
+  branch, and `Intrinsic.expect(condition: bool, likely: bool) -> bool` (branch weights), to fix
+  block frequencies in state machines like this one, which is what C's `BROTLI_PREDICT_FALSE`
+  does in the same function.
