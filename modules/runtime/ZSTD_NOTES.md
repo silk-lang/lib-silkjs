@@ -78,7 +78,7 @@ Node 24 with the cases of `tests/compat-zstd.mjs`:
 The compressor's own differential test (`../zstd/tests/compress_diff.py`, every call's return
 value and positions as well as the bytes) covers levels -131072 to 4 exactly; the lazy and
 optimal parsers, long-distance matching, workers and compressor dictionaries are being finished.
-The C library stays in `../native/zstd` until those pass.
+`../native/zstd`, which compiled the C library, is removed: nothing links Zstandard C.
 
 ## Compiler walls
 
