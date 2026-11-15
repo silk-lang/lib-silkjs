@@ -266,8 +266,14 @@ Median Silk/C 0.98; compressed bytes identical in every row.
   interleaved runs), text at quality 6 takes 44.7 ms against 38.8 ms in the runtime and 44.6
   against 39.5 in the standalone tools, about 15%, with only 1 to 3% more instructions and the
   same simulated cache misses and branch mispredictions (cachegrind: 226.2M against 223.9M
-  instructions, 3.95M D1 misses on both, 1.36M against 1.38M mispredictions). Under
-  investigation; recorded here until it is resolved.
+  instructions, 3.95M D1 misses on both, 1.36M against 1.38M mispredictions). The cause: the
+  port had left out the C encoder's `PREFETCH_L1` of the bucket and tag lines in the H5, H6, H58
+  and H68 searches. A prefetch lets the cache miss overlap the search of the last distances;
+  cachegrind counts it as one instruction and does not model the overlap, which is why the
+  counts matched. A C build with the prefetch made a no-op was as slow as the port (1.049x C over
+  301 paired rounds). With the prefetches added, quality 6 on text is 0.99 of C (paired median of
+  15 runs), JSON at 9 0.96 to 0.97, text at 5 1.01; the quality 4 rows were within noise
+  already (their hashers have no prefetch in C either).
 - Peak RSS is 2 to 3 MiB higher in every row: the startup cost described above.
 
 ## Compiler walls
@@ -331,3 +337,15 @@ together they are most of the encoder's remaining time gap.
   it does not call `memcpy`, whose ERMS path may be faster at that size. Not measured precisely:
   it is about 10% of sampled time on binary input at quality 6, where the encoder is 6% slower
   than C with the same instruction count.
+- **No prefetch.** Neither the standard library nor `Intrinsic` has a prefetch, and binding
+  `llvm.prefetch.p0` as an extern function is rejected (`SEM0190 A native symbol that is not an
+  ASCII identifier`). The encoder's searches need C's `PREFETCH_L1` to match its speed (about 5%
+  at qualities 5 to 9), so the port issues `prefetcht0` (x86-64) or `prfm pldl1keep` (AArch64)
+  through `Intrinsic.assembly` in `enc/memory.silk`, and nothing on other targets. Proposed:
+  `pub fn prefetch<T>(pointer: ?*const T, locality: PrefetchLocality) -> ()` in `silk.mem.pointer`
+  (safe: a prefetch never faults), lowered to `llvm.prefetch`.
+- **`Intrinsic.assembly` takes no register-class constraints.** `"r"` (and `"=r,0"`, `"r,r"`) is
+  rejected with `SEM0214`; only fixed registers such as `"{rdi}"` are accepted, so the prefetch
+  above pins its address in `rdi` (`x0`) inside a loop that is short of registers, which costs
+  about 1.5% of the instructions at quality 6. Proposed: accept the LLVM constraint classes `r`
+  and `m`.
