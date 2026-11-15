@@ -28,7 +28,7 @@ import dec.bit_reader
 import dec.huffman
 import dec.memory
 import dec.prefix
-import dec.state { State }
+import dec.state { CompoundDictionary, State }
 import dec.state
 import dec.transform
 
@@ -504,10 +504,10 @@ fn readPreloadedSymbol(table: &[u32], base: usize, br: &mut BitReader, src: &[u8
 }
 
 // Reads up to `limit` symbols and copies them into the ring buffer, starting from `pos`. The
-// caller must ensure that there is enough space for the write. Returns the number of symbols
-// actually copied.
+// caller must ensure that there is enough space for the write: `pos + limit` is at most
+// `ring.length`. Returns the number of symbols actually copied.
 @inlineAlways
-fn copyPreloadedSymbolsToU8(table: &[u32], base: usize, br: &mut BitReader, src: &[u8], bits: &mut u64, value: &mut u64, ring: &mut [u8], pos: usize, limit: i32) -> i32 {
+unsafe fn copyPreloadedSymbolsToU8(table: &[u32], base: usize, br: &mut BitReader, src: &[u8], bits: &mut u64, value: &mut u64, ring: &mut [u8], pos: usize, limit: i32) -> i32 {
   // Calculate the range where `checkInputAmount` is always true. Start with the number of bytes
   // we can read, convert to bits (symbols use a variable number of bits) and to symbols: at most
   // 15 bits per symbol.
@@ -522,14 +522,15 @@ fn copyPreloadedSymbolsToU8(table: &[u32], base: usize, br: &mut BitReader, src:
   let mut at = pos
   let end = usize.wrappingAdd(at, i32.toUsize(posLimit))
   // Fast path: the caller made sure it is safe to write, and it is safe to read.
+  // Every write is below `pos + limit` (`posLimit` is at most `limit`), inside the ring buffer.
   while at < end {
-    ring[at] = u64.wrappingToU8(readPreloadedSymbol(table, base, &mut br, src, &mut bits, &mut value))
+    unsafe memory.setByte(&mut ring, at, u64.wrappingToU8(readPreloadedSymbol(table, base, &mut br, src, &mut bits, &mut value)))
     at = usize.wrappingAdd(at, 1)
   }
   // Do the remainder: the caller made sure it is safe to write, we verify that it is safe to
   // read.
   while bit_reader.checkInputAmount(&br) && copies < limit {
-    ring[at] = u64.wrappingToU8(readPreloadedSymbol(table, base, &mut br, src, &mut bits, &mut value))
+    unsafe memory.setByte(&mut ring, at, u64.wrappingToU8(readPreloadedSymbol(table, base, &mut br, src, &mut bits, &mut value)))
     at = usize.wrappingAdd(at, 1)
     copies = i32.wrappingAdd(copies, 1)
   }
@@ -1460,29 +1461,31 @@ fn initializeCompoundDictionaryCopy(s: &mut State, address: i32, length: i32) ->
   return true
 }
 
-fn copyFromCompoundDictionary(s: &mut State, position: i32) -> i32 {
+// Copies the rest of the compound dictionary reference into `ring` from `position`, up to the
+// ring buffer size; returns the number of bytes copied.
+fn copyFromCompoundDictionary(ring: &mut [u8], compound: &mut CompoundDictionary, ringbufferSize: i32, position: i32) -> i32 {
   let mut pos = position
   let origPos = pos
-  while s.compound.brLength != s.compound.brCopied {
-    let chunkStart = s.compound.chunkOffsets[i32.toUsize(s.compound.brIndex)]
-    let space = s.ringbufferSize - pos
-    let remChunkLength = s.compound.chunkOffsets[i32.toUsize(s.compound.brIndex + 1)] - chunkStart - s.compound.brOffset
-    let mut length = s.compound.brLength - s.compound.brCopied
+  while compound.brLength != compound.brCopied {
+    let chunkStart = compound.chunkOffsets[i32.toUsize(compound.brIndex)]
+    let space = ringbufferSize - pos
+    let remChunkLength = compound.chunkOffsets[i32.toUsize(compound.brIndex + 1)] - chunkStart - compound.brOffset
+    let mut length = compound.brLength - compound.brCopied
     if length > remChunkLength { length = remChunkLength }
     if length > space { length = space }
     Slice.copyInto<u8>(
-      state.bytesMut(&mut s.ringbuffer),
+      &mut ring,
       i32.toUsize(pos),
-      Slice.view<u8>(List<u8>.asSlice(&s.compound.data), i32.toUsize(chunkStart + s.compound.brOffset), i32.toUsize(length)),
+      Slice.view<u8>(List<u8>.asSlice(&compound.data), i32.toUsize(chunkStart + compound.brOffset), i32.toUsize(length)),
     )
     pos = pos + length
-    s.compound.brOffset = s.compound.brOffset + length
-    s.compound.brCopied = s.compound.brCopied + length
+    compound.brOffset = compound.brOffset + length
+    compound.brCopied = compound.brCopied + length
     if length == remChunkLength {
-      s.compound.brIndex = s.compound.brIndex + 1
-      s.compound.brOffset = 0
+      compound.brIndex = compound.brIndex + 1
+      compound.brOffset = 0
     }
-    if pos == s.ringbufferSize { break }
+    if pos == ringbufferSize { break }
   }
   return pos - origPos
 }
@@ -1558,10 +1561,11 @@ fn takeDistanceFromRingBuffer(s: &mut State) -> () {
   }
 }
 
-// A value that is known to be below 2^31, as C's `int`.
+// C's conversion to `int` of a value that is known to be below 2^31. Were it not, C's
+// conversion would wrap the same way.
 @inlineAlways
 fn toInt(value: u64) -> i32 {
-  return u64.toI32(value & 2147483647)
+  return u64.wrappingToI32(value)
 }
 
 // `SafeReadBits` and `SafeReadBits32` of decode.c: a read of zero bits succeeds.
@@ -1607,17 +1611,20 @@ fn calculateDistanceLut(s: &mut State) -> () {
   }
 }
 
-// Reads a distance. Precondition: s.distanceCode < 0.
+// Reads a distance. Precondition: s.distanceCode < 0. `distanceTable` is the buffer of
+// `s.distanceHgroup`.
 @inlineAlways
-fn readDistanceInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8]) -> bool {
+fn readDistanceInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8], distanceTable: &[u32]) -> bool {
   let mut code: u64 = 0
   let mut bits: u64 = 0
   let memento = bit_reader.saveState(&br)
-  let distanceTree = htree(&s.distanceHgroup.codes, s.distHtreeIndex)
+  // C's `dist_htree_index` is a byte; the mask says so, and the first 256 entries of the buffer
+  // exist (see `processCommandsInternal`).
+  let distanceTree = u32.toUsize(distanceTable[s.distHtreeIndex & 255])
   if !safe {
-    code = readSymbol(state.words(&s.distanceHgroup.codes), distanceTree, &mut br, src)
+    code = readSymbol(distanceTable, distanceTree, &mut br, src)
   } else {
-    if !safeReadSymbol(state.words(&s.distanceHgroup.codes), distanceTree, &mut br, src, &mut code) { return false }
+    if !safeReadSymbol(distanceTable, distanceTree, &mut br, src, &mut code) { return false }
   }
   s.blockLength[2] = u64.wrappingSubtract(s.blockLength[2], 1)
   // Convert the distance code to the actual distance by possibly looking up past distances.
@@ -1627,7 +1634,10 @@ fn readDistanceInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8
     takeDistanceFromRingBuffer(&mut s)
     return true
   }
-  let extraBits = u8.toU64(s.distExtraBits[u64.wrappingToUsize(code)])
+  // The symbol is below the alphabet size, at most 544; the mask says it is below 1024, the size
+  // of the tables.
+  let distanceSymbol = u64.wrappingToUsize(code) & 1023
+  let extraBits = u8.toU64(s.distExtraBits[distanceSymbol])
   if !safe {
     bits = bit_reader.readBits(&mut br, src, extraBits)
   } else {
@@ -1638,26 +1648,29 @@ fn readDistanceInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8
     }
   }
   // The distance alphabet is limited so that no distance reaches 2^31.
-  s.distanceCode = toInt(u64.wrappingAdd(s.distOffset[u64.wrappingToUsize(code)], u64.shiftLeft(bits, s.distancePostfixBits & 3)))
+  s.distanceCode = toInt(u64.wrappingAdd(s.distOffset[distanceSymbol], u64.shiftLeft(bits, s.distancePostfixBits & 3)))
   return true
 }
 
-// Reads an insert-and-copy command; the insert length goes to `insertLength`.
+// Reads an insert-and-copy command; the insert length goes to `insertLength`. `commandTable` is
+// the buffer of `s.insertCopyHgroup`, `distContexts` the four bytes of `s.distContextMap` at
+// `s.distContextMapSlice`.
 @inlineAlways
-fn readCommandInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8], insertLength: &mut i32) -> bool {
+fn readCommandInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8], commandTable: &[u32], distContexts: &[u8], insertLength: &mut i32) -> bool {
   let mut cmdCode: u64 = 0
   let mut insertLenExtra: u64 = 0
   let mut copyLength: u64 = 0
   let memento = bit_reader.saveState(&br)
   if !safe {
-    cmdCode = readSymbol(state.words(&s.insertCopyHgroup.codes), s.htreeCommand, &mut br, src)
+    cmdCode = readSymbol(commandTable, s.htreeCommand, &mut br, src)
   } else {
-    if !safeReadSymbol(state.words(&s.insertCopyHgroup.codes), s.htreeCommand, &mut br, src, &mut cmdCode) { return false }
+    if !safeReadSymbol(commandTable, s.htreeCommand, &mut br, src, &mut cmdCode) { return false }
   }
   let v = prefix.cmdLut(u64.wrappingToUsize(cmdCode))
   s.distanceCode = prefix.cmdDistanceCode(v)
   s.distanceContext = toInt(prefix.cmdContext(v))
-  s.distHtreeIndex = u8.toUsize(state.bytes(&s.distContextMap)[usize.wrappingAdd(s.distContextMapSlice, u64.wrappingToUsize(prefix.cmdContext(v)))])
+  // The context is 0 to 3.
+  s.distHtreeIndex = u8.toUsize(distContexts[u64.wrappingToUsize(prefix.cmdContext(v)) & 3])
   insertLength.* = toInt(prefix.cmdInsertOffset(v))
   if !safe {
     if prefix.cmdInsertExtraBits(v) != 0 {
@@ -1677,6 +1690,80 @@ fn readCommandInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8]
   return true
 }
 
+// The copy of a command whose distance is beyond the window: a reference to the compound
+// dictionary or to a word of the static dictionary, written to `ring` at `pos`. Returns the
+// number of bytes written, or an error (negative). Out of line: it is rare, and it keeps the
+// registers of the command loop free.
+@inlineNever
+fn copyFarReference(s: &mut State, ring: &mut [u8], pos: usize, i: i32) -> i32 {
+  let compoundDictionarySize = s.compound.totalSize
+  // The maximum allowed distance is 0x7FFFFFFC. With this choice, no signed overflow can
+  // occur after decoding a special distance code (e.g., after adding 3 to the last
+  // distance).
+  if s.distanceCode > MAX_ALLOWED_DISTANCE { return ERROR_FORMAT_DISTANCE }
+  if s.distanceCode - s.maxDistance - 1 < compoundDictionarySize {
+    let address = compoundDictionarySize - (s.distanceCode - s.maxDistance)
+    if !initializeCompoundDictionaryCopy(&mut s, address, i) {
+      return ERROR_COMPOUND_DICTIONARY
+    }
+    return copyFromCompoundDictionary(&mut ring, &mut s.compound, s.ringbufferSize, usize.toI32(pos))
+  } else if i >= MIN_DICTIONARY_WORD_LENGTH && i <= MAX_DICTIONARY_WORD_LENGTH {
+    // A build without `BROTLI_EXPERIMENTAL` has exactly one static dictionary, the one of
+    // RFC 7932, with its 121 transforms and no context map; C's selection among several
+    // dictionaries reduces to this.
+    let wordLength = i32.toUsize(i)
+    let shift = brotli_tables.wordSizeBits(wordLength)
+    let address = s.distanceCode - s.maxDistance - 1 - compoundDictionarySize
+    let wordMask = u32.toI32(u32.shiftLeft(1, shift & 31) - 1)
+    let wordIdx = address & wordMask
+    let transformIdx = i32.shiftRight(address, u32.toI32(shift & 31))
+    // Compensate the double distance-ring-buffer roll.
+    s.distRbIdx = i32.wrappingAdd(s.distRbIdx, s.distanceContext)
+    if shift == 0 {
+      return ERROR_FORMAT_DICTIONARY
+    }
+    let offset = brotli_tables.wordOffset(wordLength) + i32.toUsize(wordIdx) * wordLength
+    if transformIdx < usize.toI32(brotli_tables.transformCount()) {
+      let mut len = wordLength
+      if transformIdx == 0 {
+        Slice.copyInto<u8>(&mut ring, pos, Slice.view<u8>(brotli_tables.words(), offset, wordLength))
+      } else {
+        len = transform.transformDictionaryWord(&mut ring, pos, brotli_tables.words(), offset, wordLength, i32.toUsize(transformIdx))
+        if len == 0 && s.distanceCode <= 120 { return ERROR_FORMAT_TRANSFORM }
+      }
+      s.metaBlockRemainingLen = s.metaBlockRemainingLen - usize.toI32(len)
+      return usize.toI32(len)
+    } else {
+      return ERROR_FORMAT_TRANSFORM
+    }
+  } else {
+    return ERROR_FORMAT_DICTIONARY
+  }
+}
+
+// C's literal loops count the literals of the command down in `i` and stop when it gets to 0 or
+// when `pos` gets to the ring buffer size, whichever is first. The fast loops count only `pos`,
+// up to this end. `pos` is below `ringSize`. A count that is not positive is no limit: C's loop
+// would only stop when it got to 0 again, after more than 2^31 literals, but the ring buffer
+// (at most 2^30 bytes) ends first.
+@inlineAlways
+fn literalEnd(pos: usize, ringSize: usize, i: i32) -> usize {
+  let room = ringSize - pos
+  if i > 0 && i32.toUsize(i) < room { return pos + i32.toUsize(i) }
+  return ringSize
+}
+
+// After a fast literal loop that ran from `posStart` to `pos`: counts the literals off `i`, and
+// suspends to write out the ring buffer if the loop got to its end, which C checks first.
+@inlineAlways
+fn endLiterals(s: &mut State, pos: usize, posStart: usize, ringSize: usize, i: &mut i32, label: &mut u32) -> () {
+  i.* = i32.wrappingSubtract(i.*, usize.wrappingToI32(pos - posStart))
+  if label.* == LABEL_INNER && pos == ringSize {
+    s.state = state.STATE_COMMAND_INNER_WRITE
+    label.* = LABEL_SAVE
+  }
+}
+
 // The command loop of a compressed meta-block: C's `ProcessCommandsInternal`, whose labels are
 // the values of `label`. With `safe` unset the input is known to suffice for each step (at least
 // 28 bytes are ahead whenever that is checked); with `safe` set every read can stop for lack of
@@ -1689,7 +1776,6 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
   let mut pos = i32.toUsize(s.pos)
   let mut i = s.loopCounter
   let mut result = SUCCESS
-  let compoundDictionarySize = s.compound.totalSize
   let ringSize = i32.toUsize(s.ringbufferSize)
   let mask = i32.toUsize(s.ringbufferMask)
   let mut label = LABEL_SAVE
@@ -1697,8 +1783,39 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
   // write to the ring buffer or to the state can change it. It goes back to the state around
   // the calls that read through the state, and at the end.
   let mut br = s.br
+  // The buffers the commands read and write, in locals for the same reason. None of them is
+  // reallocated or freed while the commands run: the calls below that take the state only
+  // decode block switches (which change positions in these buffers, not the buffers) or copy
+  // from a compound dictionary.
+  let mut ringAnchor: usize = 0
+  let ring = unsafe memory.detachMut<u8>(&mut ringAnchor, state.bytesMut(&mut s.ringbuffer))
+  let tablesAnchor: usize = 0
+  let literalTable = unsafe memory.detach<u32>(&tablesAnchor, state.words(&s.literalHgroup.codes))
+  let commandTable = unsafe memory.detach<u32>(&tablesAnchor, state.words(&s.insertCopyHgroup.codes))
+  let distanceTable = unsafe memory.detach<u32>(&tablesAnchor, state.words(&s.distanceHgroup.codes))
+  let distContextMap = unsafe memory.detach<u8>(&tablesAnchor, state.bytes(&s.distContextMap))
+  let contextMap = unsafe memory.detach<u8>(&tablesAnchor, state.bytes(&s.contextMap))
+  // The contexts of the current distance block type; they change with it.
+  let mut distContexts = Slice.view<u8>(distContextMap, s.distContextMapSlice, 4)
+  // A tree group of the meta-block has at least one tree of at least 256 entries after the
+  // positions of its trees, so a tree position (an index below 256) needs no further check.
+  if literalTable.length < 256 || distanceTable.length < 256 {
+    return Intrinsic.trap("brotli: a tree group is missing")
+  }
+  // The two 16-byte moves of a short copy stay inside the ring buffer if both positions are
+  // below `copyBound` (then each is at most `ring.length - 32`); no position is below 0.
+  let mut copyBound: usize = 0
+  if ring.length >= 32 { copyBound = ring.length - 31 }
+  // The ring buffer holds its size plus the write-ahead slack, so a masked position and every
+  // position below the size are inside it.
+  if mask >= ring.length || ringSize > ring.length {
+    return Intrinsic.trap("brotli: the ring buffer is smaller than its size")
+  }
 
-  if !safe && !bit_reader.checkInputAmount(&br) {
+  // A source of fewer than 8 bytes never has the 28 bytes ahead that `checkInputAmount` asks
+  // for, so testing its length first changes nothing; it tells the refills below that the
+  // source has at least 8 bytes, so that they test only their position.
+  if !safe && (src.length < 8 || !bit_reader.checkInputAmount(&br)) {
     result = NEEDS_MORE_INPUT
   } else {
     if !safe {
@@ -1739,12 +1856,12 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
       }
       // Read the insert/copy length in the command.
       if safe {
-        if !readCommandInternal(true, &mut s, &mut br, src, &mut i) {
+        if !readCommandInternal(true, &mut s, &mut br, src, commandTable, distContexts, &mut i) {
           result = NEEDS_MORE_INPUT
           break
         }
       } else {
-        let _read = readCommandInternal(false, &mut s, &mut br, src, &mut i)
+        let _read = readCommandInternal(false, &mut s, &mut br, src, commandTable, distContexts, &mut i)
       }
       if i == 0 {
         label = LABEL_POST_DECODE_LITERALS
@@ -1758,10 +1875,13 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
       if safe { s.state = state.STATE_COMMAND_INNER }
       // Read the literals in the command.
       if s.trivialLiteralContext {
-        let table = state.words(&s.literalHgroup.codes)
-        let ring = state.bytesMut(&mut s.ringbuffer)
+        let table = literalTable
         let literalHtree = s.literalHtree
         if !safe {
+          // The literals go to `pos` and on, and stop when `pos` reaches the ring buffer size.
+          // Every command step leaves `pos` below it (a step that reaches it suspends to write
+          // the ring buffer out, which brings it back below), so the writes need no checks.
+          if pos >= ringSize { return Intrinsic.trap("brotli: the ring buffer position is past its size") }
           let mut bits: u64 = 0
           let mut value: u64 = 0
           preloadSymbol(table, literalHtree, &mut br, src, &mut bits, &mut value)
@@ -1779,10 +1899,13 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
             numSteps = i32.wrappingSubtract(usize.toI32(ringSize - pos), 1)
           }
           if numSteps < 0 { numSteps = 0 }
-          numSteps = copyPreloadedSymbolsToU8(table, literalHtree, &mut br, src, &mut bits, &mut value, &mut ring, pos, numSteps)
+          // `numSteps` is below `ringSize - pos`.
+          numSteps = unsafe copyPreloadedSymbolsToU8(table, literalHtree, &mut br, src, &mut bits, &mut value, &mut ring, pos, numSteps)
           pos = usize.wrappingAdd(pos, i32.toUsize(numSteps))
           s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], i32.toU64(numSteps))
           i = i32.wrappingSubtract(i, numSteps)
+          let posStart = pos
+          let end = literalEnd(pos, ringSize, i)
           while true {
             if !bit_reader.checkInputAmount(&br) {
               s.state = state.STATE_COMMAND_INNER
@@ -1794,18 +1917,13 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
               label = LABEL_NEXT_LITERAL_BLOCK
               break
             }
-            let _copied = copyPreloadedSymbolsToU8(table, literalHtree, &mut br, src, &mut bits, &mut value, &mut ring, pos, 1)
+            // `pos` is below `ringSize`: the loop stops when it gets there.
+            let _copied = unsafe copyPreloadedSymbolsToU8(table, literalHtree, &mut br, src, &mut bits, &mut value, &mut ring, pos, 1)
             s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], 1)
             pos = usize.wrappingAdd(pos, 1)
-            if pos == ringSize {
-              s.state = state.STATE_COMMAND_INNER_WRITE
-              i = i32.wrappingSubtract(i, 1)
-              label = LABEL_SAVE
-              break
-            }
-            i = i32.wrappingSubtract(i, 1)
-            if i == 0 { break }
+            if pos == end { break }
           }
+          endLiterals(&mut s, pos, posStart, ringSize, &mut i, &mut label)
         } else {
           while true {
             if s.blockLength[0] == 0 {
@@ -1832,15 +1950,21 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
           }
         }
       } else {
-        let table = state.words(&s.literalHgroup.codes)
-        // The 64 contexts of the block type, and the two halves of the lookup table of the
-        // context mode.
-        let contextMap = Slice.view<u8>(state.bytes(&s.contextMap), s.contextMapSlice, 64)
-        let lookup1 = Slice.view<u8>(brotli_tables.contextLookup(), s.contextLookup, 256)
-        let lookup2 = Slice.view<u8>(brotli_tables.contextLookup(), s.contextLookup + 256, 256)
-        let ring = state.bytesMut(&mut s.ringbuffer)
-        let mut p1 = ring[usize.wrappingSubtract(pos, 1) & mask]
-        let mut p2 = ring[usize.wrappingSubtract(pos, 2) & mask]
+        let table = literalTable
+        // The 64 contexts of the block type, and the lookup table of the context mode: its
+        // first half for the last byte, the second for the one before. `contextLookup` is the
+        // mode (0 to 3) times 512, so the mask keeps it and keeps every index below 2048, the
+        // size of the table.
+        let blockContexts = Slice.view<u8>(contextMap, s.contextMapSlice, 64)
+        let lookup = brotli_tables.contextLookup()
+        let lookupOffset = s.contextLookup & 1536
+        // Masked positions are inside the ring buffer (checked above).
+        let mut p1 = unsafe memory.byteAt(&ring, usize.wrappingSubtract(pos, 1) & mask)
+        let mut p2 = unsafe memory.byteAt(&ring, usize.wrappingSubtract(pos, 2) & mask)
+        // As in the other literal loop, `pos` stays below `ringSize`.
+        if pos >= ringSize { return Intrinsic.trap("brotli: the ring buffer position is past its size") }
+        let posStart = pos
+        let end = literalEnd(pos, ringSize, i)
         while true {
           if !safe && !bit_reader.checkInputAmount(&br) {
             s.state = state.STATE_COMMAND_INNER
@@ -1852,8 +1976,9 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
             label = LABEL_NEXT_LITERAL_BLOCK
             break
           }
-          let context = lookup1[u8.toUsize(p1)] | lookup2[u8.toUsize(p2)]
-          let hc = u32.toUsize(table[u8.toUsize(contextMap[u8.toUsize(context) & 63])])
+          let context = lookup[lookupOffset + u8.toUsize(p1)] | lookup[lookupOffset + 256 + u8.toUsize(p2)]
+          // A tree index is a byte, below 256 (checked above).
+          let hc = u32.toUsize(table[u8.toUsize(blockContexts[u8.toUsize(context) & 63])])
           p2 = p1
           if !safe {
             p1 = u64.wrappingToU8(readSymbol(table, hc, &mut br, src))
@@ -1866,18 +1991,12 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
             }
             p1 = u64.wrappingToU8(literal)
           }
-          ring[pos] = p1
+          unsafe memory.setByte(&mut ring, pos, p1)
           s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], 1)
           pos = usize.wrappingAdd(pos, 1)
-          if pos == ringSize {
-            s.state = state.STATE_COMMAND_INNER_WRITE
-            i = i32.wrappingSubtract(i, 1)
-            label = LABEL_SAVE
-            break
-          }
-          i = i32.wrappingSubtract(i, 1)
-          if i == 0 { break }
+          if pos == end { break }
         }
+        endLiterals(&mut s, pos, posStart, ringSize, &mut i, &mut label)
       }
       if label == LABEL_INNER {
         if s.metaBlockRemainingLen <= 0 {
@@ -1907,82 +2026,33 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
             result = status
             break
           }
+          distContexts = Slice.view<u8>(distContextMap, s.distContextMapSlice, 4)
         }
         if safe {
-          if !readDistanceInternal(true, &mut s, &mut br, src) {
+          if !readDistanceInternal(true, &mut s, &mut br, src, distanceTable) {
             result = NEEDS_MORE_INPUT
             break
           }
         } else {
-          let _read = readDistanceInternal(false, &mut s, &mut br, src)
+          let _read = readDistanceInternal(false, &mut s, &mut br, src, distanceTable)
         }
       }
       if s.maxDistance != s.maxBackwardDistance {
-        if pos < i32.toUsize(s.maxBackwardDistance) { s.maxDistance = usize.toI32(pos) } else { s.maxDistance = s.maxBackwardDistance }
+        // C compares as `int`; `pos` is below 2^31, as C's is.
+        if usize.wrappingToI64(pos) < i32.toI64(s.maxBackwardDistance) { s.maxDistance = usize.wrappingToI32(pos) } else { s.maxDistance = s.maxBackwardDistance }
       }
       i = s.copyLength
       // Apply the copy of an LZ77 back-reference, or a static dictionary reference if the
       // distance is larger than the max LZ77 distance.
       if s.distanceCode > s.maxDistance {
-        // The maximum allowed distance is 0x7FFFFFFC. With this choice, no signed overflow can
-        // occur after decoding a special distance code (e.g., after adding 3 to the last
-        // distance).
-        if s.distanceCode > MAX_ALLOWED_DISTANCE {
-            result = ERROR_FORMAT_DISTANCE
-            break
-          }
-        if s.distanceCode - s.maxDistance - 1 < compoundDictionarySize {
-          let address = compoundDictionarySize - (s.distanceCode - s.maxDistance)
-          if !initializeCompoundDictionaryCopy(&mut s, address, i) {
-            result = ERROR_COMPOUND_DICTIONARY
-            break
-          }
-          pos = pos + i32.toUsize(copyFromCompoundDictionary(&mut s, usize.toI32(pos)))
-          if pos >= ringSize {
-            s.state = state.STATE_COMMAND_POST_WRITE_1
-            break
-          }
-        } else if i >= MIN_DICTIONARY_WORD_LENGTH && i <= MAX_DICTIONARY_WORD_LENGTH {
-          // A build without `BROTLI_EXPERIMENTAL` has exactly one static dictionary, the one of
-          // RFC 7932, with its 121 transforms and no context map; C's selection among several
-          // dictionaries reduces to this.
-          let wordLength = i32.toUsize(i)
-          let shift = brotli_tables.wordSizeBits(wordLength)
-          let address = s.distanceCode - s.maxDistance - 1 - compoundDictionarySize
-          let wordMask = u32.toI32(u32.shiftLeft(1, shift & 31) - 1)
-          let wordIdx = address & wordMask
-          let transformIdx = i32.shiftRight(address, u32.toI32(shift & 31))
-          // Compensate the double distance-ring-buffer roll.
-          s.distRbIdx = i32.wrappingAdd(s.distRbIdx, s.distanceContext)
-          if shift == 0 {
-            result = ERROR_FORMAT_DICTIONARY
-            break
-          }
-          let offset = brotli_tables.wordOffset(wordLength) + i32.toUsize(wordIdx) * wordLength
-          if transformIdx < usize.toI32(brotli_tables.transformCount()) {
-            let ring = state.bytesMut(&mut s.ringbuffer)
-            let mut len = wordLength
-            if transformIdx == 0 {
-              Slice.copyInto<u8>(&mut ring, pos, Slice.view<u8>(brotli_tables.words(), offset, wordLength))
-            } else {
-              len = transform.transformDictionaryWord(&mut ring, pos, brotli_tables.words(), offset, wordLength, i32.toUsize(transformIdx))
-              if len == 0 && s.distanceCode <= 120 {
-            result = ERROR_FORMAT_TRANSFORM
-            break
-          }
-            }
-            pos = pos + len
-            s.metaBlockRemainingLen = s.metaBlockRemainingLen - usize.toI32(len)
-            if pos >= ringSize {
-              s.state = state.STATE_COMMAND_POST_WRITE_1
-              break
-            }
-          } else {
-            result = ERROR_FORMAT_TRANSFORM
-            break
-          }
-        } else {
-          result = ERROR_FORMAT_DICTIONARY
+        let written = copyFarReference(&mut s, &mut ring, pos, i)
+        if written < 0 {
+          result = written
+          break
+        }
+        pos = pos + i32.toUsize(written)
+        if pos >= ringSize {
+          s.state = state.STATE_COMMAND_POST_WRITE_1
           break
         }
       } else {
@@ -1990,7 +2060,8 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
         // read with its extra bits.
         // A copy length is at least 2 and below 2^25.
         let copyLength = i32.toUsize(i & 33554431)
-        let srcStart = usize.wrappingSubtract(pos, i32.wrappingToUsize(s.distanceCode)) & mask
+        // The distance is positive, so its zero extension is its value.
+        let srcStart = usize.wrappingSubtract(pos, u32.toUsize(i32.wrappingToU32(s.distanceCode))) & mask
         let dstEnd = usize.wrappingAdd(pos, copyLength)
         let srcEnd = usize.wrappingAdd(srcStart, copyLength)
         // Update the recent distances cache.
@@ -2000,8 +2071,15 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
         // There are 32+ bytes of slack in the ring buffer allocation. Also, we have 16 short
         // codes, that make these 16 bytes irrelevant in the ring buffer. Let's copy over them as
         // a first guess.
-        let ring = state.bytesMut(&mut s.ringbuffer)
-        memory.move16(&mut ring, pos, srcStart)
+        // A position below `copyBound` leaves room for both 16-byte moves, and the union (bitwise
+        // or) of two positions is below it only if both are. Both positions are below the ring
+        // buffer size (the source one is masked), far below `copyBound`, so the test passes.
+        let shortCopyFits = (pos | srcStart) < copyBound
+        if shortCopyFits {
+          unsafe memory.move16Unchecked(&mut ring, pos, srcStart)
+        } else {
+          memory.move16(&mut ring, pos, srcStart)
+        }
         if srcEnd > pos && dstEnd > srcStart {
           // The regions intersect.
           label = LABEL_POST_WRAP_COPY
@@ -2015,7 +2093,11 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
             } else {
               // This branch covers about 45% cases. A fixed size short copy allows more compiler
               // optimizations.
-              memory.move16(&mut ring, usize.wrappingAdd(pos, 16), usize.wrappingAdd(srcStart, 16))
+              if shortCopyFits {
+                unsafe memory.move16Unchecked(&mut ring, usize.wrappingAdd(pos, 16), usize.wrappingAdd(srcStart, 16))
+              } else {
+                memory.move16(&mut ring, usize.wrappingAdd(pos, 16), usize.wrappingAdd(srcStart, 16))
+              }
             }
           }
           pos = dstEnd
@@ -2038,7 +2120,6 @@ fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
       let count = i32.toUsize(i)
       let wrapGuard = usize.wrappingSubtract(ringSize, pos)
       let distance = i32.wrappingToUsize(s.distanceCode)
-      let ring = state.bytesMut(&mut s.ringbuffer)
       if wrapGuard != 0 && wrapGuard <= count {
         memory.copyBackward(&mut ring, pos, distance, mask, wrapGuard)
         pos = usize.wrappingAdd(pos, wrapGuard)
@@ -2391,7 +2472,7 @@ effect fn step(s: &mut State, src: &[u8], output: &mut [u8], returned: &mut bool
       if s.state == state.STATE_COMMAND_POST_WRITE_1 {
         if s.compound.numChunks != 0 && s.compound.brLength != s.compound.brCopied {
           let position = s.pos
-          let copied = copyFromCompoundDictionary(&mut s, position)
+          let copied = copyFromCompoundDictionary(state.bytesMut(&mut s.ringbuffer), &mut s.compound, s.ringbufferSize, position)
           s.pos = position + copied
           if s.pos >= s.ringbufferSize { return SUCCESS }
         }
