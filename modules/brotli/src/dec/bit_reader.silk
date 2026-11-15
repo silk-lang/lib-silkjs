@@ -1,0 +1,297 @@
+//! The decoder's bit reader: a port of google/brotli v1.2.0 `c/dec/bit_reader.h` and
+//! `c/dec/bit_reader.c`, in the variant of a 64-bit little-endian build with fast unaligned reads.
+//!
+//! The C reader keeps pointers into the input. Here the reader keeps positions, and every
+//! function that reads input takes the bytes those positions refer to as `src`: either the
+//! caller's input or the decoder's 8-byte carry buffer.
+//!
+//! As in C, the accumulator may hold more valid stream bits than `bitPos` counts: a 64-bit load
+//! brings 8 bytes of which 6 or 7 are counted. Those extra bits are always the next bytes of the
+//! stream, so a later load that overlaps them writes the same values.
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// `BROTLI_FAST_INPUT_SLACK`: 162 bits + 7 bytes.
+const FAST_INPUT_SLACK: usize = 28
+
+/// `BrotliBitReader`.
+pub struct BitReader {
+  /// `val_`: the pre-fetched bits.
+  pub val: u64,
+  /// `bit_pos_`: the number of counted bits in `val`.
+  pub bitPos: u64,
+  /// `next_in`, as a position in the current source.
+  pub next: usize,
+  /// `guard_in`: the position from which the fast path is prohibited.
+  pub guard: usize,
+  /// `last_in`: the end of the current source.
+  pub last: usize,
+}
+
+impl Copy for BitReader {}
+
+/// `BrotliBitReaderState`.
+pub struct BitReaderState {
+  val: u64,
+  bitPos: u64,
+  next: usize,
+  availIn: usize,
+}
+
+impl Copy for BitReaderState {}
+
+/// `BitMask`: the low `n` bits set, for `n` up to 63.
+@inlineAlways
+pub fn bitMask(n: u64) -> u64 {
+  return u64.shiftLeft(1, n & 63) - 1
+}
+
+/// `BrotliInitBitReader`.
+pub fn make() -> BitReader {
+  return BitReader { val: 0, bitPos: 0, next: 0, guard: 0, last: 0 }
+}
+
+/// `BrotliBitReaderGetAvailIn`.
+@inlineAlways
+pub fn availIn(br: &BitReader) -> usize {
+  return br.last - br.next
+}
+
+/// `BrotliBitReaderSaveState`.
+@inlineAlways
+pub fn saveState(br: &BitReader) -> BitReaderState {
+  return BitReaderState { val: br.val, bitPos: br.bitPos, next: br.next, availIn: br.last - br.next }
+}
+
+/// `BrotliBitReaderSetInput`: the source is `avail` bytes from position `next`.
+@inlineAlways
+pub fn setInput(br: &mut BitReader, next: usize, avail: usize) -> () {
+  br.next = next
+  br.last = next + avail
+  if avail + 1 > FAST_INPUT_SLACK {
+    br.guard = next + (avail + 1 - FAST_INPUT_SLACK)
+  } else {
+    br.guard = next
+  }
+}
+
+/// `BrotliBitReaderRestoreState`.
+@inlineAlways
+pub fn restoreState(br: &mut BitReader, from: &BitReaderState) -> () {
+  br.val = from.val
+  br.bitPos = from.bitPos
+  setInput(&mut br, from.next, from.availIn)
+}
+
+/// `BrotliGetRemainingBytes`: the unread bytes of the source plus the whole bytes of the
+/// accumulator, capped at the largest ring buffer.
+@inlineAlways
+pub fn remainingBytes(br: &BitReader) -> usize {
+  let avail = br.last - br.next
+  if avail > 1073741824 { return 1073741824 }
+  return avail + u64.wrappingToUsize(u64.shiftRight(br.bitPos, 3))
+}
+
+/// `BrotliCheckInputAmount`: whether the fast path may read.
+@inlineAlways
+pub fn checkInputAmount(br: &BitReader) -> bool {
+  return br.next < br.guard
+}
+
+// The bytes from `at` to the end of `src` as the low bytes of a word. C never loads past the end
+// of its input; this keeps a load that would do so defined instead of trapping.
+fn loadTail(src: &[u8], at: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index = at
+  let mut shift: u64 = 0
+  while index < src.length && shift < 64 {
+    value = value | u64.shiftLeft(u8.toU64(src[index]), shift)
+    shift = shift + 8
+    index = index + 1
+  }
+  return value
+}
+
+/// `BROTLI_UNALIGNED_LOAD64LE`.
+@inlineAlways
+pub fn load64(src: &[u8], at: usize) -> u64 {
+  if at > src.length || src.length - at < 8 { return loadTail(src, at) }
+  let bytes = Slice.view<u8>(src, at, 8)
+  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
+    | u64.shiftLeft(u8.toU64(bytes[4]), 32)
+    | u64.shiftLeft(u8.toU64(bytes[5]), 40)
+    | u64.shiftLeft(u8.toU64(bytes[6]), 48)
+    | u64.shiftLeft(u8.toU64(bytes[7]), 56)
+}
+
+/// `BROTLI_UNALIGNED_LOAD32LE`, widened.
+@inlineAlways
+pub fn load32(src: &[u8], at: usize) -> u64 {
+  if at > src.length || src.length - at < 4 { return loadTail(src, at) & 4294967295 }
+  let bytes = Slice.view<u8>(src, at, 4)
+  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
+}
+
+/// `BrotliFillBitWindow` for a constant `n_bits` of at most 8: at least 9 bits afterwards.
+@inlineAlways
+pub fn fillBitWindow8(br: &mut BitReader, src: &[u8]) -> () {
+  let bitPos = br.bitPos
+  if bitPos <= 8 {
+    br.val = br.val | u64.shiftLeft(load64(src, br.next), bitPos)
+    br.bitPos = bitPos + 56
+    br.next = br.next + 7
+  }
+}
+
+/// `BrotliFillBitWindow` for a constant `n_bits` of 9 to 16: at least 17 bits afterwards.
+@inlineAlways
+pub fn fillBitWindow16(br: &mut BitReader, src: &[u8]) -> () {
+  let bitPos = br.bitPos
+  if bitPos <= 16 {
+    br.val = br.val | u64.shiftLeft(load64(src, br.next), bitPos)
+    br.bitPos = bitPos + 48
+    br.next = br.next + 6
+  }
+}
+
+/// `BrotliFillBitWindow` for any other `n_bits` (also `BrotliFillBitWindow16`, which asks for
+/// 17): at least 33 bits afterwards.
+@inlineAlways
+pub fn fillBitWindow32(br: &mut BitReader, src: &[u8]) -> () {
+  let bitPos = br.bitPos
+  if bitPos <= 32 {
+    br.val = br.val | u64.shiftLeft(load32(src, br.next), bitPos)
+    br.bitPos = bitPos + 32
+    br.next = br.next + 4
+  }
+}
+
+/// `BrotliPullByte`: moves one byte of input to the accumulator; false when there is none.
+@inlineAlways
+pub fn pullByte(br: &mut BitReader, src: &[u8]) -> bool {
+  if br.next == br.last { return false }
+  br.val = br.val | u64.shiftLeft(u8.toU64(src[br.next]), br.bitPos & 63)
+  br.bitPos = br.bitPos + 8
+  br.next = br.next + 1
+  return true
+}
+
+/// `BrotliGet16BitsUnmasked`: the accumulator with at least 16 valid bits.
+@inlineAlways
+pub fn get16BitsUnmasked(br: &mut BitReader, src: &[u8]) -> u64 {
+  fillBitWindow16(&mut br, src)
+  return br.val
+}
+
+/// `BrotliSafeGetBits`: makes `nBits` bits available; false when the input ends first. The bits
+/// are then `br.val & bitMask(nBits)`.
+@inlineAlways
+pub fn safeGetBits(br: &mut BitReader, src: &[u8], nBits: u64) -> bool {
+  while br.bitPos < nBits {
+    if !pullByte(&mut br, src) { return false }
+  }
+  return true
+}
+
+/// `BrotliDropBits`.
+@inlineAlways
+pub fn dropBits(br: &mut BitReader, nBits: u64) -> () {
+  br.bitPos = br.bitPos - nBits
+  br.val = u64.shiftRight(br.val, nBits & 63)
+}
+
+/// `BrotliBitReaderNormalize`: clears the bits of the accumulator that are not counted.
+@inlineAlways
+pub fn normalize(br: &mut BitReader) -> () {
+  if br.bitPos < 64 {
+    br.val = br.val & (u64.shiftLeft(1, br.bitPos) - 1)
+  }
+}
+
+/// `BrotliBitReaderUnload`: returns the whole bytes of the accumulator to the source.
+@inlineAlways
+pub fn unload(br: &mut BitReader) -> () {
+  let unusedBytes = u64.shiftRight(br.bitPos, 3)
+  let unusedBits = u64.shiftLeft(unusedBytes, 3)
+  br.next = br.next - u64.wrappingToUsize(unusedBytes)
+  br.bitPos = br.bitPos - unusedBits
+  normalize(&mut br)
+}
+
+/// `BrotliTakeBits`: reads `nBits` bits that the accumulator is known to hold.
+@inlineAlways
+pub fn takeBits(br: &mut BitReader, nBits: u64) -> u64 {
+  let value = br.val & bitMask(nBits)
+  dropBits(&mut br, nBits)
+  return value
+}
+
+/// `BrotliReadBits24` and `BrotliReadBits32` with a variable count: the input is known to
+/// suffice.
+@inlineAlways
+pub fn readBits(br: &mut BitReader, src: &[u8], nBits: u64) -> u64 {
+  fillBitWindow32(&mut br, src)
+  return takeBits(&mut br, nBits)
+}
+
+/// `BrotliSafeReadBits` and `BrotliSafeReadBits32`: reads `nBits` (positive) bits into `value`;
+/// false when the input ends first.
+@inlineAlways
+pub fn safeReadBits(br: &mut BitReader, src: &[u8], nBits: u64, value: &mut u64) -> bool {
+  while br.bitPos < nBits {
+    if !pullByte(&mut br, src) { return false }
+  }
+  value.* = takeBits(&mut br, nBits)
+  return true
+}
+
+/// `BrotliWarmupBitReader`: makes the accumulator hold at least one bit; false when it is empty
+/// and there is no input.
+pub fn warmup(br: &mut BitReader, src: &[u8]) -> bool {
+  if br.bitPos == 0 {
+    br.val = 0
+    if !pullByte(&mut br, src) { return false }
+  }
+  return true
+}
+
+/// `BrotliJumpToByteBoundary`: skips to the next byte boundary; false when a skipped bit is set.
+pub fn jumpToByteBoundary(br: &mut BitReader) -> bool {
+  let padBitsCount = br.bitPos & 7
+  let mut padBits: u64 = 0
+  if padBitsCount != 0 {
+    padBits = takeBits(&mut br, padBitsCount)
+  }
+  normalize(&mut br)
+  return padBits == 0
+}
+
+/// `BrotliDropBytes`.
+@inlineAlways
+pub fn dropBytes(br: &mut BitReader, count: usize) -> () {
+  br.next = br.next + count
+}
+
+/// `BrotliCopyBytes`: copies `count` bytes (at most `remainingBytes`) to `destination` at `at`,
+/// first from the accumulator and then from the source.
+pub fn copyBytes(br: &mut BitReader, src: &[u8], destination: &mut [u8], at: usize, count: usize) -> () {
+  let mut position = at
+  let mut rest = count
+  while br.bitPos >= 8 && rest > 0 {
+    destination[position] = u64.wrappingToU8(br.val)
+    dropBits(&mut br, 8)
+    position = position + 1
+    rest = rest - 1
+  }
+  normalize(&mut br)
+  if rest > 0 {
+    Slice.copyInto<u8>(&mut destination, position, Slice.view<u8>(src, br.next, rest))
+    dropBytes(&mut br, rest)
+  }
+}

@@ -1,0 +1,522 @@
+//! Entropy encoding utilities: a port of google/brotli v1.2.0 `c/enc/entropy_encode.h` and
+//! `entropy_encode.c`.
+import silk.core.ownership { Copy }
+import silk.num.i16
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import enc.constants { INITIAL_REPEATED_CODE_LENGTH }
+
+/// A node of a Huffman tree, `HuffmanTree`.
+pub struct HuffmanTree {
+  pub totalCount: u32,
+  pub indexLeft: i16,
+  pub indexRightOrValue: i16,
+}
+
+impl Copy for HuffmanTree {}
+
+impl HuffmanTree {
+  /// `InitHuffmanTree`.
+  @inlineAlways
+  pub fn make(count: u32, left: i16, right: i16) -> HuffmanTree {
+    return HuffmanTree { totalCount: count, indexLeft: left, indexRightOrValue: right }
+  }
+
+  /// A node for storage that is written before it is read.
+  pub fn empty() -> HuffmanTree {
+    return HuffmanTree { totalCount: 0, indexLeft: 0, indexRightOrValue: 0 }
+  }
+}
+
+/// `BrotliSetDepth`: writes the depth of each leaf under `p0`; false if one is deeper than
+/// `maxDepth`.
+pub fn setDepth(p0: i32, pool: &[HuffmanTree], depth: &mut [u8], maxDepth: i32) -> bool {
+  let mut stack: [i32; 16] = [0; 16]
+  let mut level: i32 = 0
+  let mut p = p0
+  stack[0] = -1
+  while true {
+    let node = pool[i32.toUsize(p)]
+    if node.indexLeft >= 0 {
+      level = level + 1
+      if level > maxDepth { return false }
+      stack[i32.toUsize(level)] = i16.toI32(node.indexRightOrValue)
+      p = i16.toI32(node.indexLeft)
+      continue
+    } else {
+      depth[i16.toUsize(node.indexRightOrValue)] = i32.wrappingToU8(level)
+    }
+    while level >= 0 && stack[i32.toUsize(level)] == -1 { level = level - 1 }
+    if level < 0 { return true }
+    p = stack[i32.toUsize(level)]
+    stack[i32.toUsize(level)] = -1
+  }
+  return true
+}
+
+// The comparators of the two callers of `SortHuffmanTreeItems`: `byValue` is `SortHuffmanTree` of
+// entropy_encode.c (least popular first, then the larger symbol first); without it, the one of
+// brotli_bit_stream.c (by count alone).
+@inlineAlways
+fn before(v0: HuffmanTree, v1: HuffmanTree, byValue: bool) -> bool {
+  if byValue {
+    if v0.totalCount != v1.totalCount { return v0.totalCount < v1.totalCount }
+    return v0.indexRightOrValue > v1.indexRightOrValue
+  }
+  return v0.totalCount < v1.totalCount
+}
+
+const SHELL_GAPS: [usize; 6] = [132, 57, 23, 10, 4, 1]
+
+/// `SortHuffmanTreeItems`: an insertion sort below 13 items and else a Shell sort with the gaps
+/// of `kBrotliShellGaps`. Neither is stable in general, so the order of the steps matters.
+@inlineAlways
+pub fn sortHuffmanTreeItems(items: &mut [HuffmanTree], n: usize, byValue: bool) -> () {
+  if n < 13 {
+    // Insertion sort.
+    let mut i: usize = 1
+    while i < n {
+      let tmp = items[i]
+      let mut k = i
+      let mut j = i - 1
+      while before(tmp, items[j], byValue) {
+        items[k] = items[j]
+        k = j
+        if j == 0 { break }
+        j = j - 1
+      }
+      items[k] = tmp
+      i = i + 1
+    }
+    return ()
+  }
+  // Shell sort.
+  let mut g: usize = if n < 57 { 2 } else { 0 }
+  while g < 6 {
+    let gap = SHELL_GAPS[g]
+    let mut i = gap
+    while i < n {
+      let mut j = i
+      let tmp = items[i]
+      while j >= gap && before(tmp, items[j - gap], byValue) {
+        items[j] = items[j - gap]
+        j = j - gap
+      }
+      items[j] = tmp
+      i = i + 1
+    }
+    g = g + 1
+  }
+}
+
+/// `BrotliCreateHuffmanTree`: the depths of a Huffman code for the counts `data[0..length]`, at
+/// most `treeLimit` bits deep. `tree` needs `2 * length + 1` nodes.
+pub fn createHuffmanTree(data: &[u32], length: usize, treeLimit: i32, tree: &mut [HuffmanTree], depth: &mut [u8]) -> () {
+  let sentinel = HuffmanTree.make(0xffffffff, -1, -1)
+  // For block sizes below 64 kB, we never need to do a second iteration of this loop.
+  let mut countLimit: u32 = 1
+  while true {
+    let mut n: usize = 0
+    let mut i = length
+    while i != 0 {
+      i = i - 1
+      if data[i] != 0 {
+        let count = if data[i] > countLimit { data[i] } else { countLimit }
+        tree[n] = HuffmanTree.make(count, -1, usize.wrappingToI16(i))
+        n = n + 1
+      }
+    }
+    if n == 1 {
+      // Only one element.
+      depth[i16.toUsize(tree[0].indexRightOrValue)] = 1
+      break
+    }
+    sortHuffmanTreeItems(&mut tree, n, true)
+    // The nodes are:
+    //   [0, n): the sorted leaf nodes that we start with.
+    //   [n]: we add a sentinel here.
+    //   [n + 1, 2n): new parent nodes are added here, starting from (n+1). These are naturally
+    //                in ascending order.
+    //   [2n]: we add a sentinel at the end as well.
+    // There will be (2n+1) elements at the end.
+    tree[n] = sentinel
+    tree[n + 1] = sentinel
+    i = 0
+    let mut j = n + 1
+    let mut k = n - 1
+    while k != 0 {
+      let mut left: usize = 0
+      let mut right: usize = 0
+      if tree[i].totalCount <= tree[j].totalCount {
+        left = i
+        i = i + 1
+      } else {
+        left = j
+        j = j + 1
+      }
+      if tree[i].totalCount <= tree[j].totalCount {
+        right = i
+        i = i + 1
+      } else {
+        right = j
+        j = j + 1
+      }
+      // The sentinel node becomes the parent node.
+      let jEnd = 2 * n - k
+      tree[jEnd] = HuffmanTree.make(
+        u32.wrappingAdd(tree[left].totalCount, tree[right].totalCount),
+        usize.wrappingToI16(left),
+        usize.wrappingToI16(right),
+      )
+      // Add back the last sentinel node.
+      tree[jEnd + 1] = sentinel
+      k = k - 1
+    }
+    if setDepth(usize.toI32(2 * n - 1), &tree, &mut depth, treeLimit) {
+      // We need to pack the Huffman tree in treeLimit bits. If this was not successful, add fake
+      // entities to the lowest values and retry.
+      break
+    }
+    countLimit = u32.wrappingMultiply(countLimit, 2)
+  }
+}
+
+fn reverse(v: &mut [u8], from: usize, to: usize) -> () {
+  let mut start = from
+  let mut end = to - 1
+  while start < end {
+    let tmp = v[start]
+    v[start] = v[end]
+    v[end] = tmp
+    start = start + 1
+    end = end - 1
+  }
+}
+
+fn writeHuffmanTreeRepetitions(previousValue: u8, value: u8, count: usize, treeSize: &mut usize, tree: &mut [u8], extraBitsData: &mut [u8]) -> () {
+  let mut repetitions = count
+  let mut size = treeSize.*
+  if previousValue != value {
+    tree[size] = value
+    extraBitsData[size] = 0
+    size = size + 1
+    repetitions = repetitions - 1
+  }
+  if repetitions == 7 {
+    tree[size] = value
+    extraBitsData[size] = 0
+    size = size + 1
+    repetitions = repetitions - 1
+  }
+  if repetitions < 3 {
+    let mut i: usize = 0
+    while i < repetitions {
+      tree[size] = value
+      extraBitsData[size] = 0
+      size = size + 1
+      i = i + 1
+    }
+  } else {
+    let start = size
+    repetitions = repetitions - 3
+    while true {
+      tree[size] = 16
+      extraBitsData[size] = usize.wrappingToU8(repetitions & 0x3)
+      size = size + 1
+      repetitions = usize.shiftRight(repetitions, 2)
+      if repetitions == 0 { break }
+      repetitions = repetitions - 1
+    }
+    reverse(&mut tree, start, size)
+    reverse(&mut extraBitsData, start, size)
+  }
+  treeSize.* = size
+}
+
+fn writeHuffmanTreeRepetitionsZeros(count: usize, treeSize: &mut usize, tree: &mut [u8], extraBitsData: &mut [u8]) -> () {
+  let mut repetitions = count
+  let mut size = treeSize.*
+  if repetitions == 11 {
+    tree[size] = 0
+    extraBitsData[size] = 0
+    size = size + 1
+    repetitions = repetitions - 1
+  }
+  if repetitions < 3 {
+    let mut i: usize = 0
+    while i < repetitions {
+      tree[size] = 0
+      extraBitsData[size] = 0
+      size = size + 1
+      i = i + 1
+    }
+  } else {
+    let start = size
+    repetitions = repetitions - 3
+    while true {
+      tree[size] = 17
+      extraBitsData[size] = usize.wrappingToU8(repetitions & 0x7)
+      size = size + 1
+      repetitions = usize.shiftRight(repetitions, 3)
+      if repetitions == 0 { break }
+      repetitions = repetitions - 1
+    }
+    reverse(&mut tree, start, size)
+    reverse(&mut extraBitsData, start, size)
+  }
+  treeSize.* = size
+}
+
+/// `BrotliOptimizeHuffmanCountsForRle`: changes the counts so that the code lengths of their
+/// Huffman code compress better with run lengths. `goodForRle` needs `length` bytes.
+///
+/// The arithmetic is `size_t` in C; the unsigned wrap-around of the streak test is kept.
+pub fn optimizeHuffmanCountsForRle(fullLength: usize, counts: &mut [u32], goodForRle: &mut [u8]) -> () {
+  let mut length = fullLength
+  let mut nonzeroCount: usize = 0
+  let streakLimit: usize = 1240
+  // Let's make the Huffman code more compatible with RLE encoding.
+  let mut i: usize = 0
+  while i < length {
+    if counts[i] != 0 { nonzeroCount = nonzeroCount + 1 }
+    i = i + 1
+  }
+  if nonzeroCount < 16 { return () }
+  while length != 0 && counts[length - 1] == 0 { length = length - 1 }
+  if length == 0 { return () }
+  // Now counts[0..length - 1] does not have trailing zeros.
+  let mut nonzeros: usize = 0
+  let mut smallestNonzero: u32 = 1073741824
+  i = 0
+  while i < length {
+    if counts[i] != 0 {
+      nonzeros = nonzeros + 1
+      if smallestNonzero > counts[i] { smallestNonzero = counts[i] }
+    }
+    i = i + 1
+  }
+  if nonzeros < 5 {
+    // Small histogram will model it well.
+    return ()
+  }
+  if smallestNonzero < 4 {
+    let zeros = length - nonzeros
+    if zeros < 6 {
+      i = 1
+      while i < length - 1 {
+        if counts[i - 1] != 0 && counts[i] == 0 && counts[i + 1] != 0 { counts[i] = 1 }
+        i = i + 1
+      }
+    }
+  }
+  if nonzeros < 28 { return () }
+  // 2) Let's mark all population counts that already can be encoded with an RLE code.
+  i = 0
+  while i < length {
+    goodForRle[i] = 0
+    i = i + 1
+  }
+  // Let's not spoil any of the existing good RLE codes. Mark any seq of 0's that is longer as 5
+  // as a goodForRle. Mark any seq of non-0's that is longer as 7 as a goodForRle.
+  let mut symbol = counts[0]
+  let mut step: usize = 0
+  i = 0
+  while i <= length {
+    if i == length || counts[i] != symbol {
+      if (symbol == 0 && step >= 5) || (symbol != 0 && step >= 7) {
+        let mut k: usize = 0
+        while k < step {
+          goodForRle[i - k - 1] = 1
+          k = k + 1
+        }
+      }
+      step = 1
+      if i != length { symbol = counts[i] }
+    } else {
+      step = step + 1
+    }
+    i = i + 1
+  }
+  // 3) Let's replace those population counts that lead to more RLE codes. Math here is in 24.8
+  // fixed point representation.
+  let mut stride: usize = 0
+  // counts[0] + counts[1] + counts[2] is a 32-bit sum in C.
+  let mut limit = 256 * u32.toUsize(u32.wrappingAdd(u32.wrappingAdd(counts[0], counts[1]), counts[2])) / 3 + 420
+  let mut sum: usize = 0
+  i = 0
+  while i <= length {
+    let mut ends = i == length
+    if !ends { ends = goodForRle[i] != 0 }
+    if !ends && i != 0 { ends = goodForRle[i - 1] != 0 }
+    if !ends {
+      // 256 * counts[i] is a 32-bit product in C, widened afterwards.
+      let scaled = u32.toUsize(u32.wrappingMultiply(256, counts[i]))
+      ends = usize.wrappingAdd(usize.wrappingSubtract(scaled, limit), streakLimit) >= 2 * streakLimit
+    }
+    if ends {
+      if stride >= 4 || (stride >= 3 && sum == 0) {
+        // The stride must end, collapse what we have, if we have enough (4).
+        let mut count = (sum + stride / 2) / stride
+        if count == 0 { count = 1 }
+        if sum == 0 {
+          // Don't make an all zeros stride to be upgraded to ones.
+          count = 0
+        }
+        let mut k: usize = 0
+        while k < stride {
+          // We don't want to change value at counts[i], that is already belonging to the next
+          // stride. Thus - 1.
+          counts[i - k - 1] = usize.wrappingToU32(count)
+          k = k + 1
+        }
+      }
+      stride = 0
+      sum = 0
+      if i + 2 < length {
+        // All interesting strides have a count of at least 4, at least when non-zeros.
+        limit = 256 * u32.toUsize(u32.wrappingAdd(u32.wrappingAdd(counts[i], counts[i + 1]), counts[i + 2])) / 3 + 420
+      } else if i < length {
+        limit = u32.toUsize(u32.wrappingMultiply(256, counts[i]))
+      } else {
+        limit = 0
+      }
+    }
+    stride = stride + 1
+    if i != length {
+      sum = sum + u32.toUsize(counts[i])
+      if stride >= 4 { limit = (256 * sum + stride / 2) / stride }
+      if stride == 4 { limit = limit + 120 }
+    }
+    i = i + 1
+  }
+}
+
+// `DecideOverRleUse`, returning use_rle_for_non_zero in bit 0 and use_rle_for_zero in bit 1.
+fn decideOverRleUse(depth: &[u8], length: usize) -> u32 {
+  let mut totalRepsZero: usize = 0
+  let mut totalRepsNonZero: usize = 0
+  let mut countRepsZero: usize = 1
+  let mut countRepsNonZero: usize = 1
+  let mut i: usize = 0
+  while i < length {
+    let value = depth[i]
+    let mut reps: usize = 1
+    let mut k = i + 1
+    while k < length && depth[k] == value {
+      reps = reps + 1
+      k = k + 1
+    }
+    if reps >= 3 && value == 0 {
+      totalRepsZero = totalRepsZero + reps
+      countRepsZero = countRepsZero + 1
+    }
+    if reps >= 4 && value != 0 {
+      totalRepsNonZero = totalRepsNonZero + reps
+      countRepsNonZero = countRepsNonZero + 1
+    }
+    i = i + reps
+  }
+  let mut result: u32 = 0
+  if totalRepsNonZero > countRepsNonZero * 2 { result = result | 1 }
+  if totalRepsZero > countRepsZero * 2 { result = result | 2 }
+  return result
+}
+
+/// `BrotliWriteHuffmanTree`: the code lengths `depth[0..length]` as symbols of the code length
+/// alphabet in `tree` and their extra bits in `extraBitsData`, appended at `treeSize`.
+pub fn writeHuffmanTree(depth: &[u8], length: usize, treeSize: &mut usize, tree: &mut [u8], extraBitsData: &mut [u8]) -> () {
+  let mut previousValue = INITIAL_REPEATED_CODE_LENGTH
+  let mut useRleForNonZero = false
+  let mut useRleForZero = false
+  // Throw away trailing zeros.
+  let mut newLength = length
+  let mut i: usize = 0
+  while i < length {
+    if depth[length - i - 1] == 0 {
+      newLength = newLength - 1
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  // First gather statistics on if it is a good idea to do RLE.
+  if length > 50 {
+    // Find RLE coding for longer codes. Shorter codes seem not to benefit from RLE.
+    let use = decideOverRleUse(depth, newLength)
+    useRleForNonZero = (use & 1) != 0
+    useRleForZero = (use & 2) != 0
+  }
+  // Actual RLE coding.
+  i = 0
+  while i < newLength {
+    let value = depth[i]
+    let mut reps: usize = 1
+    if (value != 0 && useRleForNonZero) || (value == 0 && useRleForZero) {
+      let mut k = i + 1
+      while k < newLength && depth[k] == value {
+        reps = reps + 1
+        k = k + 1
+      }
+    }
+    if value == 0 {
+      writeHuffmanTreeRepetitionsZeros(reps, &mut treeSize, &mut tree, &mut extraBitsData)
+    } else {
+      writeHuffmanTreeRepetitions(previousValue, value, reps, &mut treeSize, &mut tree, &mut extraBitsData)
+      previousValue = value
+    }
+    i = i + reps
+  }
+}
+
+// Pre-reversed 4-bit values.
+const REVERSE_LUT: [u16; 16] = [0x00, 0x08, 0x04, 0x0c, 0x02, 0x0a, 0x06, 0x0e, 0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b, 0x07, 0x0f]
+
+@inlineAlways
+fn reverseBits(numBits: usize, value: u16) -> u16 {
+  let mut bits = value
+  let mut retval = u16.toUsize(REVERSE_LUT[u16.toUsize(bits & 0x0f)])
+  let mut i: usize = 4
+  while i < numBits {
+    retval = usize.shiftLeft(retval, 4)
+    bits = u16.shiftRight(bits, 4)
+    retval = retval | u16.toUsize(REVERSE_LUT[u16.toUsize(bits & 0x0f)])
+    i = i + 4
+  }
+  retval = usize.shiftRight(retval, usize.wrappingSubtract(0, numBits) & 0x03)
+  return usize.wrappingToU16(retval)
+}
+
+/// `BrotliConvertBitDepthsToSymbols`: the canonical code words, bit-reversed for the writer, of
+/// the code lengths `depth[0..len]`. Symbols of depth 0 keep what `bits` held.
+pub fn convertBitDepthsToSymbols(depth: &[u8], len: usize, bits: &mut [u16]) -> () {
+  // In Brotli, all bit depths are [1..15]; 0 bit depth means that the symbol does not exist.
+  let mut blCount: [u16; 16] = [0; 16]
+  let mut nextCode: [u16; 16] = [0; 16]
+  let mut i: usize = 0
+  while i < len {
+    let d = u8.toUsize(depth[i])
+    blCount[d] = u16.wrappingAdd(blCount[d], 1)
+    i = i + 1
+  }
+  blCount[0] = 0
+  nextCode[0] = 0
+  let mut code: i32 = 0
+  i = 1
+  while i < 16 {
+    code = i32.wrappingMultiply(i32.wrappingAdd(code, u16.toI32(blCount[i - 1])), 2)
+    nextCode[i] = i32.wrappingToU16(code)
+    i = i + 1
+  }
+  i = 0
+  while i < len {
+    let d = u8.toUsize(depth[i])
+    if d != 0 {
+      bits[i] = reverseBits(d, nextCode[d])
+      nextCode[d] = u16.wrappingAdd(nextCode[d], 1)
+    }
+    i = i + 1
+  }
+}
