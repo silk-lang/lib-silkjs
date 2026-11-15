@@ -24,7 +24,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import enc.find_match_length { findMatchLengthWithLimitUnchecked }
-import enc.hash_base { DictionaryStats, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
+import enc.hash_base { DictionaryStats, checkHashable, checkReadable, signExtend, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
 import enc.memory { bytes, bytesMut, getUncheckedMut, halfwordsMut, setUnchecked, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
 import enc.params { HasherParams }
 import enc.write_bits { byteUnchecked, load32Unchecked, load64Unchecked }
@@ -54,18 +54,11 @@ impl HashWidth for Wide {
   fn wide(self: &Self) -> bool { return true }
 }
 
-// Traps unless `data` holds `maxLength + 8` bytes after every position up to `ringBufferMask`:
-// what the search loops read without bounds checks.
-@inlineAlways
-fn checkReadable(data: &[u8], ringBufferMask: usize, maxLength: usize) -> () {
-  let last = data[ringBufferMask + maxLength + 7]
-}
-
 // The first loop of `FindLongestMatch` of all four hashers: tries the last distances (and the
 // candidates of `PrepareDistanceCache` around them) first.
 //
 // # Gotchas
-// `checkReadable(data, ringBufferMask, maxLength)` must hold.
+// `checkReadable(data, ringBufferMask, curIxMasked, maxLength)` must hold.
 @inlineAlways
 unsafe fn searchLastDistances(
   data: &[u8],
@@ -84,7 +77,7 @@ unsafe fn searchLastDistances(
   let mut bestLen = bestLenRef.*
   let mut i: usize = 0
   while i < numLastDistancesToCheck {
-    let backward = i32.wrappingToUsize(distanceCache[i])
+    let backward = signExtend(distanceCache[i])
     let mut prevIx = usize.wrappingSubtract(curIx, backward)
     i = i + 1
     if prevIx >= curIx {
@@ -141,21 +134,22 @@ unsafe fn hashBytes(wide: bool, data: &[u8], at: usize, shift32: u32, bits64: u6
 // `hashBytes` with a bounds check.
 @inlineAlways
 fn hashBytesChecked(wide: bool, data: &[u8], at: usize, shift32: u32, bits64: u64) -> usize {
-  let last = data[at + 7]
+  let _last = data[at + 7]
   return unsafe hashBytes(wide, data, at, shift32, bits64)
 }
 
 // One candidate of the bucket loops at `prevIxIn`: its match length shifted left by 16, plus 1,
-// or 0 when the C code skips it (the conditions of H5/H58 and of H6/H68).
+// or 0 when the C code skips it (the conditions of H5/H58 and of H6/H68). `lastCur` is
+// `curIxMasked + bestLen`.
 //
 // # Gotchas
-// `checkReadable(data, ringBufferMask, maxLength)` must hold and `bestLen` must be at least 3.
+// `checkReadable(data, ringBufferMask, curIxMasked, maxLength)` must hold and `bestLen` must be at least 3.
 @inlineAlways
-unsafe fn tryCandidate(wide: bool, data: &[u8], ringBufferMask: usize, curIxMasked: usize, prevIxIn: usize, maxLength: usize, bestLen: usize) -> usize {
+unsafe fn tryCandidate(wide: bool, data: &[u8], ringBufferMask: usize, curIxMasked: usize, lastCur: usize, prevIxIn: usize, maxLength: usize, bestLen: usize) -> usize {
   let prevIx = prevIxIn & ringBufferMask
   // Compare 4 bytes ending at bestLen + 1.
   let lastPrev = usize.wrappingAdd(prevIx, bestLen)
-  if lastPrev > ringBufferMask || unsafe load32Unchecked(data, usize.wrappingSubtract(usize.wrappingAdd(curIxMasked, bestLen), 3)) != unsafe load32Unchecked(data, usize.wrappingSubtract(lastPrev, 3)) {
+  if lastPrev > ringBufferMask || unsafe load32Unchecked(data, usize.wrappingSubtract(lastCur, 3)) != unsafe load32Unchecked(data, usize.wrappingSubtract(lastPrev, 3)) {
     return 0
   }
   if wide {
@@ -265,9 +259,9 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
   // REQUIRES: `prepareDistanceCache` must be invoked for current distance cache values; if this
   // method is invoked repeatedly with the same distance cache values, it is enough to invoke
   // `prepareDistanceCache` once.
-  @inlineAlways
+  @inlineNever
   fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
-    checkReadable(data, ringBufferMask, maxLength)
+    checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)
     let wide = HashWidth.wide(&self.width)
     let curIxMasked = curIx & ringBufferMask
     // Don't accept a short copy from far away.
@@ -275,8 +269,8 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
     let mut bestScore = out.score
     let mut bestLen = out.len
     // Precalculate the hash key.
-    let key = unsafe hashBytes(wide, data, curIxMasked, self.hashShift, 15)
-    let bucketStart = usize.shiftLeft(key, self.blockBits)
+    let key = unsafe hashBytes(wide, data, curIxMasked, self.hashShift & 31, 15)
+    let bucketStart = usize.shiftLeft(key, self.blockBits & 63)
     out.len = 0
     out.lenCodeDelta = 0
 
@@ -295,17 +289,20 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
     let down = if count > blockSize { count - blockSize } else { 0 }
     let bucket = wordsMut(&mut self.buckets)
     let mut i = count
+    // C checks `curIxMasked + bestLen > ringBufferMask` before each candidate and stops the loop
+    // when it holds; that changes only with `bestLen`.
+    let mut lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+    if lastCur > ringBufferMask {
+      i = down
+    }
     while i > down {
-      i = i - 1
+      i = usize.wrappingSubtract(i, 1)
       let prevIx = u32.toUsize(unsafe getUncheckedMut<u32>(&mut bucket, usize.wrappingAdd(bucketStart, i & blockMask)))
       let backward = usize.wrappingSubtract(curIx, prevIx)
       if backward > maxBackward {
         break
       }
-      if usize.wrappingAdd(curIxMasked, bestLen) > ringBufferMask {
-        break
-      }
-      let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, prevIx, maxLength, bestLen)
+      let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, lastCur, prevIx, maxLength, bestLen)
       if found != 0 {
         let len = usize.shiftRight(found, 16)
         let score = backwardReferenceScore(len, backward)
@@ -315,6 +312,10 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
           out.len = bestLen
           out.distance = backward
           out.score = bestScore
+          lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+          if lastCur > ringBufferMask {
+            break
+          }
         }
       }
     }
@@ -327,22 +328,28 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
 
   @inlineAlways
   fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
-    let key = hashBytesChecked(HashWidth.wide(&self.width), data, ix & mask, self.hashShift, 15)
-    let blockMask = self.blockMask
-    let blockBits = self.blockBits
-    let num = halfwordsMut(&mut self.num)
-    // `key` is below the bucket size.
-    let count = unsafe getUncheckedMut<u16>(&mut num, key)
-    let offset = (u16.toUsize(count) & blockMask) + usize.shiftLeft(key, blockBits)
-    unsafe setUnchecked<u16>(&mut num, key, u16.wrappingAdd(count, 1))
-    unsafe setUnchecked<u32>(wordsMut(&mut self.buckets), offset, usize.wrappingToU32(ix))
+    MatchFinder.storeRange(&mut self, data, mask, ix, ix + 1)
   }
 
+  @inlineAlways
   fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
-    let mut i = ixStart
-    while i < ixEnd {
-      MatchFinder.store(&mut self, data, mask, i)
-      i = i + 1
+    // The 8 bytes that each position hashes are inside what this checks.
+    checkHashable(data, mask, ixStart, ixEnd, 8)
+    let wide = HashWidth.wide(&self.width)
+    let shift = self.hashShift & 31
+    let blockMask = self.blockMask
+    let blockBits = self.blockBits & 63
+    let num = halfwordsMut(&mut self.num)
+    let buckets = wordsMut(&mut self.buckets)
+    let mut ix = ixStart
+    while ix < ixEnd {
+      let key = unsafe hashBytes(wide, data, ix & mask, shift, 15)
+      // `key` is below the bucket size.
+      let count = unsafe getUncheckedMut<u16>(&mut num, key)
+      let offset = usize.wrappingAdd(u16.toUsize(count) & blockMask, usize.shiftLeft(key, blockBits))
+      unsafe setUnchecked<u16>(&mut num, key, u16.wrappingAdd(count, 1))
+      unsafe setUnchecked<u32>(&mut buckets, offset, usize.wrappingToU32(ix))
+      ix = ix + 1
     }
   }
 }
@@ -472,9 +479,9 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     prepareDistanceCache(&mut distanceCache, usize.toI32(self.numLastDistancesToCheck))
   }
 
-  @inlineAlways
+  @inlineNever
   fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
-    checkReadable(data, ringBufferMask, maxLength)
+    checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)
     let wide = HashWidth.wide(&self.width)
     let curIxMasked = curIx & ringBufferMask
     // Don't accept a short copy from far away.
@@ -482,9 +489,9 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     let mut bestScore = out.score
     let mut bestLen = out.len
     // Precalculate the hash key.
-    let hash = unsafe hashBytes(wide, data, curIxMasked, self.hashShift, 23)
+    let hash = unsafe hashBytes(wide, data, curIxMasked, self.hashShift & 31, 23)
     let key = usize.shiftRight(hash, TAG_HASH_BITS)
-    let bucketStart = usize.shiftLeft(key, self.blockBits)
+    let bucketStart = usize.shiftLeft(key, self.blockBits & 63)
     out.len = 0
     out.lenCodeDelta = 0
 
@@ -511,6 +518,12 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     let mask = u64.wrappingSubtract(u64.shiftLeft(blockHasUnusedSlots, u16.toU64(n & 63)), 1)
     matches = matches & mask
     let bucket = wordsMut(&mut self.buckets)
+    // C checks `curIxMasked + bestLen > ringBufferMask` before each candidate and stops the loop
+    // when it holds; that changes only with `bestLen`.
+    let mut lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+    if lastCur > ringBufferMask {
+      matches = 0
+    }
     while matches > 0 {
       let rbIndex = usize.wrappingAdd(head, u32.toUsize(u64.trailingZeros(matches))) & blockMask
       matches = matches & (matches - 1)
@@ -519,10 +532,7 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
       if backward > maxBackward {
         break
       }
-      if usize.wrappingAdd(curIxMasked, bestLen) > ringBufferMask {
-        break
-      }
-      let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, prevIx, maxLength, bestLen)
+      let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, lastCur, prevIx, maxLength, bestLen)
       if found != 0 {
         let len = usize.shiftRight(found, 16)
         let score = backwardReferenceScore(len, backward)
@@ -532,6 +542,10 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
           out.len = bestLen
           out.distance = backward
           out.score = bestScore
+          lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+          if lastCur > ringBufferMask {
+            break
+          }
         }
       }
     }
@@ -546,24 +560,31 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
 
   @inlineAlways
   fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
-    let hash = hashBytesChecked(HashWidth.wide(&self.width), data, ix & mask, self.hashShift, 23)
-    let key = usize.shiftRight(hash, TAG_HASH_BITS)
-    let blockMask = self.blockMask
-    let blockBits = self.blockBits
-    let num = halfwordsMut(&mut self.num)
-    // `key` is below the bucket size.
-    let count = unsafe getUncheckedMut<u16>(&mut num, key)
-    let offset = (u16.toUsize(count) & blockMask) + usize.shiftLeft(key, blockBits)
-    unsafe setUnchecked<u16>(&mut num, key, u16.wrappingSubtract(count, 1))
-    unsafe setUnchecked<u32>(wordsMut(&mut self.buckets), offset, usize.wrappingToU32(ix))
-    unsafe setUnchecked<u8>(bytesMut(&mut self.tags), offset, usize.wrappingToU8(hash & 0xff))
+    MatchFinder.storeRange(&mut self, data, mask, ix, ix + 1)
   }
 
+  @inlineAlways
   fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
-    let mut i = ixStart
-    while i < ixEnd {
-      MatchFinder.store(&mut self, data, mask, i)
-      i = i + 1
+    // The 8 bytes that each position hashes are inside what this checks.
+    checkHashable(data, mask, ixStart, ixEnd, 8)
+    let wide = HashWidth.wide(&self.width)
+    let shift = self.hashShift & 31
+    let blockMask = self.blockMask
+    let blockBits = self.blockBits & 63
+    let num = halfwordsMut(&mut self.num)
+    let buckets = wordsMut(&mut self.buckets)
+    let tags = bytesMut(&mut self.tags)
+    let mut ix = ixStart
+    while ix < ixEnd {
+      let hash = unsafe hashBytes(wide, data, ix & mask, shift, 23)
+      let key = usize.shiftRight(hash, TAG_HASH_BITS)
+      // `key` is below the bucket size.
+      let count = unsafe getUncheckedMut<u16>(&mut num, key)
+      let offset = usize.wrappingAdd(u16.toUsize(count) & blockMask, usize.shiftLeft(key, blockBits))
+      unsafe setUnchecked<u16>(&mut num, key, u16.wrappingSubtract(count, 1))
+      unsafe setUnchecked<u32>(&mut buckets, offset, usize.wrappingToU32(ix))
+      unsafe setUnchecked<u8>(&mut tags, offset, usize.wrappingToU8(hash & 0xff))
+      ix = ix + 1
     }
   }
 }

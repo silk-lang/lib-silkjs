@@ -12,10 +12,10 @@ import silk.num.i32
 import silk.num.u16
 import silk.num.u32
 import silk.num.usize
-import enc.find_match_length { findMatchLengthWithLimit }
-import enc.hash_base { DictionaryStats, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
-import enc.memory { bytesMut, halfwordsMut, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
-import enc.write_bits { load32 }
+import enc.find_match_length { findMatchLengthWithLimitUnchecked }
+import enc.hash_base { DictionaryStats, checkHashable, checkReadable, signExtend, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
+import enc.memory { bytesMut, getUncheckedMut, halfwordsMut, setUnchecked, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
+import enc.write_bits { load32Unchecked }
 
 // `BUCKET_BITS`: the number of hash buckets is `1 << BUCKET_BITS`.
 const BUCKET_BITS: u32 = 15
@@ -105,7 +105,14 @@ impl<C: ForgetfulChainConfig> HashForgetfulChain<C> {
   // `HashBytes`.
   @inlineAlways
   fn hashBytes(data: &[u8], at: usize) -> usize {
-    let h = u32.wrappingMultiply(load32(data, at), HASH_MUL_32)
+    let _last = data[at + 3]
+    return unsafe HashForgetfulChain<C>.hashBytesUnchecked(data, at)
+  }
+
+  // `hashBytes` without a bounds check: the caller proves that `data` has 4 bytes at `at`.
+  @inlineAlways
+  unsafe fn hashBytesUnchecked(data: &[u8], at: usize) -> usize {
+    let h = u32.wrappingMultiply(unsafe load32Unchecked(data, at), HASH_MUL_32)
     // The higher bits contain more mixture from the multiplication, so we take our results from
     // there.
     return u32.toUsize(u32.shiftRight(h, 32 - BUCKET_BITS))
@@ -176,36 +183,38 @@ impl<C: ForgetfulChainConfig> MatchFinder for HashForgetfulChain<C> {
   // REQUIRES: `prepareDistanceCache` must be invoked for current distance cache values; if this
   // method is invoked repeatedly with the same distance cache values, it is enough to invoke
   // `prepareDistanceCache` once.
-  @inlineAlways
+  @inlineNever
   fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
+    // The reads of `data` below are inside what this checks.
+    checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)
     let curIxMasked = curIx & ringBufferMask
     // Don't accept a short copy from far away.
     let minScore = out.score
     let mut bestScore = out.score
     let mut bestLen = out.len
-    let key = HashForgetfulChain<C>.hashBytes(data, curIxMasked)
+    let key = unsafe HashForgetfulChain<C>.hashBytesUnchecked(data, curIxMasked)
     let tinyHash = usize.wrappingToU8(key & 0xff)
     out.len = 0
     out.lenCodeDelta = 0
 
-    // Try last distance first.
+    // Try last distance first. The tiny hashes are indexed by 16 bits, the cache has 16 entries.
     let tinyHashes = bytesMut(&mut self.tinyHash)
     let numLast = ForgetfulChainConfig.numLastDistancesToCheck(&self.config)
     let mut i: usize = 0
     while i < numLast {
-      let backward = i32.wrappingToUsize(distanceCache[i])
+      let backward = signExtend(distanceCache[i])
       let mut prevIx = usize.wrappingSubtract(curIx, backward)
       let index = i
       i = i + 1
       // For distance code 0 we want to consider 2-byte matches.
-      if index > 0 && tinyHashes[prevIx & 0xffff] != tinyHash {
+      if index > 0 && unsafe getUncheckedMut<u8>(&mut tinyHashes, prevIx & 0xffff) != tinyHash {
         continue
       }
       if prevIx >= curIx || backward > maxBackward {
         continue
       }
       prevIx = prevIx & ringBufferMask
-      let len = findMatchLengthWithLimit(data, prevIx, curIxMasked, maxLength)
+      let len = unsafe findMatchLengthWithLimitUnchecked(data, prevIx, curIxMasked, maxLength)
       if len >= 2 {
         let mut score = backwardReferenceScoreUsingLastDistance(len)
         if bestScore < score {
@@ -228,12 +237,20 @@ impl<C: ForgetfulChainConfig> MatchFinder for HashForgetfulChain<C> {
       bestLen = 3
     }
     let bankMask = ForgetfulChainConfig.numBanks(&self.config) - 1
-    let bankBase = usize.shiftLeft(key & bankMask, ForgetfulChainConfig.bankBits(&self.config))
+    let bankBits = ForgetfulChainConfig.bankBits(&self.config)
+    let bankBase = usize.shiftLeft(key & bankMask, bankBits)
     let banks = wordsMut(&mut self.banks)
     let mut backward: usize = 0
     let mut hops = self.maxHops
-    let mut delta = usize.wrappingSubtract(curIx, u32.toUsize(wordsMut(&mut self.addr)[key]))
-    let mut slot = u16.toUsize(halfwordsMut(&mut self.head)[key])
+    // `key` is below the bucket size.
+    let mut delta = usize.wrappingSubtract(curIx, u32.toUsize(unsafe getUncheckedMut<u32>(&mut wordsMut(&mut self.addr), key)))
+    let mut slot = u16.toUsize(unsafe getUncheckedMut<u16>(&mut halfwordsMut(&mut self.head), key))
+    // C skips each candidate while `curIxMasked + bestLen > ringBufferMask`, which changes only
+    // with `bestLen`: then the rest of the chain is walked for nothing.
+    let mut lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+    if lastCur > ringBufferMask {
+      hops = 0
+    }
     while hops != 0 {
       hops = hops - 1
       let last = slot
@@ -242,14 +259,17 @@ impl<C: ForgetfulChainConfig> MatchFinder for HashForgetfulChain<C> {
         break
       }
       let prevIx = usize.wrappingSubtract(curIx, backward) & ringBufferMask
-      let node = banks[bankBase + last]
+      // A slot index that is not below the bank size is never reached: the node that holds it has
+      // the delta 0xffff, which is more than any `maxBackward` of the windows of these hashers.
+      let node = banks[usize.wrappingAdd(bankBase, last)]
       slot = u32.toUsize(u32.shiftRight(node, 16))
       delta = u32.toUsize(node & 0xffff)
       // Compare 4 bytes ending at bestLen + 1.
-      if curIxMasked + bestLen > ringBufferMask || prevIx + bestLen > ringBufferMask || load32(data, curIxMasked + bestLen - 3) != load32(data, prevIx + bestLen - 3) {
+      let lastPrev = usize.wrappingAdd(prevIx, bestLen)
+      if lastPrev > ringBufferMask || unsafe load32Unchecked(data, usize.wrappingSubtract(lastCur, 3)) != unsafe load32Unchecked(data, usize.wrappingSubtract(lastPrev, 3)) {
         continue
       }
-      let len = findMatchLengthWithLimit(data, prevIx, curIxMasked, maxLength)
+      let len = unsafe findMatchLengthWithLimitUnchecked(data, prevIx, curIxMasked, maxLength)
       if len >= 4 {
         // Comparing for >= 3 does not change the semantics, but just saves for a few unnecessary
         // binary logarithms in backward reference score, since we are not interested in such
@@ -261,6 +281,10 @@ impl<C: ForgetfulChainConfig> MatchFinder for HashForgetfulChain<C> {
           out.len = bestLen
           out.distance = backward
           out.score = bestScore
+          lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+          if lastCur > ringBufferMask {
+            break
+          }
         }
       }
     }
@@ -270,35 +294,44 @@ impl<C: ForgetfulChainConfig> MatchFinder for HashForgetfulChain<C> {
     }
   }
 
+  @inlineAlways
+  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
+    MatchFinder.storeRange(&mut self, data, mask, ix, ix + 1)
+  }
+
   // Looks at 4 bytes at `data[ix & mask]`. Computes a hash from these, and prepends a node to the
   // corresponding chain; also updates `tinyHash` for the current position.
   @inlineAlways
-  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
-    let key = HashForgetfulChain<C>.hashBytes(data, ix & mask)
-    let bank = key & (ForgetfulChainConfig.numBanks(&self.config) - 1)
+  fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
+    // The 4 bytes that each position hashes are inside what this checks.
+    checkHashable(data, mask, ixStart, ixEnd, 4)
+    let bankMask = ForgetfulChainConfig.numBanks(&self.config) - 1
     let bankBits = ForgetfulChainConfig.bankBits(&self.config)
+    let slotMask = usize.shiftLeft(1, bankBits) - 1
+    // The keys are below the bucket size and the banks below their number; the tiny hashes are
+    // indexed by 16 bits.
     let free = List<u16>.asMutSlice(&mut self.freeSlotIdx)
-    let idx = u16.toUsize(free[bank]) & (usize.shiftLeft(1, bankBits) - 1)
-    free[bank] = u16.wrappingAdd(free[bank], 1)
     let addr = wordsMut(&mut self.addr)
     let head = halfwordsMut(&mut self.head)
-    let mut delta = usize.wrappingSubtract(ix, u32.toUsize(addr[key]))
     let tinyHash = bytesMut(&mut self.tinyHash)
-    tinyHash[ix & 0xffff] = usize.wrappingToU8(key & 0xff)
-    if delta > 0xffff {
-      delta = 0xffff
-    }
     let banks = wordsMut(&mut self.banks)
-    banks[usize.shiftLeft(bank, bankBits) + idx] = usize.wrappingToU32(delta) | u32.shiftLeft(u16.toU32(head[key]), 16)
-    addr[key] = usize.wrappingToU32(ix)
-    head[key] = usize.wrappingToU16(idx)
-  }
-
-  fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
-    let mut i = ixStart
-    while i < ixEnd {
-      MatchFinder.store(&mut self, data, mask, i)
-      i = i + 1
+    let mut ix = ixStart
+    while ix < ixEnd {
+      let key = unsafe HashForgetfulChain<C>.hashBytesUnchecked(data, ix & mask)
+      let bank = key & bankMask
+      let freeSlot = unsafe getUncheckedMut<u16>(&mut free, bank)
+      let idx = u16.toUsize(freeSlot) & slotMask
+      unsafe setUnchecked<u16>(&mut free, bank, u16.wrappingAdd(freeSlot, 1))
+      let mut delta = usize.wrappingSubtract(ix, u32.toUsize(unsafe getUncheckedMut<u32>(&mut addr, key)))
+      unsafe setUnchecked<u8>(&mut tinyHash, ix & 0xffff, usize.wrappingToU8(key & 0xff))
+      if delta > 0xffff {
+        delta = 0xffff
+      }
+      let next = u16.toU32(unsafe getUncheckedMut<u16>(&mut head, key))
+      unsafe setUnchecked<u32>(&mut banks, usize.wrappingAdd(usize.shiftLeft(bank, bankBits), idx), usize.wrappingToU32(delta) | u32.shiftLeft(next, 16))
+      unsafe setUnchecked<u32>(&mut addr, key, usize.wrappingToU32(ix))
+      unsafe setUnchecked<u16>(&mut head, key, usize.wrappingToU16(idx))
+      ix = ix + 1
     }
   }
 }
