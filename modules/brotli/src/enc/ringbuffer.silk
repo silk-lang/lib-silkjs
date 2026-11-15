@@ -1,0 +1,176 @@
+//! The sliding window over the input data: a port of google/brotli v1.2.0 `c/enc/ringbuffer.h`.
+//!
+//! A `RingBuffer(window_bits, tail_bits)` contains `1 << window_bits` bytes of data in a circular
+//! manner: writing a byte writes it to `position() % (1 << window_bits)`. For convenience, the
+//! array contains another copy of the first `1 << tail_bits` bytes:
+//! `buffer[i] == buffer[i + (1 << window_bits)]` if `i < (1 << tail_bits)`, and another copy of
+//! the last two bytes before the start: `buffer[-1] == buffer[(1 << window_bits) - 1]` and
+//! `buffer[-2] == buffer[(1 << window_bits) - 2]`.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import enc.memory { zeroedBytes }
+import enc.params { EncoderParams, computeRbBits }
+
+const SLACK_FOR_EIGHT_BYTE_HASHING_EVERYWHERE: usize = 7
+
+/// The offset of `buffer_` in `data_`: the two bytes before the start.
+pub const BUFFER_OFFSET: usize = 2
+
+/// `RingBuffer`.
+pub struct RingBuffer {
+  /// The size of the ring buffer is `(1 << window_bits) + tailSize`.
+  pub size: u32,
+  pub mask: u32,
+  pub tailSize: u32,
+  pub totalSize: u32,
+  pub curSize: u32,
+  /// The position to write in the ring buffer.
+  pub pos: u32,
+  /// `data_`: the copy of the last two bytes, the data, and the copy of the beginning as a tail.
+  /// `buffer_` of the C code starts `BUFFER_OFFSET` bytes into it.
+  data: Intrinsic.RawBuffer<u8>,
+  /// Whether `data_` is allocated (`buffer_ != NULL`).
+  pub allocated: bool,
+}
+
+impl RingBuffer {
+  /// `RingBufferInit`.
+  pub effect fn make() -> RingBuffer ! OutOfMemoryError ? &mut Allocator {
+    return RingBuffer { size: 0, mask: 0, tailSize: 0, totalSize: 0, curSize: 0, pos: 0, data: run zeroedBytes(0), allocated: false }
+  }
+
+  /// `RingBufferSetup`.
+  pub fn setup(self: &mut Self, params: &EncoderParams) -> () {
+    let windowBits = i32.toU32(computeRbBits(params))
+    let tailBits = i32.toU32(params.lgblock)
+    self.size = u32.shiftLeft(1, windowBits)
+    self.mask = u32.shiftLeft(1, windowBits) - 1
+    self.tailSize = u32.shiftLeft(1, tailBits)
+    self.totalSize = u32.wrappingAdd(self.size, self.tailSize)
+  }
+
+  /// `data_`, all of it: `buffer_[i]` is at `BUFFER_OFFSET + i`.
+  @inlineAlways
+  pub fn bytes(self: &Self) -> &[u8] {
+    return unsafe RawBuffer.view<u8>(&self.data, 0, RawBuffer.count<u8>(&self.data))
+  }
+
+  @inlineAlways
+  fn bytesMut(self: &mut Self) -> &mut [u8] {
+    let count = RawBuffer.count<u8>(&self.data)
+    return unsafe RawBuffer.viewMut<u8>(&mut self.data, 0, count)
+  }
+
+  /// `buffer_`: the ring buffer from its position 0, with the tail and the slack after it.
+  @inlineAlways
+  pub fn buffer(self: &Self) -> &[u8] {
+    let count = RawBuffer.count<u8>(&self.data)
+    if count < BUFFER_OFFSET { return unsafe RawBuffer.view<u8>(&self.data, 0, 0) }
+    return unsafe RawBuffer.view<u8>(&self.data, BUFFER_OFFSET, count - BUFFER_OFFSET)
+  }
+
+  // `RingBufferInitBuffer`: allocates or re-allocates `data_` to the given length plus some slack
+  // region before and after. The slack regions are zero.
+  effect fn initBuffer(self: &mut Self, buflen: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let newSize = 2 + u32.toUsize(buflen) + SLACK_FOR_EIGHT_BYTE_HASHING_EVERYWHERE
+    // C uses malloc and initializes what it reads; see `enc.memory`.
+    let mut newData = run zeroedBytes(newSize)
+    if self.allocated {
+      let keep = 2 + u32.toUsize(self.curSize) + SLACK_FOR_EIGHT_BYTE_HASHING_EVERYWHERE
+      let source = unsafe RawBuffer.view<u8>(&self.data, 0, keep)
+      Slice.copyInto<u8>(unsafe RawBuffer.viewMut<u8>(&mut newData, 0, newSize), 0, source)
+    }
+    self.data = move newData
+    self.allocated = true
+    self.curSize = buflen
+    let buffer = RingBuffer.bytesMut(&mut self)
+    buffer[0] = 0
+    buffer[1] = 0
+    let mut i: usize = 0
+    while i < SLACK_FOR_EIGHT_BYTE_HASHING_EVERYWHERE {
+      buffer[BUFFER_OFFSET + u32.toUsize(buflen) + i] = 0
+      i = i + 1
+    }
+  }
+
+  // `RingBufferWriteTail`.
+  fn writeTail(self: &mut Self, bytes: &[u8], n: usize) -> () {
+    let maskedPos = u32.toUsize(self.pos & self.mask)
+    let tailSize = u32.toUsize(self.tailSize)
+    if maskedPos < tailSize {
+      // Just fill the tail buffer with the beginning data.
+      let p = u32.toUsize(self.size) + maskedPos
+      let count = if n < tailSize - maskedPos { n } else { tailSize - maskedPos }
+      Slice.copyInto<u8>(RingBuffer.bytesMut(&mut self), BUFFER_OFFSET + p, Slice.view<u8>(bytes, 0, count))
+    }
+  }
+
+  /// `RingBufferWrite`: pushes `bytes` into the ring buffer.
+  pub effect fn write(self: &mut Self, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let n = bytes.length
+    if self.pos == 0 && n < u32.toUsize(self.tailSize) {
+      // Special case for the first write: to process the first block, we don't need to allocate
+      // the whole ring-buffer and we don't need the tail either. However, we do this memory usage
+      // optimization only if the first write is less than the tail size, which is also the input
+      // block size, otherwise it is likely that other blocks will follow and we will need to
+      // reallocate to the full size anyway.
+      self.pos = usize.toU32(n)
+      run RingBuffer.initBuffer(&mut self, self.pos)
+      Slice.copyInto<u8>(RingBuffer.bytesMut(&mut self), BUFFER_OFFSET, bytes)
+      return ()
+    }
+    let size = u32.toUsize(self.size)
+    if self.curSize < self.totalSize {
+      // Lazily allocate the full buffer.
+      run RingBuffer.initBuffer(&mut self, self.totalSize)
+      let buffer = RingBuffer.bytesMut(&mut self)
+      // Initialize the last two bytes to zero, so that we don't have to worry later when we copy
+      // the last two bytes to the first two positions.
+      buffer[BUFFER_OFFSET + size - 2] = 0
+      buffer[BUFFER_OFFSET + size - 1] = 0
+      // Initialize tail; might be touched by "best_len++" optimization when ring buffer is "full".
+      buffer[BUFFER_OFFSET + size] = 241
+    }
+    let maskedPos = u32.toUsize(self.pos & self.mask)
+    // The length of the writes is limited so that we do not need to worry about a write wrapping
+    // around more than once.
+    RingBuffer.writeTail(&mut self, bytes, n)
+    if maskedPos + n <= size {
+      // A single write fits.
+      Slice.copyInto<u8>(RingBuffer.bytesMut(&mut self), BUFFER_OFFSET + maskedPos, bytes)
+    } else {
+      // Split into two writes. Copy into the end of the buffer, including the tail buffer.
+      let totalSize = u32.toUsize(self.totalSize)
+      let first = if n < totalSize - maskedPos { n } else { totalSize - maskedPos }
+      Slice.copyInto<u8>(RingBuffer.bytesMut(&mut self), BUFFER_OFFSET + maskedPos, Slice.view<u8>(bytes, 0, first))
+      // Copy into the beginning of the buffer.
+      let head = size - maskedPos
+      Slice.copyInto<u8>(RingBuffer.bytesMut(&mut self), BUFFER_OFFSET, Slice.view<u8>(bytes, head, n - head))
+    }
+    let notFirstLap = (self.pos & 0x80000000) != 0
+    let rbPosMask: u32 = 0x7fffffff
+    let buffer = RingBuffer.bytesMut(&mut self)
+    buffer[0] = buffer[BUFFER_OFFSET + size - 2]
+    buffer[1] = buffer[BUFFER_OFFSET + size - 1]
+    self.pos = u32.wrappingAdd(self.pos & rbPosMask, usize.wrappingToU32(n) & rbPosMask)
+    if notFirstLap {
+      // Wrap, but preserve not-a-first-lap feature.
+      self.pos = self.pos | 0x80000000
+    }
+  }
+
+  /// The `memset(buffer_ + pos_, 0, 7)` of `CopyInputToRingBuffer`.
+  pub fn clearSlack(self: &mut Self) -> () {
+    let at = BUFFER_OFFSET + u32.toUsize(self.pos)
+    let buffer = RingBuffer.bytesMut(&mut self)
+    let mut i: usize = 0
+    while i < 7 {
+      buffer[at + i] = 0
+      i = i + 1
+    }
+  }
+}

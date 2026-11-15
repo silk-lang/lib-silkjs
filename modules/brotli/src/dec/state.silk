@@ -1,0 +1,450 @@
+//! The decoder state: a port of google/brotli v1.2.0 `c/dec/state.h` and `c/dec/state.c`.
+//!
+//! Pointers of the C state are positions here: a Huffman table is a position in the buffer that
+//! holds it, a context map slice a position in its map. A tree group keeps, like C, one
+//! allocation: first the position of each tree, then the tables.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.num.u64
+import dec.bit_reader { BitReader }
+import dec.bit_reader
+
+// `BrotliRunningState`.
+pub const STATE_UNINITED: u32 = 0
+pub const STATE_LARGE_WINDOW_BITS: u32 = 1
+pub const STATE_INITIALIZE: u32 = 2
+pub const STATE_METABLOCK_BEGIN: u32 = 3
+pub const STATE_METABLOCK_HEADER: u32 = 4
+pub const STATE_METABLOCK_HEADER_2: u32 = 5
+pub const STATE_CONTEXT_MODES: u32 = 6
+pub const STATE_COMMAND_BEGIN: u32 = 7
+pub const STATE_COMMAND_INNER: u32 = 8
+pub const STATE_COMMAND_POST_DECODE_LITERALS: u32 = 9
+pub const STATE_COMMAND_POST_WRAP_COPY: u32 = 10
+pub const STATE_UNCOMPRESSED: u32 = 11
+pub const STATE_METADATA: u32 = 12
+pub const STATE_COMMAND_INNER_WRITE: u32 = 13
+pub const STATE_METABLOCK_DONE: u32 = 14
+pub const STATE_COMMAND_POST_WRITE_1: u32 = 15
+pub const STATE_COMMAND_POST_WRITE_2: u32 = 16
+pub const STATE_BEFORE_COMPRESSED_METABLOCK_HEADER: u32 = 17
+pub const STATE_HUFFMAN_CODE_0: u32 = 18
+pub const STATE_HUFFMAN_CODE_1: u32 = 19
+pub const STATE_HUFFMAN_CODE_2: u32 = 20
+pub const STATE_HUFFMAN_CODE_3: u32 = 21
+pub const STATE_CONTEXT_MAP_1: u32 = 22
+pub const STATE_CONTEXT_MAP_2: u32 = 23
+pub const STATE_TREE_GROUP: u32 = 24
+pub const STATE_BEFORE_COMPRESSED_METABLOCK_BODY: u32 = 25
+pub const STATE_DONE: u32 = 26
+
+// `BrotliRunningMetablockHeaderState`.
+pub const HEADER_NONE: u32 = 0
+pub const HEADER_EMPTY: u32 = 1
+pub const HEADER_NIBBLES: u32 = 2
+pub const HEADER_SIZE: u32 = 3
+pub const HEADER_UNCOMPRESSED: u32 = 4
+pub const HEADER_RESERVED: u32 = 5
+pub const HEADER_BYTES: u32 = 6
+pub const HEADER_METADATA: u32 = 7
+
+// `BrotliRunningUncompressedState`.
+pub const UNCOMPRESSED_NONE: u32 = 0
+pub const UNCOMPRESSED_WRITE: u32 = 1
+
+// `BrotliRunningTreeGroupState`.
+pub const TREE_GROUP_NONE: u32 = 0
+pub const TREE_GROUP_LOOP: u32 = 1
+
+// `BrotliRunningContextMapState`.
+pub const CONTEXT_MAP_NONE: u32 = 0
+pub const CONTEXT_MAP_READ_PREFIX: u32 = 1
+pub const CONTEXT_MAP_HUFFMAN: u32 = 2
+pub const CONTEXT_MAP_DECODE: u32 = 3
+pub const CONTEXT_MAP_TRANSFORM: u32 = 4
+
+// `BrotliRunningHuffmanState`.
+pub const HUFFMAN_NONE: u32 = 0
+pub const HUFFMAN_SIMPLE_SIZE: u32 = 1
+pub const HUFFMAN_SIMPLE_READ: u32 = 2
+pub const HUFFMAN_SIMPLE_BUILD: u32 = 3
+pub const HUFFMAN_COMPLEX: u32 = 4
+pub const HUFFMAN_LENGTH_SYMBOLS: u32 = 5
+
+// `BrotliRunningDecodeUint8State`.
+pub const DECODE_UINT8_NONE: u32 = 0
+pub const DECODE_UINT8_SHORT: u32 = 1
+pub const DECODE_UINT8_LONG: u32 = 2
+
+// `BrotliRunningReadBlockLengthState`.
+pub const READ_BLOCK_LENGTH_NONE: u32 = 0
+pub const READ_BLOCK_LENGTH_SUFFIX: u32 = 1
+
+/// `BROTLI_BLOCK_SIZE_CAP`: the block length when there is no block switching.
+pub const BLOCK_SIZE_CAP: u64 = 16777216
+
+/// `HuffmanTreeGroup`: a collection of Huffman trees with the same alphabet size.
+pub struct HuffmanTreeGroup {
+  /// C's `htrees` and `codes` in their one allocation: `numHtrees` positions (each the start of
+  /// a tree in this buffer), then the tables. Empty when C's pointers are null.
+  pub codes: Intrinsic.RawBuffer<u32>,
+  pub alphabetSizeMax: u64,
+  pub alphabetSizeLimit: u64,
+  pub numHtrees: u64,
+}
+
+/// `BrotliDecoderCompoundDictionary`. C allocates it at the first attached dictionary; here it is
+/// absent while `numChunks` is 0.
+pub struct CompoundDictionary {
+  pub numChunks: i32,
+  pub totalSize: i32,
+  pub brIndex: i32,
+  pub brOffset: i32,
+  pub brLength: i32,
+  pub brCopied: i32,
+  /// The bytes of all chunks, one after another: chunk `i` starts at `chunkOffsets[i]`. C keeps
+  /// pointers to the caller's memory instead.
+  pub data: List<u8>,
+  pub chunkOffsets: [i32; 16],
+  pub blockBits: i32,
+  pub blockMap: [u8; 256],
+}
+
+/// `BrotliDecoderStateStruct`. The members of C's `arena` union (the meta-block header arena and
+/// the body arena) are plain fields: no code reads one member after writing the other.
+pub struct State {
+  pub state: u32,
+  /// This counter is reused for several disjoint loops.
+  pub loopCounter: i32,
+  pub br: BitReader,
+  /// Temporary storage for remaining input. The stream format is designed so that 64 bits are
+  /// enough to make progress in decoding.
+  pub buffer: [u8; 8],
+  pub bufferLength: usize,
+  pub pos: i32,
+  pub maxBackwardDistance: i32,
+  pub maxDistance: i32,
+  pub ringbufferSize: i32,
+  pub ringbufferMask: i32,
+  pub distRbIdx: i32,
+  pub distRb: [i32; 4],
+  pub errorCode: i32,
+  pub metaBlockRemainingLen: i32,
+  /// `ringbuffer_size + kRingBufferWriteAheadSlack` bytes; empty when C's pointer is null.
+  pub ringbuffer: Intrinsic.RawBuffer<u8>,
+  /// The position of the current command tree in `insertCopyHgroup.codes`.
+  pub htreeCommand: usize,
+  /// `context_lookup`: the position of the current context mode's table in the lookup table.
+  pub contextLookup: usize,
+  /// The position of the current literal block type's contexts in `contextMap`.
+  pub contextMapSlice: usize,
+  /// The position of the current distance block type's contexts in `distContextMap`.
+  pub distContextMapSlice: usize,
+  pub literalHgroup: HuffmanTreeGroup,
+  pub insertCopyHgroup: HuffmanTreeGroup,
+  pub distanceHgroup: HuffmanTreeGroup,
+  /// `block_type_trees` and `block_len_trees` in their one allocation: three block type tables,
+  /// then three block length tables.
+  pub blockTrees: Intrinsic.RawBuffer<u32>,
+  /// True if the literal context map always gives the same tree for the block type, so the
+  /// context need not be kept.
+  pub trivialLiteralContext: bool,
+  /// The distance context is actual after a command is decoded and before the distance is
+  /// computed. After that it is used as a temporary variable.
+  pub distanceContext: i32,
+  pub blockLength: [u64; 3],
+  pub blockLengthIndex: u64,
+  pub numBlockTypes: [u64; 3],
+  pub blockTypeRb: [u64; 6],
+  pub distancePostfixBits: u64,
+  pub numDirectDistanceCodes: u64,
+  pub numDistHtrees: u64,
+  pub distContextMap: Intrinsic.RawBuffer<u8>,
+  /// The position of the current literal tree in `literalHgroup.codes`.
+  pub literalHtree: usize,
+  /// How many times the output went around the ring buffer.
+  pub rbRoundtrips: usize,
+  /// How much output was given to the caller in total.
+  pub partialPosOut: usize,
+  pub mtfUpperBound: u64,
+  /// C's `mtf` words as bytes: the list starts at position 4, so that C's index -1 exists.
+  pub mtf: [u8; 260],
+  pub copyLength: i32,
+  pub distanceCode: i32,
+  pub distHtreeIndex: usize,
+  /// How many bytes of input are consumed.
+  pub usedInput: u64,
+  pub substateMetablockHeader: u32,
+  pub substateUncompressed: u32,
+  pub substateDecodeUint8: u32,
+  pub substateReadBlockLength: u32,
+  pub newRingbufferSize: i32,
+  pub isLastMetablock: bool,
+  pub isUncompressed: bool,
+  pub isMetadata: bool,
+  pub shouldWrapRingbuffer: bool,
+  pub cannyRingbufferAllocation: bool,
+  pub largeWindow: bool,
+  pub windowBits: u32,
+  pub sizeNibbles: u32,
+  pub numLiteralHtrees: u64,
+  pub contextMap: Intrinsic.RawBuffer<u8>,
+  pub contextModes: Intrinsic.RawBuffer<u8>,
+  pub compound: CompoundDictionary,
+  /// 256 bits.
+  pub trivialLiteralContexts: [u32; 8],
+
+  // `BrotliMetablockHeaderArena`.
+  pub substateTreeGroup: u32,
+  pub substateContextMap: u32,
+  pub substateHuffman: u32,
+  pub subLoopCounter: u64,
+  pub repeatCodeLen: u64,
+  pub prevCodeLen: u64,
+  pub symbol: u64,
+  pub repeat: u64,
+  pub space: u64,
+  /// The Huffman table for the code lengths.
+  pub table: [u32; 32],
+  /// `symbols_lists_array`. C's `symbol_lists` points 16 entries in, so that the heads of the
+  /// symbol chains have the indices -16 to -1: C index `i` is position `i + 16` here.
+  pub symbolsListsArray: [u16; 720],
+  /// The tails of the symbol chains.
+  pub nextSymbol: [i32; 32],
+  pub codeLengthCodeLengths: [u8; 18],
+  /// The population counts of the code lengths.
+  pub codeLengthHisto: [u16; 16],
+  pub htreeIndex: u64,
+  /// The position of the next tree in the buffer of the group that is being decoded.
+  pub next: usize,
+  pub contextIndex: u64,
+  pub maxRunLengthPrefix: u64,
+  pub code: u64,
+  pub contextMapTable: [u32; 646],
+
+  // `BrotliMetablockBodyArena`.
+  pub distExtraBits: [u8; 544],
+  pub distOffset: [u64; 544],
+
+  // The progress of the running `decompressStream` call: C's `*next_in` and `*next_out` as
+  // positions in the call's input and output.
+  pub inPos: usize,
+  pub outPos: usize,
+}
+
+/// An empty buffer of bytes: C's null pointer.
+@inlineAlways
+pub fn noBytes() -> Intrinsic.RawBuffer<u8> {
+  return Intrinsic.rawBufferEmpty<u8>()
+}
+
+/// An empty buffer of table entries: C's null pointer.
+@inlineAlways
+pub fn noWords() -> Intrinsic.RawBuffer<u32> {
+  return Intrinsic.rawBufferEmpty<u32>()
+}
+
+/// `BROTLI_DECODER_ALLOC` for `count` bytes, which start as zero.
+pub effect fn allocBytes(count: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: count, alignment: 1 })
+  // The allocation holds `count` bytes, all zero.
+  return unsafe RawBuffer.from<u8>(move allocation, count)
+}
+
+/// `BROTLI_DECODER_ALLOC` for `count` bytes that are not written, as C's `malloc` gives them. The
+/// ring buffer uses it: it can be 1 GiB and the decoder writes every byte before it reads it,
+/// apart from speculative copies whose result is never used.
+pub effect fn allocBytesUnwritten(count: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocate(Layout { bytes: count, alignment: 1 })
+  // The allocation holds `count` bytes; every bit pattern is a valid byte.
+  return unsafe RawBuffer.from<u8>(move allocation, count)
+}
+
+/// `BROTLI_DECODER_ALLOC` for `count` table entries, which start as zero.
+pub effect fn allocWords(count: usize) -> Intrinsic.RawBuffer<u32> ! OutOfMemoryError ? &mut Allocator {
+  if count > 1073741824 { run Allocator.outOfMemory() }
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: count * 4, alignment: 4 })
+  // The allocation holds `count` aligned words, all zero.
+  return unsafe RawBuffer.from<u32>(move allocation, count)
+}
+
+/// All bytes of `buffer`. Every buffer of the state is initialized over its whole count.
+@inlineAlways
+pub fn bytes(buffer: &Intrinsic.RawBuffer<u8>) -> &[u8] {
+  return unsafe RawBuffer.view<u8>(&buffer, 0, RawBuffer.count<u8>(&buffer))
+}
+
+/// All bytes of `buffer`, to write.
+@inlineAlways
+pub fn bytesMut(buffer: &mut Intrinsic.RawBuffer<u8>) -> &mut [u8] {
+  let count = RawBuffer.count<u8>(&buffer)
+  return unsafe RawBuffer.viewMut<u8>(&mut buffer, 0, count)
+}
+
+/// All entries of `buffer`.
+@inlineAlways
+pub fn words(buffer: &Intrinsic.RawBuffer<u32>) -> &[u32] {
+  return unsafe RawBuffer.view<u32>(&buffer, 0, RawBuffer.count<u32>(&buffer))
+}
+
+/// All entries of `buffer`, to write.
+@inlineAlways
+pub fn wordsMut(buffer: &mut Intrinsic.RawBuffer<u32>) -> &mut [u32] {
+  let count = RawBuffer.count<u32>(&buffer)
+  return unsafe RawBuffer.viewMut<u32>(&mut buffer, 0, count)
+}
+
+fn noGroup() -> HuffmanTreeGroup {
+  return HuffmanTreeGroup { codes: noWords(), alphabetSizeMax: 0, alphabetSizeLimit: 0, numHtrees: 0 }
+}
+
+/// `BrotliDecoderStateInit`.
+pub fn make() -> State {
+  return State {
+    state: STATE_UNINITED,
+    loopCounter: 0,
+    br: bit_reader.make(),
+    buffer: [0; 8],
+    bufferLength: 0,
+    pos: 0,
+    maxBackwardDistance: 0,
+    maxDistance: 0,
+    ringbufferSize: 0,
+    ringbufferMask: 0,
+    distRbIdx: 0,
+    distRb: [16, 15, 11, 4],
+    errorCode: 0,
+    metaBlockRemainingLen: 0,
+    ringbuffer: noBytes(),
+    htreeCommand: 0,
+    contextLookup: 0,
+    contextMapSlice: 0,
+    distContextMapSlice: 0,
+    literalHgroup: noGroup(),
+    insertCopyHgroup: noGroup(),
+    distanceHgroup: noGroup(),
+    blockTrees: noWords(),
+    trivialLiteralContext: false,
+    distanceContext: 0,
+    blockLength: [0; 3],
+    blockLengthIndex: 0,
+    numBlockTypes: [0; 3],
+    blockTypeRb: [0; 6],
+    distancePostfixBits: 0,
+    numDirectDistanceCodes: 0,
+    numDistHtrees: 0,
+    distContextMap: noBytes(),
+    literalHtree: 0,
+    rbRoundtrips: 0,
+    partialPosOut: 0,
+    mtfUpperBound: 63,
+    mtf: [0; 260],
+    copyLength: 0,
+    distanceCode: 0,
+    distHtreeIndex: 0,
+    usedInput: 0,
+    substateMetablockHeader: HEADER_NONE,
+    substateUncompressed: UNCOMPRESSED_NONE,
+    substateDecodeUint8: DECODE_UINT8_NONE,
+    substateReadBlockLength: READ_BLOCK_LENGTH_NONE,
+    newRingbufferSize: 0,
+    isLastMetablock: false,
+    isUncompressed: false,
+    isMetadata: false,
+    shouldWrapRingbuffer: false,
+    cannyRingbufferAllocation: true,
+    largeWindow: false,
+    windowBits: 0,
+    sizeNibbles: 0,
+    numLiteralHtrees: 0,
+    contextMap: noBytes(),
+    contextModes: noBytes(),
+    compound: CompoundDictionary {
+      numChunks: 0,
+      totalSize: 0,
+      brIndex: 0,
+      brOffset: 0,
+      brLength: 0,
+      brCopied: 0,
+      data: List<u8>.make(),
+      chunkOffsets: [0; 16],
+      blockBits: -1,
+      blockMap: [0; 256],
+    },
+    trivialLiteralContexts: [0; 8],
+    substateTreeGroup: TREE_GROUP_NONE,
+    substateContextMap: CONTEXT_MAP_NONE,
+    substateHuffman: HUFFMAN_NONE,
+    subLoopCounter: 0,
+    repeatCodeLen: 0,
+    prevCodeLen: 0,
+    symbol: 0,
+    repeat: 0,
+    space: 0,
+    table: [0; 32],
+    symbolsListsArray: [0; 720],
+    nextSymbol: [0; 32],
+    codeLengthCodeLengths: [0; 18],
+    codeLengthHisto: [0; 16],
+    htreeIndex: 0,
+    next: 0,
+    contextIndex: 0,
+    maxRunLengthPrefix: 0,
+    code: 0,
+    contextMapTable: [0; 646],
+    distExtraBits: [0; 544],
+    distOffset: [0; 544],
+    inPos: 0,
+    outPos: 0,
+  }
+}
+
+/// `BrotliDecoderStateMetablockBegin`.
+pub fn metablockBegin(s: &mut State) -> () {
+  s.metaBlockRemainingLen = 0
+  s.blockLength[0] = BLOCK_SIZE_CAP
+  s.blockLength[1] = BLOCK_SIZE_CAP
+  s.blockLength[2] = BLOCK_SIZE_CAP
+  s.numBlockTypes[0] = 1
+  s.numBlockTypes[1] = 1
+  s.numBlockTypes[2] = 1
+  s.blockTypeRb[0] = 1
+  s.blockTypeRb[1] = 0
+  s.blockTypeRb[2] = 1
+  s.blockTypeRb[3] = 0
+  s.blockTypeRb[4] = 1
+  s.blockTypeRb[5] = 0
+  s.contextMap = noBytes()
+  s.contextModes = noBytes()
+  s.distContextMap = noBytes()
+  s.contextMapSlice = 0
+  s.literalHtree = 0
+  s.distContextMapSlice = 0
+  s.distHtreeIndex = 0
+  s.contextLookup = 0
+  s.literalHgroup.codes = noWords()
+  s.insertCopyHgroup.codes = noWords()
+  s.distanceHgroup.codes = noWords()
+}
+
+/// `BrotliDecoderStateCleanupAfterMetablock`.
+pub fn cleanupAfterMetablock(s: &mut State) -> () {
+  s.contextModes = noBytes()
+  s.contextMap = noBytes()
+  s.distContextMap = noBytes()
+  s.literalHgroup.codes = noWords()
+  s.insertCopyHgroup.codes = noWords()
+  s.distanceHgroup.codes = noWords()
+}
+
+/// `BrotliDecoderHuffmanTreeGroupInit`: the buffer for `ntrees` trees of the group, or an empty
+/// one when the allocation fails.
+pub effect fn huffmanTreeGroupBuffer(alphabetSizeLimit: u64, ntrees: u64) -> Intrinsic.RawBuffer<u32> ! OutOfMemoryError ? &mut Allocator {
+  // 376 = 256 (1-st level table) + 4 + 7 + 15 + 31 + 63 (2-nd level mix-tables). This number is
+  // discovered by the "unlimited" "enough" calculator; it is actually a wee bigger than required
+  // in several cases (especially for alphabets with less than 16 symbols).
+  let maxTableSize = alphabetSizeLimit + 376
+  return run allocWords(u64.toUsize(ntrees * maxTableSize + ntrees))
+}
