@@ -14,6 +14,7 @@ import cstate
 import cstate { MatchState, SeqStore, Cwksp, Window, OptState }
 import cseq
 import cdispatch
+import zldm
 import silk.mem.pointer { Pointer }
 import silk.mem.layout { Layout }
 import silk.num.u8
@@ -102,6 +103,9 @@ pub struct CCtx {
   pub prefixDictSize: usize,
   /// The default distributions (`cseq.initConsts`).
   pub consts: [*]mut u8,
+  /// `externSeqStore`: a `RawSeqStore_t` (`zopt.RSS_*`) of sequences that the next blocks use
+  /// (`ZSTD_referenceExternalSequences`); `zldm.silk` and `zmt.silk` own its use.
+  pub externSeqStore: [*]mut u8,
 }
 
 /// Borrows the context behind the opaque pointer `c` of the public API.
@@ -113,7 +117,7 @@ pub unsafe fn of<'a>(anchor: &'a mut (), c: [*]mut u8) -> &'a mut CCtx {
 /// `ZSTD_createCCtx`: returns a new context with the default parameters, or null.
 pub unsafe fn create() -> ?[*]mut u8 {
   let size = Layout.of<CCtx>().bytes
-  let raw = unsafe mem.calloc(1, size + cseq.CONSTS_SIZE)
+  let raw = unsafe mem.calloc(1, size + cseq.CONSTS_SIZE + 40)
   if Pointer.isNullMany<u8>(raw) { return raw }
   let p = unsafe mem.nn(raw)
   let consts = unsafe mem.add(p, size)
@@ -191,6 +195,7 @@ pub unsafe fn create() -> ?[*]mut u8 {
     prefixDict: mem.nullp(),
     prefixDictSize: 0,
     consts: consts,
+    externSeqStore: unsafe mem.add(p, size + cseq.CONSTS_SIZE),
   })
   return raw
 }
@@ -461,7 +466,8 @@ pub fn confirmRepcodesAndEntropyTables(c: &mut CCtx) -> () {
 pub unsafe fn buildSeqStore(c: &mut CCtx, src: [*]const u8, srcSize: usize) -> usize {
   // Don't even attempt compression below a certain size.
   if srcSize < cstate.MIN_CBLOCK_SIZE + cstate.BLOCK_HEADER_SIZE + 1 + 1 {
-    // Hook (`ldm.silk`): `ZSTD_ldm_skipRawSeqStoreBytes` / `ZSTD_ldm_skipSequences`.
+    // `ZSTD_ldm_skipRawSeqStoreBytes` / `ZSTD_ldm_skipSequences` on the external sequences.
+    unsafe zldm.skipBlock(&mut c, srcSize)
     return BSS_NO_COMPRESS
   }
   cstate.resetSeqStore(&mut c.seqStore)
@@ -477,11 +483,16 @@ pub unsafe fn buildSeqStore(c: &mut CCtx, src: [*]const u8, srcSize: usize) -> u
   // Select and store the sequences.
   let dictMode = cstate.dictMode(&c.matchState)
   let _r = unsafe mem.memcpy(unsafe mem.add(c.nextCBlock, cstate.CBS_REP), unsafe mem.addc(unsafe mem.ro(c.prevCBlock), cstate.CBS_REP), 12)
-  // Hook (`ldm.silk`): when `c.appliedParams.ldmParams.enableLdm` is on, the reference runs
-  // `ZSTD_ldm_generateSequences` and `ZSTD_ldm_blockCompress` here. Not ported: the block is
-  // compressed without the long distance matcher.
-  c.matchState.ldmSeqStore = mem.nullp()
-  let lastLLSize = unsafe cdispatch.compressBlock(c.appliedParams.cParams.strategy, c.appliedParams.useRowMatchFinder, dictMode, &mut c.matchState, &mut c.seqStore, unsafe mem.add(c.nextCBlock, cstate.CBS_REP), src, srcSize)
+  let mut lastLLSize: usize = 0
+  if unsafe zldm.isActive(&c) {
+    // External sequences (the long distance matches of a worker job), or long distance
+    // matching: `ZSTD_ldm_generateSequences` and `ZSTD_ldm_blockCompress` (`zldm.silk`).
+    lastLLSize = unsafe zldm.compressBlock(&mut c, src, srcSize)
+    if errors.isError(lastLLSize) { return lastLLSize }
+  } else {
+    c.matchState.ldmSeqStore = mem.nullp()
+    lastLLSize = unsafe cdispatch.compressBlock(c.appliedParams.cParams.strategy, c.appliedParams.useRowMatchFinder, dictMode, &mut c.matchState, &mut c.seqStore, unsafe mem.add(c.nextCBlock, cstate.CBS_REP), src, srcSize)
+  }
   // `ZSTD_storeLastLiterals`.
   let _c = unsafe mem.memcpy(unsafe mem.add(c.seqStore.litStart, c.seqStore.litSize), unsafe mem.addc(src, srcSize - lastLLSize), lastLLSize)
   c.seqStore.litSize = c.seqStore.litSize + lastLLSize
