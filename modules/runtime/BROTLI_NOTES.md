@@ -74,6 +74,35 @@ alone: there is no local copy of them and no fix to upstream.
 Whether `../brotli` should replace or join the standard library's Brotli is the owner's decision.
 It is written to be movable: nothing in it knows about Node or the runtime.
 
+## Status
+
+| Part | State | Verified by |
+| --- | --- | --- |
+| Decoder | Done | `modules/brotli/tests/differential.py` against the C library: `decode` 355/355 and `corrupt` 2000/2000 (new seeds), plus 939 dictionary and large-window cases; every call's result, consumed and written bytes and error code match. In the runtime, `tests/brotli/decode.cjs` (177 reference streams at every quality and window size, 2,500 corrupted ones, and a hand-built `FORMAT_BLOCK_SWITCH` stream) prints the same 2,678 lines as Node 24. Same speed and peak memory as the C library (table below). |
+| Encoder, qualities 0 and 1 | Done | `encode --quality 0,1` byte-equal to the C library (130/130 and more seeds). |
+| Encoder, qualities 2 to 11 | Being ported | (placeholder output: valid streams, not the C library's bytes) |
+| Encoder, prepared dictionaries | Not ported yet | |
+| Runtime | Links no Brotli C | `modules/native/brotli` is gone; the release build compiles 70 fewer C objects and none of its objects defines a C Brotli function. |
+
+`reset()` on a Brotli stream now drops its parameters and dictionary, as Node's
+`ResetStream()` does (it calls `Init()` with no dictionary and sets no parameters). Before, the
+runtime re-applied them and differed from Node after a reset.
+
+### Decoder speed (Silk tool against the C tool, the same driver, Linux x86-64)
+
+Wall time of three runs each; peak RSS was 12 to 13 MB for both everywhere.
+
+| Stream | C | Silk |
+| --- | --- | --- |
+| 30 MB of JavaScript at quality 1 (7.3 MB) | 0.108–0.115 s | 0.109–0.134 s |
+| the same at quality 5 (143 KB) | 0.053–0.077 s | 0.047–0.051 s |
+| at quality 9 | 0.058–0.061 s | 0.045–0.050 s |
+| at quality 11 | 0.052–0.078 s | 0.057–0.063 s |
+| 564 KB binary at quality 5 | 0.005–0.008 s | 0.005–0.007 s |
+| 1 MB random at quality 5 | 0.004 s | 0.004 s |
+
+The runtime-level before/after table (`bench/brotli/compare.py`) is below once the encoder is done.
+
 ## Compiler walls
 
 (Filled in as the port proceeds.)
