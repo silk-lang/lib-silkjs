@@ -1,0 +1,378 @@
+//! The match finder of qualities 10 and 11 (hasher H10): a port of google/brotli v1.2.0
+//! `c/enc/hash_to_binary_tree_inc.h` as `hash.h` instantiates it (`BUCKET_BITS` 17,
+//! `MAX_TREE_SEARCH_DEPTH` 64, `MAX_TREE_COMP_LENGTH` 128), with `BackwardMatch` of `hash.h`.
+//!
+//! A (forgetful) hash table where each hash bucket contains a binary tree of sequences whose first
+//! 4 bytes share the same hash code. Each sequence is `MAX_TREE_COMP_LENGTH` long and is
+//! identified by its starting position in the input data. The binary tree is sorted by the
+//! lexicographic order of the sequences, and it is also a max-heap with respect to the starting
+//! positions.
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import enc.constants { WINDOW_GAP }
+import enc.find_match_length { findMatchLengthWithLimit, findMatchLengthWithLimitUnchecked }
+import enc.memory { uninitializedWords }
+import enc.params { EncoderParams, HQ_ZOPFLIFICATION_QUALITY }
+import enc.static_dict { HASH_MUL32, INVALID_MATCH, MAX_STATIC_DICTIONARY_MATCH_LEN, findAllStaticDictionaryMatches }
+import enc.write_bits { byteUnchecked, load32 }
+
+const BUCKET_BITS: u32 = 17
+const BUCKET_SIZE: usize = 131072
+const MAX_TREE_SEARCH_DEPTH: usize = 64
+const MAX_TREE_COMP_LENGTH: usize = 128
+
+/// `MAX_NUM_MATCHES_H10`: `64 + MAX_TREE_SEARCH_DEPTH`.
+pub const MAX_NUM_MATCHES_H10: usize = 128
+
+/// `HashTypeLengthH10`.
+pub const HASH_TYPE_LENGTH_H10: usize = 4
+/// `StoreLookaheadH10`.
+pub const STORE_LOOKAHEAD_H10: usize = 128
+
+/// `BackwardMatch`.
+pub struct BackwardMatch {
+  pub distance: u32,
+  pub lengthAndCode: u32,
+}
+
+impl Copy for BackwardMatch {}
+
+impl BackwardMatch {
+  /// `InitBackwardMatch`.
+  @inlineAlways
+  pub fn make(dist: usize, len: usize) -> BackwardMatch {
+    return BackwardMatch { distance: usize.wrappingToU32(dist), lengthAndCode: usize.wrappingToU32(usize.shiftLeft(len, 5)) }
+  }
+
+  /// `InitDictionaryBackwardMatch`.
+  @inlineAlways
+  pub fn makeDictionary(dist: usize, len: usize, lenCode: usize) -> BackwardMatch {
+    let code = if len == lenCode { 0 } else { lenCode }
+    return BackwardMatch { distance: usize.wrappingToU32(dist), lengthAndCode: usize.wrappingToU32(usize.shiftLeft(len, 5) | code) }
+  }
+
+  /// `BackwardMatchLength`.
+  @inlineAlways
+  pub fn length(self: &Self) -> usize {
+    return u32.toUsize(u32.shiftRight(self.lengthAndCode, 5))
+  }
+
+  /// `BackwardMatchLengthCode`.
+  @inlineAlways
+  pub fn lengthCode(self: &Self) -> usize {
+    let code = u32.toUsize(self.lengthAndCode & 31)
+    if code != 0 { return code }
+    return BackwardMatch.length(&self)
+  }
+}
+
+/// `FindMatchLengthWithLimit` of the bytes at `s1` and `s2` of `data`, with one bounds test for
+/// the whole comparison where both ranges are inside `data`.
+@inlineAlways
+pub fn matchLength(data: &[u8], s1: usize, s2: usize, limit: usize) -> usize {
+  let end = data.length
+  if s1 <= end && limit <= end - s1 && s2 <= end && limit <= end - s2 {
+    // Both `s1 + limit` and `s2 + limit` are at most `data.length`.
+    return unsafe findMatchLengthWithLimitUnchecked(data, s1, s2, limit)
+  }
+  return findMatchLengthWithLimit(data, s1, s2, limit)
+}
+
+/// `HashMemAllocInBytesH10`: the bytes of `common.extra[0]` and `common.extra[1]`.
+pub fn hashMemAllocInBytes(params: &EncoderParams, oneShot: bool, inputSize: usize) -> [usize; 2] {
+  let mut numNodes = usize.shiftLeft(1, i32.toUsize(params.lgwin))
+  if oneShot && inputSize < numNodes {
+    numNodes = inputSize
+  }
+  return [4 * BUCKET_SIZE, 2 * 4 * numNodes]
+}
+
+/// `H10`, `HashToBinaryTree`.
+pub struct HashToBinaryTree {
+  // The window size minus 1.
+  windowMask: usize,
+  // Hash table that maps the 4-byte hashes of the sequence to the last position where this hash
+  // was found, which is the root of the binary tree of sequences that share this hash bucket.
+  buckets: Intrinsic.RawBuffer<u32>,
+  // A position used to mark a non-existent sequence, i.e. a tree is empty if its root is at
+  // invalid_pos_ and a node is a leaf if both its children are at invalid_pos_.
+  invalidPos: u32,
+  // The union of the binary trees of each hash bucket. The root of the tree corresponding to a
+  // hash is a sequence starting at buckets_[hash] and the left and right children of a sequence
+  // starting at pos are forest_[2 * pos] and forest_[2 * pos + 1].
+  forest: Intrinsic.RawBuffer<u32>,
+}
+
+impl HashToBinaryTree {
+  /// The allocation of `HasherSetup` (`alloc_size` from `hashMemAllocInBytes`) and
+  /// `InitializeH10`. As with `malloc`, the tables are not cleared: `prepare` fills the buckets,
+  /// and a node of the forest is written before it is read.
+  pub effect fn make(params: &EncoderParams, oneShot: bool, inputSize: usize) -> HashToBinaryTree ! OutOfMemoryError ? &mut Allocator {
+    let sizes = hashMemAllocInBytes(params, oneShot, inputSize)
+    let buckets = run uninitializedWords(sizes[0] / 4)
+    let forest = run uninitializedWords(sizes[1] / 4)
+    let windowMask = u32.toUsize(u32.shiftLeft(1, i32.toU32(params.lgwin)) - 1)
+    return HashToBinaryTree {
+      windowMask: windowMask,
+      buckets: move buckets,
+      invalidPos: usize.wrappingToU32(usize.wrappingSubtract(0, windowMask)),
+      forest: move forest,
+    }
+  }
+
+  /// `PrepareH10`.
+  pub fn prepare(self: &mut Self) -> () {
+    let invalidPos = self.invalidPos
+    let buckets = unsafe RawBuffer.viewMut<u32>(&mut self.buckets, 0, BUCKET_SIZE)
+    let mut i: usize = 0
+    while i < BUCKET_SIZE {
+      buckets[i] = invalidPos
+      i = i + 1
+    }
+  }
+
+  // `HashBytesH10`.
+  @inlineAlways
+  fn hashBytes(data: &[u8], at: usize) -> usize {
+    let h = u32.wrappingMultiply(load32(data, at), HASH_MUL32)
+    // The higher bits contain more mixture from the multiplication, so we take our results from
+    // there.
+    return u32.toUsize(u32.shiftRight(h, 32 - BUCKET_BITS))
+  }
+
+  // `StoreAndFindMatchesH10`: stores the hash of the next 4 bytes and in a single
+  // tree-traversal, the hash bucket's binary tree is searched for matches and is re-rooted at the
+  // current position.
+  //
+  // If less than MAX_TREE_COMP_LENGTH data is available, the hash bucket of the current position
+  // is searched for matches, but the state of the hash table is not changed, since we can not know
+  // the final sorting order of the current (incomplete) sequence.
+  //
+  // This function must be called with increasing cur_ix positions. With `collect`, the matches
+  // longer than `bestLen` are written to `matches` from `matchesAt`; the result is where the
+  // written matches end. Without it (`matches == NULL` in C) nothing is written.
+  @inlineAlways
+  fn storeAndFindMatches(
+    self: &mut Self,
+    data: &[u8],
+    curIx: usize,
+    ringBufferMask: usize,
+    maxLength: usize,
+    maxBackward: usize,
+    bestLen: &mut usize,
+    collect: bool,
+    matches: &mut [BackwardMatch],
+    matchesAt: usize,
+  ) -> usize {
+    let mut out = matchesAt
+    let curIxMasked = curIx & ringBufferMask
+    let maxCompLen = if maxLength < MAX_TREE_COMP_LENGTH { maxLength } else { MAX_TREE_COMP_LENGTH }
+    let shouldRerootTree = maxLength >= MAX_TREE_COMP_LENGTH
+    let key = HashToBinaryTree.hashBytes(data, curIxMasked)
+    let windowMask = self.windowMask
+    let invalidPos = self.invalidPos
+    let buckets = unsafe RawBuffer.viewMut<u32>(&mut self.buckets, 0, BUCKET_SIZE)
+    let forestLength = RawBuffer.count<u32>(&self.forest)
+    let forest = unsafe RawBuffer.viewMut<u32>(&mut self.forest, 0, forestLength)
+    let mut prevIx = u32.toUsize(buckets[key])
+    // The forest index of the rightmost node of the left subtree of the new root, updated as we
+    // traverse and re-root the tree of the hash bucket.
+    let mut nodeLeft = 2 * (curIx & windowMask)
+    // The forest index of the leftmost node of the right subtree of the new root, updated as we
+    // traverse and re-root the tree of the hash bucket.
+    let mut nodeRight = 2 * (curIx & windowMask) + 1
+    // The match length of the rightmost node of the left subtree of the new root, updated as we
+    // traverse and re-root the tree of the hash bucket.
+    let mut bestLenLeft: usize = 0
+    // The match length of the leftmost node of the right subtree of the new root, updated as we
+    // traverse and re-root the tree of the hash bucket.
+    let mut bestLenRight: usize = 0
+    if shouldRerootTree {
+      buckets[key] = usize.wrappingToU32(curIx)
+    }
+    // Whether `curIxMasked + maxLength` is inside `data`.
+    let curFits = maxLength <= data.length && curIxMasked <= data.length - maxLength
+    let mut depthRemaining = MAX_TREE_SEARCH_DEPTH
+    while true {
+      let backward = usize.wrappingSubtract(curIx, prevIx)
+      let prevIxMasked = prevIx & ringBufferMask
+      if backward == 0 || backward > maxBackward || depthRemaining == 0 {
+        if shouldRerootTree {
+          forest[nodeLeft] = invalidPos
+          forest[nodeRight] = invalidPos
+        }
+        break
+      }
+      let curLen = if bestLenLeft < bestLenRight { bestLenLeft } else { bestLenRight }
+      // With `prevIxMasked + maxLength` inside `data` too, both compared ranges are.
+      let mut len = curLen
+      if curFits && prevIxMasked <= data.length - maxLength {
+        len = curLen + unsafe findMatchLengthWithLimitUnchecked(data, curIxMasked + curLen, prevIxMasked + curLen, maxLength - curLen)
+      } else {
+        len = curLen + findMatchLengthWithLimit(data, curIxMasked + curLen, prevIxMasked + curLen, maxLength - curLen)
+      }
+      if collect && len > bestLen.* {
+        bestLen.* = len
+        matches[out] = BackwardMatch.make(backward, len)
+        out = out + 1
+      }
+      if len >= maxCompLen {
+        if shouldRerootTree {
+          forest[nodeLeft] = forest[2 * (prevIx & windowMask)]
+          forest[nodeRight] = forest[2 * (prevIx & windowMask) + 1]
+        }
+        break
+      }
+      if data[curIxMasked + len] > data[prevIxMasked + len] {
+        bestLenLeft = len
+        if shouldRerootTree {
+          forest[nodeLeft] = usize.wrappingToU32(prevIx)
+        }
+        nodeLeft = 2 * (prevIx & windowMask) + 1
+        prevIx = u32.toUsize(forest[nodeLeft])
+      } else {
+        bestLenRight = len
+        if shouldRerootTree {
+          forest[nodeRight] = usize.wrappingToU32(prevIx)
+        }
+        nodeRight = 2 * (prevIx & windowMask)
+        prevIx = u32.toUsize(forest[nodeRight])
+      }
+      depthRemaining = depthRemaining - 1
+    }
+    return out
+  }
+
+  /// `FindAllMatchesH10`: finds all backward matches of the data at `curIx` up to the length of
+  /// `maxLength` and stores the position `curIx` in the hash table.
+  ///
+  /// Writes the matches to `matches` from `matchesAt` and returns their number. The matches are
+  /// sorted by strictly increasing length and (non-strictly) increasing distance.
+  @inlineAlways
+  pub fn findAllMatches(
+    self: &mut Self,
+    data: &[u8],
+    ringBufferMask: usize,
+    curIx: usize,
+    maxLength: usize,
+    maxBackward: usize,
+    dictionaryDistance: usize,
+    params: &EncoderParams,
+    matches: &mut [BackwardMatch],
+    matchesAt: usize,
+  ) -> usize {
+    let mut out = matchesAt
+    let curIxMasked = curIx & ringBufferMask
+    let mut bestLen: usize = 1
+    let shortMatchMaxBackward: usize = if params.quality != HQ_ZOPFLIFICATION_QUALITY { 16 } else { 64 }
+    let stop: usize = if curIx < shortMatchMaxBackward { 0 } else { curIx - shortMatchMaxBackward }
+    let mut dictMatches: [u32; 38] = [INVALID_MATCH; 38]
+    let mut i = usize.wrappingSubtract(curIx, 1)
+    let c0 = data[curIxMasked]
+    let c1 = data[curIxMasked + 1]
+    while i > stop && bestLen <= 2 {
+      let backward = usize.wrappingSubtract(curIx, i)
+      if backward > maxBackward {
+        break
+      }
+      let prevIx = i & ringBufferMask
+      // One test for both bytes below.
+      if usize.wrappingAdd(prevIx, 1) >= data.length {
+        Intrinsic.trap("brotli: a match candidate outside the ring buffer")
+      }
+      if c0 != unsafe byteUnchecked(data, prevIx) || c1 != unsafe byteUnchecked(data, usize.wrappingAdd(prevIx, 1)) {
+        i = usize.wrappingSubtract(i, 1)
+        continue
+      }
+      let len = matchLength(data, prevIx, curIxMasked, maxLength)
+      if len > bestLen {
+        bestLen = len
+        matches[out] = BackwardMatch.make(backward, len)
+        out = out + 1
+      }
+      i = usize.wrappingSubtract(i, 1)
+    }
+    if bestLen < maxLength {
+      out = HashToBinaryTree.storeAndFindMatches(&mut self, data, curIx, ringBufferMask, maxLength, maxBackward, &mut bestLen, true, &mut matches, out)
+    }
+    let minlen = if bestLen + 1 > 4 { bestLen + 1 } else { 4 }
+    if findAllStaticDictionaryMatches(data, curIxMasked, minlen, maxLength, &mut dictMatches) {
+      let maxlen = if maxLength < MAX_STATIC_DICTIONARY_MATCH_LEN { maxLength } else { MAX_STATIC_DICTIONARY_MATCH_LEN }
+      let mut l = minlen
+      while l <= maxlen {
+        let dictId = dictMatches[l]
+        if dictId < INVALID_MATCH {
+          let distance = dictionaryDistance + u32.toUsize(u32.shiftRight(dictId, 5)) + 1
+          if distance <= params.dist.maxDistance {
+            matches[out] = BackwardMatch.makeDictionary(distance, l, u32.toUsize(dictId & 31))
+            out = out + 1
+          }
+        }
+        l = l + 1
+      }
+    }
+    return out - matchesAt
+  }
+
+  // `StoreH10`: stores the hash of the next 4 bytes and re-roots the binary tree at the current
+  // sequence, without returning any matches.
+  // REQUIRES: ix + MAX_TREE_COMP_LENGTH <= end-of-current-block
+  @inlineAlways
+  fn store(self: &mut Self, data: &[u8], mask: usize, ix: usize) -> () {
+    // Maximum distance is window size - 16, see section 9.1. of the spec.
+    let maxBackward = self.windowMask - WINDOW_GAP + 1
+    let mut unused: usize = 0
+    let mut none: [BackwardMatch; 1] = [BackwardMatch { distance: 0, lengthAndCode: 0 }]
+    drop HashToBinaryTree.storeAndFindMatches(&mut self, data, ix, mask, MAX_TREE_COMP_LENGTH, maxBackward, &mut unused, false, &mut none, 0)
+  }
+
+  /// `StoreRangeH10`.
+  pub fn storeRange(self: &mut Self, data: &[u8], mask: usize, ixStart: usize, ixEnd: usize) -> () {
+    let mut i = ixStart
+    let mut j = ixStart
+    if ixStart + 63 <= ixEnd {
+      i = ixEnd - 63
+    }
+    if ixStart + 512 <= i {
+      while j < i {
+        HashToBinaryTree.store(&mut self, data, mask, j)
+        j = j + 8
+      }
+    }
+    while i < ixEnd {
+      HashToBinaryTree.store(&mut self, data, mask, i)
+      i = i + 1
+    }
+  }
+
+  /// `StitchToPreviousBlockH10`.
+  pub fn stitchToPreviousBlock(self: &mut Self, numBytes: usize, position: usize, ringbuffer: &[u8], ringbufferMask: usize) -> () {
+    if numBytes >= HASH_TYPE_LENGTH_H10 - 1 && position >= MAX_TREE_COMP_LENGTH {
+      // Store the last `MAX_TREE_COMP_LENGTH - 1` positions in the hasher. These could not be
+      // calculated before, since they require knowledge of both the previous and the current
+      // block.
+      let iStart = position - MAX_TREE_COMP_LENGTH + 1
+      let iEnd = if position < iStart + numBytes { position } else { iStart + numBytes }
+      let mut i = iStart
+      while i < iEnd {
+        // Maximum distance is window size - 16, see section 9.1. of the spec. Furthermore, we
+        // have to make sure that we don't look further back from the start of the next block
+        // than the window size, otherwise we could access already overwritten areas of the
+        // ring-buffer.
+        let gap = if WINDOW_GAP - 1 > position - i { WINDOW_GAP - 1 } else { position - i }
+        let maxBackward = self.windowMask - gap
+        let mut unused: usize = 0
+        let mut none: [BackwardMatch; 1] = [BackwardMatch { distance: 0, lengthAndCode: 0 }]
+        // We know that i + MAX_TREE_COMP_LENGTH <= position + num_bytes, i.e. the end of the
+        // current block and that we have at least MAX_TREE_COMP_LENGTH tail in the ring-buffer.
+        drop HashToBinaryTree.storeAndFindMatches(&mut self, ringbuffer, i, ringbufferMask, MAX_TREE_COMP_LENGTH, maxBackward, &mut unused, false, &mut none, 0)
+        i = i + 1
+      }
+    }
+  }
+}

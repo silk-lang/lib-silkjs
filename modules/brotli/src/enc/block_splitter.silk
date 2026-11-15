@@ -1,9 +1,24 @@
-//! The split of a meta-block into blocks of different types: the data structure of google/brotli
-//! v1.2.0 `c/enc/block_splitter.h`.
+//! The split of a meta-block into blocks of different types: a port of google/brotli v1.2.0
+//! `c/enc/block_splitter.h`, `block_splitter.c` and `block_splitter_inc.h`.
 //!
-//! NOT PORTED YET: the block splitter itself (`block_splitter.c`, `block_splitter_inc.h`). The
-//! structure is here because the bit stream writer reads it.
+//! The three instantiations of the C template (`Literal` over bytes, `Command` and `Distance` over
+//! 16-bit codes) are one generic function over the histogram type and the symbol type.
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import enc.cluster { HistogramOps, HistogramPair, SymbolValue, clearedHistograms, filledWords, histogramBitCostDistance, histogramCombine, makePairs }
+import enc.command { Command }
+import enc.constants { MAX_NUMBER_OF_BLOCK_TYPES }
+import enc.fast_log { fastLog2 }
+import enc.histogram { HistogramCommand, HistogramDistance, HistogramLiteral }
+import enc.params { EncoderParams, HQ_ZOPFLIFICATION_QUALITY }
 
 /// `BlockSplit`. `types` and `lengths` hold at least `numBlocks` entries (the lists are the
 /// allocations of the C structure, `types_alloc_size` and `lengths_alloc_size` their lengths).
@@ -21,4 +36,683 @@ impl BlockSplit {
   pub fn make() -> BlockSplit {
     return BlockSplit { numTypes: 0, numBlocks: 0, types: List<u8>.make(), lengths: List<u32>.make() }
   }
+
+  // `BROTLI_ENSURE_CAPACITY` of `types` and `lengths` to `count` entries.
+  effect fn ensureCapacity(self: &mut Self, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let have = List<u8>.length(&self.types)
+    if have < count {
+      run List<u8>.reserveExact(&mut self.types, count - have)
+      run List<u8>.appendRepeated(&mut self.types, 0, count - have)
+    }
+    let haveLengths = List<u32>.length(&self.lengths)
+    if haveLengths < count {
+      run List<u32>.reserveExact(&mut self.lengths, count - haveLengths)
+      run List<u32>.appendRepeated(&mut self.lengths, 0, count - haveLengths)
+    }
+  }
+}
+
+const MAX_LITERAL_HISTOGRAMS: usize = 100
+const MAX_COMMAND_HISTOGRAMS: usize = 50
+const LITERAL_BLOCK_SWITCH_COST: f64 = 28.1
+const COMMAND_BLOCK_SWITCH_COST: f64 = 13.5
+const DISTANCE_BLOCK_SWITCH_COST: f64 = 14.6
+const LITERAL_STRIDE_LENGTH: usize = 70
+const COMMAND_STRIDE_LENGTH: usize = 40
+const DISTANCE_STRIDE_LENGTH: usize = 40
+const SYMBOLS_PER_LITERAL_HISTOGRAM: usize = 544
+const SYMBOLS_PER_COMMAND_HISTOGRAM: usize = 530
+const SYMBOLS_PER_DISTANCE_HISTOGRAM: usize = 544
+const MIN_LENGTH_FOR_BLOCK_SPLITTING: usize = 128
+const ITER_MUL_FOR_REFINING: usize = 2
+const MIN_ITERS_FOR_REFINING: usize = 100
+
+const HISTOGRAMS_PER_BATCH: usize = 64
+const CLUSTERS_PER_BATCH: usize = 16
+
+// `values[index]` without a bounds check.
+//
+// # Gotchas
+// The caller must prove that `index` is less than `values.length`.
+@inlineAlways
+unsafe fn readAt<T: Copy>(values: &[T], index: usize) -> T {
+  unsafe {
+    // The caller's proof implies that the slice is not empty, so its pointer is not null.
+    let base = Intrinsic.pointerRequalify<?[*]const T, [*]const T>(Pointer.fromSlice<T>(values))
+    return Pointer.read<T>(Pointer.at<T>(base, index))
+  }
+}
+
+// `values[index] = value` without a bounds check.
+//
+// # Gotchas
+// The caller must prove that `index` is less than `values.length`.
+@inlineAlways
+unsafe fn writeAt<T: Copy>(values: &mut [T], index: usize, value: T) -> () {
+  unsafe {
+    // The caller's proof implies that the slice is not empty, so its pointer is not null.
+    let base = Intrinsic.pointerRequalify<?[*]mut T, [*]mut T>(Pointer.fromMutSlice<T>(&mut values))
+    Pointer.write<T>(Pointer.atMut<T>(base, index), value)
+  }
+}
+
+// `CountLiterals`.
+fn countLiterals(cmds: &[Command], numCommands: usize) -> usize {
+  // Count how many we have.
+  let mut totalLength: usize = 0
+  let mut i: usize = 0
+  while i < numCommands {
+    totalLength = totalLength + u32.toUsize(cmds[i].insertLen)
+    i = i + 1
+  }
+  return totalLength
+}
+
+// `CopyLiteralsToByteArray`.
+fn copyLiteralsToByteArray(cmds: &[Command], numCommands: usize, data: &[u8], offset: usize, mask: usize, literals: &mut [u8]) -> () {
+  let mut pos: usize = 0
+  let mut fromPos = offset & mask
+  let mut i: usize = 0
+  while i < numCommands {
+    let mut insertLen = u32.toUsize(cmds[i].insertLen)
+    if fromPos + insertLen > mask {
+      let headSize = mask + 1 - fromPos
+      Slice.copyInto<u8>(&mut literals, pos, Slice.view<u8>(data, fromPos, headSize))
+      fromPos = 0
+      pos = pos + headSize
+      insertLen = insertLen - headSize
+    }
+    if insertLen > 0 {
+      Slice.copyInto<u8>(&mut literals, pos, Slice.view<u8>(data, fromPos, insertLen))
+      pos = pos + insertLen
+    }
+    fromPos = (fromPos + insertLen + u32.toUsize(Command.copyLength(&cmds[i]))) & mask
+    i = i + 1
+  }
+}
+
+// `MyRand`: initial seed should be 7. In this case, loop length is (1 << 29).
+@inlineAlways
+fn myRand(seed: &mut u32) -> u32 {
+  seed.* = u32.wrappingMultiply(seed.*, 16807)
+  return seed.*
+}
+
+// `BitCost`.
+@inlineAlways
+fn bitCost(count: u32) -> f64 {
+  if count == 0 { return -2.0 }
+  return fastLog2(u32.toUsize(count))
+}
+
+// `HistogramAddVector`.
+@inlineAlways
+fn addVector<H: HistogramOps + Copy, D: SymbolValue + Copy>(histogram: &mut H, data: &[D], pos: usize, n: usize) -> () {
+  let mut i: usize = 0
+  while i < n {
+    HistogramOps.addOne(&mut histogram, SymbolValue.symbol(data[pos + i]))
+    i = i + 1
+  }
+}
+
+// `InitialEntropyCodes`.
+fn initialEntropyCodes<H: HistogramOps + Copy, D: SymbolValue + Copy>(data: &[D], length: usize, stride: usize, numHistograms: usize, histograms: &mut [H]) -> () {
+  let mut seed: u32 = 7
+  let blockLength = length / numHistograms
+  let mut i: usize = 0
+  while i < numHistograms {
+    HistogramOps.clearAll(&mut histograms[i])
+    i = i + 1
+  }
+  i = 0
+  while i < numHistograms {
+    let mut pos = length * i / numHistograms
+    if i != 0 {
+      pos = pos + u32.toUsize(myRand(&mut seed)) % blockLength
+    }
+    if pos + stride >= length {
+      pos = length - stride - 1
+    }
+    addVector<H, D>(&mut histograms[i], data, pos, stride)
+    i = i + 1
+  }
+}
+
+// `RandomSample`.
+fn randomSample<H: HistogramOps + Copy, D: SymbolValue + Copy>(seed: &mut u32, data: &[D], length: usize, strideIn: usize, sample: &mut H) -> () {
+  let mut pos: usize = 0
+  let mut stride = strideIn
+  if stride >= length {
+    stride = length
+  } else {
+    pos = u32.toUsize(myRand(&mut seed)) % (length - stride + 1)
+  }
+  addVector<H, D>(&mut sample, data, pos, stride)
+}
+
+// `RefineEntropyCodes`.
+fn refineEntropyCodes<H: HistogramOps + Copy, D: SymbolValue + Copy>(data: &[D], length: usize, stride: usize, numHistograms: usize, histograms: &mut [H], tmp: &mut H) -> () {
+  let mut iters = ITER_MUL_FOR_REFINING * length / stride + MIN_ITERS_FOR_REFINING
+  let mut seed: u32 = 7
+  iters = ((iters + numHistograms - 1) / numHistograms) * numHistograms
+  let mut iter: usize = 0
+  while iter < iters {
+    HistogramOps.clearAll(&mut tmp)
+    randomSample<H, D>(&mut seed, data, length, stride, &mut tmp)
+    HistogramOps.addAll(&mut histograms[iter % numHistograms], &tmp)
+    iter = iter + 1
+  }
+}
+
+// `FindBlocks`: assigns a block id from the range [0, num_histograms) to each data element in
+// data[0..length) and fills in block_id[0..length) with the assigned values. Returns the number of
+// blocks, i.e. one plus the number of block switches.
+fn findBlocks<H: HistogramOps + Copy, D: SymbolValue + Copy>(
+  data: &[D],
+  length: usize,
+  blockSwitchBitcost: f64,
+  numHistograms: usize,
+  histograms: &[H],
+  insertCost: &mut [f64],
+  cost: &mut [f64],
+  switchSignal: &mut [u8],
+  blockId: &mut [u8],
+) -> usize {
+  let alphabetSize = HistogramOps.dataSize(&histograms[0])
+  let bitmapLen = usize.shiftRight(numHistograms + 7, 3)
+  let mut numBlocks: usize = 1
+  let mut i: usize = 0
+
+  // Trivial case: single histogram -> single block type.
+  if numHistograms <= 1 {
+    while i < length {
+      blockId[i] = 0
+      i = i + 1
+    }
+    return 1
+  }
+
+  // Fill bitcost for each symbol of all histograms.
+  // Non-existing symbol cost: 2 + log2(total_count).
+  // Regular symbol cost: -log2(symbol_count / total_count).
+  i = 0
+  while i < alphabetSize * numHistograms {
+    insertCost[i] = 0.0
+    i = i + 1
+  }
+  i = 0
+  while i < numHistograms {
+    insertCost[i] = fastLog2(u32.toUsize(usize.wrappingToU32(HistogramOps.total(&histograms[i]))))
+    i = i + 1
+  }
+  i = alphabetSize
+  while i != 0 {
+    // Reverse order to use the 0-th row as a temporary storage.
+    i = i - 1
+    let mut j: usize = 0
+    while j < numHistograms {
+      insertCost[i * numHistograms + j] = insertCost[j] - bitCost(HistogramOps.counts(&histograms[j])[i])
+      j = j + 1
+    }
+  }
+
+  // After each iteration of this loop, cost[k] will contain the difference between the minimum
+  // cost of arriving at the current byte position using entropy code k, and the minimum cost of
+  // arriving at the current byte position. This difference is capped at the block switch cost,
+  // and if it reaches block switch cost, it means that when we trace back from the last
+  // position, we need to switch here.
+  i = 0
+  while i < numHistograms {
+    cost[i] = 0.0
+    i = i + 1
+  }
+  i = 0
+  while i < length * bitmapLen {
+    switchSignal[i] = 0
+    i = i + 1
+  }
+  let prologueLength: usize = 2000
+  let multiplier: f64 = 0.07 / 2000.0
+  // The loops below index `cost` below `numHistograms`, `insertCost` below
+  // `alphabetSize * numHistograms` (the symbols are below the alphabet size) and `switchSignal`
+  // below `length * bitmapLen`.
+  if cost.length < numHistograms || insertCost.length < alphabetSize * numHistograms || switchSignal.length < length * bitmapLen {
+    Intrinsic.trap("brotli: the block splitter's arrays are too short")
+  }
+  let mut byteIx: usize = 0
+  while byteIx < length {
+    let ix = byteIx * bitmapLen
+    let symbol = SymbolValue.symbol(data[byteIx])
+    if symbol >= alphabetSize {
+      Intrinsic.trap("brotli: a symbol outside the alphabet")
+    }
+    let insertCostIx = symbol * numHistograms
+    let mut minCost: f64 = 1e99
+    let mut blockSwitchCost = blockSwitchBitcost
+    let mut best: usize = 0
+    let mut k: usize = 0
+    while k < numHistograms {
+      // We are coding the symbol with entropy code k.
+      let c = unsafe readAt<f64>(&cost, k) + unsafe readAt<f64>(&insertCost, usize.wrappingAdd(insertCostIx, k))
+      unsafe writeAt<f64>(&mut cost, k, c)
+      if c < minCost {
+        minCost = c
+        best = k
+      }
+      k = k + 1
+    }
+    if numHistograms != 0 && minCost < 1e99 {
+      blockId[byteIx] = usize.wrappingToU8(best)
+    }
+    // More blocks for the beginning.
+    if byteIx < prologueLength {
+      blockSwitchCost = blockSwitchCost * (0.77 + multiplier * usize.toF64(byteIx))
+    }
+    k = 0
+    while k < numHistograms {
+      let c = unsafe readAt<f64>(&cost, k) - minCost
+      if c >= blockSwitchCost {
+        let mask = u8.shiftLeft(1, usize.wrappingToU8(k & 7))
+        unsafe writeAt<f64>(&mut cost, k, blockSwitchCost)
+        let at = usize.wrappingAdd(ix, usize.shiftRight(k, 3))
+        let signal = unsafe readAt<u8>(&switchSignal, at) | mask
+        unsafe writeAt<u8>(&mut switchSignal, at, signal)
+      } else {
+        unsafe writeAt<f64>(&mut cost, k, c)
+      }
+      k = k + 1
+    }
+    byteIx = byteIx + 1
+  }
+
+  byteIx = length - 1
+  // Trace back from the last position and switch at the marked places.
+  let mut ix = byteIx * bitmapLen
+  let mut curId = blockId[byteIx]
+  while byteIx > 0 {
+    let mask = u8.shiftLeft(1, curId & 7)
+    byteIx = byteIx - 1
+    ix = ix - bitmapLen
+    if (switchSignal[ix + u8.toUsize(u8.shiftRight(curId, 3))] & mask) != 0 {
+      if curId != blockId[byteIx] {
+        curId = blockId[byteIx]
+        numBlocks = numBlocks + 1
+      }
+    }
+    blockId[byteIx] = curId
+  }
+  return numBlocks
+}
+
+// `RemapBlockIds`.
+fn remapBlockIds(blockIds: &mut [u8], length: usize, newId: &mut [u16], numHistograms: usize) -> usize {
+  let invalidId: u16 = 256
+  let mut nextId: u16 = 0
+  let mut i: usize = 0
+  while i < numHistograms {
+    newId[i] = invalidId
+    i = i + 1
+  }
+  i = 0
+  while i < length {
+    let b = u8.toUsize(blockIds[i])
+    if newId[b] == invalidId {
+      newId[b] = nextId
+      nextId = nextId + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < length {
+    blockIds[i] = u16.wrappingToU8(newId[u8.toUsize(blockIds[i])])
+    i = i + 1
+  }
+  return u16.toUsize(nextId)
+}
+
+// `BuildBlockHistograms`.
+fn buildBlockHistograms<H: HistogramOps + Copy, D: SymbolValue + Copy>(data: &[D], length: usize, blockIds: &[u8], numHistograms: usize, histograms: &mut [H]) -> () {
+  let mut i: usize = 0
+  while i < numHistograms {
+    HistogramOps.clearAll(&mut histograms[i])
+    i = i + 1
+  }
+  i = 0
+  while i < length {
+    HistogramOps.addOne(&mut histograms[u8.toUsize(blockIds[i])], SymbolValue.symbol(data[i]))
+    i = i + 1
+  }
+}
+
+// `ClusterBlocks`: given the initial partitioning build partitioning with limited number of
+// histograms (and block types).
+effect fn clusterBlocks<H: HistogramOps + Copy, D: SymbolValue + Copy>(data: &[D], length: usize, numBlocks: usize, blockIds: &[u8], split: &mut BlockSplit) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut histogramSymbolsList = run filledWords(0, numBlocks)
+  let histogramSymbols = List<u32>.asMutSlice(&mut histogramSymbolsList)
+  let mut u32List = run filledWords(0, numBlocks + 4 * HISTOGRAMS_PER_BATCH)
+  let words = List<u32>.asMutSlice(&mut u32List)
+  let expectedNumClusters = CLUSTERS_PER_BATCH * (numBlocks + HISTOGRAMS_PER_BATCH - 1) / HISTOGRAMS_PER_BATCH
+  let mut allHistogramsList = List<H>.make()
+  run List<H>.reserveExact(&mut allHistogramsList, expectedNumClusters)
+  let mut clusterSizeList = List<u32>.make()
+  run List<u32>.reserveExact(&mut clusterSizeList, expectedNumClusters)
+  let mut numClusters: usize = 0
+  let mut histogramsList = run clearedHistograms<H>(if numBlocks < HISTOGRAMS_PER_BATCH { numBlocks } else { HISTOGRAMS_PER_BATCH })
+  let histograms = List<H>.asMutSlice(&mut histogramsList)
+  let mut maxNumPairs = HISTOGRAMS_PER_BATCH * HISTOGRAMS_PER_BATCH / 2
+  let mut pairsCapacity = maxNumPairs + 1
+  let mut pairsList = run makePairs(pairsCapacity)
+  let mut pos: usize = 0
+  let invalidIndex: u32 = 0xffffffff
+  // TODO(eustas): move to arena?
+  let mut tmp: H = HistogramOps.cleared()
+  let mut tmp1: H = HistogramOps.cleared()
+
+  // Calculate block lengths (convert repeating values -> series length).
+  let blockLengthsAt = 4 * HISTOGRAMS_PER_BATCH
+  let mut blockIdx: usize = 0
+  let mut i: usize = 0
+  while i < length {
+    words[blockLengthsAt + blockIdx] = words[blockLengthsAt + blockIdx] + 1
+    if i + 1 == length || blockIds[i] != blockIds[i + 1] {
+      blockIdx = blockIdx + 1
+    }
+    i = i + 1
+  }
+
+  // Pre-cluster blocks (cluster batches).
+  i = 0
+  while i < numBlocks {
+    let numToCombine = if numBlocks - i < HISTOGRAMS_PER_BATCH { numBlocks - i } else { HISTOGRAMS_PER_BATCH }
+    let mut j: usize = 0
+    while j < numToCombine {
+      let blockLength = u32.toUsize(words[blockLengthsAt + i + j])
+      HistogramOps.clearAll(&mut histograms[j])
+      let mut k: usize = 0
+      while k < blockLength {
+        HistogramOps.addOne(&mut histograms[j], SymbolValue.symbol(data[pos]))
+        pos = pos + 1
+        k = k + 1
+      }
+      let c = HistogramOps.population(&histograms[j])
+      HistogramOps.setCost(&mut histograms[j], c)
+      // `new_clusters`, `symbols` and `sizes`.
+      words[HISTOGRAMS_PER_BATCH + j] = usize.wrappingToU32(j)
+      words[2 * HISTOGRAMS_PER_BATCH + j] = usize.wrappingToU32(j)
+      words[j] = 1
+      j = j + 1
+    }
+    let numNewClusters = combineBatch<H>(&mut histograms, &mut tmp, &mut words, &mut pairsList, numToCombine, maxNumPairs)
+    j = 0
+    while j < numNewClusters {
+      let newCluster = u32.toUsize(words[HISTOGRAMS_PER_BATCH + j])
+      run List<H>.append(&mut allHistogramsList, histograms[newCluster])
+      run List<u32>.append(&mut clusterSizeList, words[newCluster])
+      // `remap`.
+      words[3 * HISTOGRAMS_PER_BATCH + newCluster] = usize.wrappingToU32(j)
+      j = j + 1
+    }
+    j = 0
+    while j < numToCombine {
+      let symbol = u32.toUsize(words[2 * HISTOGRAMS_PER_BATCH + j])
+      histogramSymbols[i + j] = usize.wrappingToU32(numClusters) + words[3 * HISTOGRAMS_PER_BATCH + symbol]
+      j = j + 1
+    }
+    numClusters = numClusters + numNewClusters
+    i = i + HISTOGRAMS_PER_BATCH
+  }
+  drop histogramsList
+
+  // Final clustering.
+  let a = 64 * numClusters
+  let b = (numClusters / 2) * numClusters
+  maxNumPairs = if a < b { a } else { b }
+  if pairsCapacity < maxNumPairs + 1 {
+    pairsList = run makePairs(0)
+    pairsList = run makePairs(maxNumPairs + 1)
+    pairsCapacity = maxNumPairs + 1
+  }
+  let mut clustersList = run filledWords(0, numClusters)
+  let clusters = List<u32>.asMutSlice(&mut clustersList)
+  i = 0
+  while i < numClusters {
+    clusters[i] = usize.wrappingToU32(i)
+    i = i + 1
+  }
+  let allHistograms = List<H>.asMutSlice(&mut allHistogramsList)
+  let numFinalClusters = histogramCombine<H>(&mut allHistograms, &mut tmp, List<u32>.asMutSlice(&mut clusterSizeList), &mut histogramSymbols, &mut clusters, List<HistogramPair>.asMutSlice(&mut pairsList), numClusters, numBlocks, MAX_NUMBER_OF_BLOCK_TYPES, maxNumPairs)
+  drop pairsList
+  drop clusterSizeList
+
+  // Assign blocks to final histograms.
+  let mut newIndexList = run filledWords(invalidIndex, numClusters)
+  let newIndex = List<u32>.asMutSlice(&mut newIndexList)
+  pos = 0
+  let mut nextIndex: u32 = 0
+  i = 0
+  while i < numBlocks {
+    HistogramOps.clearAll(&mut tmp)
+    let blockLength = u32.toUsize(words[blockLengthsAt + i])
+    let mut j: usize = 0
+    while j < blockLength {
+      HistogramOps.addOne(&mut tmp, SymbolValue.symbol(data[pos]))
+      pos = pos + 1
+      j = j + 1
+    }
+    // Among equally good histograms prefer last used.
+    // TODO(eustas): should we give a block-switch discount here?
+    let mut bestOut = if i == 0 { histogramSymbols[0] } else { histogramSymbols[i - 1] }
+    let mut bestBits = histogramBitCostDistance<H>(&tmp, &allHistograms[u32.toUsize(bestOut)], &mut tmp1)
+    j = 0
+    while j < numFinalClusters {
+      let curBits = histogramBitCostDistance<H>(&tmp, &allHistograms[u32.toUsize(clusters[j])], &mut tmp1)
+      if curBits < bestBits {
+        bestBits = curBits
+        bestOut = clusters[j]
+      }
+      j = j + 1
+    }
+    histogramSymbols[i] = bestOut
+    if newIndex[u32.toUsize(bestOut)] == invalidIndex {
+      newIndex[u32.toUsize(bestOut)] = nextIndex
+      nextIndex = nextIndex + 1
+    }
+    i = i + 1
+  }
+  drop clustersList
+  drop allHistogramsList
+  run BlockSplit.ensureCapacity(&mut split, numBlocks)
+
+  // Rewrite final assignment to block-split. There might be less blocks than |num_blocks| due to
+  // clustering.
+  let types = List<u8>.asMutSlice(&mut split.types)
+  let lengths = List<u32>.asMutSlice(&mut split.lengths)
+  let mut curLength: u32 = 0
+  blockIdx = 0
+  let mut maxType: u8 = 0
+  i = 0
+  while i < numBlocks {
+    curLength = u32.wrappingAdd(curLength, words[blockLengthsAt + i])
+    if i + 1 == numBlocks || histogramSymbols[i] != histogramSymbols[i + 1] {
+      let id = u32.wrappingToU8(newIndex[u32.toUsize(histogramSymbols[i])])
+      types[blockIdx] = id
+      lengths[blockIdx] = curLength
+      if id > maxType { maxType = id }
+      curLength = 0
+      blockIdx = blockIdx + 1
+    }
+    i = i + 1
+  }
+  split.numBlocks = blockIdx
+  split.numTypes = u8.toUsize(maxType) + 1
+}
+
+// The batch step of `ClusterBlocks`: `BrotliHistogramCombine` over the batch, with `sizes`,
+// `new_clusters` and `symbols` at their places in `words`.
+fn combineBatch<H: HistogramOps + Copy>(histograms: &mut [H], tmp: &mut H, words: &mut [u32], pairsList: &mut List<HistogramPair>, numToCombine: usize, maxNumPairs: usize) -> usize {
+  let mut sizes: [u32; 64] = [0; 64]
+  let mut newClusters: [u32; 64] = [0; 64]
+  let mut symbols: [u32; 64] = [0; 64]
+  let mut j: usize = 0
+  while j < HISTOGRAMS_PER_BATCH {
+    sizes[j] = words[j]
+    newClusters[j] = words[HISTOGRAMS_PER_BATCH + j]
+    symbols[j] = words[2 * HISTOGRAMS_PER_BATCH + j]
+    j = j + 1
+  }
+  let result = histogramCombine<H>(&mut histograms, &mut tmp, &mut sizes, &mut symbols, &mut newClusters, List<HistogramPair>.asMutSlice(&mut pairsList), numToCombine, numToCombine, HISTOGRAMS_PER_BATCH, maxNumPairs)
+  j = 0
+  while j < HISTOGRAMS_PER_BATCH {
+    words[j] = sizes[j]
+    words[HISTOGRAMS_PER_BATCH + j] = newClusters[j]
+    words[2 * HISTOGRAMS_PER_BATCH + j] = symbols[j]
+    j = j + 1
+  }
+  return result
+}
+
+// `SplitByteVector`: create BlockSplit (partitioning) given the limits, estimates and "effort"
+// parameters.
+//
+// NB: max_histograms is often less than number of histograms allowed by format; this is done
+//     intentionally, to save some "space" for context-aware clustering (here entropy is estimated
+//     for context-free symbols).
+effect fn splitByteVector<H: HistogramOps + Copy, D: SymbolValue + Copy>(
+  data: &[D],
+  length: usize,
+  symbolsPerHistogram: usize,
+  maxHistograms: usize,
+  samplingStrideLength: usize,
+  blockSwitchCost: f64,
+  params: &EncoderParams,
+  split: &mut BlockSplit,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let probe: H = HistogramOps.cleared()
+  let dataSize = HistogramOps.dataSize(&probe)
+  // Calculate number of histograms; initial estimate is one histogram per specified amount of
+  // symbols; however, this value is capped.
+  let mut numHistograms = length / symbolsPerHistogram + 1
+  if numHistograms > maxHistograms {
+    numHistograms = maxHistograms
+  }
+
+  // Corner case: no input.
+  if length == 0 {
+    split.numTypes = 1
+    return ()
+  }
+
+  if length < MIN_LENGTH_FOR_BLOCK_SPLITTING {
+    let wanted = split.numBlocks + 1
+    run BlockSplit.ensureCapacity(&mut split, wanted)
+    split.numTypes = 1
+    let at = split.numBlocks
+    let types = List<u8>.asMutSlice(&mut split.types)
+    types[at] = 0
+    let lengths = List<u32>.asMutSlice(&mut split.lengths)
+    lengths[at] = usize.wrappingToU32(length)
+    split.numBlocks = split.numBlocks + 1
+    return ()
+  }
+  let mut histogramsList = run clearedHistograms<H>(numHistograms + 1)
+  let histogramsAll = List<H>.asMutSlice(&mut histogramsList)
+  let mut tmp: H = HistogramOps.cleared()
+  // Find good entropy codes.
+  initialEntropyCodes<H, D>(data, length, samplingStrideLength, numHistograms, &mut histogramsAll)
+  refineEntropyCodes<H, D>(data, length, samplingStrideLength, numHistograms, &mut histogramsAll, &mut tmp)
+  // Find a good path through literals with the good entropy codes.
+  let mut blockIdsList = List<u8>.make()
+  run List<u8>.reserveExact(&mut blockIdsList, length)
+  run List<u8>.appendRepeated(&mut blockIdsList, 0, length)
+  let blockIds = List<u8>.asMutSlice(&mut blockIdsList)
+  let mut numBlocks: usize = 0
+  let bitmaplen = usize.shiftRight(numHistograms + 7, 3)
+  let mut insertCostList = List<f64>.make()
+  run List<f64>.reserveExact(&mut insertCostList, dataSize * numHistograms)
+  run List<f64>.appendRepeated(&mut insertCostList, 0.0, dataSize * numHistograms)
+  let mut costList = List<f64>.make()
+  run List<f64>.reserveExact(&mut costList, numHistograms)
+  run List<f64>.appendRepeated(&mut costList, 0.0, numHistograms)
+  let mut switchSignalList = List<u8>.make()
+  run List<u8>.reserveExact(&mut switchSignalList, length * bitmaplen)
+  run List<u8>.appendRepeated(&mut switchSignalList, 0, length * bitmaplen)
+  let mut newIdList = List<u16>.make()
+  run List<u16>.reserveExact(&mut newIdList, numHistograms)
+  run List<u16>.appendRepeated(&mut newIdList, 0, numHistograms)
+  let iters: usize = if params.quality < HQ_ZOPFLIFICATION_QUALITY { 3 } else { 10 }
+  let mut i: usize = 0
+  while i < iters {
+    numBlocks = findBlocks<H, D>(
+      data,
+      length,
+      blockSwitchCost,
+      numHistograms,
+      &histogramsAll,
+      List<f64>.asMutSlice(&mut insertCostList),
+      List<f64>.asMutSlice(&mut costList),
+      List<u8>.asMutSlice(&mut switchSignalList),
+      &mut blockIds,
+    )
+    numHistograms = remapBlockIds(&mut blockIds, length, List<u16>.asMutSlice(&mut newIdList), numHistograms)
+    buildBlockHistograms<H, D>(data, length, &blockIds, numHistograms, &mut histogramsAll)
+    i = i + 1
+  }
+  drop insertCostList
+  drop costList
+  drop switchSignalList
+  drop newIdList
+  drop histogramsList
+  run clusterBlocks<H, D>(data, length, numBlocks, &blockIds, &mut split)
+}
+
+/// `BrotliSplitBlock`: extracts literals, command distance and prefix codes, then applies
+/// `SplitByteVector` to create partitioning.
+pub effect fn splitBlock(
+  cmds: &[Command],
+  numCommands: usize,
+  data: &[u8],
+  pos: usize,
+  mask: usize,
+  params: &EncoderParams,
+  literalSplit: &mut BlockSplit,
+  insertAndCopySplit: &mut BlockSplit,
+  distSplit: &mut BlockSplit,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let literalsCount = countLiterals(cmds, numCommands)
+  let mut literals = List<u8>.make()
+  run List<u8>.reserveExact(&mut literals, literalsCount)
+  run List<u8>.appendRepeated(&mut literals, 0, literalsCount)
+  // Create a continuous array of literals.
+  copyLiteralsToByteArray(cmds, numCommands, data, pos, mask, List<u8>.asMutSlice(&mut literals))
+  // Create the block split on the array of literals. Literal histograms can have alphabet size up
+  // to 256. Though, to accommodate context modeling, less than half of maximum size is allowed.
+  run splitByteVector<HistogramLiteral, u8>(List<u8>.asSlice(&literals), literalsCount, SYMBOLS_PER_LITERAL_HISTOGRAM, MAX_LITERAL_HISTOGRAMS, LITERAL_STRIDE_LENGTH, LITERAL_BLOCK_SWITCH_COST, params, &mut literalSplit)
+  drop literals
+
+  // Compute prefix codes for commands.
+  let mut insertAndCopyCodes = List<u16>.make()
+  run List<u16>.reserveExact(&mut insertAndCopyCodes, numCommands)
+  let mut i: usize = 0
+  while i < numCommands {
+    run List<u16>.append(&mut insertAndCopyCodes, cmds[i].cmdPrefix)
+    i = i + 1
+  }
+  // Create the block split on the array of command prefixes.
+  run splitByteVector<HistogramCommand, u16>(List<u16>.asSlice(&insertAndCopyCodes), numCommands, SYMBOLS_PER_COMMAND_HISTOGRAM, MAX_COMMAND_HISTOGRAMS, COMMAND_STRIDE_LENGTH, COMMAND_BLOCK_SWITCH_COST, params, &mut insertAndCopySplit)
+  drop insertAndCopyCodes
+
+  // Create a continuous array of distance prefixes.
+  let mut distancePrefixes = List<u16>.make()
+  run List<u16>.reserveExact(&mut distancePrefixes, numCommands)
+  i = 0
+  while i < numCommands {
+    let cmd = cmds[i]
+    if Command.copyLength(&cmd) != 0 && cmd.cmdPrefix >= 128 {
+      run List<u16>.append(&mut distancePrefixes, cmd.distPrefix & 0x3ff)
+    }
+    i = i + 1
+  }
+  let j = List<u16>.length(&distancePrefixes)
+  // Create the block split on the array of distance prefixes.
+  run splitByteVector<HistogramDistance, u16>(List<u16>.asSlice(&distancePrefixes), j, SYMBOLS_PER_DISTANCE_HISTOGRAM, MAX_COMMAND_HISTOGRAMS, DISTANCE_STRIDE_LENGTH, DISTANCE_BLOCK_SWITCH_COST, params, &mut distSplit)
 }

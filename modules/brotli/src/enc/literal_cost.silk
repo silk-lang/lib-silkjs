@@ -1,0 +1,215 @@
+//! The literal cost model of the Zopfli match finder: a port of google/brotli v1.2.0
+//! `c/enc/literal_cost.h` and `literal_cost.c` (`BrotliEstimateBitCostsForLiterals`).
+//!
+//! The estimates are doubles rounded to `float` at the end, as in C.
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.u8
+import silk.num.usize
+import enc.fast_log { fastLog2 }
+import enc.utf8_util { MIN_UTF8_RATIO, isMostlyUtf8 }
+
+// `UTF8Position`.
+@inlineAlways
+fn utf8Position(last: usize, c: usize, clamp: usize) -> usize {
+  if c < 128 {
+    // Next one is the 'Byte 1' again.
+    return 0
+  } else if c >= 192 {
+    // Next one is the 'Byte 2' of utf-8 encoding.
+    return if clamp < 1 { clamp } else { 1 }
+  }
+  // Let's decide over the last byte if this ends the sequence.
+  if last < 0xe0 {
+    // Completed two or three byte coding.
+    return 0
+  }
+  // Next one is the 'Byte 3' of utf-8 encoding.
+  return if clamp < 2 { clamp } else { 2 }
+}
+
+// `DecideMultiByteStatsLevel`.
+fn decideMultiByteStatsLevel(pos: usize, len: usize, mask: usize, data: &[u8]) -> usize {
+  let mut counts: [usize; 3] = [0; 3]
+  // should be 2, but 1 compresses better.
+  let mut maxUtf8: usize = 1
+  let mut lastC: usize = 0
+  let mut i: usize = 0
+  while i < len {
+    let c = u8.toUsize(data[(pos + i) & mask])
+    let slot = utf8Position(lastC, c, 2)
+    counts[slot] = counts[slot] + 1
+    lastC = c
+    i = i + 1
+  }
+  if counts[2] < 500 {
+    maxUtf8 = 1
+  }
+  if counts[1] + counts[2] < 25 {
+    maxUtf8 = 0
+  }
+  return maxUtf8
+}
+
+// `EstimateBitCostsForLiteralsUTF8`.
+fn estimateBitCostsForLiteralsUtf8(pos: usize, len: usize, mask: usize, data: &[u8], histogram: &mut [usize], cost: &mut [f32], costAt: usize) -> () {
+  // max_utf8 is 0 (normal ASCII single byte modeling), 1 (for 2-byte UTF-8 modeling), or 2 (for
+  // 3-byte UTF-8 modeling).
+  let maxUtf8 = decideMultiByteStatsLevel(pos, len, mask, data)
+  let windowHalf: usize = 495
+  let inWindow = if windowHalf < len { windowHalf } else { len }
+  let mut inWindowUtf8: [usize; 3] = [0; 3]
+  let mut i: usize = 0
+  while i < 3 * 256 {
+    histogram[i] = 0
+    i = i + 1
+  }
+
+  // Bootstrap histograms.
+  let mut lastC: usize = 0
+  let mut utf8Pos: usize = 0
+  i = 0
+  while i < inWindow {
+    let c = u8.toUsize(data[(pos + i) & mask])
+    histogram[256 * utf8Pos + c] = histogram[256 * utf8Pos + c] + 1
+    inWindowUtf8[utf8Pos] = inWindowUtf8[utf8Pos] + 1
+    utf8Pos = utf8Position(lastC, c, maxUtf8)
+    lastC = c
+    i = i + 1
+  }
+
+  // Compute bit costs with sliding window. The positions below stay inside the input, so their
+  // sums do not wrap; the histogram slots are below 3 * 256 (`utf8Position` is at most 2).
+  let prologueLength: usize = 2000
+  let multiplier: f64 = 0.35 / 2000.0
+  if histogram.length < 3 * 256 {
+    Intrinsic.trap("brotli: the literal cost histogram is too short")
+  }
+  i = 0
+  while i < len {
+    let at = usize.wrappingAdd(pos, i)
+    if i >= windowHalf {
+      // Remove a byte in the past.
+      let c: usize = if i < windowHalf + 1 { 0 } else { u8.toUsize(data[usize.wrappingSubtract(at, windowHalf + 1) & mask]) }
+      let last: usize = if i < windowHalf + 2 { 0 } else { u8.toUsize(data[usize.wrappingSubtract(at, windowHalf + 2) & mask]) }
+      let utf8Pos2 = utf8Position(last, c, maxUtf8)
+      let slot = usize.wrappingAdd(usize.shiftLeft(utf8Pos2 & 3, 8), u8.toUsize(data[usize.wrappingSubtract(at, windowHalf) & mask])) % 768
+      let count = usize.wrappingSubtract(unsafe readAt(&histogram, slot), 1)
+      unsafe writeAt(&mut histogram, slot, count)
+      inWindowUtf8[utf8Pos2] = usize.wrappingSubtract(inWindowUtf8[utf8Pos2], 1)
+    }
+    if i + windowHalf < len {
+      // Add a byte in the future.
+      let ahead = usize.wrappingAdd(at, windowHalf)
+      let c = u8.toUsize(data[usize.wrappingSubtract(ahead, 1) & mask])
+      let last = u8.toUsize(data[usize.wrappingSubtract(ahead, 2) & mask])
+      let utf8Pos2 = utf8Position(last, c, maxUtf8)
+      let slot = usize.wrappingAdd(usize.shiftLeft(utf8Pos2 & 3, 8), u8.toUsize(data[ahead & mask])) % 768
+      let count = usize.wrappingAdd(unsafe readAt(&histogram, slot), 1)
+      unsafe writeAt(&mut histogram, slot, count)
+      inWindowUtf8[utf8Pos2] = usize.wrappingAdd(inWindowUtf8[utf8Pos2], 1)
+    }
+    let c: usize = if i < 1 { 0 } else { u8.toUsize(data[usize.wrappingSubtract(at, 1) & mask]) }
+    let last: usize = if i < 2 { 0 } else { u8.toUsize(data[usize.wrappingSubtract(at, 2) & mask]) }
+    let utf8Pos3 = utf8Position(last, c, maxUtf8)
+    let maskedPos = at & mask
+    let mut histo = unsafe readAt(&histogram, usize.wrappingAdd(usize.shiftLeft(utf8Pos3 & 3, 8), u8.toUsize(data[maskedPos])) % 768)
+    if histo == 0 {
+      histo = 1
+    }
+    let mut litCost = fastLog2(inWindowUtf8[utf8Pos3]) - fastLog2(histo)
+    litCost = litCost + 0.02905
+    if litCost < 1.0 {
+      litCost = litCost * 0.5
+      litCost = litCost + 0.5
+    }
+    // Make the first bytes more expensive -- seems to help, not sure why. Perhaps because the
+    // entropy source is changing its properties rapidly in the beginning of the file, perhaps
+    // because the beginning of the data is a statistical "anomaly".
+    if i < prologueLength {
+      litCost = litCost + (0.35 + multiplier * usize.toF64(i))
+    }
+    cost[costAt + i] = f64.toF32(litCost)
+    i = i + 1
+  }
+}
+
+// `values[index]` without a bounds check.
+//
+// # Gotchas
+// The caller must prove that `index` is less than `values.length`.
+@inlineAlways
+unsafe fn readAt(values: &[usize], index: usize) -> usize {
+  unsafe {
+    // The caller's proof implies that the slice is not empty, so its pointer is not null.
+    let base = Intrinsic.pointerRequalify<?[*]const usize, [*]const usize>(Pointer.fromSlice<usize>(values))
+    return Pointer.read<usize>(Pointer.at<usize>(base, index))
+  }
+}
+
+// `values[index] = value` without a bounds check.
+//
+// # Gotchas
+// The caller must prove that `index` is less than `values.length`.
+@inlineAlways
+unsafe fn writeAt(values: &mut [usize], index: usize, value: usize) -> () {
+  unsafe {
+    // The caller's proof implies that the slice is not empty, so its pointer is not null.
+    let base = Intrinsic.pointerRequalify<?[*]mut usize, [*]mut usize>(Pointer.fromMutSlice<usize>(&mut values))
+    Pointer.write<usize>(Pointer.atMut<usize>(base, index), value)
+  }
+}
+
+/// `BrotliEstimateBitCostsForLiterals`: estimates how many bits the literals in the interval
+/// `[pos, pos + len)` in the ring buffer `data` will take entropy coded, and writes these
+/// estimates to `cost[costAt .. costAt + len)`. `histogram` holds `3 * 256` counts.
+pub fn estimateBitCostsForLiterals(pos: usize, len: usize, mask: usize, data: &[u8], histogram: &mut [usize], cost: &mut [f32], costAt: usize) -> () {
+  if isMostlyUtf8(data, pos, mask, len, MIN_UTF8_RATIO) {
+    estimateBitCostsForLiteralsUtf8(pos, len, mask, data, &mut histogram, &mut cost, costAt)
+    return ()
+  }
+  let windowHalf: usize = 2000
+  let mut inWindow = if windowHalf < len { windowHalf } else { len }
+  let mut i: usize = 0
+  while i < 256 {
+    histogram[i] = 0
+    i = i + 1
+  }
+
+  // Bootstrap histogram.
+  i = 0
+  while i < inWindow {
+    let c = u8.toUsize(data[(pos + i) & mask])
+    histogram[c] = histogram[c] + 1
+    i = i + 1
+  }
+
+  // Compute bit costs with sliding window.
+  i = 0
+  while i < len {
+    if i >= windowHalf {
+      // Remove a byte in the past.
+      let c = u8.toUsize(data[(pos + i - windowHalf) & mask])
+      histogram[c] = histogram[c] - 1
+      inWindow = inWindow - 1
+    }
+    if i + windowHalf < len {
+      // Add a byte in the future.
+      let c = u8.toUsize(data[(pos + i + windowHalf) & mask])
+      histogram[c] = histogram[c] + 1
+      inWindow = inWindow + 1
+    }
+    let mut histo = histogram[u8.toUsize(data[(pos + i) & mask])]
+    if histo == 0 {
+      histo = 1
+    }
+    let mut litCost = fastLog2(inWindow) - fastLog2(histo)
+    litCost = litCost + 0.029
+    if litCost < 1.0 {
+      litCost = litCost * 0.5
+      litCost = litCost + 0.5
+    }
+    cost[costAt + i] = f64.toF32(litCost)
+    i = i + 1
+  }
+}

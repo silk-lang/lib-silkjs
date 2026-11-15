@@ -1,0 +1,512 @@
+//! The search of the static dictionary with all its transforms, for the Zopfli match finder of
+//! qualities 10 and 11: a port of google/brotli v1.2.0 `c/enc/static_dict.h` and `static_dict.c`
+//! (`BrotliFindAllStaticDictionaryMatches`) for the built-in dictionary.
+//!
+//! Only the built-in dictionary is searched: an encoder without attached dictionaries has one
+//! dictionary (`num_dictionaries == 1`), so the second pass of the C function never runs.
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.compress.brotli_tables
+import enc.static_dict_lut { bucket, wordBytes }
+import enc.write_bits { load32, load64 }
+
+/// `BROTLI_MAX_STATIC_DICTIONARY_MATCH_LEN`.
+pub const MAX_STATIC_DICTIONARY_MATCH_LEN: usize = 37
+/// `kInvalidMatch`.
+pub const INVALID_MATCH: u32 = 0xfffffff
+
+/// `kHashMul32` of `hash_base.h`.
+pub const HASH_MUL32: u32 = 0x1e35a7bd
+
+// `kCutoffTransforms` and `kCutoffTransformsCount` of `hash.h`, which the built-in dictionary
+// takes as its `cutoffTransforms`.
+const CUTOFF_TRANSFORMS: u64 = 0x071b520ada2d3200
+
+// `BROTLI_TRANSFORM_UPPERCASE_FIRST`.
+const TRANSFORM_UPPERCASE_FIRST: u8 = 10
+
+/// `Hash15` of `hash_base.h` over the 4 bytes at `at`.
+@inlineAlways
+pub fn hash15(data: &[u8], at: usize) -> usize {
+  let h = u32.wrappingMultiply(load32(data, at), HASH_MUL32)
+  // The higher bits contain more mixture from the multiplication, so we take our results from
+  // there.
+  return u32.toUsize(u32.shiftRight(h, 17))
+}
+
+// `cond ? a : b` for transform numbers.
+@inlineAlways
+fn pick(cond: bool, a: usize, b: usize) -> usize {
+  if cond { return a }
+  return b
+}
+
+// `AddMatch`.
+@inlineAlways
+fn addMatch(distance: usize, len: usize, lenCode: usize, matches: &mut [u32; 38]) -> () {
+  let m = usize.wrappingToU32(usize.wrappingAdd(usize.shiftLeft(distance, 5), lenCode))
+  if m < matches[len] {
+    matches[len] = m
+  }
+}
+
+// `FindMatchLengthWithLimit` between the dictionary at `s1` and the data at `s2`.
+@inlineAlways
+fn matchLength(dict: &[u8], s1: usize, data: &[u8], s2: usize, limit: usize) -> usize {
+  let mut matched: usize = 0
+  let mut left = limit
+  while left >= 8 {
+    let x = u64.bitXor(load64(data, s2 + matched), load64(dict, s1 + matched))
+    if x != 0 {
+      return matched + u32.toUsize(u64.trailingZeros(x) / 8)
+    }
+    matched = matched + 8
+    left = left - 8
+  }
+  while left != 0 && dict[s1 + matched] == data[s2 + matched] {
+    left = left - 1
+    matched = matched + 1
+  }
+  return matched
+}
+
+// One `DictWord` of the lookup table.
+struct DictWord {
+  len: u8,
+  transform: u8,
+  idx: u16,
+}
+
+@inlineAlways
+fn dictWord(offset: usize) -> DictWord {
+  let w = load32(wordBytes(), 4 * offset)
+  return DictWord { len: u32.wrappingToU8(w), transform: u32.wrappingToU8(u32.shiftRight(w, 8)), idx: u32.wrappingToU16(u32.shiftRight(w, 16)) }
+}
+
+// `IsMatch`: whether the word with its transform matches the data at `at`.
+@inlineAlways
+fn isMatch(dict: &[u8], len: usize, transform: u8, idx: usize, data: &[u8], at: usize, maxLength: usize) -> bool {
+  if len > maxLength {
+    return false
+  }
+  let offset = brotli_tables.wordOffset(len) + len * idx
+  if transform == 0 {
+    // Match against base dictionary word.
+    return matchLength(dict, offset, data, at, len) == len
+  } else if transform == 10 {
+    // Match against uppercase first transform. Note that there are only ASCII uppercase words
+    // in the lookup table.
+    let first = dict[offset]
+    return first >= 97 && first <= 122 && u8.bitXor(first, 32) == data[at] && matchLength(dict, offset + 1, data, at + 1, len - 1) == len - 1
+  }
+  // Match against uppercase all transform. Note that there are only ASCII uppercase words in the
+  // lookup table.
+  let mut i: usize = 0
+  while i < len {
+    let c = dict[offset + i]
+    if c >= 97 && c <= 122 {
+      if u8.bitXor(c, 32) != data[at + i] { return false }
+    } else {
+      if c != data[at + i] { return false }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// `BrotliFindAllStaticDictionaryMatches`: the matches of the dictionary words with their
+/// transforms against the data at `at`, from `minLength` to at most `maxLength` bytes.
+///
+/// `matches[len]` holds the smallest `(distance << 5) + len_code` of a match of `len` bytes, and
+/// stays at its value (initially `INVALID_MATCH`) where there is none. Returns whether a match
+/// was found.
+pub fn findAllStaticDictionaryMatches(data: &[u8], at: usize, minLength: usize, maxLength: usize, matches: &mut [u32; 38]) -> bool {
+  let dict = brotli_tables.words()
+  let mut hasFoundMatch = false
+  let mut offset = bucket(hash15(data, at))
+  let mut end = offset == 0
+  while !end {
+    let w = dictWord(offset)
+    offset = offset + 1
+    let l = u8.toUsize(w.len & 0x1f)
+    let n = usize.shiftLeft(1, u32.toUsize(brotli_tables.wordSizeBits(l)))
+    let id = u16.toUsize(w.idx)
+    end = (w.len & 0x80) != 0
+    if w.transform == 0 {
+      let matchlen = matchLength(dict, brotli_tables.wordOffset(l) + l * id, data, at, if l < maxLength { l } else { maxLength })
+      // Transform "" + BROTLI_TRANSFORM_IDENTITY + ""
+      if matchlen == l {
+        addMatch(id, l, l, &mut matches)
+        hasFoundMatch = true
+      }
+      // Transforms "" + BROTLI_TRANSFORM_OMIT_LAST_1 + "" and
+      //            "" + BROTLI_TRANSFORM_OMIT_LAST_1 + "ing "
+      if matchlen >= l - 1 {
+        addMatch(id + 12 * n, l - 1, l, &mut matches)
+        if l + 2 < maxLength && data[at + l - 1] == 105 && data[at + l] == 110 && data[at + l + 1] == 103 && data[at + l + 2] == 32 {
+          addMatch(id + 49 * n, l + 3, l, &mut matches)
+        }
+        hasFoundMatch = true
+      }
+      // Transform "" + BROTLI_TRANSFORM_OMIT_LAST_# + "" (# = 2 .. 9)
+      let mut minlen = minLength
+      if l > 9 && l - 9 > minlen { minlen = l - 9 }
+      let maxlen = if matchlen < l - 2 { matchlen } else { l - 2 }
+      let mut len = minlen
+      while len <= maxlen {
+        let cut = l - len
+        let transformId = usize.shiftLeft(cut, 2) + u64.toUsize(u64.shiftRight(CUTOFF_TRANSFORMS, usize.toU64(cut * 6)) & 0x3f)
+        addMatch(id + transformId * n, len, l, &mut matches)
+        hasFoundMatch = true
+        len = len + 1
+      }
+      if matchlen < l || l + 6 >= maxLength {
+        continue
+      }
+      let s = at + l
+      // Transforms "" + BROTLI_TRANSFORM_IDENTITY + <suffix>
+      let s0 = data[s]
+      if s0 == 32 {
+        addMatch(id + n, l + 1, l, &mut matches)
+        let s1 = data[s + 1]
+        if s1 == 97 {
+          if data[s + 2] == 32 {
+            addMatch(id + 28 * n, l + 3, l, &mut matches)
+          } else if data[s + 2] == 115 {
+            if data[s + 3] == 32 { addMatch(id + 46 * n, l + 4, l, &mut matches) }
+          } else if data[s + 2] == 116 {
+            if data[s + 3] == 32 { addMatch(id + 60 * n, l + 4, l, &mut matches) }
+          } else if data[s + 2] == 110 {
+            if data[s + 3] == 100 && data[s + 4] == 32 {
+              addMatch(id + 10 * n, l + 5, l, &mut matches)
+            }
+          }
+        } else if s1 == 98 {
+          if data[s + 2] == 121 && data[s + 3] == 32 {
+            addMatch(id + 38 * n, l + 4, l, &mut matches)
+          }
+        } else if s1 == 105 {
+          if data[s + 2] == 110 {
+            if data[s + 3] == 32 { addMatch(id + 16 * n, l + 4, l, &mut matches) }
+          } else if data[s + 2] == 115 {
+            if data[s + 3] == 32 { addMatch(id + 47 * n, l + 4, l, &mut matches) }
+          }
+        } else if s1 == 102 {
+          if data[s + 2] == 111 {
+            if data[s + 3] == 114 && data[s + 4] == 32 {
+              addMatch(id + 25 * n, l + 5, l, &mut matches)
+            }
+          } else if data[s + 2] == 114 {
+            if data[s + 3] == 111 && data[s + 4] == 109 && data[s + 5] == 32 {
+              addMatch(id + 37 * n, l + 6, l, &mut matches)
+            }
+          }
+        } else if s1 == 111 {
+          if data[s + 2] == 102 {
+            if data[s + 3] == 32 { addMatch(id + 8 * n, l + 4, l, &mut matches) }
+          } else if data[s + 2] == 110 {
+            if data[s + 3] == 32 { addMatch(id + 45 * n, l + 4, l, &mut matches) }
+          }
+        } else if s1 == 110 {
+          if data[s + 2] == 111 && data[s + 3] == 116 && data[s + 4] == 32 {
+            addMatch(id + 80 * n, l + 5, l, &mut matches)
+          }
+        } else if s1 == 116 {
+          if data[s + 2] == 104 {
+            if data[s + 3] == 101 {
+              if data[s + 4] == 32 { addMatch(id + 5 * n, l + 5, l, &mut matches) }
+            } else if data[s + 3] == 97 {
+              if data[s + 4] == 116 && data[s + 5] == 32 {
+                addMatch(id + 29 * n, l + 6, l, &mut matches)
+              }
+            }
+          } else if data[s + 2] == 111 {
+            if data[s + 3] == 32 { addMatch(id + 17 * n, l + 4, l, &mut matches) }
+          }
+        } else if s1 == 119 {
+          if data[s + 2] == 105 && data[s + 3] == 116 && data[s + 4] == 104 && data[s + 5] == 32 {
+            addMatch(id + 35 * n, l + 6, l, &mut matches)
+          }
+        }
+      } else if s0 == 34 {
+        addMatch(id + 19 * n, l + 1, l, &mut matches)
+        if data[s + 1] == 62 {
+          addMatch(id + 21 * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 46 {
+        addMatch(id + 20 * n, l + 1, l, &mut matches)
+        if data[s + 1] == 32 {
+          addMatch(id + 31 * n, l + 2, l, &mut matches)
+          if data[s + 2] == 84 && data[s + 3] == 104 {
+            if data[s + 4] == 101 {
+              if data[s + 5] == 32 { addMatch(id + 43 * n, l + 6, l, &mut matches) }
+            } else if data[s + 4] == 105 {
+              if data[s + 5] == 115 && data[s + 6] == 32 {
+                addMatch(id + 75 * n, l + 7, l, &mut matches)
+              }
+            }
+          }
+        }
+      } else if s0 == 44 {
+        addMatch(id + 76 * n, l + 1, l, &mut matches)
+        if data[s + 1] == 32 {
+          addMatch(id + 14 * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 10 {
+        addMatch(id + 22 * n, l + 1, l, &mut matches)
+        if data[s + 1] == 9 {
+          addMatch(id + 50 * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 93 {
+        addMatch(id + 24 * n, l + 1, l, &mut matches)
+      } else if s0 == 39 {
+        addMatch(id + 36 * n, l + 1, l, &mut matches)
+      } else if s0 == 58 {
+        addMatch(id + 51 * n, l + 1, l, &mut matches)
+      } else if s0 == 40 {
+        addMatch(id + 57 * n, l + 1, l, &mut matches)
+      } else if s0 == 61 {
+        if data[s + 1] == 34 {
+          addMatch(id + 70 * n, l + 2, l, &mut matches)
+        } else if data[s + 1] == 39 {
+          addMatch(id + 86 * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 97 {
+        if data[s + 1] == 108 && data[s + 2] == 32 {
+          addMatch(id + 84 * n, l + 3, l, &mut matches)
+        }
+      } else if s0 == 101 {
+        if data[s + 1] == 100 {
+          if data[s + 2] == 32 { addMatch(id + 53 * n, l + 3, l, &mut matches) }
+        } else if data[s + 1] == 114 {
+          if data[s + 2] == 32 { addMatch(id + 82 * n, l + 3, l, &mut matches) }
+        } else if data[s + 1] == 115 {
+          if data[s + 2] == 116 && data[s + 3] == 32 {
+            addMatch(id + 95 * n, l + 4, l, &mut matches)
+          }
+        }
+      } else if s0 == 102 {
+        if data[s + 1] == 117 && data[s + 2] == 108 && data[s + 3] == 32 {
+          addMatch(id + 90 * n, l + 4, l, &mut matches)
+        }
+      } else if s0 == 105 {
+        if data[s + 1] == 118 {
+          if data[s + 2] == 101 && data[s + 3] == 32 {
+            addMatch(id + 92 * n, l + 4, l, &mut matches)
+          }
+        } else if data[s + 1] == 122 {
+          if data[s + 2] == 101 && data[s + 3] == 32 {
+            addMatch(id + 100 * n, l + 4, l, &mut matches)
+          }
+        }
+      } else if s0 == 108 {
+        if data[s + 1] == 101 {
+          if data[s + 2] == 115 && data[s + 3] == 115 && data[s + 4] == 32 {
+            addMatch(id + 93 * n, l + 5, l, &mut matches)
+          }
+        } else if data[s + 1] == 121 {
+          if data[s + 2] == 32 { addMatch(id + 61 * n, l + 3, l, &mut matches) }
+        }
+      } else if s0 == 111 {
+        if data[s + 1] == 117 && data[s + 2] == 115 && data[s + 3] == 32 {
+          addMatch(id + 106 * n, l + 4, l, &mut matches)
+        }
+      }
+    } else {
+      // Set is_all_caps=0 for BROTLI_TRANSFORM_UPPERCASE_FIRST and is_all_caps=1 otherwise
+      // (BROTLI_TRANSFORM_UPPERCASE_ALL) transform.
+      let isAllCaps = w.transform != TRANSFORM_UPPERCASE_FIRST
+      if !isMatch(dict, l, w.transform, id, data, at, maxLength) {
+        continue
+      }
+      // Transform "" + kUppercase{First,All} + ""
+      addMatch(id + pick(isAllCaps, 44, 9) * n, l, l, &mut matches)
+      hasFoundMatch = true
+      if l + 1 >= maxLength {
+        continue
+      }
+      // Transforms "" + kUppercase{First,All} + <suffix>
+      let s = at + l
+      let s0 = data[s]
+      if s0 == 32 {
+        addMatch(id + pick(isAllCaps, 68, 4) * n, l + 1, l, &mut matches)
+      } else if s0 == 34 {
+        addMatch(id + pick(isAllCaps, 87, 66) * n, l + 1, l, &mut matches)
+        if data[s + 1] == 62 {
+          addMatch(id + pick(isAllCaps, 97, 69) * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 46 {
+        addMatch(id + pick(isAllCaps, 101, 79) * n, l + 1, l, &mut matches)
+        if data[s + 1] == 32 {
+          addMatch(id + pick(isAllCaps, 114, 88) * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 44 {
+        addMatch(id + pick(isAllCaps, 112, 99) * n, l + 1, l, &mut matches)
+        if data[s + 1] == 32 {
+          addMatch(id + pick(isAllCaps, 107, 58) * n, l + 2, l, &mut matches)
+        }
+      } else if s0 == 39 {
+        addMatch(id + pick(isAllCaps, 94, 74) * n, l + 1, l, &mut matches)
+      } else if s0 == 40 {
+        addMatch(id + pick(isAllCaps, 113, 78) * n, l + 1, l, &mut matches)
+      } else if s0 == 61 {
+        if data[s + 1] == 34 {
+          addMatch(id + pick(isAllCaps, 105, 104) * n, l + 2, l, &mut matches)
+        } else if data[s + 1] == 39 {
+          addMatch(id + pick(isAllCaps, 116, 108) * n, l + 2, l, &mut matches)
+        }
+      }
+    }
+  }
+  // Transforms with prefixes " " and "."
+  if maxLength >= 5 && (data[at] == 32 || data[at] == 46) {
+    let isSpace = data[at] == 32
+    let mut offset2 = bucket(hash15(data, at + 1))
+    let mut end2 = offset2 == 0
+    while !end2 {
+      let w = dictWord(offset2)
+      offset2 = offset2 + 1
+      let l = u8.toUsize(w.len & 0x1f)
+      let n = usize.shiftLeft(1, u32.toUsize(brotli_tables.wordSizeBits(l)))
+      let id = u16.toUsize(w.idx)
+      end2 = (w.len & 0x80) != 0
+      if w.transform == 0 {
+        if !isMatch(dict, l, w.transform, id, data, at + 1, maxLength - 1) {
+          continue
+        }
+        // Transforms " " + BROTLI_TRANSFORM_IDENTITY + "" and
+        //            "." + BROTLI_TRANSFORM_IDENTITY + ""
+        addMatch(id + pick(isSpace, 6, 32) * n, l + 1, l, &mut matches)
+        hasFoundMatch = true
+        if l + 2 >= maxLength {
+          continue
+        }
+        // Transforms " " + BROTLI_TRANSFORM_IDENTITY + <suffix> and
+        //            "." + BROTLI_TRANSFORM_IDENTITY + <suffix>
+        let s = at + l + 1
+        let s0 = data[s]
+        if s0 == 32 {
+          addMatch(id + pick(isSpace, 2, 77) * n, l + 2, l, &mut matches)
+        } else if s0 == 40 {
+          addMatch(id + pick(isSpace, 89, 67) * n, l + 2, l, &mut matches)
+        } else if isSpace {
+          if s0 == 44 {
+            addMatch(id + 103 * n, l + 2, l, &mut matches)
+            if data[s + 1] == 32 {
+              addMatch(id + 33 * n, l + 3, l, &mut matches)
+            }
+          } else if s0 == 46 {
+            addMatch(id + 71 * n, l + 2, l, &mut matches)
+            if data[s + 1] == 32 {
+              addMatch(id + 52 * n, l + 3, l, &mut matches)
+            }
+          } else if s0 == 61 {
+            if data[s + 1] == 34 {
+              addMatch(id + 81 * n, l + 3, l, &mut matches)
+            } else if data[s + 1] == 39 {
+              addMatch(id + 98 * n, l + 3, l, &mut matches)
+            }
+          }
+        }
+      } else if isSpace {
+        // Set is_all_caps=0 for BROTLI_TRANSFORM_UPPERCASE_FIRST and is_all_caps=1 otherwise
+        // (BROTLI_TRANSFORM_UPPERCASE_ALL) transform.
+        let isAllCaps = w.transform != TRANSFORM_UPPERCASE_FIRST
+        if !isMatch(dict, l, w.transform, id, data, at + 1, maxLength - 1) {
+          continue
+        }
+        // Transforms " " + kUppercase{First,All} + ""
+        addMatch(id + pick(isAllCaps, 85, 30) * n, l + 1, l, &mut matches)
+        hasFoundMatch = true
+        if l + 2 >= maxLength {
+          continue
+        }
+        // Transforms " " + kUppercase{First,All} + <suffix>
+        let s = at + l + 1
+        let s0 = data[s]
+        if s0 == 32 {
+          addMatch(id + pick(isAllCaps, 83, 15) * n, l + 2, l, &mut matches)
+        } else if s0 == 44 {
+          if !isAllCaps {
+            addMatch(id + 109 * n, l + 2, l, &mut matches)
+          }
+          if data[s + 1] == 32 {
+            addMatch(id + pick(isAllCaps, 111, 65) * n, l + 3, l, &mut matches)
+          }
+        } else if s0 == 46 {
+          addMatch(id + pick(isAllCaps, 115, 96) * n, l + 2, l, &mut matches)
+          if data[s + 1] == 32 {
+            addMatch(id + pick(isAllCaps, 117, 91) * n, l + 3, l, &mut matches)
+          }
+        } else if s0 == 61 {
+          if data[s + 1] == 34 {
+            addMatch(id + pick(isAllCaps, 110, 118) * n, l + 3, l, &mut matches)
+          } else if data[s + 1] == 39 {
+            addMatch(id + pick(isAllCaps, 119, 120) * n, l + 3, l, &mut matches)
+          }
+        }
+      }
+    }
+  }
+  if maxLength >= 6 {
+    // Transforms with prefixes "e ", "s ", ", " and "\xC2\xA0"
+    let d0 = data[at]
+    let d1 = data[at + 1]
+    if (d1 == 32 && (d0 == 101 || d0 == 115 || d0 == 44)) || (d0 == 0xc2 && d1 == 0xa0) {
+      let mut offset3 = bucket(hash15(data, at + 2))
+      let mut end3 = offset3 == 0
+      while !end3 {
+        let w = dictWord(offset3)
+        offset3 = offset3 + 1
+        let l = u8.toUsize(w.len & 0x1f)
+        let n = usize.shiftLeft(1, u32.toUsize(brotli_tables.wordSizeBits(l)))
+        let id = u16.toUsize(w.idx)
+        end3 = (w.len & 0x80) != 0
+        if w.transform == 0 && isMatch(dict, l, w.transform, id, data, at + 2, maxLength - 2) {
+          if d0 == 0xc2 {
+            addMatch(id + 102 * n, l + 2, l, &mut matches)
+            hasFoundMatch = true
+          } else if l + 2 < maxLength && data[at + l + 2] == 32 {
+            let t: usize = if d0 == 101 { 18 } else if d0 == 115 { 7 } else { 13 }
+            addMatch(id + t * n, l + 3, l, &mut matches)
+            hasFoundMatch = true
+          }
+        }
+      }
+    }
+  }
+  if maxLength >= 9 {
+    // Transforms with prefixes " the " and ".com/"
+    if (data[at] == 32 && data[at + 1] == 116 && data[at + 2] == 104 && data[at + 3] == 101 && data[at + 4] == 32) || (data[at] == 46 && data[at + 1] == 99 && data[at + 2] == 111 && data[at + 3] == 109 && data[at + 4] == 47) {
+      let mut offset4 = bucket(hash15(data, at + 5))
+      let mut end4 = offset4 == 0
+      while !end4 {
+        let w = dictWord(offset4)
+        offset4 = offset4 + 1
+        let l = u8.toUsize(w.len & 0x1f)
+        let n = usize.shiftLeft(1, u32.toUsize(brotli_tables.wordSizeBits(l)))
+        let id = u16.toUsize(w.idx)
+        end4 = (w.len & 0x80) != 0
+        if w.transform == 0 && isMatch(dict, l, w.transform, id, data, at + 5, maxLength - 5) {
+          addMatch(id + pick(data[at] == 32, 41, 72) * n, l + 5, l, &mut matches)
+          hasFoundMatch = true
+          if l + 5 < maxLength {
+            let s = at + l + 5
+            if data[at] == 32 {
+              if l + 8 < maxLength && data[s] == 32 && data[s + 1] == 111 && data[s + 2] == 102 && data[s + 3] == 32 {
+                addMatch(id + 62 * n, l + 9, l, &mut matches)
+                if l + 12 < maxLength && data[s + 4] == 116 && data[s + 5] == 104 && data[s + 6] == 101 && data[s + 7] == 32 {
+                  addMatch(id + 73 * n, l + 13, l, &mut matches)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return hasFoundMatch
+}
