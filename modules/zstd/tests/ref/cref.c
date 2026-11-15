@@ -34,9 +34,33 @@ int main(void) {
             if (ZSTD_isError(r)) failed = 1;
         }
     }
+    unsigned char* dictBuf = NULL; size_t dictLength = 0;
+    if (getenv("ZDICT")) {
+        FILE* df = fopen(getenv("ZDICT"), "rb"); if (!df) { printf("cannot open ZDICT\n"); return 2; }
+        fseek(df, 0, SEEK_END); dictLength = (size_t)ftell(df); fseek(df, 0, SEEK_SET);
+        dictBuf = malloc(dictLength + 64);
+        if (fread(dictBuf, 1, dictLength, df) != dictLength) return 2;
+        fclose(df);
+        if (!failed) {
+            size_t r = ZSTD_CCtx_loadDictionary(c, dictBuf, dictLength);
+            if (trace) fprintf(trace, "D %ld\n", (long)r);
+            if (ZSTD_isError(r)) failed = 1;
+        }
+    }
+    long resetEach = envInt("ZRESET", 0), dropAt = envInt("ZDROP", -1), midLoad = envInt("ZMIDLOAD", 0);
     clock_t start = clock();
     size_t total = 0;
     for (long frame = 0; frame < repeat && !failed; frame++) {
+        if (frame > 0 && resetEach == 1) {
+            size_t r = ZSTD_CCtx_reset(c, ZSTD_reset_session_only);
+            if (trace) fprintf(trace, "R %ld\n", (long)r);
+            if (ZSTD_isError(r)) failed = 1;
+        }
+        if (frame == dropAt) {
+            size_t r = ZSTD_CCtx_loadDictionary(c, NULL, 0);
+            if (trace) fprintf(trace, "D %ld\n", (long)r);
+            if (ZSTD_isError(r)) failed = 1;
+        }
         if (pledge >= 0) {
             size_t r = ZSTD_CCtx_setPledgedSrcSize(c, (unsigned long long)pledge);
             if (trace) fprintf(trace, "S %ld\n", (long)r);
@@ -67,6 +91,10 @@ int main(void) {
                     fwrite(outBuffer, 1, dstPos, out); total += dstPos;
                     if (ZSTD_isError(r)) failed = 1;
                     if (srcPos == size && (endOp == 0 || r == 0)) break;
+                }
+                if (midLoad == 1 && frame == 0 && index == 1 && dictBuf) {
+                    size_t r = ZSTD_CCtx_loadDictionary(c, dictBuf, dictLength);
+                    if (trace) fprintf(trace, "D %ld\n", (long)r);
                 }
                 offset += size;
             }
