@@ -14,9 +14,9 @@ import silk.num.u16
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import enc.hash_base { HasherSearchResult, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, signExtend }
-import enc.memory { bytes, uninitializedBytes, uninitializedWords, words, wordsMut, zeroedHalfwords, halfwords, halfwordsMut }
-import enc.write_bits { load32, load64 }
+import enc.hash_base { HasherSearchResult, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, checkReadable, signExtend }
+import enc.memory { bytes, getUnchecked, uninitializedBytes, uninitializedWords, words, wordsMut, zeroedHalfwords, halfwords, halfwordsMut }
+import enc.write_bits { byteUnchecked, load32Unchecked, load64, load64Unchecked }
 
 /// `SHARED_BROTLI_MAX_COMPOUND_DICTS`: the most prepared dictionaries an encoder takes.
 pub const MAX_COMPOUND_DICTS: usize = 15
@@ -301,6 +301,30 @@ pub fn matchLengthBetween(a: &[u8], aAt: usize, b: &[u8], bAt: usize, limit: usi
   return matched
 }
 
+// [`matchLengthBetween`] without bounds checks.
+//
+// # Gotchas
+// The caller must prove that `aAt + limit <= a.length` and `bAt + limit <= b.length`.
+@inlineAlways
+unsafe fn matchLengthBetweenUnchecked(a: &[u8], aAt: usize, b: &[u8], bAt: usize, limit: usize) -> usize {
+  let mut matched: usize = 0
+  let mut left = limit
+  // `matched + left` stays `limit`, so every read is inside what the caller proved.
+  while left >= 8 {
+    let x = unsafe load64Unchecked(b, usize.wrappingAdd(bAt, matched)) ^ unsafe load64Unchecked(a, usize.wrappingAdd(aAt, matched))
+    if x != 0 {
+      return usize.wrappingAdd(matched, u32.toUsize(u64.trailingZeros(x) / 8))
+    }
+    matched = usize.wrappingAdd(matched, 8)
+    left = left - 8
+  }
+  while left != 0 && unsafe byteUnchecked(a, usize.wrappingAdd(aAt, matched)) == unsafe byteUnchecked(b, usize.wrappingAdd(bAt, matched)) {
+    left = left - 1
+    matched = usize.wrappingAdd(matched, 1)
+  }
+  return matched
+}
+
 /// The bucket of `data[curIxMasked..]` in `dictionary`: the index in `items` of its first
 /// position, or `none` for an empty bucket (the `head == 0xFFFF` of the C code).
 @inlineAlways
@@ -311,9 +335,11 @@ pub fn bucketStart(dictionary: &RawPreparedDictionary, data: &[u8], curIxMasked:
   let h = u64.wrappingMultiply(load64(data, curIxMasked) & hashMask, PREPARED_DICTIONARY_HASH_MUL_64_LONG)
   let key = u64.wrappingToU32(u64.shiftRight(h, u32.toU64(hashShift)))
   let slot = key & slotMask
-  let head = halfwords(&dictionary.heads)[u32.toUsize(key)]
+  // `key` has `bucketBits` bits, the size of `heads`, and `slot` has `slotBits` bits, the size of
+  // `slotOffsets`.
+  let head = unsafe getUnchecked<u16>(halfwords(&dictionary.heads), u32.toUsize(key))
   if head == 0xffff { return NO_BUCKET }
-  return u32.toUsize(words(&dictionary.slotOffsets)[u32.toUsize(slot)]) + u16.toUsize(head)
+  return u32.toUsize(unsafe getUnchecked<u32>(words(&dictionary.slotOffsets), u32.toUsize(slot))) + u16.toUsize(head)
 }
 
 /// What [`bucketStart`] returns for an empty bucket.
@@ -341,6 +367,8 @@ fn findCompoundDictionaryMatch(
   let boundary = distanceOffset - sourceSize
   let source = bytes(&dictionary.source)
   let curIxMasked = curIx & ringBufferMask
+  // The reads of `data` below are at most `maxLength` bytes after `curIxMasked`.
+  checkReadable(data, ringBufferMask, curIxMasked, maxLength)
   let mut bestScore = out.score
   let mut bestLen = out.len
   let mut index = bucketStart(dictionary, data, curIxMasked)
@@ -356,7 +384,8 @@ fn findCompoundDictionaryMatch(
     let offset = distanceOffset - distance
     let mut limit = sourceSize - offset
     limit = if limit > maxLength { maxLength } else { limit }
-    let len = matchLengthBetween(source, offset, data, curIxMasked, limit)
+    // `offset + limit` is at most the size of the source, and `limit` at most `maxLength`.
+    let len = unsafe matchLengthBetweenUnchecked(source, offset, data, curIxMasked, limit)
     if len >= 2 {
       let mut score = backwardReferenceScoreUsingLastDistance(len)
       if bestScore < score {
@@ -379,18 +408,20 @@ fn findCompoundDictionaryMatch(
     bestLen = 3
   }
   while index != NO_BUCKET {
-    let item = chain[index]
+    // A bucket is a run of `items` that ends with a marked item.
+    let item = unsafe getUnchecked<u32>(chain, index)
     index = if (item & 0x80000000) != 0 { NO_BUCKET } else { index + 1 }
     let offset = u32.toUsize(item & 0x7fffffff)
     let distance = distanceOffset - offset
     let mut limit = sourceSize - offset
     limit = if limit > maxLength { maxLength } else { limit }
     if distance > maxDistance { continue }
-    // Compare 4 bytes ending at best_len + 1.
-    if curIxMasked + bestLen > ringBufferMask || bestLen >= limit || load32(data, curIxMasked + bestLen - 3) != load32(source, offset + bestLen - 3) {
+    // Compare 4 bytes ending at best_len + 1. With `bestLen < limit`, they are inside the source
+    // and inside the `maxLength` bytes of `data`.
+    if curIxMasked + bestLen > ringBufferMask || bestLen >= limit || unsafe load32Unchecked(data, curIxMasked + bestLen - 3) != unsafe load32Unchecked(source, offset + bestLen - 3) {
       continue
     }
-    let len = matchLengthBetween(source, offset, data, curIxMasked, limit)
+    let len = unsafe matchLengthBetweenUnchecked(source, offset, data, curIxMasked, limit)
     if len >= 4 {
       let score = backwardReferenceScore(len, distance)
       if bestScore < score {
