@@ -16,6 +16,7 @@
 //! The search loops read the ring buffer without bounds checks: `findLongestMatch` first checks
 //! that every byte it can read (up to `maxLength + 8` bytes after any masked position) is inside
 //! it, and the table indexes are masked to the table sizes.
+import silk.collections.slice { Slice }
 import silk.mem.pointer { Pointer }
 import silk.simd.mask16
 import silk.simd.u8x16
@@ -27,7 +28,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import enc.find_match_length { findMatchLengthWithLimitUnchecked }
-import enc.hash_base { DictionaryStats, checkHashable, checkReadable, signExtend, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
+import enc.hash_base { DictionaryStats, checkHashable, signExtend, HASH_MUL_32, HasherSearchResult, MatchFinder, backwardReferencePenaltyUsingLastDistance, backwardReferenceScore, backwardReferenceScoreUsingLastDistance, prepareDistanceCache, searchInStaticDictionary }
 import enc.memory { bytes, bytesMut, getUnchecked, getUncheckedMut, halfwordsMut, setUnchecked, wordsMut, zeroedBytes, zeroedHalfwords, zeroedWords }
 import enc.params { HasherParams }
 import enc.write_bits { byteUnchecked, load32Unchecked, load64Unchecked }
@@ -80,18 +81,18 @@ unsafe fn searchLastDistances(
   let mut bestLen = bestLenRef.*
   // At most the 16 entries of the cache.
   let count = if numLastDistancesToCheck < 16 { numLastDistancesToCheck } else { 16 }
+  // C skips a distance when `prevIx >= curIx` or `backward > maxBackward`. With `prevIx` equal to
+  // `curIx - backward`, the first holds when `backward` is 0 or above `curIx`; so both together
+  // are `backward - 1 >= min(maxBackward, curIx)` (as unsigned numbers), one test in the loop.
+  let limit = if maxBackward < curIx { maxBackward } else { curIx }
   let mut i: usize = 0
   while i < count {
     let backward = signExtend(unsafe getUnchecked<i32>(distanceCache, i))
-    let mut prevIx = usize.wrappingSubtract(curIx, backward)
     i = i + 1
-    if prevIx >= curIx {
+    if usize.wrappingSubtract(backward, 1) >= limit {
       continue
     }
-    if backward > maxBackward {
-      continue
-    }
-    prevIx = prevIx & ringBufferMask
+    let prevIx = usize.wrappingSubtract(curIx, backward) & ringBufferMask
     if usize.wrappingAdd(curIxMasked, bestLen) > ringBufferMask {
       break
     }
@@ -136,25 +137,18 @@ unsafe fn hashBytes(wide: bool, data: &[u8], at: usize, shift32: u32, bits64: u6
   return u32.toUsize(u32.shiftRight(h, shift32))
 }
 
-// `hashBytes` with a bounds check.
-@inlineAlways
-fn hashBytesChecked(wide: bool, data: &[u8], at: usize, shift32: u32, bits64: u64) -> usize {
-  let _last = data[at + 7]
-  return unsafe hashBytes(wide, data, at, shift32, bits64)
-}
-
 // One candidate of the bucket loops at `prevIxIn`: its match length shifted left by 16, plus 1,
-// or 0 when the C code skips it (the conditions of H5/H58 and of H6/H68). `lastCur` is
-// `curIxMasked + bestLen`.
+// or 0 when the C code skips it (the conditions of H5/H58 and of H6/H68). `curTail` is the
+// 4 bytes at `curIxMasked + bestLen - 3`, which C loads for each candidate.
 //
 // # Gotchas
 // `checkReadable(data, ringBufferMask, curIxMasked, maxLength)` must hold and `bestLen` must be at least 3.
 @inlineAlways
-unsafe fn tryCandidate(wide: bool, data: &[u8], ringBufferMask: usize, curIxMasked: usize, lastCur: usize, prevIxIn: usize, maxLength: usize, bestLen: usize) -> usize {
+unsafe fn tryCandidate(wide: bool, data: &[u8], ringBufferMask: usize, curIxMasked: usize, curTail: u32, prevIxIn: usize, maxLength: usize, bestLen: usize) -> usize {
   let prevIx = prevIxIn & ringBufferMask
   // Compare 4 bytes ending at bestLen + 1.
   let lastPrev = usize.wrappingAdd(prevIx, bestLen)
-  if lastPrev > ringBufferMask || unsafe load32Unchecked(data, usize.wrappingSubtract(lastCur, 3)) != unsafe load32Unchecked(data, usize.wrappingSubtract(lastPrev, 3)) {
+  if lastPrev > ringBufferMask || curTail != unsafe load32Unchecked(data, usize.wrappingSubtract(lastPrev, 3)) {
     return 0
   }
   if wide {
@@ -172,6 +166,13 @@ unsafe fn tryCandidate(wide: bool, data: &[u8], ringBufferMask: usize, curIxMask
     return usize.shiftLeft(len, 16) | 1
   }
   return 0
+}
+
+// `hashBytes` with a bounds check.
+@inlineAlways
+fn hashBytesChecked(wide: bool, data: &[u8], at: usize, shift32: u32, bits64: u64) -> usize {
+  let _last = data[at + 7]
+  return unsafe hashBytes(wide, data, at, shift32, bits64)
 }
 
 /// `HashLongestMatch` of `hash_longest_match_inc.h` (H5, `W` = [`Narrow`]) and
@@ -264,9 +265,11 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
   // REQUIRES: `prepareDistanceCache` must be invoked for current distance cache values; if this
   // method is invoked repeatedly with the same distance cache values, it is enough to invoke
   // `prepareDistanceCache` once.
+  // Out of line: inlined into the reference search, it makes that loop's register allocation
+  // worse (measured: about 6% more instructions at qualities 7 to 9).
   @inlineNever
-  fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
-    checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)
+  unsafe fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
+    // The caller proved `checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)`.
     let wide = HashWidth.wide(&self.width)
     let curIxMasked = curIx & ringBufferMask
     // Don't accept a short copy from far away.
@@ -292,39 +295,47 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
     // `key` is below the bucket size, and so are the indexes into `bucket` below its size.
     let count = u16.toUsize(unsafe getUncheckedMut<u16>(&mut num, key))
     let down = if count > blockSize { count - blockSize } else { 0 }
-    let bucket = wordsMut(&mut self.buckets)
+    // The entries of this bucket: `bucketStart` is `key << blockBits`, so the bucket is inside the
+    // table, and the view lets the loop index it from one base.
+    let bucket = Slice.viewMut<u32>(wordsMut(&mut self.buckets), bucketStart, blockSize)
     let mut i = count
     // C checks `curIxMasked + bestLen > ringBufferMask` before each candidate and stops the loop
     // when it holds; that changes only with `bestLen`.
     let mut lastCur = usize.wrappingAdd(curIxMasked, bestLen)
-    if lastCur > ringBufferMask {
-      i = down
-    }
-    while i > down {
-      i = usize.wrappingSubtract(i, 1)
-      let prevIx = u32.toUsize(unsafe getUncheckedMut<u32>(&mut bucket, usize.wrappingAdd(bucketStart, i & blockMask)))
-      let backward = usize.wrappingSubtract(curIx, prevIx)
-      if backward > maxBackward {
-        break
-      }
-      let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, lastCur, prevIx, maxLength, bestLen)
-      if found != 0 {
-        let len = usize.shiftRight(found, 16)
-        let score = backwardReferenceScore(len, backward)
-        if bestScore < score {
-          bestScore = score
-          bestLen = len
-          out.len = bestLen
-          out.distance = backward
-          out.score = bestScore
-          lastCur = usize.wrappingAdd(curIxMasked, bestLen)
-          if lastCur > ringBufferMask {
-            break
+    if lastCur <= ringBufferMask {
+      while i > down {
+        i = usize.wrappingSubtract(i, 1)
+        // Masked to the block size.
+        let prevIx = u32.toUsize(unsafe getUncheckedMut<u32>(&mut bucket, i & blockMask))
+        let backward = usize.wrappingSubtract(curIx, prevIx)
+        if backward > maxBackward {
+          break
+        }
+        // The 4 bytes that end at `lastCur + 1`, loaded for each candidate as in C: kept in a
+        // local across this loop, they make its register allocation much worse. `lastCur` is at
+        // most `ringBufferMask` and `bestLen` is at least 3, so they are inside what
+        // `checkReadable` proved.
+        let curTail = unsafe load32Unchecked(data, usize.wrappingSubtract(lastCur, 3))
+        let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, curTail, prevIx, maxLength, bestLen)
+        if found != 0 {
+          let len = usize.shiftRight(found, 16)
+          let score = backwardReferenceScore(len, backward)
+          if bestScore < score {
+            bestScore = score
+            bestLen = len
+            out.len = bestLen
+            out.distance = backward
+            out.score = bestScore
+            lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+            if lastCur > ringBufferMask {
+              break
+            }
           }
         }
       }
     }
-    unsafe setUnchecked<u32>(&mut bucket, bucketStart + (count & blockMask), usize.wrappingToU32(curIx))
+    // Masked to the block size.
+    unsafe setUnchecked<u32>(&mut bucket, count & blockMask, usize.wrappingToU32(curIx))
     unsafe setUnchecked<u16>(&mut num, key, u16.wrappingAdd(usize.wrappingToU16(count), 1))
     if minScore == out.score {
       unsafe searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
@@ -359,7 +370,8 @@ impl<W: HashWidth> MatchFinder for HashLongestMatch<W> {
       let offset = usize.wrappingAdd(u16.toUsize(count) & blockMask, usize.shiftLeft(key, blockBits))
       unsafe setUnchecked<u16>(&mut num, key, u16.wrappingAdd(count, 1))
       unsafe setUnchecked<u32>(&mut buckets, offset, usize.wrappingToU32(ix))
-      ix = ix + step
+      // ix < ixEnd and the step is at most 4: the sum does not wrap.
+      ix = usize.wrappingAdd(ix, step)
     }
   }
 }
@@ -378,7 +390,8 @@ unsafe fn matchingTagMask(chunkCount: usize, tag: u8, tagBucket: &[u8], start: u
   let mut matches: u64 = 0
   let mut i: usize = 0
   while i < chunkCount && i < 4 {
-    let chunk = unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, start + 16 * i)))
+    // Inside the tags, as the caller proved; the sum cannot wrap.
+    let chunk = unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(start, 16 * i))))
     let equal = u8x16.lanesEqual(chunk, comparison)
     matches = matches | u64.shiftLeft(mask16.toBits(equal), usize.toU64(16 * i))
     i = i + 1
@@ -485,9 +498,11 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     prepareDistanceCache(&mut distanceCache, usize.toI32(self.numLastDistancesToCheck))
   }
 
-  @inlineNever
-  fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
-    checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)
+  // Inlined, as C inlines it: the call (with its arguments on the stack) costs more than the
+  // search of a small bucket (measured: 3 to 10% of the instructions at qualities 5 and 6).
+  @inlineAlways
+  unsafe fn findLongestMatch(self: &mut Self, data: &[u8], ringBufferMask: usize, distanceCache: &[i32; 16], curIx: usize, maxLength: usize, maxBackward: usize, dictionaryDistance: usize, maxDistance: usize, out: &mut HasherSearchResult) -> () {
+    // The caller proved `checkReadable(data, ringBufferMask, curIx & ringBufferMask, maxLength)`.
     let wide = HashWidth.wide(&self.width)
     let curIxMasked = curIx & ringBufferMask
     // Don't accept a short copy from far away.
@@ -522,41 +537,50 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
     let blockHasUnusedSlots: u64 = if blockSize > u16.toUsize(n) { 1 } else { 0 }
     let mask = u64.wrappingSubtract(u64.shiftLeft(blockHasUnusedSlots, u16.toU64(n & 63)), 1)
     matches = matches & mask
-    let bucket = wordsMut(&mut self.buckets)
+    // The entries of this bucket: `bucketStart` is `key << blockBits`, so the bucket is inside the
+    // table, and the view lets the loop index it from one base.
+    let bucket = Slice.viewMut<u32>(wordsMut(&mut self.buckets), bucketStart, blockSize)
     // C checks `curIxMasked + bestLen > ringBufferMask` before each candidate and stops the loop
     // when it holds; that changes only with `bestLen`.
     let mut lastCur = usize.wrappingAdd(curIxMasked, bestLen)
-    if lastCur > ringBufferMask {
-      matches = 0
-    }
-    while matches > 0 {
-      let rbIndex = usize.wrappingAdd(head, u32.toUsize(u64.trailingZeros(matches))) & blockMask
-      matches = matches & (matches - 1)
-      let prevIx = u32.toUsize(unsafe getUncheckedMut<u32>(&mut bucket, usize.wrappingAdd(bucketStart, rbIndex)))
-      let backward = usize.wrappingSubtract(curIx, prevIx)
-      if backward > maxBackward {
-        break
-      }
-      let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, lastCur, prevIx, maxLength, bestLen)
-      if found != 0 {
-        let len = usize.shiftRight(found, 16)
-        let score = backwardReferenceScore(len, backward)
-        if bestScore < score {
-          bestScore = score
-          bestLen = len
-          out.len = bestLen
-          out.distance = backward
-          out.score = bestScore
-          lastCur = usize.wrappingAdd(curIxMasked, bestLen)
-          if lastCur > ringBufferMask {
-            break
+    if lastCur <= ringBufferMask {
+      // The 4 bytes that end at `lastCur + 1`, which each candidate compares first: they change
+      // only with `bestLen`. `lastCur` is at most `ringBufferMask` and `bestLen` is at least 3,
+      // so they are inside what `checkReadable` proved.
+      let mut curTail = unsafe load32Unchecked(data, usize.wrappingSubtract(lastCur, 3))
+      while matches > 0 {
+        // `rbIndex` is masked to the block size.
+        let rbIndex = usize.wrappingAdd(head, u32.toUsize(u64.trailingZeros(matches))) & blockMask
+        matches = matches & (matches - 1)
+        let prevIx = u32.toUsize(unsafe getUncheckedMut<u32>(&mut bucket, rbIndex))
+        let backward = usize.wrappingSubtract(curIx, prevIx)
+        if backward > maxBackward {
+          break
+        }
+        let found = unsafe tryCandidate(wide, data, ringBufferMask, curIxMasked, curTail, prevIx, maxLength, bestLen)
+        if found != 0 {
+          let len = usize.shiftRight(found, 16)
+          let score = backwardReferenceScore(len, backward)
+          if bestScore < score {
+            bestScore = score
+            bestLen = len
+            out.len = bestLen
+            out.distance = backward
+            out.score = bestScore
+            lastCur = usize.wrappingAdd(curIxMasked, bestLen)
+            if lastCur > ringBufferMask {
+              break
+            }
+            // As above.
+            curTail = unsafe load32Unchecked(data, usize.wrappingSubtract(lastCur, 3))
           }
         }
       }
     }
-    let slot = bucketStart + (u16.toUsize(numKey) & blockMask)
-    unsafe setUnchecked<u32>(&mut bucket, slot, usize.wrappingToU32(curIx))
-    unsafe setUnchecked<u8>(bytesMut(&mut self.tags), slot, tag)
+    // Below the block size, as `rbIndex` above.
+    let slotInBucket = u16.toUsize(numKey) & blockMask
+    unsafe setUnchecked<u32>(&mut bucket, slotInBucket, usize.wrappingToU32(curIx))
+    unsafe setUnchecked<u8>(bytesMut(&mut self.tags), usize.wrappingAdd(bucketStart, slotInBucket), tag)
     unsafe setUnchecked<u16>(&mut num, key, u16.wrappingSubtract(numKey, 1))
     if minScore == out.score {
       unsafe searchInStaticDictionary(&mut self.stats, data, curIxMasked, maxLength, dictionaryDistance, maxDistance, &mut out, false)
@@ -594,7 +618,8 @@ impl<W: HashWidth> MatchFinder for HashLongestMatchSimd<W> {
       unsafe setUnchecked<u16>(&mut num, key, u16.wrappingSubtract(count, 1))
       unsafe setUnchecked<u32>(&mut buckets, offset, usize.wrappingToU32(ix))
       unsafe setUnchecked<u8>(&mut tags, offset, usize.wrappingToU8(hash & 0xff))
-      ix = ix + step
+      // ix < ixEnd and the step is at most 4: the sum does not wrap.
+      ix = usize.wrappingAdd(ix, step)
     }
   }
 }

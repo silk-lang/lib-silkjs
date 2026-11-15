@@ -20,7 +20,7 @@ import enc.command { Command }
 import enc.compound_dictionary { CompoundDictionary, lookupCompoundDictionaryMatch }
 import enc.constants { NUM_DISTANCE_SHORT_CODES, maxBackwardLimit }
 import enc.hash { Hasher, HasherKernel }
-import enc.hash_base { HasherSearchResult, MatchFinder, SCORE_BASE, signExtend }
+import enc.hash_base { HasherSearchResult, MatchFinder, SCORE_BASE, checkReadable, signExtend }
 import enc.params { EncoderParams, MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH, literalSpreeLengthForSparseSearch }
 
 // `ComputeDistanceCode`: the distance code of `distance`, a short code where the distance cache
@@ -87,28 +87,43 @@ fn createBackwardReferencesWith<H: MatchFinder>(
   let minScore = SCORE_BASE + 100
 
   MatchFinder.prepareDistanceCache(&hasher, &mut distCache)
+  // Loop invariants, in locals: through the references, the stores of the loop could change them.
+  let extensiveSearch = params.quality >= MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH
+  let maxDistanceParam = params.dist.maxDistance
 
+  // What the hashers read without bounds checks, for every search below at once: each searches
+  // at a position `p` at or after `position` with `maxLength` equal to `posEnd - p`, and
+  // `checkReadable(ringbuffer, ringbufferMask, p & ringbufferMask, posEnd - p)` holds for all of
+  // them once it holds for the first. (With the full ring buffer it tests `ringbufferMask +
+  // posEnd - p`; before that `(p & mask) + posEnd - p`, which is `posEnd - (p & ~mask)`; both do
+  // not grow with `p`.) The first search is at `position`, when the loop runs at all.
+  if usize.wrappingAdd(position, hashTypeLength) < posEnd {
+    checkReadable(ringbuffer, ringbufferMask, position & ringbufferMask, posEnd - position)
+  }
   // The positions are below 2^32 plus the size of the ring buffer, so the sums below do not wrap.
   while usize.wrappingAdd(position, hashTypeLength) < posEnd {
-    let mut maxLength = posEnd - position
+    // position < posEnd, by the test above.
+    let mut maxLength = usize.wrappingSubtract(posEnd, position)
     let mut maxDistance = if position < maxBackwardLimit { position } else { maxBackwardLimit }
     let startOffset = usize.wrappingAdd(position, positionOffset)
     let mut dictionaryStart = if startOffset < maxBackwardLimit { startOffset } else { maxBackwardLimit }
     // A contextual static dictionary (`params.dictionary.contextual.context_based`) cannot be
     // attached in this build, so the dictionary is always the first one.
     let mut sr = HasherSearchResult { len: 0, distance: 0, score: minScore, lenCodeDelta: 0 }
-    MatchFinder.findLongestMatch(&mut hasher, ringbuffer, ringbufferMask, &distCache.*, position, maxLength, maxDistance, usize.wrappingAdd(dictionaryStart, gap), params.dist.maxDistance, &mut sr)
+    // Proven above.
+    unsafe MatchFinder.findLongestMatch(&mut hasher, ringbuffer, ringbufferMask, &distCache.*, position, maxLength, maxDistance, usize.wrappingAdd(dictionaryStart, gap), maxDistanceParam, &mut sr)
     if useCompound {
-      lookupCompoundDictionaryMatch(compound, ringbuffer, ringbufferMask, &distCache.*, position, maxLength, dictionaryStart, params.dist.maxDistance, &mut sr)
+      lookupCompoundDictionaryMatch(compound, ringbuffer, ringbufferMask, &distCache.*, position, maxLength, dictionaryStart, maxDistanceParam, &mut sr)
     }
     if sr.score > minScore {
       // Found a match. Let's look for something even better ahead.
       let mut delayedBackwardReferencesInRow: i32 = 0
-      maxLength = maxLength - 1
+      // maxLength > hashTypeLength here, and at each `continue` below.
+      maxLength = usize.wrappingSubtract(maxLength, 1)
       while true {
         let costDiffLazy: usize = 175
         let mut sr2 = HasherSearchResult {
-          len: if params.quality < MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH { (if sr.len - 1 < maxLength { sr.len - 1 } else { maxLength }) } else { 0 },
+          len: if !extensiveSearch { (if sr.len - 1 < maxLength { sr.len - 1 } else { maxLength }) } else { 0 },
           distance: 0,
           score: minScore,
           lenCodeDelta: 0,
@@ -117,25 +132,29 @@ fn createBackwardReferencesWith<H: MatchFinder>(
         maxDistance = if next < maxBackwardLimit { next } else { maxBackwardLimit }
         let nextOffset = usize.wrappingAdd(next, positionOffset)
         dictionaryStart = if nextOffset < maxBackwardLimit { nextOffset } else { maxBackwardLimit }
-        MatchFinder.findLongestMatch(&mut hasher, ringbuffer, ringbufferMask, &distCache.*, next, maxLength, maxDistance, usize.wrappingAdd(dictionaryStart, gap), params.dist.maxDistance, &mut sr2)
+        // Proven above: `next` is `position + 1` and `maxLength` is `posEnd - next`.
+        unsafe MatchFinder.findLongestMatch(&mut hasher, ringbuffer, ringbufferMask, &distCache.*, next, maxLength, maxDistance, usize.wrappingAdd(dictionaryStart, gap), maxDistanceParam, &mut sr2)
         if useCompound {
-          lookupCompoundDictionaryMatch(compound, ringbuffer, ringbufferMask, &distCache.*, next, maxLength, dictionaryStart, params.dist.maxDistance, &mut sr2)
+          lookupCompoundDictionaryMatch(compound, ringbuffer, ringbufferMask, &distCache.*, next, maxLength, dictionaryStart, maxDistanceParam, &mut sr2)
         }
         if sr2.score >= usize.wrappingAdd(sr.score, costDiffLazy) {
           // Ok, let's just write one byte for now and start a match from the next byte.
-          position = position + 1
-          insertLength = insertLength + 1
+          // The insert length is at most the number of bytes seen.
+          position = usize.wrappingAdd(position, 1)
+          insertLength = usize.wrappingAdd(insertLength, 1)
           sr = sr2
           delayedBackwardReferencesInRow = delayedBackwardReferencesInRow + 1
-          if delayedBackwardReferencesInRow < 4 && position + hashTypeLength < posEnd {
-            maxLength = maxLength - 1
+          if delayedBackwardReferencesInRow < 4 && usize.wrappingAdd(position, hashTypeLength) < posEnd {
+            maxLength = usize.wrappingSubtract(maxLength, 1)
             continue
           }
         }
         break
       }
-      applyRandomHeuristics = position + 2 * sr.len + randomHeuristicsWindowSize
-      dictionaryStart = if position + positionOffset < maxBackwardLimit { position + positionOffset } else { maxBackwardLimit }
+      // A match length is below posEnd - position, and the window size is small.
+      applyRandomHeuristics = usize.wrappingAdd(usize.wrappingAdd(position, usize.shiftLeft(sr.len, 1)), randomHeuristicsWindowSize)
+      let matchOffset = usize.wrappingAdd(position, positionOffset)
+      dictionaryStart = if matchOffset < maxBackwardLimit { matchOffset } else { maxBackwardLimit }
       // The first 16 codes are special short-codes, and the minimum offset is 1.
       let distanceCode = computeDistanceCode(sr.distance, dictionaryStart + gap, &distCache.*)
       if sr.distance <= dictionaryStart + gap && distanceCode > 0 {
@@ -146,50 +165,55 @@ fn createBackwardReferencesWith<H: MatchFinder>(
         MatchFinder.prepareDistanceCache(&hasher, &mut distCache)
       }
       commands[written] = Command.make(&params.dist, insertLength, sr.len, sr.lenCodeDelta, distanceCode)
-      written = written + 1
-      numLiterals.* = numLiterals.* + insertLength
+      written = usize.wrappingAdd(written, 1)
+      numLiterals.* = usize.wrappingAdd(numLiterals.*, insertLength)
       insertLength = 0
       // Put the hash keys into the table, if there are enough bytes left. Depending on the hasher
       // implementation, it can push all positions in the given range or only a subset of them.
       // Avoid hash poisoning with RLE data.
-      let mut rangeStart = position + 2
-      let rangeEnd = if position + sr.len < storeEnd { position + sr.len } else { storeEnd }
+      // position + sr.len is at most posEnd.
+      let matchEnd = usize.wrappingAdd(position, sr.len)
+      let mut rangeStart = usize.wrappingAdd(position, 2)
+      let rangeEnd = if matchEnd < storeEnd { matchEnd } else { storeEnd }
       if sr.distance < usize.shiftRight(sr.len, 2) {
-        let candidate = position + sr.len - usize.shiftLeft(sr.distance, 2)
+        // 4 * sr.distance < sr.len.
+        let candidate = usize.wrappingSubtract(matchEnd, usize.shiftLeft(sr.distance, 2))
         let atLeast = if rangeStart > candidate { rangeStart } else { candidate }
         rangeStart = if rangeEnd < atLeast { rangeEnd } else { atLeast }
       }
       MatchFinder.storeRange(&mut hasher, ringbuffer, ringbufferMask, rangeStart, rangeEnd)
-      position = position + sr.len
+      position = matchEnd
     } else {
-      insertLength = insertLength + 1
-      position = position + 1
+      insertLength = usize.wrappingAdd(insertLength, 1)
+      position = usize.wrappingAdd(position, 1)
       // If we have not seen matches for a long time, we can skip some match lookups. Unsuccessful
       // match lookups are very very expensive and this kind of a heuristic speeds up compression
       // quite a lot.
       if position > applyRandomHeuristics {
-        // Going through uncompressible data, jump.
-        if position > applyRandomHeuristics + 4 * randomHeuristicsWindowSize {
+        // Going through uncompressible data, jump. The positions and the insert length stay far
+        // from overflowing (they are bounded by the input), so the sums below do not wrap; the
+        // jumps end at `posJump`, which is past `position` when they run.
+        if position > usize.wrappingAdd(applyRandomHeuristics, 4 * randomHeuristicsWindowSize) {
           // It is quite a long time since we saw a copy, so we assume that this data is not
           // compressible, and store hashes less often. Hashes of non compressible data are less
           // likely to turn out to be useful in the future, too, so we store less of them to not
           // to flood out the hash table of good compressible data.
           let kMargin = if storeLookahead - 1 > 4 { storeLookahead - 1 } else { 4 }
-          let posJump = if position + 16 < usize.wrappingSubtract(posEnd, kMargin) { position + 16 } else { usize.wrappingSubtract(posEnd, kMargin) }
+          let posJump = if usize.wrappingAdd(position, 16) < usize.wrappingSubtract(posEnd, kMargin) { usize.wrappingAdd(position, 16) } else { usize.wrappingSubtract(posEnd, kMargin) }
           if position < posJump {
-            let count = (posJump - position + 3) / 4
+            let count = usize.shiftRight(usize.wrappingAdd(usize.wrappingSubtract(posJump, position), 3), 2)
             MatchFinder.storeEvery(&mut hasher, ringbuffer, ringbufferMask, position, posJump, 4)
-            insertLength = insertLength + 4 * count
-            position = position + 4 * count
+            insertLength = usize.wrappingAdd(insertLength, usize.shiftLeft(count, 2))
+            position = usize.wrappingAdd(position, usize.shiftLeft(count, 2))
           }
         } else {
           let kMargin = if storeLookahead - 1 > 2 { storeLookahead - 1 } else { 2 }
-          let posJump = if position + 8 < usize.wrappingSubtract(posEnd, kMargin) { position + 8 } else { usize.wrappingSubtract(posEnd, kMargin) }
+          let posJump = if usize.wrappingAdd(position, 8) < usize.wrappingSubtract(posEnd, kMargin) { usize.wrappingAdd(position, 8) } else { usize.wrappingSubtract(posEnd, kMargin) }
           if position < posJump {
-            let count = (posJump - position + 1) / 2
+            let count = usize.shiftRight(usize.wrappingAdd(usize.wrappingSubtract(posJump, position), 1), 1)
             MatchFinder.storeEvery(&mut hasher, ringbuffer, ringbufferMask, position, posJump, 2)
-            insertLength = insertLength + 2 * count
-            position = position + 2 * count
+            insertLength = usize.wrappingAdd(insertLength, usize.shiftLeft(count, 1))
+            position = usize.wrappingAdd(position, usize.shiftLeft(count, 1))
           }
         }
       }
