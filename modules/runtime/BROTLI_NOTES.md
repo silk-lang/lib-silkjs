@@ -297,7 +297,37 @@ requests for the compiler.
   attaching after the start and the serialized kind were checked with a private driver during
   the port (1,549/1,549 for each of four seeds) and are not in the committed one.
 
-## Compiler walls
+## Compiler walls: fixes in Silk, and what the port does when they are released
+
+The walls below are addressed by two compiler pull requests:
+[silk-lang/silk#3126](https://github.com/silk-lang/silk/pull/3126) (merged: `Intrinsic.prefetch`
+and `silk.mem.prefetch`) and [silk-lang/silk#3128](https://github.com/silk-lang/silk/pull/3128)
+(`f64.log2`, one-instruction narrow signed widenings, `silk.core.hint` with `likely`, `unlikely`,
+`assume` and `unreachable`, unchecked float-to-integer conversions and shifts, inlining of
+functions that call `extern "C"`, `r` and `m` constraints in `Intrinsic.assembly`, and
+`Intrinsic.sliceCopy`; `Slice.copyInto` moves onto it after the next seed bump). When a release
+with them is pinned (`silk set <version>` at the repository root), the port should:
+
+- Replace the inline-assembly prefetch of `enc/memory.silk` with `Prefetch.hint`, and keep the
+  same places and locality (`High`, as `PREFETCH_L1`).
+- Replace the masked shifts, the xor-and-subtract sign extension and the checked
+  float-to-integer conversion in `BrotliPopulationCost` with the unchecked forms, and the
+  `@inlineNever` helper around `log2` in `enc/fast_log.silk` with a plain inline call.
+- Try `hint.likely`/`hint.unlikely` where C has `BROTLI_PREDICT_TRUE`/`FALSE` in the decoder's
+  `processCommands` and the encoder's searches, and `hint.assume` for the facts checked once at
+  entry, and keep only what measures better (both are sensitive to register allocation).
+- **Check `log2` before replacing libm's.** The encoder's output depends on `log2` (block
+  splitting and cost comparisons). Today the port calls the same glibc `log2` as the C library
+  in Node, so they agree on any host. The new `f64.log2` is bit-identical to glibc's non-FMA
+  path; glibc's FMA path rounds about 1 in 20,000 results the other way. Switching could change
+  compressed bytes on hosts where glibc takes the FMA path, so run `tests/differential.py` (all
+  suites, qualities 10 and 11 above all) on such a host before switching, and keep libm's `log2`
+  if any byte differs. The runtime itself binds glibc's current `log2`, not the compatibility
+  entry, so it gains nothing there.
+- Re-run `bench/brotli/compare.py` and the instruction counts, and update this file.
+
+The individual walls, as found:
+
 
 Each one was checked on a minimal case compiled with `silk build --release` (Silk
 0.1.0-dev.74+205aea3f5b2e, x86-64) and read in the disassembly. None of them blocks the port;
