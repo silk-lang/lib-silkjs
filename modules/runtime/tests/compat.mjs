@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { register as registerZstd } from './compat-zstd.mjs';
 
 const runtime = resolve(process.env.SILKJS_RUNTIME || 'build/silkjs');
 const reference = process.env.NODE_REFERENCE || process.execPath;
@@ -385,11 +386,12 @@ await tick(); await tick();
 console.log(log.join('\n'));
 `);
 cases.push({ name: 'promise-combinators-mixed', args: [join(directory, 'promise-combinators-mixed.mjs')] });
+registerZstd(file, cases, directory);
 let passed = 0, failed = 0;
 try {
   if (!cases.some(item => filter.test(item.name))) throw new Error('No compatibility scenarios match ' + filter);
   for (const scenario of cases.filter(item => filter.test(item.name))) {
-    const options = { cwd: directory, encoding: 'utf8', timeout: 15000, env: { ...process.env, NODE_REFERENCE: reference, NO_COLOR: '1', NODE_DEBUG: '' } };
+    const options = { cwd: directory, encoding: 'utf8', timeout: scenario.timeout || 15000, env: { ...process.env, NODE_REFERENCE: reference, NO_COLOR: '1', NODE_DEBUG: '' } };
     const expected = spawnSync(reference, scenario.args, options);
     const actual = spawnSync(runtime, scenario.args, options);
     try {

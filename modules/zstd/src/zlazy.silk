@@ -365,10 +365,26 @@ unsafe fn rowNextIndex(tagRow: [*]mut u8, rowMask: u32) -> usize {
   return mem.z(next)
 }
 
+/// Stand-in for `ZSTD_row_prefetch`. Silk has no prefetch, so this reads the row of `hash` in the
+/// hash table and in the tag table, which brings it in the cache some positions before the
+/// position is inserted or searched. It returns 0 for each value that it reads (`t * t + t` is
+/// even), in a way that the optimizer does not see through: the caller mixes the result in the
+/// hash that it stores, so the reads stay.
+@inlineAlways
+unsafe fn rowTouch(ms: &MatchState, hash: u32, rowLog: u32) -> u32 {
+  let relRow = mem.z(mem.shl32(mem.shr32(hash, ROW_TAG_BITS), rowLog))
+  let mut t = unsafe cstate.tget(ms.hashTable, relRow)
+  if rowLog >= 5 { t = t ^ unsafe cstate.tget(ms.hashTable, mem.ua(relRow, 16)) }
+  let tagTable = unsafe mem.ro(unsafe mem.nn(ms.tagTable))
+  t = t ^ u8.toU32(unsafe mem.r8(tagTable, relRow))
+  if rowLog == 6 { t = t ^ u8.toU32(unsafe mem.r8(tagTable, mem.ua(relRow, 32))) }
+  return mem.a32(mem.m32(t, t), t) & 1
+}
+
 /// `ZSTD_row_fillHashCache`: fills the cache with the hashes of the positions from `idx`, up to
 /// `ROW_CACHE_SIZE` of them and not after `iLimit`.
 @inlineAlways
-unsafe fn rowFillHashCache(ms: &mut MatchState, base: [*]const u8, mls: u32, start: u32, iLimit: usize) -> () {
+unsafe fn rowFillHashCache(ms: &mut MatchState, base: [*]const u8, rowLog: u32, mls: u32, start: u32, iLimit: usize) -> () {
   let hBits = mem.a32(ms.rowHashLog, ROW_TAG_BITS)
   let salt = ms.hashSalt
   let startZ = mem.z(start)
@@ -380,7 +396,8 @@ unsafe fn rowFillHashCache(ms: &mut MatchState, base: [*]const u8, mls: u32, sta
   let lim = mem.a32(start, mem.t32(count))
   let mut idx = start
   while idx < lim {
-    ms.hashCache[mem.z(idx & ROW_CACHE_MASK)] = unsafe hashSalted(base, mem.z(idx), hBits, mls, salt)
+    let hash = unsafe hashSalted(base, mem.z(idx), hBits, mls, salt)
+    ms.hashCache[mem.z(idx & ROW_CACHE_MASK)] = hash ^ unsafe rowTouch(&ms, hash, rowLog)
     idx = mem.a32(idx, 1)
   }
 }
@@ -388,11 +405,11 @@ unsafe fn rowFillHashCache(ms: &mut MatchState, base: [*]const u8, mls: u32, sta
 /// `ZSTD_row_nextCachedHash`: the hash of the position `idx`, from the cache, where the hash of
 /// `idx + ROW_CACHE_SIZE` replaces it.
 @inlineAlways
-unsafe fn rowNextCachedHash(ms: &mut MatchState, base: [*]const u8, idx: u32, hBits: u32, mls: u32, salt: u64) -> u32 {
+unsafe fn rowNextCachedHash(ms: &mut MatchState, base: [*]const u8, idx: u32, hBits: u32, rowLog: u32, mls: u32, salt: u64) -> u32 {
   let newHash = unsafe hashSalted(base, mem.ua(mem.z(idx), ROW_CACHE_SIZE), hBits, mls, salt)
   let slot = mem.z(idx & ROW_CACHE_MASK)
   let hash = ms.hashCache[slot]
-  ms.hashCache[slot] = newHash
+  ms.hashCache[slot] = newHash ^ unsafe rowTouch(&ms, newHash, rowLog)
   return hash
 }
 
@@ -405,7 +422,7 @@ unsafe fn rowUpdateImpl(ms: &mut MatchState, base: [*]const u8, start: u32, end:
   let salt = ms.hashSalt
   let mut idx = start
   while idx < end {
-    let hash = if useCache { unsafe rowNextCachedHash(&mut ms, base, idx, hBits, mls, salt) } else { unsafe hashSalted(base, mem.z(idx), hBits, mls, salt) }
+    let hash = if useCache { unsafe rowNextCachedHash(&mut ms, base, idx, hBits, rowLog, mls, salt) } else { unsafe hashSalted(base, mem.z(idx), hBits, mls, salt) }
     let relRow = mem.z(mem.shl32(mem.shr32(hash, ROW_TAG_BITS), rowLog))
     let tagRow = unsafe mem.add(tagTable, relRow)
     let pos = unsafe rowNextIndex(tagRow, rowMask)
@@ -427,7 +444,7 @@ unsafe fn rowUpdateInternal(ms: &mut MatchState, base: [*]const u8, ip: usize, m
       let bound = mem.a32(idx, 96)
       unsafe rowUpdateImpl(&mut ms, base, idx, bound, mls, rowLog, rowMask, useCache)
       idx = mem.s32(target, 32)
-      unsafe rowFillHashCache(&mut ms, base, mls, idx, mem.ua(ip, 1))
+      unsafe rowFillHashCache(&mut ms, base, rowLog, mls, idx, mem.ua(ip, 1))
     }
   }
   unsafe rowUpdateImpl(&mut ms, base, idx, target, mls, rowLog, rowMask, useCache)
@@ -553,7 +570,7 @@ unsafe fn rowFindBestMatch(ms: &mut MatchState, ip: usize, iLimit: usize, mls: u
   // Update the rows up to (but not including) ip.
   if !ms.lazySkipping {
     unsafe rowUpdateInternal(&mut ms, base, ip, mls, rowLog, rowMask, true)
-    hash = unsafe rowNextCachedHash(&mut ms, base, curr, hBits, mls, salt)
+    hash = unsafe rowNextCachedHash(&mut ms, base, curr, hBits, rowLog, mls, salt)
   } else {
     // Stop inserting every position when in the lazy skipping mode. The hash cache is not kept
     // up to date in this mode.
@@ -567,37 +584,26 @@ unsafe fn rowFindBestMatch(ms: &mut MatchState, ip: usize, iLimit: usize, mls: u
   let row = unsafe mem.add(hashTable, usize.wrappingMultiply(relRow, 4))
   let tagRow = unsafe mem.add(tagTable, relRow)
   let head = u8.toU32(unsafe mem.r8(unsafe mem.ro(tagRow), 0)) & rowMask
-  let mut matchBuffer: [u32; 64] = [0; 64]
-  let mut numMatches: usize = 0
   let mut matches = unsafe rowMatchMask(unsafe mem.ro(tagRow), tag, head, rowEntries)
+  let ip32 = unsafe mem.r32(base, ip)
 
-  // Collect the candidates, the most recent first.
+  // Go through the candidates, the most recent first, and keep the longest match. The reference
+  // first collects the candidates in a buffer (and prefetches them), then inserts the current
+  // position, then compares them. The comparison does not read the tables, so comparing each
+  // candidate when it is collected, before the insertion, finds the same match. (For the
+  // dictionary variants, `nbAttempts` must still count the candidates that are left when the
+  // loop ends on a match that reaches `iLimit`.)
   while matches != 0 && nbAttempts > 0 {
     let matchPos = mem.z(mem.a32(head, u64.trailingZeros(matches)) & rowMask)
     matches = matches & u64.wrappingSubtract(matches, 1)
     if matchPos == 0 { continue }
     let matchIndex = unsafe cstate.tget(row, matchPos)
     if matchIndex < lowLimit { break }
-    matchBuffer[numMatches & 63] = matchIndex
-    numMatches = mem.ua(numMatches, 1)
     nbAttempts = mem.s32(nbAttempts, 1)
-  }
-
-  // Insert the current position too: it saves one iteration of the update at the next search.
-  let pos = unsafe rowNextIndex(tagRow, rowMask)
-  unsafe mem.w8(tagRow, pos, tag)
-  let inserted = ms.nextToUpdate
-  unsafe cstate.tset(row, pos, inserted)
-  ms.nextToUpdate = mem.a32(inserted, 1)
-
-  // Return the longest match.
-  let ip32 = unsafe mem.r32(base, ip)
-  let mut currMatch: usize = 0
-  while currMatch < numMatches {
-    let matchIndex = matchBuffer[currMatch & 63]
     let mIdx = mem.z(matchIndex)
     let mut currentMl: usize = 0
     if dictMode != cstate.EXT_DICT || matchIndex >= dictLimit {
+      // Read 4 bytes that end at the first byte that makes the match longer.
       if unsafe mem.r32(base, mem.us(mem.ua(mIdx, ml), 3)) == unsafe mem.r32(base, mem.us(mem.ua(ip, ml), 3)) {
         currentMl = unsafe cstate.count(base, ip, base, mIdx, iLimit)
       }
@@ -609,10 +615,17 @@ unsafe fn rowFindBestMatch(ms: &mut MatchState, ip: usize, iLimit: usize, mls: u
     if currentMl > ml {
       ml = currentMl
       offBase = cstate.offsetToOffBase(mem.s32(curr, matchIndex))
+      // The best possible; avoids a read after the end at the next candidate.
       if mem.ua(ip, currentMl) == iLimit { break }
     }
-    currMatch = mem.ua(currMatch, 1)
   }
+
+  // Insert the current position too: it saves one iteration of the update at the next search.
+  let pos = unsafe rowNextIndex(tagRow, rowMask)
+  unsafe mem.w8(tagRow, pos, tag)
+  let inserted = ms.nextToUpdate
+  unsafe cstate.tset(row, pos, inserted)
+  ms.nextToUpdate = mem.a32(inserted, 1)
   return pack(ml, offBase)
 }
 
@@ -776,7 +789,7 @@ unsafe fn lazyGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut 
   ms.lazySkipping = false
   if searchMethod == SEARCH_ROW {
     let nextToUpdate = ms.nextToUpdate
-    unsafe rowFillHashCache(&mut ms, base, mls, nextToUpdate, ilimit)
+    unsafe rowFillHashCache(&mut ms, base, rowLog, mls, nextToUpdate, ilimit)
   }
 
   while slt(ip, ilimit) {
@@ -884,7 +897,7 @@ unsafe fn lazyGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut 
       // We found a match: leave the lazy skipping mode, and refill the hash cache.
       if searchMethod == SEARCH_ROW {
         let nextToUpdate = ms.nextToUpdate
-        unsafe rowFillHashCache(&mut ms, base, mls, nextToUpdate, ilimit)
+        unsafe rowFillHashCache(&mut ms, base, rowLog, mls, nextToUpdate, ilimit)
       }
       ms.lazySkipping = false
     }
@@ -945,7 +958,7 @@ unsafe fn lazyExtDictGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: 
   if ip == dictLimitZ { ip = mem.ua(ip, 1) }
   if searchMethod == SEARCH_ROW {
     let nextToUpdate = ms.nextToUpdate
-    unsafe rowFillHashCache(&mut ms, base, mls, nextToUpdate, ilimit)
+    unsafe rowFillHashCache(&mut ms, base, rowLog, mls, nextToUpdate, ilimit)
   }
 
   while slt(ip, ilimit) {
@@ -1082,7 +1095,7 @@ unsafe fn lazyExtDictGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: 
       // We found a match: leave the lazy skipping mode, and refill the hash cache.
       if searchMethod == SEARCH_ROW {
         let nextToUpdate = ms.nextToUpdate
-        unsafe rowFillHashCache(&mut ms, base, mls, nextToUpdate, ilimit)
+        unsafe rowFillHashCache(&mut ms, base, rowLog, mls, nextToUpdate, ilimit)
       }
       ms.lazySkipping = false
     }

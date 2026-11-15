@@ -19,7 +19,7 @@ int main(void) {
     FILE* out = fopen(getenv("ZOUT"), "wb"); if (!out) { printf("cannot open ZOUT\n"); return 2; }
     FILE* trace = getenv("ZTRACE") ? fopen(getenv("ZTRACE"), "wb") : NULL;
     size_t ichunk = (size_t)envInt("ZICHUNK", 0), ochunk = (size_t)envInt("ZOCHUNK", 16384), flushEvery = (size_t)envInt("ZFLUSH", 0);
-    long pledge = envInt("ZPLEDGE", -1), repeat = envInt("ZREPEAT", 1);
+    long pledge = envInt("ZPLEDGE", -1), repeat = envInt("ZREPEAT", 1), loops = envInt("ZLOOPS", 1);
     unsigned char* outBuffer = malloc(ochunk + 64);
     ZSTD_CCtx* c = ZSTD_createCCtx();
     int failed = 0;
@@ -53,8 +53,9 @@ int main(void) {
                 if (r == 0) break;
             }
         } else {
-            size_t offset = 0, index = 0;
-            while (offset < length && !failed) {
+            size_t offset = 0, index = 0; long loopsLeft = loops;
+            while (!failed) {
+                if (offset >= length) { if (--loopsLeft <= 0 || length == 0) break; offset = 0; }
                 size_t size = length - offset < ichunk ? length - offset : ichunk;
                 index++;
                 int endOp = (flushEvery != 0 && index % flushEvery == 0) ? 1 : 0;

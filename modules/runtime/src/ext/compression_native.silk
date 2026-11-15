@@ -32,6 +32,7 @@ import silkjs.js_buffer_storage as buffers
 import silkjs.js_promise as promise
 import libs.core.host as host
 import ext.compression_abi as c
+import zstd.api as zstd
 import ext.resource_snapshot as resources
 
 pub struct State { first: ?*mut Handle, jobs: ?*mut Job, next: i32, closing: bool }
@@ -54,7 +55,7 @@ struct Job {
   handle: ?*mut Handle, stream: ?*mut CodecState, op: i32, numbers: [i32; 8], data: [?*mut u8; 8], lengths: [usize; 8],
   output: ?*mut u8, capacity: usize, written: usize, consumed: usize,
   status: i32, finished: bool, again: bool, pledgedSize: u64,
-  // A static C string naming the codec failure (zlib msg or ZSTD_getErrorName).
+  // A static C string naming the codec failure (zlib msg or the Zstandard error name).
   message: ?*mut u8
 }
 unsafe fn nonnull<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
@@ -95,8 +96,8 @@ unsafe fn destroyCodec(h: &mut CodecState) -> () {
   if h.kind <= 7 { let z = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut c.ZStream>(unsafe nonnull(h.codec)) let mut ignored: i32 = 0 if h.kind == 1 || h.kind == 3 || h.kind == 5 { ignored = unsafe c.deflateEnd(z) } else { ignored = unsafe c.inflateEnd(z) } unsafe c.free(h.codec) }
   if h.kind == 8 { unsafe c.BrotliEncoderDestroyInstance(h.codec) unsafe c.BrotliEncoderDestroyPreparedDictionary(h.preparedDictionary) h.preparedDictionary = nil() }
   if h.kind == 9 { unsafe c.BrotliDecoderDestroyInstance(h.codec) }
-  if h.kind == 10 { let _ignored = unsafe c.ZSTD_freeCStream(h.codec) }
-  if h.kind == 11 { let _ignored = unsafe c.ZSTD_freeDStream(h.codec) }
+  if h.kind == 10 { let _ignored = unsafe zstd.freeCStream(h.codec) }
+  if h.kind == 11 { let _ignored = unsafe zstd.freeDStream(h.codec) }
   h.codec = nil()
 }
 unsafe fn releaseHandle(s: *mut State, id: i32) -> () {
@@ -121,8 +122,8 @@ unsafe fn parameters(h: &mut CodecState) -> i32 {
     // -3002: the codec rejected a parameter value.
     if h.kind == 8 && unsafe c.BrotliEncoderSetParameter(h.codec, key, i32.toU32(value)) == 0 { return -3002 }
     if h.kind == 9 && unsafe c.BrotliDecoderSetParameter(h.codec, key, i32.toU32(value)) == 0 { return -3002 }
-    if h.kind == 10 && unsafe c.ZSTD_isError(unsafe c.ZSTD_CCtx_setParameter(h.codec, key, value)) != 0 { return -3002 }
-    if h.kind == 11 && unsafe c.ZSTD_isError(unsafe c.ZSTD_DCtx_setParameter(h.codec, key, value)) != 0 { return -3002 }
+    if h.kind == 10 && zstd.isError(unsafe zstd.cctxSetParameter(h.codec, key, value)) != 0 { return -3002 }
+    if h.kind == 11 && zstd.isError(unsafe zstd.dctxSetParameter(h.codec, key, value)) != 0 { return -3002 }
     offset = offset + 8
   }
   return 0
@@ -145,8 +146,8 @@ unsafe fn initialize(h: &mut CodecState, numbers: &[i32; 8]) -> i32 {
   }
   if kind == 8 { h.codec = unsafe c.BrotliEncoderCreateInstance(nil(), nil(), nil()) }
   if kind == 9 { h.codec = unsafe c.BrotliDecoderCreateInstance(nil(), nil(), nil()) }
-  if kind == 10 { h.codec = unsafe c.ZSTD_createCStream() }
-  if kind == 11 { h.codec = unsafe c.ZSTD_createDStream() }
+  if kind == 10 { h.codec = unsafe zstd.createCStream() }
+  if kind == 11 { h.codec = unsafe zstd.createDStream() }
   if Pointer.isNull<u8>(h.codec) { return -4 }
   let status = unsafe parameters(&mut h) if status != 0 { return status }
   if kind == 8 && h.dictionaryLength != 0 {
@@ -155,8 +156,8 @@ unsafe fn initialize(h: &mut CodecState, numbers: &[i32; 8]) -> i32 {
     if unsafe c.BrotliEncoderAttachPreparedDictionary(h.codec, h.preparedDictionary) == 0 { return -2 }
   }
   if kind == 9 && h.dictionaryLength != 0 && unsafe c.BrotliDecoderAttachDictionary(h.codec, 0, h.dictionaryLength, h.dictionary) == 0 { return -2 }
-  if kind == 10 && unsafe c.ZSTD_isError(unsafe c.ZSTD_CCtx_loadDictionary(h.codec, h.dictionary, h.dictionaryLength)) != 0 { return -2 }
-  if kind == 11 && unsafe c.ZSTD_isError(unsafe c.ZSTD_DCtx_loadDictionary(h.codec, h.dictionary, h.dictionaryLength)) != 0 { return -2 }
+  if kind == 10 && zstd.isError(unsafe zstd.cctxLoadDictionary(h.codec, h.dictionary, h.dictionaryLength)) != 0 { return -2 }
+  if kind == 11 && zstd.isError(unsafe zstd.dctxLoadDictionary(h.codec, h.dictionary, h.dictionaryLength)) != 0 { return -2 }
   return 0
 }
 unsafe fn process(j: &mut Job, h: &mut CodecState) -> () {
@@ -202,7 +203,10 @@ unsafe fn process(j: &mut Job, h: &mut CodecState) -> () {
     if j.status != 0 && j.status != -3001 && j.status != -3000 { j.message = message }
     return ()
   }
-  if h.ended && (kind == 8 || kind == 9 || length == 0) { j.finished = true return () }
+  // A finished Zstandard compressor is not held back: ZSTD_e_end with no input after a frame
+  // ended writes an empty frame, and Node's stream asks for exactly that when its last chunk
+  // was written with the finish flag and _flush follows.
+  if h.ended && (kind == 8 || kind == 9 || kind == 11 && length == 0 || kind == 10 && length == 0 && flush != 2) { j.finished = true return () }
   if kind == 8 || kind == 9 {
     let mut availableIn = length let mut availableOut = capacity let mut nextIn = input let mut nextOut: ?*mut u8 = output
     if kind == 8 {
@@ -235,14 +239,14 @@ unsafe fn process(j: &mut Job, h: &mut CodecState) -> () {
   // ZSTD_e_end on a frame's first call makes zstd take that input as the whole
   // frame, replacing the pledged size; the pledge is checked here instead.
   if kind == 10 && flush == 2 && h.pledged && h.frameInput + usize.toU64(length) != h.pledgedSize {
-    j.status = -2000 - 72 j.message = unsafe c.ZSTD_getErrorString(72) return ()
+    j.status = -2000 - 72 j.message = zstd.getErrorString(72) return ()
   }
   let mut source = c.ZBuffer { data: input, size: length, pos: 0 }
   let mut dest = c.ZBuffer { data: output, size: capacity, pos: 0 }
   let mut status: usize = 0
-  if kind == 10 { status = unsafe c.ZSTD_compressStream2(h.codec, Pointer.fromMutRef<c.ZBuffer>(&mut dest), Pointer.fromMutRef<c.ZBuffer>(&mut source), flush) }
-  else { status = unsafe c.ZSTD_decompressStream(h.codec, Pointer.fromMutRef<c.ZBuffer>(&mut dest), Pointer.fromMutRef<c.ZBuffer>(&mut source)) }
-  if unsafe c.ZSTD_isError(status) != 0 { j.status = -2000 - unsafe c.ZSTD_getErrorCode(status) j.message = unsafe c.ZSTD_getErrorName(status) }
+  if kind == 10 { status = unsafe zstd.compressStream2(h.codec, dest.data, dest.size, &mut dest.pos, source.data, source.size, &mut source.pos, flush) }
+  else { status = unsafe zstd.decompressStream(h.codec, dest.data, dest.size, &mut dest.pos, source.data, source.size, &mut source.pos) }
+  if zstd.isError(status) != 0 { j.status = -2000 - zstd.getErrorCode(status) j.message = zstd.getErrorName(status) }
   h.ended = status == 0 && (kind == 11 || flush == 2)
   if kind == 11 && h.ended { h.afterFrame = false }
   if kind == 10 { h.frameInput = h.frameInput + usize.toU64(source.pos) if h.ended { h.pledged = false h.frameInput = 0 } }
@@ -265,11 +269,11 @@ unsafe fn execute(j: &mut Job) -> () {
       else { j.status = unsafe c.inflateReset(z) if j.status == 0 && h.kind == 6 && h.dictionaryLength != 0 { j.status = unsafe c.inflateSetDictionary(z, h.dictionary, usize.toU32(h.dictionaryLength)) } }
     } else {
       if h.kind == 8 || h.kind == 9 { unsafe destroyCodec(&mut h) j.status = unsafe initialize(&mut h, &j.numbers) }
-      if h.kind == 10 && unsafe c.ZSTD_isError(unsafe c.ZSTD_CCtx_reset(h.codec, 1)) != 0 { j.status = -2 }
+      if h.kind == 10 && zstd.isError(unsafe zstd.cctxReset(h.codec, 1)) != 0 { j.status = -2 }
       if h.kind == 10 && j.status == 0 && h.pledgeInitial {
-        if unsafe c.ZSTD_isError(unsafe c.ZSTD_CCtx_setPledgedSrcSize(h.codec, h.pledgedSize)) != 0 { j.status = -2 } else { h.pledged = true }
+        if zstd.isError(unsafe zstd.cctxSetPledgedSrcSize(h.codec, h.pledgedSize)) != 0 { j.status = -2 } else { h.pledged = true }
       }
-      if h.kind == 11 && unsafe c.ZSTD_isError(unsafe c.ZSTD_DCtx_reset(h.codec, 1)) != 0 { j.status = -2 }
+      if h.kind == 11 && zstd.isError(unsafe zstd.dctxReset(h.codec, 1)) != 0 { j.status = -2 }
     }
   } else {
     // Transfer the snapshot once, then keep its unconsumed suffix across output
@@ -378,8 +382,8 @@ unsafe effect fn synchronous<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
     let h = unsafe Pointer.borrowMut<(), CodecState>(&mut anchor, unsafe nonnull(j.stream))
     if h.kind != 10 { j.status = -2 }
     else {
-      let status = unsafe c.ZSTD_CCtx_setPledgedSrcSize(h.codec, j.pledgedSize)
-      if unsafe c.ZSTD_isError(status) != 0 { j.status = -2000 - unsafe c.ZSTD_getErrorCode(status) j.message = unsafe c.ZSTD_getErrorName(status) }
+      let status = unsafe zstd.cctxSetPledgedSrcSize(h.codec, j.pledgedSize)
+      if zstd.isError(status) != 0 { j.status = -2000 - zstd.getErrorCode(status) j.message = zstd.getErrorName(status) }
       else { h.pledged = true h.pledgeInitial = true h.pledgedSize = j.pledgedSize h.frameInput = 0 }
     }
     drop h
