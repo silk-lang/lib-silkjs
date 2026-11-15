@@ -11,7 +11,7 @@
 //   ca:<input>:<level>    zstdCompress (thread pool), 4 at a time
 //   da:<input>:<level>    zstdDecompress (thread pool), 4 at a time
 //   http:<input>:<level>  a server answers with Content-Encoding: zstd, compressing each response;
-//                         fetch() decodes it
+//                         the client decodes it (ZSTD_FETCH=1: fetch() does)
 // Inputs are <corpus-dir>/{text,json,random,binary}.bin. It prints one JSON line: the case, the
 // megabytes of uncompressed data per second (median and best of the timed runs), the compressed
 // size, and the peak RSS in MiB.
@@ -74,13 +74,32 @@ async function http(data, level, seconds) {
   const samples = [];
   const deadline = Date.now() + seconds * 1000;
   let compressed = 0;
+  // With ZSTD_FETCH=1 the client is fetch(), which decodes the body itself; otherwise http.get
+  // piped through createZstdDecompress, which builds without fetch's decoding have too.
+  const viaFetch = process.env.ZSTD_FETCH === '1';
+  const get = () => new Promise((resolve, reject) => {
+    http.get(url, (response) => {
+      compressed = Number(response.headers['content-length']);
+      const chunks = [];
+      const decoder = zlib.createZstdDecompress();
+      decoder.on('data', (chunk) => chunks.push(chunk));
+      decoder.on('end', () => resolve(Buffer.concat(chunks)));
+      decoder.on('error', reject);
+      response.pipe(decoder);
+    }).on('error', reject);
+  });
   while (Date.now() < deadline || samples.length < 3) {
     const start = process.hrtime.bigint();
-    const response = await fetch(url);
-    const body = Buffer.from(await response.arrayBuffer());
+    let body;
+    if (viaFetch) {
+      const response = await fetch(url);
+      body = Buffer.from(await response.arrayBuffer());
+      compressed = Number(response.headers.get('content-length'));
+    } else {
+      body = await get();
+    }
     samples.push(Number(process.hrtime.bigint() - start) / 1e6);
-    if (body.length !== data.length || body[0] !== data[0] || body[body.length - 1] !== data[data.length - 1]) throw new Error('the decoded response is not the body');
-    compressed = Number(response.headers.get('content-length'));
+    if (!body.equals(data)) throw new Error('the decoded response is not the body');
   }
   server.close();
   return { samples, compressed };

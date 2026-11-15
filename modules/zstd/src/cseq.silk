@@ -17,6 +17,8 @@ import silk.num.i16
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
+import silk.simd.cpu { CpuFeatures }
+import silk.core.target { Arch, Target }
 
 // ---- The default distributions, as arrays of `i16` in memory. ----
 /// The size in bytes of the area that [`initConsts`] fills.
@@ -210,8 +212,29 @@ pub unsafe fn buildCTable(dst: [*]mut u8, dstCapacity: usize, nextCTable: [*]mut
   return errors.err(errors.E_GENERIC)
 }
 
+// `LL_bits` and `ML_bits` padded to 64 entries, so that an index masked with 63 needs no bounds
+// check in the sequence encoder's loop.
+const LL_BITS64: [u8; 64] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+const ML_BITS64: [u8; 64] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
 /// `ZSTD_encodeSequences`: writes the bitstream of the `nbSeq` sequences at `sequences`.
+// Where the CPU has BMI2 the body runs compiled for it, as `ZSTD_encodeSequences_bmi2` does in
+// the reference: the bit writer's variable shifts become single instructions.
 pub unsafe fn encodeSequences(dst: [*]mut u8, dstCapacity: usize, ctableMatchLength: [*]const u8, mlCodeTable: [*]const u8, ctableOffsetBits: [*]const u8, ofCodeTable: [*]const u8, ctableLitLength: [*]const u8, llCodeTable: [*]const u8, sequences: [*]const u8, nbSeq: usize, longOffsets: bool) -> usize {
+  static if Target.arch() == Arch.X86_64 {
+    if CpuFeatures.available("bmi2") { return unsafe encodeSequencesBmi2(dst, dstCapacity, ctableMatchLength, mlCodeTable, ctableOffsetBits, ofCodeTable, ctableLitLength, llCodeTable, sequences, nbSeq, longOffsets) }
+  }
+  return unsafe encodeSequencesBody(dst, dstCapacity, ctableMatchLength, mlCodeTable, ctableOffsetBits, ofCodeTable, ctableLitLength, llCodeTable, sequences, nbSeq, longOffsets)
+}
+
+static if Target.arch() == Arch.X86_64 {
+  @features("bmi2")
+  @inlineNever
+  unsafe fn encodeSequencesBmi2(dst: [*]mut u8, dstCapacity: usize, ctableMatchLength: [*]const u8, mlCodeTable: [*]const u8, ctableOffsetBits: [*]const u8, ofCodeTable: [*]const u8, ctableLitLength: [*]const u8, llCodeTable: [*]const u8, sequences: [*]const u8, nbSeq: usize, longOffsets: bool) -> usize { return unsafe encodeSequencesBody(dst, dstCapacity, ctableMatchLength, mlCodeTable, ctableOffsetBits, ofCodeTable, ctableLitLength, llCodeTable, sequences, nbSeq, longOffsets) }
+}
+
+@inlineAlways
+unsafe fn encodeSequencesBody(dst: [*]mut u8, dstCapacity: usize, ctableMatchLength: [*]const u8, mlCodeTable: [*]const u8, ctableOffsetBits: [*]const u8, ofCodeTable: [*]const u8, ctableLitLength: [*]const u8, llCodeTable: [*]const u8, sequences: [*]const u8, nbSeq: usize, longOffsets: bool) -> usize {
   if dstCapacity <= 8 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
   let mut blockStream = fse.bitInit(dst, dstCapacity)
   let last = nbSeq - 1
@@ -219,8 +242,8 @@ pub unsafe fn encodeSequences(dst: [*]mut u8, dstCapacity: usize, ctableMatchLen
   let mut stateMatchLength = unsafe fse.initCState2(ctableMatchLength, u8.toU32(unsafe mem.r8(mlCodeTable, last)))
   let mut stateOffsetBits = unsafe fse.initCState2(ctableOffsetBits, u8.toU32(unsafe mem.r8(ofCodeTable, last)))
   let mut stateLitLength = unsafe fse.initCState2(ctableLitLength, u8.toU32(unsafe mem.r8(llCodeTable, last)))
-  fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, last * 8 + 4)), u8.toU32(cstate.LL_BITS[u8.toUsize(unsafe mem.r8(llCodeTable, last)) & 63]))
-  fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, last * 8 + 6)), u8.toU32(cstate.ML_BITS[u8.toUsize(unsafe mem.r8(mlCodeTable, last)) & 63]))
+  fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, last * 8 + 4)), u8.toU32(LL_BITS64[u8.toUsize(unsafe mem.r8(llCodeTable, last)) & 63]))
+  fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, last * 8 + 6)), u8.toU32(ML_BITS64[u8.toUsize(unsafe mem.r8(mlCodeTable, last)) & 63]))
   let lastOffBase = u32.toU64(unsafe mem.r32(sequences, last * 8))
   let lastOfBits = u8.toU32(unsafe mem.r8(ofCodeTable, last))
   if longOffsets {
@@ -240,17 +263,18 @@ pub unsafe fn encodeSequences(dst: [*]mut u8, dstCapacity: usize, ctableMatchLen
     let llCode = u8.toU32(unsafe mem.r8(llCodeTable, n))
     let ofCode = u8.toU32(unsafe mem.r8(ofCodeTable, n))
     let mlCode = u8.toU32(unsafe mem.r8(mlCodeTable, n))
-    let llBits = u8.toU32(cstate.LL_BITS[mem.z(llCode) & 63])
+    let llBits = u8.toU32(LL_BITS64[mem.z(llCode) & 63])
     let ofBits = ofCode
-    let mlBits = u8.toU32(cstate.ML_BITS[mem.z(mlCode) & 63])
+    let mlBits = u8.toU32(ML_BITS64[mem.z(mlCode) & 63])
     let at = usize.wrappingMultiply(n, 8)
     unsafe fse.encodeSymbol(&mut blockStream, &mut stateOffsetBits, ofCode)
     unsafe fse.encodeSymbol(&mut blockStream, &mut stateMatchLength, mlCode)
     unsafe fse.encodeSymbol(&mut blockStream, &mut stateLitLength, llCode)
-    if ofBits + mlBits + llBits >= 64 - 7 - (9 + 9 + 8) { unsafe fse.bitFlush(&mut blockStream) }
+    let totalBits = u32.wrappingAdd(u32.wrappingAdd(ofBits, mlBits), llBits)
+    if totalBits >= 64 - 7 - (9 + 9 + 8) { unsafe fse.bitFlush(&mut blockStream) }
     fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, at + 4)), llBits)
     fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, at + 6)), mlBits)
-    if ofBits + mlBits + llBits > 56 { unsafe fse.bitFlush(&mut blockStream) }
+    if totalBits > 56 { unsafe fse.bitFlush(&mut blockStream) }
     let offBase = u32.toU64(unsafe mem.r32(sequences, at))
     if longOffsets {
       let extraBits = ofBits - (if ofBits < 56 { ofBits } else { 56 })
