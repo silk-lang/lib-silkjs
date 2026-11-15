@@ -1,18 +1,125 @@
-//! The Brotli decoder: a port of google/brotli v1.2.0 `c/dec` with upstream commit 0ed4268
-//! ("Detect and report invalid stream earlier"), which is the decoder Node 24 bundles.
+//! The Brotli decoder: a port of google/brotli v1.2.0 `c/dec/decode.c` with upstream commit
+//! 0ed4268 ("Detect and report invalid stream earlier"), which is the decoder Node 24 bundles,
+//! and of the parts of `c/common/shared_dictionary.c` that a build without `BROTLI_EXPERIMENTAL`
+//! uses.
 //!
 //! The calls and their results are those of the C API (`BrotliDecoderDecompressStream` and
 //! friends): the same result for the same input and output space at every call, the same error
-//! codes, and the same count of consumed and written bytes.
+//! codes, and the same count of consumed and written bytes. The decoder has, like C, a fast path
+//! for when at least 28 bytes of input are at hand and a "safe" path that reads byte by byte;
+//! which one runs decides how much input a call consumes.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.compress.brotli_tables
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
+import dec.bit_reader { BitReader }
+import dec.bit_reader
+import dec.huffman
+import dec.memory
+import dec.prefix
+import dec.state { State }
+import dec.state
+import dec.transform
 
 /// `BROTLI_DECODER_RESULT_*`.
 pub const RESULT_ERROR: u32 = 0
 pub const RESULT_SUCCESS: u32 = 1
 pub const RESULT_NEEDS_MORE_INPUT: u32 = 2
 pub const RESULT_NEEDS_MORE_OUTPUT: u32 = 3
+
+/// `BROTLI_DECODER_PARAM_*`.
+pub const PARAM_DISABLE_RING_BUFFER_REALLOCATION: u32 = 0
+pub const PARAM_LARGE_WINDOW: u32 = 1
+
+// `BrotliDecoderErrorCode`.
+const SUCCESS: i32 = 1
+const NEEDS_MORE_INPUT: i32 = 2
+const NEEDS_MORE_OUTPUT: i32 = 3
+pub const ERROR_FORMAT_EXUBERANT_NIBBLE: i32 = -1
+pub const ERROR_FORMAT_RESERVED: i32 = -2
+pub const ERROR_FORMAT_EXUBERANT_META_NIBBLE: i32 = -3
+pub const ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET: i32 = -4
+pub const ERROR_FORMAT_SIMPLE_HUFFMAN_SAME: i32 = -5
+pub const ERROR_FORMAT_CL_SPACE: i32 = -6
+pub const ERROR_FORMAT_HUFFMAN_SPACE: i32 = -7
+pub const ERROR_FORMAT_CONTEXT_MAP_REPEAT: i32 = -8
+pub const ERROR_FORMAT_BLOCK_LENGTH_1: i32 = -9
+pub const ERROR_FORMAT_BLOCK_LENGTH_2: i32 = -10
+pub const ERROR_FORMAT_TRANSFORM: i32 = -11
+pub const ERROR_FORMAT_DICTIONARY: i32 = -12
+pub const ERROR_FORMAT_WINDOW_BITS: i32 = -13
+pub const ERROR_FORMAT_PADDING_1: i32 = -14
+pub const ERROR_FORMAT_PADDING_2: i32 = -15
+pub const ERROR_FORMAT_DISTANCE: i32 = -16
+pub const ERROR_FORMAT_BLOCK_SWITCH: i32 = -17
+pub const ERROR_COMPOUND_DICTIONARY: i32 = -18
+pub const ERROR_DICTIONARY_NOT_SET: i32 = -19
+pub const ERROR_INVALID_ARGUMENTS: i32 = -20
+pub const ERROR_ALLOC_CONTEXT_MODES: i32 = -21
+pub const ERROR_ALLOC_TREE_GROUPS: i32 = -22
+pub const ERROR_ALLOC_CONTEXT_MAP: i32 = -25
+pub const ERROR_ALLOC_RING_BUFFER_1: i32 = -26
+pub const ERROR_ALLOC_RING_BUFFER_2: i32 = -27
+pub const ERROR_ALLOC_BLOCK_TYPE_TREES: i32 = -30
+pub const ERROR_UNREACHABLE: i32 = -31
+
+const HUFFMAN_TABLE_BITS: u64 = 8
+const HUFFMAN_TABLE_MASK: u64 = 255
+
+// The slack region of the ring buffer is needed for up to two 16-byte copies for fast backward
+// copying, and for inserting a transformed dictionary word: 255 prefix + 32 base + 255 suffix.
+const RING_BUFFER_WRITE_AHEAD_SLACK: usize = 542
+
+const CODE_LENGTH_CODE_ORDER: [usize; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+// The static prefix code for the complex code length code lengths.
+const CODE_LENGTH_PREFIX_LENGTH: [u64; 16] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+
+const CODE_LENGTH_PREFIX_VALUE: [u64; 16] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+
+const NUM_LITERAL_SYMBOLS: u64 = 256
+const NUM_COMMAND_SYMBOLS: u64 = 704
+const NUM_BLOCK_LEN_SYMBOLS: u64 = 26
+const REPEAT_PREVIOUS_CODE_LENGTH: u64 = 16
+const INITIAL_REPEATED_CODE_LENGTH: u64 = 8
+const LARGE_MAX_DISTANCE_BITS: u64 = 62
+const LARGE_MIN_WBITS: u32 = 10
+const LARGE_MAX_WBITS: u32 = 30
+const NUM_DISTANCE_SHORT_CODES: u64 = 16
+const MAX_DISTANCE_BITS: u64 = 24
+const MAX_ALLOWED_DISTANCE: i32 = 2147483644
+const LITERAL_CONTEXT_BITS: u64 = 6
+const DISTANCE_CONTEXT_BITS: u64 = 2
+const WINDOW_GAP: i32 = 16
+const MIN_DICTIONARY_WORD_LENGTH: i32 = 4
+const MAX_DICTIONARY_WORD_LENGTH: i32 = 31
+const MAX_COMPOUND_DICTS: i32 = 15
+
+// Where `readHuffmanCode` builds its table.
+const TABLE_BLOCK_TREES: u32 = 0
+const TABLE_CONTEXT_MAP: u32 = 1
+const TABLE_LITERAL_GROUP: u32 = 2
+const TABLE_INSERT_COPY_GROUP: u32 = 3
+const TABLE_DISTANCE_GROUP: u32 = 4
+
+// The labels of `processCommandsInternal`.
+const LABEL_BEGIN: u32 = 0
+const LABEL_INNER: u32 = 1
+const LABEL_POST_DECODE_LITERALS: u32 = 2
+const LABEL_POST_WRAP_COPY: u32 = 3
+const LABEL_NEXT_LITERAL_BLOCK: u32 = 4
+const LABEL_SAVE: u32 = 5
 
 /// What one call to [`BrotliDecoder.decompressStream`] did.
 pub struct DecodeStep {
@@ -26,52 +133,2435 @@ pub struct DecodeStep {
 
 /// A streaming decoder, `BrotliDecoderState` of the C API.
 pub struct BrotliDecoder {
-  error: i32,
+  s: State,
 }
 
 impl BrotliDecoder {
   /// `BrotliDecoderCreateInstance`.
   pub effect fn make() -> BrotliDecoder ! OutOfMemoryError ? &mut Allocator {
-    return BrotliDecoder { error: 0 }
+    return BrotliDecoder { s: state.make() }
   }
 
   /// `BrotliDecoderSetParameter`: false when the decoder has started or the parameter is unknown.
   pub fn setParameter(self: &mut Self, parameter: u32, value: u32) -> bool {
+    if self.s.state != state.STATE_UNINITED { return false }
+    if parameter == PARAM_DISABLE_RING_BUFFER_REALLOCATION {
+      self.s.cannyRingbufferAllocation = value == 0
+      return true
+    }
+    if parameter == PARAM_LARGE_WINDOW {
+      self.s.largeWindow = value != 0
+      return true
+    }
     return false
   }
 
   /// `BrotliDecoderAttachDictionary`. The decoder keeps its own copy of `data`.
+  ///
+  /// `kind` 0 (`BROTLI_SHARED_DICTIONARY_RAW`) adds `data` as a chunk of the compound dictionary.
+  /// It returns false when the decoder has started, when 15 chunks are attached already, when
+  /// the copy cannot be allocated, and for every other `kind`: C reads a serialized dictionary
+  /// (kind 1) only in `BROTLI_EXPERIMENTAL` builds.
   pub effect fn attachDictionary(self: &mut Self, kind: u32, data: &[u8]) -> bool ? &mut Allocator {
-    return false
+    if self.s.state != state.STATE_UNINITED { return false }
+    if kind != 0 { return false }
+    if self.s.compound.numChunks == MAX_COMPOUND_DICTS { return false }
+    match run Effect.result(List<u8>.appendSlice(&mut self.s.compound.data, data)) {
+      Result<(), OutOfMemoryError>.Success {..} => {}
+      Result<(), OutOfMemoryError>.Failure {..} => { return false }
+    }
+    let addon = &mut self.s.compound
+    addon.numChunks = addon.numChunks + 1
+    addon.totalSize = i32.wrappingAdd(addon.totalSize, usize.wrappingToI32(data.length))
+    addon.chunkOffsets[i32.toUsize(addon.numChunks)] = addon.totalSize
+    return true
   }
 
   /// `BrotliDecoderDecompressStream` with `next_out` set: decodes from `input` into `output`.
   pub effect fn decompressStream(self: &mut Self, input: &[u8], output: &mut [u8]) -> DecodeStep ? &mut Allocator {
-    return DecodeStep { result: RESULT_ERROR, consumed: 0, written: 0 }
+    let result = run decompress(&mut self.s, input, &mut output)
+    return DecodeStep { result: result, consumed: self.s.inPos, written: self.s.outPos }
   }
 
-  /// `BrotliDecoderGetErrorCode`: 0, or the negative `BROTLI_DECODER_ERROR_*` value.
+  /// `BrotliDecoderGetErrorCode`: 0, or the negative `BROTLI_DECODER_ERROR_*` value. As in C,
+  /// after a call that did not fail it is that call's result code (1 to 3).
   pub fn errorCode(self: &Self) -> i32 {
-    return self.error
+    return self.s.errorCode
   }
 
   /// `BrotliDecoderHasMoreOutput`.
   pub fn hasMoreOutput(self: &Self) -> bool {
-    return false
+    // After an unrecoverable error the remaining output is considered nonsensical.
+    if self.s.errorCode < 0 { return false }
+    return RawBuffer.count<u8>(&self.s.ringbuffer) != 0 && unwrittenBytes(&self.s, false) != 0
   }
 
   /// `BrotliDecoderIsUsed`.
   pub fn isUsed(self: &Self) -> bool {
-    return false
+    return self.s.state != state.STATE_UNINITED || self.s.br.bitPos != 0
   }
 
   /// `BrotliDecoderIsFinished`.
   pub fn isFinished(self: &Self) -> bool {
-    return false
+    return self.s.state == state.STATE_DONE && !BrotliDecoder.hasMoreOutput(self)
   }
 
   /// `BrotliDecoderVersion`: 1.2.0 as `major << 24 | minor << 12 | patch`.
   pub fn version() -> u32 {
     return 16785408
   }
+}
+
+// Saves the error code and converts it to a `RESULT_*` value.
+fn saveErrorCode(s: &mut State, e: i32) -> u32 {
+  s.errorCode = e
+  s.usedInput = s.usedInput + usize.toU64(s.inPos)
+  if s.bufferLength != 0 && s.br.next == s.br.last {
+    // If the internal buffer is depleted at last, reset it.
+    s.bufferLength = 0
+  }
+  if e == SUCCESS { return RESULT_SUCCESS }
+  if e == NEEDS_MORE_INPUT { return RESULT_NEEDS_MORE_INPUT }
+  if e == NEEDS_MORE_OUTPUT { return RESULT_NEEDS_MORE_OUTPUT }
+  return RESULT_ERROR
+}
+
+// Decodes WBITS by reading 1 - 7 bits, or 0x11 for "Large Window Brotli".
+// Precondition: the accumulator has at least 8 bits.
+fn decodeWindowBits(s: &mut State) -> i32 {
+  let largeWindow = s.largeWindow
+  s.largeWindow = false
+  let mut n = bit_reader.takeBits(&mut s.br, 1)
+  if n == 0 {
+    s.windowBits = 16
+    return SUCCESS
+  }
+  n = bit_reader.takeBits(&mut s.br, 3)
+  if n != 0 {
+    s.windowBits = u64.wrappingToU32(17 + n) & 63
+    return SUCCESS
+  }
+  n = bit_reader.takeBits(&mut s.br, 3)
+  if n == 1 {
+    if largeWindow {
+      n = bit_reader.takeBits(&mut s.br, 1)
+      if n == 1 { return ERROR_FORMAT_WINDOW_BITS }
+      s.largeWindow = true
+      return SUCCESS
+    }
+    return ERROR_FORMAT_WINDOW_BITS
+  }
+  if n != 0 {
+    s.windowBits = u64.wrappingToU32(8 + n) & 63
+    return SUCCESS
+  }
+  s.windowBits = 17
+  return SUCCESS
+}
+
+// Decodes a number in the range [0..255], by reading 1 - 11 bits. `value` is also the temporary
+// storage of the number between calls that need more input, so it must persist.
+fn decodeVarLenUint8(s: &mut State, src: &[u8], value: &mut u64) -> i32 {
+  let mut bits: u64 = 0
+  if s.substateDecodeUint8 == state.DECODE_UINT8_NONE {
+    if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) { return NEEDS_MORE_INPUT }
+    if bits == 0 {
+      value.* = 0
+      return SUCCESS
+    }
+    s.substateDecodeUint8 = state.DECODE_UINT8_SHORT
+  }
+  if s.substateDecodeUint8 == state.DECODE_UINT8_SHORT {
+    if !bit_reader.safeReadBits(&mut s.br, src, 3, &mut bits) {
+      s.substateDecodeUint8 = state.DECODE_UINT8_SHORT
+      return NEEDS_MORE_INPUT
+    }
+    if bits == 0 {
+      value.* = 1
+      s.substateDecodeUint8 = state.DECODE_UINT8_NONE
+      return SUCCESS
+    }
+    // Use the output value as temporary storage. It MUST be persisted.
+    value.* = bits
+    s.substateDecodeUint8 = state.DECODE_UINT8_LONG
+  }
+  if s.substateDecodeUint8 == state.DECODE_UINT8_LONG {
+    let count = value.*
+    if !bit_reader.safeReadBits(&mut s.br, src, count, &mut bits) {
+      s.substateDecodeUint8 = state.DECODE_UINT8_LONG
+      return NEEDS_MORE_INPUT
+    }
+    value.* = u64.shiftLeft(1, count & 63) + bits
+    s.substateDecodeUint8 = state.DECODE_UINT8_NONE
+    return SUCCESS
+  }
+  return ERROR_UNREACHABLE
+}
+
+// Decodes a meta-block length and flags by reading 2 - 31 bits.
+fn decodeMetaBlockLength(s: &mut State, src: &[u8]) -> i32 {
+  let mut bits: u64 = 0
+  while true {
+    let substate = s.substateMetablockHeader
+    if substate == state.HEADER_NONE {
+      if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) { return NEEDS_MORE_INPUT }
+      s.isLastMetablock = bits != 0
+      s.metaBlockRemainingLen = 0
+      s.isUncompressed = false
+      s.isMetadata = false
+      if !s.isLastMetablock {
+        s.substateMetablockHeader = state.HEADER_NIBBLES
+        continue
+      }
+      s.substateMetablockHeader = state.HEADER_EMPTY
+      continue
+    }
+    if substate == state.HEADER_EMPTY {
+      if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) { return NEEDS_MORE_INPUT }
+      if bits != 0 {
+        s.substateMetablockHeader = state.HEADER_NONE
+        return SUCCESS
+      }
+      s.substateMetablockHeader = state.HEADER_NIBBLES
+      continue
+    }
+    if substate == state.HEADER_NIBBLES {
+      if !bit_reader.safeReadBits(&mut s.br, src, 2, &mut bits) { return NEEDS_MORE_INPUT }
+      s.sizeNibbles = u64.wrappingToU32(bits + 4) & 255
+      s.loopCounter = 0
+      if bits == 3 {
+        s.isMetadata = true
+        s.substateMetablockHeader = state.HEADER_RESERVED
+        continue
+      }
+      s.substateMetablockHeader = state.HEADER_SIZE
+      continue
+    }
+    if substate == state.HEADER_SIZE {
+      let mut i = s.loopCounter
+      let sizeNibbles = u32.wrappingToI32(s.sizeNibbles)
+      while i < sizeNibbles {
+        if !bit_reader.safeReadBits(&mut s.br, src, 4, &mut bits) {
+          s.loopCounter = i
+          return NEEDS_MORE_INPUT
+        }
+        if i + 1 == sizeNibbles && s.sizeNibbles > 4 && bits == 0 {
+          return ERROR_FORMAT_EXUBERANT_NIBBLE
+        }
+        s.metaBlockRemainingLen = s.metaBlockRemainingLen | u64.wrappingToI32(u64.shiftLeft(bits, i32.wrappingToU64(i * 4) & 63))
+        i = i + 1
+      }
+      s.substateMetablockHeader = state.HEADER_UNCOMPRESSED
+      continue
+    }
+    if substate == state.HEADER_UNCOMPRESSED {
+      if !s.isLastMetablock {
+        if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) { return NEEDS_MORE_INPUT }
+        s.isUncompressed = bits != 0
+      }
+      s.metaBlockRemainingLen = s.metaBlockRemainingLen + 1
+      s.substateMetablockHeader = state.HEADER_NONE
+      return SUCCESS
+    }
+    if substate == state.HEADER_RESERVED {
+      if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) { return NEEDS_MORE_INPUT }
+      if bits != 0 { return ERROR_FORMAT_RESERVED }
+      s.substateMetablockHeader = state.HEADER_BYTES
+      continue
+    }
+    if substate == state.HEADER_BYTES {
+      if !bit_reader.safeReadBits(&mut s.br, src, 2, &mut bits) { return NEEDS_MORE_INPUT }
+      if bits == 0 {
+        s.substateMetablockHeader = state.HEADER_NONE
+        return SUCCESS
+      }
+      s.sizeNibbles = u64.wrappingToU32(bits) & 255
+      s.substateMetablockHeader = state.HEADER_METADATA
+      continue
+    }
+    if substate == state.HEADER_METADATA {
+      let mut i = s.loopCounter
+      let sizeNibbles = u32.wrappingToI32(s.sizeNibbles)
+      while i < sizeNibbles {
+        if !bit_reader.safeReadBits(&mut s.br, src, 8, &mut bits) {
+          s.loopCounter = i
+          return NEEDS_MORE_INPUT
+        }
+        if i + 1 == sizeNibbles && s.sizeNibbles > 1 && bits == 0 {
+          return ERROR_FORMAT_EXUBERANT_META_NIBBLE
+        }
+        s.metaBlockRemainingLen = s.metaBlockRemainingLen | u64.wrappingToI32(u64.shiftLeft(bits, i32.wrappingToU64(i * 8) & 63))
+        i = i + 1
+      }
+      s.metaBlockRemainingLen = s.metaBlockRemainingLen + 1
+      s.substateMetablockHeader = state.HEADER_NONE
+      return SUCCESS
+    }
+    return ERROR_UNREACHABLE
+  }
+  return ERROR_UNREACHABLE
+}
+
+// Decodes the Huffman code. This does not read data from the source, but drops the bits of the
+// decoded symbol. `bits` MUST contain at least 15 valid bits.
+@inlineAlways
+fn decodeSymbol(bits: u64, table: &[u32], base: usize, br: &mut BitReader) -> u64 {
+  let mut index = usize.wrappingAdd(base, u64.wrappingToUsize(bits & HUFFMAN_TABLE_MASK))
+  let mut entry = table[index]
+  if huffman.codeBits(entry) > HUFFMAN_TABLE_BITS {
+    let nbits = u64.wrappingSubtract(huffman.codeBits(entry), HUFFMAN_TABLE_BITS)
+    bit_reader.dropBits(&mut br, HUFFMAN_TABLE_BITS)
+    index = usize.wrappingAdd(index, u64.wrappingToUsize(u64.wrappingAdd(huffman.codeValue(entry), u64.shiftRight(bits, HUFFMAN_TABLE_BITS) & bit_reader.bitMask(nbits))))
+    entry = table[index]
+  }
+  bit_reader.dropBits(&mut br, huffman.codeBits(entry))
+  return huffman.codeValue(entry)
+}
+
+// Reads and decodes the next Huffman code. This peeks 16 bits of input and drops 0 - 15 of them.
+@inlineAlways
+fn readSymbol(table: &[u32], base: usize, br: &mut BitReader, src: &[u8]) -> u64 {
+  let bits = bit_reader.get16BitsUnmasked(&mut br, src)
+  return decodeSymbol(bits, table, base, &mut br)
+}
+
+// Same as `decodeSymbol`, but it is known that less than 15 bits of input are available.
+@inlineNever
+fn safeDecodeSymbol(table: &[u32], base: usize, br: &mut BitReader, result: &mut u64) -> bool {
+  let mut availableBits = br.bitPos
+  if availableBits == 0 {
+    let entry = table[base]
+    if huffman.codeBits(entry) == 0 {
+      result.* = huffman.codeValue(entry)
+      return true
+    }
+    // No valid bits at all.
+    return false
+  }
+  let mut val = br.val
+  let mut index = usize.wrappingAdd(base, u64.wrappingToUsize(val & HUFFMAN_TABLE_MASK))
+  let mut entry = table[index]
+  if huffman.codeBits(entry) <= HUFFMAN_TABLE_BITS {
+    if huffman.codeBits(entry) <= availableBits {
+      bit_reader.dropBits(&mut br, huffman.codeBits(entry))
+      result.* = huffman.codeValue(entry)
+      return true
+    }
+    // Not enough bits for the first level.
+    return false
+  }
+  // Not enough bits to move to the second level.
+  if availableBits <= HUFFMAN_TABLE_BITS { return false }
+  // Speculatively drop HUFFMAN_TABLE_BITS.
+  val = u64.shiftRight(val & bit_reader.bitMask(huffman.codeBits(entry)), HUFFMAN_TABLE_BITS)
+  availableBits = availableBits - HUFFMAN_TABLE_BITS
+  index = usize.wrappingAdd(index, u64.wrappingToUsize(u64.wrappingAdd(huffman.codeValue(entry), val)))
+  entry = table[index]
+  // Not enough bits for the second level.
+  if availableBits < huffman.codeBits(entry) { return false }
+  bit_reader.dropBits(&mut br, HUFFMAN_TABLE_BITS + huffman.codeBits(entry))
+  result.* = huffman.codeValue(entry)
+  return true
+}
+
+@inlineAlways
+fn safeReadSymbol(table: &[u32], base: usize, br: &mut BitReader, src: &[u8], result: &mut u64) -> bool {
+  if bit_reader.safeGetBits(&mut br, src, 15) {
+    result.* = decodeSymbol(br.val & 32767, table, base, &mut br)
+    return true
+  }
+  return safeDecodeSymbol(table, base, &mut br, &mut result)
+}
+
+// Makes a look-up in the first level Huffman table. Peeks 8 bits.
+@inlineAlways
+fn preloadSymbol(table: &[u32], base: usize, br: &mut BitReader, src: &[u8], bits: &mut u64, value: &mut u64) -> () {
+  bit_reader.fillBitWindow8(&mut br, src)
+  let entry = table[usize.wrappingAdd(base, u64.wrappingToUsize(br.val & HUFFMAN_TABLE_MASK))]
+  bits.* = huffman.codeBits(entry)
+  value.* = huffman.codeValue(entry)
+}
+
+// Decodes the next Huffman code using the data prepared by `preloadSymbol`. Reads 0 - 15 bits.
+// Also peeks 8 following bits.
+@inlineAlways
+fn readPreloadedSymbol(table: &[u32], base: usize, br: &mut BitReader, src: &[u8], bits: &mut u64, value: &mut u64) -> u64 {
+  let mut result = value.*
+  if bits.* > HUFFMAN_TABLE_BITS {
+    let val = bit_reader.get16BitsUnmasked(&mut br, src)
+    let mut ext = usize.wrappingAdd(base, u64.wrappingToUsize(u64.wrappingAdd(val & HUFFMAN_TABLE_MASK, value.*)))
+    let mask = bit_reader.bitMask(u64.wrappingSubtract(bits.*, HUFFMAN_TABLE_BITS))
+    bit_reader.dropBits(&mut br, HUFFMAN_TABLE_BITS)
+    ext = usize.wrappingAdd(ext, u64.wrappingToUsize(u64.shiftRight(val, HUFFMAN_TABLE_BITS) & mask))
+    let entry = table[ext]
+    bit_reader.dropBits(&mut br, huffman.codeBits(entry))
+    result = huffman.codeValue(entry)
+  } else {
+    bit_reader.dropBits(&mut br, bits.*)
+  }
+  preloadSymbol(table, base, &mut br, src, &mut bits, &mut value)
+  return result
+}
+
+// Reads up to `limit` symbols and copies them into the ring buffer, starting from `pos`. The
+// caller must ensure that there is enough space for the write. Returns the number of symbols
+// actually copied.
+@inlineAlways
+fn copyPreloadedSymbolsToU8(table: &[u32], base: usize, br: &mut BitReader, src: &[u8], bits: &mut u64, value: &mut u64, ring: &mut [u8], pos: usize, limit: i32) -> i32 {
+  // Calculate the range where `checkInputAmount` is always true. Start with the number of bytes
+  // we can read, convert to bits (symbols use a variable number of bits) and to symbols: at most
+  // 15 bits per symbol.
+  let newLim = i64.divide(i64.wrappingMultiply(i64.wrappingSubtract(usize.wrappingToI64(br.guard), usize.wrappingToI64(br.next)), 8), 15)
+  let maximalOverread: i64 = 4
+  let mut posLimit = limit
+  if newLim - maximalOverread <= i32.toI64(limit) {
+    posLimit = i64.wrappingToI32(newLim - maximalOverread)
+  }
+  if posLimit < 0 { posLimit = 0 }
+  let mut copies = posLimit
+  let mut at = pos
+  let end = usize.wrappingAdd(at, i32.toUsize(posLimit))
+  // Fast path: the caller made sure it is safe to write, and it is safe to read.
+  while at < end {
+    ring[at] = u64.wrappingToU8(readPreloadedSymbol(table, base, &mut br, src, &mut bits, &mut value))
+    at = usize.wrappingAdd(at, 1)
+  }
+  // Do the remainder: the caller made sure it is safe to write, we verify that it is safe to
+  // read.
+  while bit_reader.checkInputAmount(&br) && copies < limit {
+    ring[at] = u64.wrappingToU8(readPreloadedSymbol(table, base, &mut br, src, &mut bits, &mut value))
+    at = usize.wrappingAdd(at, 1)
+    copies = i32.wrappingAdd(copies, 1)
+  }
+  return copies
+}
+
+@inlineAlways
+fn log2Floor(value: u64) -> u64 {
+  let mut x = value
+  let mut result: u64 = 0
+  while x != 0 {
+    x = u64.shiftRight(x, 1)
+    result = result + 1
+  }
+  return result
+}
+
+// Reads (s.symbol + 1) symbols. In total 1..4 symbols are read, 1..11 bits each. The list of
+// symbols MUST NOT contain duplicates.
+fn readSimpleHuffmanSymbols(alphabetSizeMax: u64, alphabetSizeLimit: u64, s: &mut State, src: &[u8]) -> i32 {
+  // max_bits == 1..11; symbol == 0..3; 1..44 bits will be read.
+  let maxBits = log2Floor(alphabetSizeMax - 1)
+  let mut i = s.subLoopCounter
+  let numSymbols = s.symbol
+  while i <= numSymbols {
+    let mut v: u64 = 0
+    if !bit_reader.safeReadBits(&mut s.br, src, maxBits, &mut v) {
+      s.subLoopCounter = i
+      s.substateHuffman = state.HUFFMAN_SIMPLE_READ
+      return NEEDS_MORE_INPUT
+    }
+    if v >= alphabetSizeLimit { return ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET }
+    s.symbolsListsArray[u64.wrappingToUsize(i)] = u64.wrappingToU16(v)
+    i = i + 1
+  }
+  i = 0
+  while i < numSymbols {
+    let mut k = i + 1
+    while k <= numSymbols {
+      if s.symbolsListsArray[u64.wrappingToUsize(i)] == s.symbolsListsArray[u64.wrappingToUsize(k)] {
+        return ERROR_FORMAT_SIMPLE_HUFFMAN_SAME
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  return SUCCESS
+}
+
+// The variables of the code length reading loops, C's locals of `ReadSymbolCodeLengths`.
+struct CodeLengths {
+  symbol: u64,
+  repeat: u64,
+  space: u64,
+  prevCodeLen: u64,
+  repeatCodeLen: u64,
+}
+
+impl Copy for CodeLengths {}
+
+@inlineAlways
+fn loadCodeLengths(s: &State) -> CodeLengths {
+  return CodeLengths { symbol: s.symbol, repeat: s.repeat, space: s.space, prevCodeLen: s.prevCodeLen, repeatCodeLen: s.repeatCodeLen }
+}
+
+@inlineAlways
+fn storeCodeLengths(s: &mut State, c: &CodeLengths) -> () {
+  s.symbol = c.symbol
+  s.repeat = c.repeat
+  s.space = c.space
+  s.prevCodeLen = c.prevCodeLen
+  s.repeatCodeLen = c.repeatCodeLen
+}
+
+// Process a single decoded symbol code length:
+//  A) reset the repeat variable
+//  B) remember the code length (if it is not 0)
+//  C) extend the corresponding index-chain
+//  D) reduce the Huffman space
+//  E) update the histogram
+@inlineAlways
+fn processSingleCodeLength(codeLen: u64, c: &mut CodeLengths, symbolLists: &mut [u16; 720], codeLengthHisto: &mut [u16; 16], nextSymbol: &mut [i32; 32]) -> () {
+  c.repeat = 0
+  if codeLen != 0 {
+    // code_len == 1..15
+    let length = u64.wrappingToUsize(codeLen) & 15
+    symbolLists[i32.wrappingToUsize(nextSymbol[length] + 16)] = u64.wrappingToU16(c.symbol)
+    nextSymbol[length] = u64.wrappingToI32(c.symbol)
+    c.prevCodeLen = codeLen
+    c.space = u64.wrappingSubtract(c.space, u64.shiftRight(32768, codeLen & 15))
+    codeLengthHisto[length] = u16.wrappingAdd(codeLengthHisto[length], 1)
+  }
+  c.symbol = c.symbol + 1
+}
+
+// Process a repeated symbol code length.
+//  A) Check if it is the extension of the previous repeat sequence; if the decoded value is not
+//     BROTLI_REPEAT_PREVIOUS_CODE_LENGTH, then it is a new symbol-skip
+//  B) Update the repeat variable
+//  C) Check if the operation is feasible (fits the alphabet)
+//  D) For each symbol do the same operations as in `processSingleCodeLength`
+//
+// PRECONDITION: codeLen is 16 (repeat previous) or 17 (repeat zero).
+@inlineAlways
+fn processRepeatedCodeLength(codeLen: u64, delta: u64, alphabetSize: u64, c: &mut CodeLengths, symbolLists: &mut [u16; 720], codeLengthHisto: &mut [u16; 16], nextSymbol: &mut [i32; 32]) -> () {
+  let mut repeatDelta = delta
+  // For BROTLI_REPEAT_ZERO_CODE_LENGTH.
+  let mut extraBits: u64 = 3
+  let mut newLen: u64 = 0
+  if codeLen == REPEAT_PREVIOUS_CODE_LENGTH {
+    newLen = c.prevCodeLen
+    extraBits = 2
+  }
+  if c.repeatCodeLen != newLen {
+    c.repeat = 0
+    c.repeatCodeLen = newLen
+  }
+  let oldRepeat = c.repeat
+  if c.repeat > 0 {
+    c.repeat = c.repeat - 2
+    c.repeat = u64.shiftLeft(c.repeat, extraBits)
+  }
+  c.repeat = c.repeat + repeatDelta + 3
+  repeatDelta = c.repeat - oldRepeat
+  if c.symbol + repeatDelta > alphabetSize {
+    c.symbol = alphabetSize
+    c.space = 1048575
+    return ()
+  }
+  if c.repeatCodeLen != 0 {
+    let length = u64.wrappingToUsize(c.repeatCodeLen) & 15
+    let last = c.symbol + repeatDelta
+    let mut next = nextSymbol[length]
+    while true {
+      symbolLists[i32.wrappingToUsize(next + 16)] = u64.wrappingToU16(c.symbol)
+      next = u64.wrappingToI32(c.symbol)
+      c.symbol = c.symbol + 1
+      if c.symbol == last { break }
+    }
+    nextSymbol[length] = next
+    c.space = u64.wrappingSubtract(c.space, u64.shiftLeft(repeatDelta, u64.wrappingSubtract(15, c.repeatCodeLen) & 63))
+    codeLengthHisto[length] = u16.wrappingAdd(codeLengthHisto[length], u64.wrappingToU16(repeatDelta))
+  } else {
+    c.symbol = c.symbol + repeatDelta
+  }
+}
+
+// Reads and decodes symbol code lengths.
+fn readSymbolCodeLengths(alphabetSize: u64, s: &mut State, src: &[u8]) -> i32 {
+  if !bit_reader.warmup(&mut s.br, src) { return NEEDS_MORE_INPUT }
+  let mut c = loadCodeLengths(&s)
+  let mut br = s.br
+  while c.symbol < alphabetSize && c.space > 0 {
+    if !bit_reader.checkInputAmount(&br) {
+      s.br = br
+      storeCodeLengths(&mut s, &c)
+      return NEEDS_MORE_INPUT
+    }
+    bit_reader.fillBitWindow32(&mut br, src)
+    let entry = s.table[u64.wrappingToUsize(br.val & 31)]
+    // Use 1..5 bits.
+    bit_reader.dropBits(&mut br, huffman.codeBits(entry))
+    // code_len == 0..17
+    let codeLen = huffman.codeValue(entry)
+    if codeLen < REPEAT_PREVIOUS_CODE_LENGTH {
+      processSingleCodeLength(codeLen, &mut c, &mut s.symbolsListsArray, &mut s.codeLengthHisto, &mut s.nextSymbol)
+    } else {
+      // code_len == 16..17, extra_bits == 2..3
+      let mut extraBits: u64 = 3
+      if codeLen == REPEAT_PREVIOUS_CODE_LENGTH { extraBits = 2 }
+      let repeatDelta = br.val & bit_reader.bitMask(extraBits)
+      bit_reader.dropBits(&mut br, extraBits)
+      processRepeatedCodeLength(codeLen, repeatDelta, alphabetSize, &mut c, &mut s.symbolsListsArray, &mut s.codeLengthHisto, &mut s.nextSymbol)
+    }
+  }
+  s.br = br
+  storeCodeLengths(&mut s, &c)
+  return SUCCESS
+}
+
+fn safeReadSymbolCodeLengths(alphabetSize: u64, s: &mut State, src: &[u8]) -> i32 {
+  let mut getByte = false
+  let mut c = loadCodeLengths(&s)
+  while c.symbol < alphabetSize && c.space > 0 {
+    let mut bits: u64 = 0
+    if getByte && !bit_reader.pullByte(&mut s.br, src) {
+      storeCodeLengths(&mut s, &c)
+      return NEEDS_MORE_INPUT
+    }
+    getByte = false
+    let availableBits = s.br.bitPos
+    if availableBits != 0 {
+      bits = s.br.val & 4294967295
+    }
+    let entry = s.table[u64.wrappingToUsize(bits & 31)]
+    if huffman.codeBits(entry) > availableBits {
+      getByte = true
+      continue
+    }
+    // code_len == 0..17
+    let codeLen = huffman.codeValue(entry)
+    if codeLen < REPEAT_PREVIOUS_CODE_LENGTH {
+      bit_reader.dropBits(&mut s.br, huffman.codeBits(entry))
+      processSingleCodeLength(codeLen, &mut c, &mut s.symbolsListsArray, &mut s.codeLengthHisto, &mut s.nextSymbol)
+    } else {
+      // code_len == 16..17, extra_bits == 2..3
+      let extraBits = codeLen - 14
+      let repeatDelta = u64.shiftRight(bits, huffman.codeBits(entry) & 63) & bit_reader.bitMask(extraBits)
+      if availableBits < huffman.codeBits(entry) + extraBits {
+        getByte = true
+        continue
+      }
+      bit_reader.dropBits(&mut s.br, huffman.codeBits(entry) + extraBits)
+      processRepeatedCodeLength(codeLen, repeatDelta, alphabetSize, &mut c, &mut s.symbolsListsArray, &mut s.codeLengthHisto, &mut s.nextSymbol)
+    }
+  }
+  storeCodeLengths(&mut s, &c)
+  return SUCCESS
+}
+
+// Reads and decodes 15..18 codes using the static prefix code. Each code is 2..4 bits long. In
+// total 30..72 bits are used.
+fn readCodeLengthCodeLengths(s: &mut State, src: &[u8]) -> i32 {
+  let mut numCodes = s.repeat
+  let mut space = s.space
+  let mut i = u64.wrappingToUsize(s.subLoopCounter)
+  while i < huffman.CODE_LENGTH_CODES {
+    let codeLenIdx = CODE_LENGTH_CODE_ORDER[i]
+    let mut ix: u64 = 0
+    if bit_reader.safeGetBits(&mut s.br, src, 4) {
+      ix = s.br.val & 15
+    } else {
+      let availableBits = s.br.bitPos
+      if availableBits != 0 {
+        ix = s.br.val & 15
+      } else {
+        ix = 0
+      }
+      if CODE_LENGTH_PREFIX_LENGTH[u64.wrappingToUsize(ix)] > availableBits {
+        s.subLoopCounter = usize.toU64(i)
+        s.repeat = numCodes
+        s.space = space
+        s.substateHuffman = state.HUFFMAN_COMPLEX
+        return NEEDS_MORE_INPUT
+      }
+    }
+    let v = CODE_LENGTH_PREFIX_VALUE[u64.wrappingToUsize(ix)]
+    bit_reader.dropBits(&mut s.br, CODE_LENGTH_PREFIX_LENGTH[u64.wrappingToUsize(ix)])
+    s.codeLengthCodeLengths[codeLenIdx] = u64.wrappingToU8(v)
+    if v != 0 {
+      space = u64.wrappingSubtract(space, u64.shiftRight(32, v))
+      numCodes = numCodes + 1
+      s.codeLengthHisto[u64.wrappingToUsize(v)] = u16.wrappingAdd(s.codeLengthHisto[u64.wrappingToUsize(v)], 1)
+      if u64.wrappingSubtract(space, 1) >= 32 {
+        // space is 0 or wrapped around.
+        break
+      }
+    }
+    i = i + 1
+  }
+  if !(numCodes == 1 || space == 0) { return ERROR_FORMAT_CL_SPACE }
+  return SUCCESS
+}
+
+// Builds the table of the simple code whose symbols `readSimpleHuffmanSymbols` read, at `base` of
+// the buffer that `dest` names.
+fn buildSimpleTable(s: &mut State, dest: u32, base: usize) -> u64 {
+  let symbol = u64.wrappingToU32(s.symbol)
+  if dest == TABLE_BLOCK_TREES {
+    return u32.toU64(huffman.buildSimpleHuffmanTable(state.wordsMut(&mut s.blockTrees), base, 8, &mut s.symbolsListsArray, symbol))
+  }
+  if dest == TABLE_CONTEXT_MAP {
+    return u32.toU64(huffman.buildSimpleHuffmanTable(&mut s.contextMapTable, base, 8, &mut s.symbolsListsArray, symbol))
+  }
+  if dest == TABLE_LITERAL_GROUP {
+    return u32.toU64(huffman.buildSimpleHuffmanTable(state.wordsMut(&mut s.literalHgroup.codes), base, 8, &mut s.symbolsListsArray, symbol))
+  }
+  if dest == TABLE_INSERT_COPY_GROUP {
+    return u32.toU64(huffman.buildSimpleHuffmanTable(state.wordsMut(&mut s.insertCopyHgroup.codes), base, 8, &mut s.symbolsListsArray, symbol))
+  }
+  return u32.toU64(huffman.buildSimpleHuffmanTable(state.wordsMut(&mut s.distanceHgroup.codes), base, 8, &mut s.symbolsListsArray, symbol))
+}
+
+// Builds the table of the code whose lengths `readSymbolCodeLengths` read, at `base` of the
+// buffer that `dest` names.
+fn buildTable(s: &mut State, dest: u32, base: usize) -> u64 {
+  if dest == TABLE_BLOCK_TREES {
+    return u32.toU64(huffman.buildHuffmanTable(state.wordsMut(&mut s.blockTrees), base, 8, &s.symbolsListsArray, &mut s.codeLengthHisto))
+  }
+  if dest == TABLE_CONTEXT_MAP {
+    return u32.toU64(huffman.buildHuffmanTable(&mut s.contextMapTable, base, 8, &s.symbolsListsArray, &mut s.codeLengthHisto))
+  }
+  if dest == TABLE_LITERAL_GROUP {
+    return u32.toU64(huffman.buildHuffmanTable(state.wordsMut(&mut s.literalHgroup.codes), base, 8, &s.symbolsListsArray, &mut s.codeLengthHisto))
+  }
+  if dest == TABLE_INSERT_COPY_GROUP {
+    return u32.toU64(huffman.buildHuffmanTable(state.wordsMut(&mut s.insertCopyHgroup.codes), base, 8, &s.symbolsListsArray, &mut s.codeLengthHisto))
+  }
+  return u32.toU64(huffman.buildHuffmanTable(state.wordsMut(&mut s.distanceHgroup.codes), base, 8, &s.symbolsListsArray, &mut s.codeLengthHisto))
+}
+
+// Decodes a Huffman table into the buffer `dest` at `base` and stores its size in `tableSize`.
+// There are 2 scenarios:
+//  A) The Huffman code contains only few symbols (1..4). Those symbols are read directly; their
+//     code lengths are defined by the number of symbols. For this scenario 4 - 49 bits will be
+//     read.
+//  B) 2-phase decoding:
+//  B.1) A small Huffman table is decoded; it is specified with code lengths encoded with a
+//       predefined entropy code. 32 - 74 bits are used.
+//  B.2) The decoded table is used to decode the code lengths of symbols in the resulting Huffman
+//       table. In the worst case 3520 bits are read.
+fn readHuffmanCode(alphabetSizeMax: u64, alphabetSizeLimit: u64, dest: u32, base: usize, tableSize: &mut u64, s: &mut State, src: &[u8]) -> i32 {
+  // State machine.
+  while true {
+    if s.substateHuffman == state.HUFFMAN_NONE {
+      if !bit_reader.safeReadBits(&mut s.br, src, 2, &mut s.subLoopCounter) { return NEEDS_MORE_INPUT }
+      // The value is used as follows:
+      // 1 for simple code;
+      // 0 for no skipping, 2 skips 2 code lengths, 3 skips 3 code lengths
+      if s.subLoopCounter != 1 {
+        s.space = 32
+        // num_codes
+        s.repeat = 0
+        let mut index: usize = 0
+        while index <= 5 {
+          s.codeLengthHisto[index] = 0
+          index = index + 1
+        }
+        s.codeLengthCodeLengths = [0; 18]
+        s.substateHuffman = state.HUFFMAN_COMPLEX
+        continue
+      }
+      s.substateHuffman = state.HUFFMAN_SIMPLE_SIZE
+    }
+    if s.substateHuffman == state.HUFFMAN_SIMPLE_SIZE {
+      // Read symbols, codes & code lengths directly. `s.symbol` is num_symbols.
+      if !bit_reader.safeReadBits(&mut s.br, src, 2, &mut s.symbol) {
+        s.substateHuffman = state.HUFFMAN_SIMPLE_SIZE
+        return NEEDS_MORE_INPUT
+      }
+      s.subLoopCounter = 0
+      s.substateHuffman = state.HUFFMAN_SIMPLE_READ
+    }
+    if s.substateHuffman == state.HUFFMAN_SIMPLE_READ {
+      let result = readSimpleHuffmanSymbols(alphabetSizeMax, alphabetSizeLimit, &mut s, src)
+      if result != SUCCESS { return result }
+      s.substateHuffman = state.HUFFMAN_SIMPLE_BUILD
+    }
+    if s.substateHuffman == state.HUFFMAN_SIMPLE_BUILD {
+      if s.symbol == 3 {
+        let mut bits: u64 = 0
+        if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) {
+          s.substateHuffman = state.HUFFMAN_SIMPLE_BUILD
+          return NEEDS_MORE_INPUT
+        }
+        s.symbol = s.symbol + bits
+      }
+      tableSize.* = buildSimpleTable(&mut s, dest, base)
+      s.substateHuffman = state.HUFFMAN_NONE
+      return SUCCESS
+    }
+    // Decode Huffman-coded code lengths.
+    if s.substateHuffman == state.HUFFMAN_COMPLEX {
+      let result = readCodeLengthCodeLengths(&mut s, src)
+      if result != SUCCESS { return result }
+      huffman.buildCodeLengthsHuffmanTable(&mut s.table, &s.codeLengthCodeLengths, &s.codeLengthHisto)
+      s.codeLengthHisto = [0; 16]
+      let mut i: i32 = 0
+      while i <= huffman.MAX_CODE_LENGTH {
+        s.nextSymbol[i32.toUsize(i)] = i - (huffman.MAX_CODE_LENGTH + 1)
+        s.symbolsListsArray[i32.toUsize(i)] = 65535
+        i = i + 1
+      }
+      s.symbol = 0
+      s.prevCodeLen = INITIAL_REPEATED_CODE_LENGTH
+      s.repeat = 0
+      s.repeatCodeLen = 0
+      s.space = 32768
+      s.substateHuffman = state.HUFFMAN_LENGTH_SYMBOLS
+    }
+    if s.substateHuffman == state.HUFFMAN_LENGTH_SYMBOLS {
+      let mut result = readSymbolCodeLengths(alphabetSizeLimit, &mut s, src)
+      if result == NEEDS_MORE_INPUT {
+        result = safeReadSymbolCodeLengths(alphabetSizeLimit, &mut s, src)
+      }
+      if result != SUCCESS { return result }
+      if s.space != 0 { return ERROR_FORMAT_HUFFMAN_SPACE }
+      tableSize.* = buildTable(&mut s, dest, base)
+      s.substateHuffman = state.HUFFMAN_NONE
+      return SUCCESS
+    }
+    return ERROR_UNREACHABLE
+  }
+  return ERROR_UNREACHABLE
+}
+
+// Decodes a block length by reading 3..39 bits.
+@inlineAlways
+fn readBlockLength(table: &[u32], base: usize, br: &mut BitReader, src: &[u8]) -> u64 {
+  let code = u64.wrappingToUsize(readSymbol(table, base, &mut br, src))
+  // nbits == 2..24
+  let nbits = u32.toU64(prefix.BLOCK_LENGTH_BITS[code])
+  return u32.toU64(prefix.BLOCK_LENGTH_OFFSET[code]) + bit_reader.readBits(&mut br, src, nbits)
+}
+
+// Reads a block length with the table at `base` of the block trees into `result`. If the
+// substate is not READ_BLOCK_LENGTH_NONE afterwards, reading can't be continued with
+// `readBlockLength`.
+@inlineAlways
+fn safeReadBlockLength(s: &mut State, src: &[u8], base: usize, result: &mut u64) -> bool {
+  let mut index: u64 = 0
+  if s.substateReadBlockLength == state.READ_BLOCK_LENGTH_NONE {
+    if !safeReadSymbol(state.words(&s.blockTrees), base, &mut s.br, src, &mut index) { return false }
+  } else {
+    index = s.blockLengthIndex
+  }
+  let mut bits: u64 = 0
+  let nbits = u32.toU64(prefix.BLOCK_LENGTH_BITS[u64.wrappingToUsize(index)])
+  let offset = u32.toU64(prefix.BLOCK_LENGTH_OFFSET[u64.wrappingToUsize(index)])
+  if !bit_reader.safeReadBits(&mut s.br, src, nbits, &mut bits) {
+    s.blockLengthIndex = index
+    s.substateReadBlockLength = state.READ_BLOCK_LENGTH_SUFFIX
+    return false
+  }
+  result.* = offset + bits
+  s.substateReadBlockLength = state.READ_BLOCK_LENGTH_NONE
+  return true
+}
+
+// Transform:
+//  1) initialize list L with values 0, 1,... 255
+//  2) For each input element X:
+//  2.1) let Y = L[X]
+//  2.2) remove X-th element from L
+//  2.3) prepend Y to L
+//  2.4) append Y to output
+//
+// In most cases max(Y) <= 7, so most of L remains intact. To reduce the cost of initialization,
+// we reuse L, remember the upper bound of Y values, and reinitialize only the first elements in
+// L.
+fn inverseMoveToFrontTransform(v: &mut [u8], vLen: usize, mtf: &mut [u8; 260], mtfUpperBound: &mut u64) -> () {
+  // Reinitialize the elements that could have been changed: C's words 0 to upper_bound.
+  let mut upperBound = mtfUpperBound.*
+  let initialized = (u64.wrappingToUsize(upperBound) + 1) * 4
+  let mut index: usize = 0
+  while index < initialized {
+    mtf[4 + index] = usize.wrappingToU8(index)
+    index = index + 1
+  }
+  // Transform the input.
+  upperBound = 0
+  let mut i: usize = 0
+  while i < vLen {
+    let mut at = u8.toUsize(v[i])
+    let value = mtf[4 + at]
+    upperBound = upperBound | u8.toU64(v[i])
+    v[i] = value
+    mtf[3] = value
+    while true {
+      mtf[4 + at] = mtf[3 + at]
+      if at == 0 { break }
+      at = at - 1
+    }
+    i = i + 1
+  }
+  // Remember the amount of elements to be reinitialized.
+  mtfUpperBound.* = u64.shiftRight(upperBound, 2)
+}
+
+// The position of tree `index` of a group in the group's buffer.
+@inlineAlways
+fn htree(codes: &Intrinsic.RawBuffer<u32>, index: usize) -> usize {
+  return u32.toUsize(state.words(&codes)[index])
+}
+
+// Decodes a series of Huffman tables of the group `dest` using `readHuffmanCode`.
+fn huffmanTreeGroupDecode(dest: u32, s: &mut State, src: &[u8]) -> i32 {
+  let mut numHtrees = s.distanceHgroup.numHtrees
+  let mut alphabetSizeMax = s.distanceHgroup.alphabetSizeMax
+  let mut alphabetSizeLimit = s.distanceHgroup.alphabetSizeLimit
+  if dest == TABLE_LITERAL_GROUP {
+    numHtrees = s.literalHgroup.numHtrees
+    alphabetSizeMax = s.literalHgroup.alphabetSizeMax
+    alphabetSizeLimit = s.literalHgroup.alphabetSizeLimit
+  } else if dest == TABLE_INSERT_COPY_GROUP {
+    numHtrees = s.insertCopyHgroup.numHtrees
+    alphabetSizeMax = s.insertCopyHgroup.alphabetSizeMax
+    alphabetSizeLimit = s.insertCopyHgroup.alphabetSizeLimit
+  }
+  if s.substateTreeGroup != state.TREE_GROUP_LOOP {
+    // The tables start after the positions of the trees.
+    s.next = u64.wrappingToUsize(numHtrees)
+    s.htreeIndex = 0
+    s.substateTreeGroup = state.TREE_GROUP_LOOP
+  }
+  while s.htreeIndex < numHtrees {
+    let mut tableSize: u64 = 0
+    let result = readHuffmanCode(alphabetSizeMax, alphabetSizeLimit, dest, s.next, &mut tableSize, &mut s, src)
+    if result != SUCCESS { return result }
+    let position = usize.wrappingToU32(s.next)
+    let index = u64.wrappingToUsize(s.htreeIndex)
+    if dest == TABLE_LITERAL_GROUP {
+      let codes = state.wordsMut(&mut s.literalHgroup.codes)
+      codes[index] = position
+    } else if dest == TABLE_INSERT_COPY_GROUP {
+      let codes = state.wordsMut(&mut s.insertCopyHgroup.codes)
+      codes[index] = position
+    } else {
+      let codes = state.wordsMut(&mut s.distanceHgroup.codes)
+      codes[index] = position
+    }
+    s.next = s.next + u64.wrappingToUsize(tableSize)
+    s.htreeIndex = s.htreeIndex + 1
+  }
+  s.substateTreeGroup = state.TREE_GROUP_NONE
+  return SUCCESS
+}
+
+// Decodes a context map: the literal one, or the distance one when `distance` is set.
+// Decoding is done in 4 phases:
+//  1) Read auxiliary information (6..16 bits) and allocate memory. In case of a trivial context
+//     map, decoding is finished at this phase.
+//  2) Decode the Huffman table using `readHuffmanCode`. This table will be used for reading the
+//     context map items.
+//  3) Read the context map items; "0" values could be run-length encoded.
+//  4) Optionally, apply the inverse move-to-front transform to the resulting map.
+effect fn decodeContextMap(contextMapSize: u64, distance: bool, s: &mut State, src: &[u8]) -> i32 ? &mut Allocator {
+  if s.substateContextMap == state.CONTEXT_MAP_NONE {
+    let mut numHtrees = s.numLiteralHtrees
+    if distance { numHtrees = s.numDistHtrees }
+    let result = decodeVarLenUint8(&mut s, src, &mut numHtrees)
+    if result == SUCCESS { numHtrees = numHtrees + 1 }
+    if distance { s.numDistHtrees = numHtrees } else { s.numLiteralHtrees = numHtrees }
+    if result != SUCCESS { return result }
+    s.contextIndex = 0
+    match run Effect.result(state.allocBytes(u64.wrappingToUsize(contextMapSize))) {
+      Result<Intrinsic.RawBuffer<u8>, OutOfMemoryError>.Success { value } => {
+        // The map starts as zero, which is what a trivial context map is.
+        if distance { s.distContextMap = move value } else { s.contextMap = move value }
+      }
+      Result<Intrinsic.RawBuffer<u8>, OutOfMemoryError>.Failure {..} => { return ERROR_ALLOC_CONTEXT_MAP }
+    }
+    if numHtrees <= 1 { return SUCCESS }
+    s.substateContextMap = state.CONTEXT_MAP_READ_PREFIX
+  }
+  let mut numHtrees = s.numLiteralHtrees
+  if distance { numHtrees = s.numDistHtrees }
+  if s.substateContextMap == state.CONTEXT_MAP_READ_PREFIX {
+    // In the next stage `readHuffmanCode` uses at least 4 bits, so it is safe to peek 4 bits
+    // ahead.
+    if !bit_reader.safeGetBits(&mut s.br, src, 5) { return NEEDS_MORE_INPUT }
+    let bits = s.br.val & 31
+    if (bits & 1) != 0 {
+      // Use RLE for zeros.
+      s.maxRunLengthPrefix = u64.shiftRight(bits, 1) + 1
+      bit_reader.dropBits(&mut s.br, 5)
+    } else {
+      s.maxRunLengthPrefix = 0
+      bit_reader.dropBits(&mut s.br, 1)
+    }
+    s.substateContextMap = state.CONTEXT_MAP_HUFFMAN
+  }
+  if s.substateContextMap == state.CONTEXT_MAP_HUFFMAN {
+    let alphabetSize = numHtrees + s.maxRunLengthPrefix
+    let mut tableSize: u64 = 0
+    let result = readHuffmanCode(alphabetSize, alphabetSize, TABLE_CONTEXT_MAP, 0, &mut tableSize, &mut s, src)
+    if result != SUCCESS { return result }
+    s.code = 65535
+    s.substateContextMap = state.CONTEXT_MAP_DECODE
+  }
+  if s.substateContextMap == state.CONTEXT_MAP_DECODE {
+    let mut contextIndex = s.contextIndex
+    let maxRunLengthPrefix = s.maxRunLengthPrefix
+    let mut code = s.code
+    let mut skipPreamble = code != 65535
+    while contextIndex < contextMapSize || skipPreamble {
+      if !skipPreamble {
+        if !safeReadSymbol(&s.contextMapTable, 0, &mut s.br, src, &mut code) {
+          s.code = 65535
+          s.contextIndex = contextIndex
+          return NEEDS_MORE_INPUT
+        }
+        if code == 0 {
+          setContextMapByte(&mut s, distance, contextIndex, 0)
+          contextIndex = contextIndex + 1
+          continue
+        }
+        if code > maxRunLengthPrefix {
+          setContextMapByte(&mut s, distance, contextIndex, u64.wrappingToU8(code - maxRunLengthPrefix))
+          contextIndex = contextIndex + 1
+          continue
+        }
+      } else {
+        skipPreamble = false
+      }
+      // RLE sub-stage.
+      let mut reps: u64 = 0
+      if !bit_reader.safeReadBits(&mut s.br, src, code, &mut reps) {
+        s.code = code
+        s.contextIndex = contextIndex
+        return NEEDS_MORE_INPUT
+      }
+      reps = reps + u64.shiftLeft(1, code & 63)
+      if contextIndex + reps > contextMapSize { return ERROR_FORMAT_CONTEXT_MAP_REPEAT }
+      while true {
+        setContextMapByte(&mut s, distance, contextIndex, 0)
+        contextIndex = contextIndex + 1
+        reps = reps - 1
+        if reps == 0 { break }
+      }
+    }
+    s.substateContextMap = state.CONTEXT_MAP_TRANSFORM
+  }
+  if s.substateContextMap == state.CONTEXT_MAP_TRANSFORM {
+    let mut bits: u64 = 0
+    if !bit_reader.safeReadBits(&mut s.br, src, 1, &mut bits) {
+      s.substateContextMap = state.CONTEXT_MAP_TRANSFORM
+      return NEEDS_MORE_INPUT
+    }
+    if bits != 0 {
+      if distance {
+        inverseMoveToFrontTransform(state.bytesMut(&mut s.distContextMap), u64.wrappingToUsize(contextMapSize), &mut s.mtf, &mut s.mtfUpperBound)
+      } else {
+        inverseMoveToFrontTransform(state.bytesMut(&mut s.contextMap), u64.wrappingToUsize(contextMapSize), &mut s.mtf, &mut s.mtfUpperBound)
+      }
+    }
+    s.substateContextMap = state.CONTEXT_MAP_NONE
+    return SUCCESS
+  }
+  return ERROR_UNREACHABLE
+}
+
+@inlineAlways
+fn setContextMapByte(s: &mut State, distance: bool, index: u64, value: u8) -> () {
+  if distance {
+    let map = state.bytesMut(&mut s.distContextMap)
+    map[u64.wrappingToUsize(index)] = value
+  } else {
+    let map = state.bytesMut(&mut s.contextMap)
+    map[u64.wrappingToUsize(index)] = value
+  }
+}
+
+// Decodes a command or literal block switch and updates the block type ring buffer. Reads 3..54
+// bits.
+@inlineAlways
+fn decodeBlockTypeAndLength(safe: bool, s: &mut State, src: &[u8], treeType: usize) -> i32 {
+  let maxBlockType = s.numBlockTypes[treeType]
+  let typeTree = treeType * huffman.MAX_SIZE_258
+  let lenTree = 3 * huffman.MAX_SIZE_258 + treeType * huffman.MAX_SIZE_26
+  let mut blockType: u64 = 0
+  if maxBlockType <= 1 { return ERROR_FORMAT_BLOCK_SWITCH }
+  // Read 0..15 + 3..39 bits.
+  if !safe {
+    let trees = state.words(&s.blockTrees)
+    blockType = readSymbol(trees, typeTree, &mut s.br, src)
+    s.blockLength[treeType] = readBlockLength(trees, lenTree, &mut s.br, src)
+  } else {
+    let memento = bit_reader.saveState(&s.br)
+    if !safeReadSymbol(state.words(&s.blockTrees), typeTree, &mut s.br, src, &mut blockType) { return NEEDS_MORE_INPUT }
+    let mut length: u64 = 0
+    if !safeReadBlockLength(&mut s, src, lenTree, &mut length) {
+      s.substateReadBlockLength = state.READ_BLOCK_LENGTH_NONE
+      bit_reader.restoreState(&mut s.br, &memento)
+      return NEEDS_MORE_INPUT
+    }
+    s.blockLength[treeType] = length
+  }
+  let rb = treeType * 2
+  if blockType == 1 {
+    blockType = s.blockTypeRb[rb + 1] + 1
+  } else if blockType == 0 {
+    blockType = s.blockTypeRb[rb]
+  } else {
+    blockType = blockType - 2
+  }
+  if blockType >= maxBlockType { blockType = blockType - maxBlockType }
+  s.blockTypeRb[rb] = s.blockTypeRb[rb + 1]
+  s.blockTypeRb[rb + 1] = blockType
+  return SUCCESS
+}
+
+fn detectTrivialLiteralBlockTypes(s: &mut State) -> () {
+  s.trivialLiteralContexts = [0; 8]
+  let contextMap = state.bytes(&s.contextMap)
+  let mut i: usize = 0
+  let count = u64.wrappingToUsize(s.numBlockTypes[0])
+  while i < count {
+    let offset = i * 64
+    let mut error: u8 = 0
+    let sample = contextMap[offset]
+    let mut j: usize = 0
+    while j < 64 {
+      error = error | u8.bitXor(contextMap[offset + j], sample)
+      j = j + 1
+    }
+    if error == 0 {
+      s.trivialLiteralContexts[i / 32] = s.trivialLiteralContexts[i / 32] | u32.shiftLeft(1, usize.wrappingToU32(i) & 31)
+    }
+    i = i + 1
+  }
+}
+
+fn prepareLiteralDecoding(s: &mut State) -> () {
+  let blockType = u64.wrappingToUsize(s.blockTypeRb[1])
+  let contextOffset = blockType * 64
+  s.contextMapSlice = contextOffset
+  let trivial = s.trivialLiteralContexts[blockType / 32]
+  s.trivialLiteralContext = (u32.shiftRight(trivial, usize.wrappingToU32(blockType) & 31) & 1) != 0
+  s.literalHtree = htree(&s.literalHgroup.codes, u8.toUsize(state.bytes(&s.contextMap)[contextOffset]))
+  let contextMode = u8.toUsize(state.bytes(&s.contextModes)[blockType]) & 3
+  s.contextLookup = contextMode * 512
+}
+
+// Decodes the block type and updates the state for the literal context. Reads 3..54 bits.
+@inlineAlways
+fn decodeLiteralBlockSwitchInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
+  let result = decodeBlockTypeAndLength(safe, &mut s, src, 0)
+  if result != SUCCESS { return result }
+  prepareLiteralDecoding(&mut s)
+  return SUCCESS
+}
+
+@inlineNever
+fn decodeLiteralBlockSwitch(s: &mut State, src: &[u8]) -> i32 {
+  return decodeLiteralBlockSwitchInternal(false, &mut s, src)
+}
+
+@inlineNever
+fn safeDecodeLiteralBlockSwitch(s: &mut State, src: &[u8]) -> i32 {
+  return decodeLiteralBlockSwitchInternal(true, &mut s, src)
+}
+
+// Block switch for insert/copy length. Reads 3..54 bits.
+@inlineAlways
+fn decodeCommandBlockSwitchInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
+  let result = decodeBlockTypeAndLength(safe, &mut s, src, 1)
+  if result != SUCCESS { return result }
+  s.htreeCommand = htree(&s.insertCopyHgroup.codes, u64.wrappingToUsize(s.blockTypeRb[3]))
+  return SUCCESS
+}
+
+@inlineNever
+fn decodeCommandBlockSwitch(s: &mut State, src: &[u8]) -> i32 {
+  return decodeCommandBlockSwitchInternal(false, &mut s, src)
+}
+
+@inlineNever
+fn safeDecodeCommandBlockSwitch(s: &mut State, src: &[u8]) -> i32 {
+  return decodeCommandBlockSwitchInternal(true, &mut s, src)
+}
+
+// Block switch for distance codes. Reads 3..54 bits.
+@inlineAlways
+fn decodeDistanceBlockSwitchInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
+  let result = decodeBlockTypeAndLength(safe, &mut s, src, 2)
+  if result != SUCCESS { return result }
+  s.distContextMapSlice = u64.wrappingToUsize(u64.shiftLeft(s.blockTypeRb[5], DISTANCE_CONTEXT_BITS))
+  s.distHtreeIndex = u8.toUsize(state.bytes(&s.distContextMap)[s.distContextMapSlice + i32.wrappingToUsize(s.distanceContext)])
+  return SUCCESS
+}
+
+@inlineNever
+fn decodeDistanceBlockSwitch(s: &mut State, src: &[u8]) -> i32 {
+  return decodeDistanceBlockSwitchInternal(false, &mut s, src)
+}
+
+@inlineNever
+fn safeDecodeDistanceBlockSwitch(s: &mut State, src: &[u8]) -> i32 {
+  return decodeDistanceBlockSwitchInternal(true, &mut s, src)
+}
+
+fn unwrittenBytes(s: &State, wrap: bool) -> usize {
+  let mut pos = i32.wrappingToUsize(s.pos)
+  if wrap && s.pos > s.ringbufferSize { pos = i32.wrappingToUsize(s.ringbufferSize) }
+  let partialPosRb = usize.wrappingAdd(usize.wrappingMultiply(s.rbRoundtrips, i32.wrappingToUsize(s.ringbufferSize)), pos)
+  return usize.wrappingSubtract(partialPosRb, s.partialPosOut)
+}
+
+// Dumps output. Returns NEEDS_MORE_OUTPUT only if there is more output to push and either the
+// ring buffer is as big as the window size, or `force` is true.
+fn writeRingBuffer(s: &mut State, output: &mut [u8], force: bool) -> i32 {
+  let start = s.partialPosOut & i32.wrappingToUsize(s.ringbufferMask)
+  let toWrite = unwrittenBytes(&s, true)
+  let mut numWritten = output.length - s.outPos
+  if numWritten > toWrite { numWritten = toWrite }
+  if s.metaBlockRemainingLen < 0 { return ERROR_FORMAT_BLOCK_LENGTH_1 }
+  if numWritten != 0 {
+    Slice.copyInto<u8>(&mut output, s.outPos, Slice.view<u8>(state.bytes(&s.ringbuffer), start, numWritten))
+    s.outPos = s.outPos + numWritten
+  }
+  s.partialPosOut = s.partialPosOut + numWritten
+  let windowSize = i32.shiftLeft(1, u32.wrappingToI32(s.windowBits))
+  if numWritten < toWrite {
+    if s.ringbufferSize == windowSize || force { return NEEDS_MORE_OUTPUT }
+    return SUCCESS
+  }
+  // Wrap the ring buffer only if it has reached its maximal size.
+  if s.ringbufferSize == windowSize && s.pos >= s.ringbufferSize {
+    s.pos = s.pos - s.ringbufferSize
+    s.rbRoundtrips = s.rbRoundtrips + 1
+    s.shouldWrapRingbuffer = s.pos != 0
+  }
+  return SUCCESS
+}
+
+fn wrapRingBuffer(s: &mut State) -> () {
+  if s.shouldWrapRingbuffer {
+    // The bytes after the end of the ring go to its start.
+    let ring = state.bytesMut(&mut s.ringbuffer)
+    let size = i32.wrappingToUsize(s.ringbufferSize)
+    let count = i32.wrappingToUsize(s.pos)
+    let mut index: usize = 0
+    while index < count {
+      ring[index] = ring[size + index]
+      index = index + 1
+    }
+    s.shouldWrapRingbuffer = false
+  }
+}
+
+// Allocates the ring buffer. `s.newRingbufferSize` MUST be updated by `calculateRingBufferSize`
+// before this is called. The last two bytes of the ring buffer are initialized to 0, so the
+// context calculation can be done uniformly for the first two and all other positions.
+effect fn ensureRingBuffer(s: &mut State) -> bool ? &mut Allocator {
+  if s.ringbufferSize == s.newRingbufferSize { return true }
+  let newSize = i32.wrappingToUsize(s.newRingbufferSize)
+  let mut ring = match run Effect.result(state.allocBytesUnwritten(newSize + RING_BUFFER_WRITE_AHEAD_SLACK)) {
+    Result<Intrinsic.RawBuffer<u8>, OutOfMemoryError>.Success { value } => move value
+    Result<Intrinsic.RawBuffer<u8>, OutOfMemoryError>.Failure {..} => { return false }
+  }
+  let fresh = state.bytesMut(&mut ring)
+  fresh[newSize - 2] = 0
+  fresh[newSize - 1] = 0
+  let old = state.bytes(&s.ringbuffer)
+  if old.length != 0 {
+    let mut count = i32.wrappingToUsize(s.pos)
+    if count > old.length { count = old.length }
+    Slice.copyInto<u8>(&mut fresh, 0, Slice.view<u8>(old, 0, count))
+  }
+  s.ringbuffer = move ring
+  s.ringbufferSize = s.newRingbufferSize
+  s.ringbufferMask = s.newRingbufferSize - 1
+  return true
+}
+
+fn skipMetadataBlock(s: &mut State, src: &[u8]) -> i32 {
+  if s.metaBlockRemainingLen == 0 { return SUCCESS }
+  // Drain the accumulator.
+  if s.br.bitPos >= 8 {
+    let mut buffer: [u8; 8] = [0; 8]
+    let mut nbytes = u64.wrappingToI32(u64.shiftRight(s.br.bitPos, 3))
+    if nbytes > s.metaBlockRemainingLen { nbytes = s.metaBlockRemainingLen }
+    bit_reader.copyBytes(&mut s.br, src, &mut buffer, 0, i32.wrappingToUsize(nbytes))
+    s.metaBlockRemainingLen = s.metaBlockRemainingLen - nbytes
+    if s.metaBlockRemainingLen == 0 { return SUCCESS }
+  }
+  // Direct access to the metadata is possible.
+  let mut nbytes = usize.wrappingToI32(bit_reader.remainingBytes(&s.br))
+  if nbytes > s.metaBlockRemainingLen { nbytes = s.metaBlockRemainingLen }
+  if nbytes > 0 {
+    bit_reader.dropBytes(&mut s.br, i32.wrappingToUsize(nbytes))
+    s.metaBlockRemainingLen = s.metaBlockRemainingLen - nbytes
+    if s.metaBlockRemainingLen == 0 { return SUCCESS }
+  }
+  return NEEDS_MORE_INPUT
+}
+
+effect fn copyUncompressedBlockToOutput(s: &mut State, src: &[u8], output: &mut [u8]) -> i32 ? &mut Allocator {
+  if !(run ensureRingBuffer(&mut s)) { return ERROR_ALLOC_RING_BUFFER_1 }
+  // State machine.
+  while true {
+    if s.substateUncompressed == state.UNCOMPRESSED_NONE {
+      let mut nbytes = usize.wrappingToI32(bit_reader.remainingBytes(&s.br))
+      if nbytes > s.metaBlockRemainingLen { nbytes = s.metaBlockRemainingLen }
+      if s.pos + nbytes > s.ringbufferSize { nbytes = s.ringbufferSize - s.pos }
+      // Copy the remaining bytes from the bit reader to the ring buffer.
+      bit_reader.copyBytes(&mut s.br, src, state.bytesMut(&mut s.ringbuffer), i32.wrappingToUsize(s.pos), i32.wrappingToUsize(nbytes))
+      s.pos = s.pos + nbytes
+      s.metaBlockRemainingLen = s.metaBlockRemainingLen - nbytes
+      if s.pos < i32.shiftLeft(1, u32.wrappingToI32(s.windowBits)) {
+        if s.metaBlockRemainingLen == 0 { return SUCCESS }
+        return NEEDS_MORE_INPUT
+      }
+      s.substateUncompressed = state.UNCOMPRESSED_WRITE
+    }
+    // UNCOMPRESSED_WRITE
+    let result = writeRingBuffer(&mut s, &mut output, false)
+    if result != SUCCESS { return result }
+    if s.ringbufferSize == i32.shiftLeft(1, u32.wrappingToI32(s.windowBits)) {
+      s.maxDistance = s.maxBackwardDistance
+    }
+    s.substateUncompressed = state.UNCOMPRESSED_NONE
+  }
+  return ERROR_UNREACHABLE
+}
+
+fn ensureCompoundDictionaryInitialized(s: &mut State) -> () {
+  let addon = &mut s.compound
+  // 256 = (1 << 8) slots in the block map.
+  let mut blockBits: i32 = 8
+  let mut cursor: i32 = 0
+  let mut index: i32 = 0
+  if addon.blockBits != -1 { return () }
+  while i32.shiftRight(addon.totalSize - 1, blockBits) != 0 { blockBits = blockBits + 1 }
+  blockBits = blockBits - 8
+  addon.blockBits = blockBits
+  while cursor < addon.totalSize {
+    while addon.chunkOffsets[i32.toUsize(index + 1)] < cursor { index = index + 1 }
+    addon.blockMap[i32.toUsize(i32.shiftRight(cursor, blockBits))] = i32.wrappingToU8(index)
+    cursor = cursor + i32.shiftLeft(1, blockBits)
+  }
+}
+
+fn initializeCompoundDictionaryCopy(s: &mut State, address: i32, length: i32) -> bool {
+  ensureCompoundDictionaryInitialized(&mut s)
+  let mut index = u8.toI32(s.compound.blockMap[i32.toUsize(i32.shiftRight(address, s.compound.blockBits))])
+  while address >= s.compound.chunkOffsets[i32.toUsize(index + 1)] { index = index + 1 }
+  if s.compound.totalSize < address + length { return false }
+  // Update the recent distances cache.
+  s.distRb[i32.wrappingToUsize(s.distRbIdx & 3)] = s.distanceCode
+  s.distRbIdx = i32.wrappingAdd(s.distRbIdx, 1)
+  s.metaBlockRemainingLen = s.metaBlockRemainingLen - length
+  s.compound.brIndex = index
+  s.compound.brOffset = address - s.compound.chunkOffsets[i32.toUsize(index)]
+  s.compound.brLength = length
+  s.compound.brCopied = 0
+  return true
+}
+
+fn copyFromCompoundDictionary(s: &mut State, position: i32) -> i32 {
+  let mut pos = position
+  let origPos = pos
+  while s.compound.brLength != s.compound.brCopied {
+    let chunkStart = s.compound.chunkOffsets[i32.toUsize(s.compound.brIndex)]
+    let space = s.ringbufferSize - pos
+    let remChunkLength = s.compound.chunkOffsets[i32.toUsize(s.compound.brIndex + 1)] - chunkStart - s.compound.brOffset
+    let mut length = s.compound.brLength - s.compound.brCopied
+    if length > remChunkLength { length = remChunkLength }
+    if length > space { length = space }
+    Slice.copyInto<u8>(
+      state.bytesMut(&mut s.ringbuffer),
+      i32.toUsize(pos),
+      Slice.view<u8>(List<u8>.asSlice(&s.compound.data), i32.toUsize(chunkStart + s.compound.brOffset), i32.toUsize(length)),
+    )
+    pos = pos + length
+    s.compound.brOffset = s.compound.brOffset + length
+    s.compound.brCopied = s.compound.brCopied + length
+    if length == remChunkLength {
+      s.compound.brIndex = s.compound.brIndex + 1
+      s.compound.brOffset = 0
+    }
+    if pos == s.ringbufferSize { break }
+  }
+  return pos - origPos
+}
+
+// Calculates the smallest feasible ring buffer. If we know the data size is small, do not
+// allocate more ring buffer size than needed to reduce memory usage. When this is called, the
+// meta-block size and flags MUST be decoded.
+fn calculateRingBufferSize(s: &mut State) -> () {
+  let windowSize = i32.shiftLeft(1, u32.wrappingToI32(s.windowBits))
+  let mut newRingbufferSize = windowSize
+  // We need at least 2 bytes of ring buffer size to get the last two bytes for context from
+  // there.
+  let mut minSize: i32 = 1024
+  if s.ringbufferSize != 0 { minSize = s.ringbufferSize }
+  // If the maximum is already reached, no further extension is required.
+  if s.ringbufferSize == windowSize { return () }
+  // Metadata blocks do not touch the ring buffer.
+  if s.isMetadata { return () }
+  let mut outputSize: i32 = 0
+  if RawBuffer.count<u8>(&s.ringbuffer) != 0 { outputSize = s.pos }
+  outputSize = outputSize + s.metaBlockRemainingLen
+  if minSize < outputSize { minSize = outputSize }
+  if s.cannyRingbufferAllocation {
+    // Reduce the ring buffer size to save memory when the server is unscrupulous. In the worst
+    // case memory usage might be 1.5x bigger for a short period of ring buffer reallocation.
+    while i32.shiftRight(newRingbufferSize, 1) >= minSize {
+      newRingbufferSize = i32.shiftRight(newRingbufferSize, 1)
+    }
+  }
+  s.newRingbufferSize = newRingbufferSize
+}
+
+// Reads 1..256 2-bit context modes.
+fn readContextModes(s: &mut State, src: &[u8]) -> i32 {
+  let mut i = s.loopCounter
+  let count = u64.wrappingToI32(s.numBlockTypes[0])
+  while i < count {
+    let mut bits: u64 = 0
+    if !bit_reader.safeReadBits(&mut s.br, src, 2, &mut bits) {
+      s.loopCounter = i
+      return NEEDS_MORE_INPUT
+    }
+    let modes = state.bytesMut(&mut s.contextModes)
+    modes[i32.toUsize(i)] = u64.wrappingToU8(bits)
+    i = i + 1
+  }
+  return SUCCESS
+}
+
+@inlineAlways
+fn takeDistanceFromRingBuffer(s: &mut State) -> () {
+  let offset = i32.wrappingSubtract(s.distanceCode, 3)
+  if s.distanceCode <= 3 {
+    // Compensate the double distance-ring-buffer roll for dictionary items.
+    s.distanceContext = i32.shiftRight(1, s.distanceCode & 3)
+    s.distanceCode = s.distRb[i32.toUsize(i32.wrappingSubtract(s.distRbIdx, offset) & 3)]
+    s.distRbIdx = i32.wrappingSubtract(s.distRbIdx, s.distanceContext)
+  } else {
+    let mut indexDelta: i32 = 3
+    let mut base = i32.wrappingSubtract(s.distanceCode, 10)
+    if s.distanceCode < 10 {
+      base = i32.wrappingSubtract(s.distanceCode, 4)
+    } else {
+      indexDelta = 2
+    }
+    // Unpack one of six 4-bit values.
+    let delta = i32.wrappingSubtract(i32.shiftRight(6312258, i32.wrappingMultiply(4, base) & 31) & 15, 3)
+    s.distanceCode = i32.wrappingAdd(s.distRb[i32.toUsize(i32.wrappingAdd(s.distRbIdx, indexDelta) & 3)], delta)
+    if s.distanceCode <= 0 {
+      // A huge distance will cause a failure soon. This is a little faster than failing here.
+      s.distanceCode = 2147483647
+    }
+  }
+}
+
+// A value that is known to be below 2^31, as C's `int`.
+@inlineAlways
+fn toInt(value: u64) -> i32 {
+  return u64.toI32(value & 2147483647)
+}
+
+// `SafeReadBits` and `SafeReadBits32` of decode.c: a read of zero bits succeeds.
+@inlineAlways
+fn safeReadBitsMaybeZero(br: &mut BitReader, src: &[u8], nBits: u64, value: &mut u64) -> bool {
+  if nBits != 0 { return bit_reader.safeReadBits(&mut br, src, nBits, &mut value) }
+  value.* = 0
+  return true
+}
+
+// Calculates the distance lookup table: for each distance code its number of extra bits and the
+// distance of its first value.
+fn calculateDistanceLut(s: &mut State) -> () {
+  let npostfix = s.distancePostfixBits
+  let ndirect = s.numDirectDistanceCodes
+  let alphabetSizeLimit = s.distanceHgroup.alphabetSizeLimit
+  let postfix = u64.shiftLeft(1, npostfix)
+  let mut bits: u64 = 1
+  let mut half: u64 = 0
+  // Skip short codes.
+  let mut i = u64.wrappingToUsize(NUM_DISTANCE_SHORT_CODES)
+  // Fill direct codes.
+  let mut j: u64 = 0
+  while j < ndirect {
+    s.distExtraBits[i] = 0
+    s.distOffset[i] = j + 1
+    i = i + 1
+    j = j + 1
+  }
+  // Fill regular distance codes.
+  while usize.toU64(i) < alphabetSizeLimit {
+    let base = ndirect + u64.shiftLeft(u64.shiftLeft(2 + half, bits) - 4, npostfix) + 1
+    // Always fill the complete group.
+    j = 0
+    while j < postfix {
+      s.distExtraBits[i] = u64.wrappingToU8(bits)
+      s.distOffset[i] = base + j
+      i = i + 1
+      j = j + 1
+    }
+    bits = bits + half
+    half = u64.bitXor(half, 1)
+  }
+}
+
+// Reads a distance. Precondition: s.distanceCode < 0.
+@inlineAlways
+fn readDistanceInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8]) -> bool {
+  let mut code: u64 = 0
+  let mut bits: u64 = 0
+  let memento = bit_reader.saveState(&br)
+  let distanceTree = htree(&s.distanceHgroup.codes, s.distHtreeIndex)
+  if !safe {
+    code = readSymbol(state.words(&s.distanceHgroup.codes), distanceTree, &mut br, src)
+  } else {
+    if !safeReadSymbol(state.words(&s.distanceHgroup.codes), distanceTree, &mut br, src, &mut code) { return false }
+  }
+  s.blockLength[2] = u64.wrappingSubtract(s.blockLength[2], 1)
+  // Convert the distance code to the actual distance by possibly looking up past distances.
+  s.distanceContext = 0
+  if code < 16 {
+    s.distanceCode = toInt(code)
+    takeDistanceFromRingBuffer(&mut s)
+    return true
+  }
+  let extraBits = u8.toU64(s.distExtraBits[u64.wrappingToUsize(code)])
+  if !safe {
+    bits = bit_reader.readBits(&mut br, src, extraBits)
+  } else {
+    if !safeReadBitsMaybeZero(&mut br, src, extraBits, &mut bits) {
+      s.blockLength[2] = u64.wrappingAdd(s.blockLength[2], 1)
+      bit_reader.restoreState(&mut br, &memento)
+      return false
+    }
+  }
+  // The distance alphabet is limited so that no distance reaches 2^31.
+  s.distanceCode = toInt(u64.wrappingAdd(s.distOffset[u64.wrappingToUsize(code)], u64.shiftLeft(bits, s.distancePostfixBits & 3)))
+  return true
+}
+
+// Reads an insert-and-copy command; the insert length goes to `insertLength`.
+@inlineAlways
+fn readCommandInternal(safe: bool, s: &mut State, br: &mut BitReader, src: &[u8], insertLength: &mut i32) -> bool {
+  let mut cmdCode: u64 = 0
+  let mut insertLenExtra: u64 = 0
+  let mut copyLength: u64 = 0
+  let memento = bit_reader.saveState(&br)
+  if !safe {
+    cmdCode = readSymbol(state.words(&s.insertCopyHgroup.codes), s.htreeCommand, &mut br, src)
+  } else {
+    if !safeReadSymbol(state.words(&s.insertCopyHgroup.codes), s.htreeCommand, &mut br, src, &mut cmdCode) { return false }
+  }
+  let v = prefix.cmdLut(u64.wrappingToUsize(cmdCode))
+  s.distanceCode = prefix.cmdDistanceCode(v)
+  s.distanceContext = toInt(prefix.cmdContext(v))
+  s.distHtreeIndex = u8.toUsize(state.bytes(&s.distContextMap)[usize.wrappingAdd(s.distContextMapSlice, u64.wrappingToUsize(prefix.cmdContext(v)))])
+  insertLength.* = toInt(prefix.cmdInsertOffset(v))
+  if !safe {
+    if prefix.cmdInsertExtraBits(v) != 0 {
+      insertLenExtra = bit_reader.readBits(&mut br, src, prefix.cmdInsertExtraBits(v))
+    }
+    copyLength = bit_reader.readBits(&mut br, src, prefix.cmdCopyExtraBits(v))
+  } else {
+    if !safeReadBitsMaybeZero(&mut br, src, prefix.cmdInsertExtraBits(v), &mut insertLenExtra)
+      || !safeReadBitsMaybeZero(&mut br, src, prefix.cmdCopyExtraBits(v), &mut copyLength) {
+      bit_reader.restoreState(&mut br, &memento)
+      return false
+    }
+  }
+  s.copyLength = toInt(u64.wrappingAdd(copyLength, prefix.cmdCopyOffset(v)))
+  s.blockLength[1] = u64.wrappingSubtract(s.blockLength[1], 1)
+  insertLength.* = i32.wrappingAdd(insertLength.*, toInt(insertLenExtra))
+  return true
+}
+
+// The command loop of a compressed meta-block: C's `ProcessCommandsInternal`, whose labels are
+// the values of `label`. With `safe` unset the input is known to suffice for each step (at least
+// 28 bytes are ahead whenever that is checked); with `safe` set every read can stop for lack of
+// input and leaves the state ready to be resumed.
+//
+// C's `int pos` is never negative; it is a `usize` here, like the ring buffer size and mask, so
+// that it indexes without a conversion.
+@inlineAlways
+fn processCommandsInternal(safe: bool, s: &mut State, src: &[u8]) -> i32 {
+  let mut pos = i32.toUsize(s.pos)
+  let mut i = s.loopCounter
+  let mut result = SUCCESS
+  let compoundDictionarySize = s.compound.totalSize
+  let ringSize = i32.toUsize(s.ringbufferSize)
+  let mask = i32.toUsize(s.ringbufferMask)
+  let mut label = LABEL_SAVE
+  // The bit reader lives in a local while the commands run, so that it stays in registers: no
+  // write to the ring buffer or to the state can change it. It goes back to the state around
+  // the calls that read through the state, and at the end.
+  let mut br = s.br
+
+  if !safe && !bit_reader.checkInputAmount(&br) {
+    result = NEEDS_MORE_INPUT
+  } else {
+    if !safe {
+      let _warm = bit_reader.warmup(&mut br, src)
+    }
+    // Jump into the state machine.
+    if s.state == state.STATE_COMMAND_BEGIN {
+      label = LABEL_BEGIN
+    } else if s.state == state.STATE_COMMAND_INNER {
+      label = LABEL_INNER
+    } else if s.state == state.STATE_COMMAND_POST_DECODE_LITERALS {
+      label = LABEL_POST_DECODE_LITERALS
+    } else if s.state == state.STATE_COMMAND_POST_WRAP_COPY {
+      label = LABEL_POST_WRAP_COPY
+    } else {
+      return ERROR_UNREACHABLE
+    }
+  }
+
+  while label != LABEL_SAVE {
+    if label == LABEL_BEGIN {
+      if safe { s.state = state.STATE_COMMAND_BEGIN }
+      if !safe && !bit_reader.checkInputAmount(&br) {
+        s.state = state.STATE_COMMAND_BEGIN
+        result = NEEDS_MORE_INPUT
+        break
+      }
+      if s.blockLength[1] == 0 {
+        let mut status = SUCCESS
+        s.br = br
+          if safe { status = safeDecodeCommandBlockSwitch(&mut s, src) } else { status = decodeCommandBlockSwitch(&mut s, src) }
+          br = s.br
+        if status != SUCCESS {
+          result = status
+          break
+        }
+        continue
+      }
+      // Read the insert/copy length in the command.
+      if safe {
+        if !readCommandInternal(true, &mut s, &mut br, src, &mut i) {
+          result = NEEDS_MORE_INPUT
+          break
+        }
+      } else {
+        let _read = readCommandInternal(false, &mut s, &mut br, src, &mut i)
+      }
+      if i == 0 {
+        label = LABEL_POST_DECODE_LITERALS
+      } else {
+        s.metaBlockRemainingLen = i32.wrappingSubtract(s.metaBlockRemainingLen, i)
+        label = LABEL_INNER
+      }
+    }
+
+    if label == LABEL_INNER {
+      if safe { s.state = state.STATE_COMMAND_INNER }
+      // Read the literals in the command.
+      if s.trivialLiteralContext {
+        let table = state.words(&s.literalHgroup.codes)
+        let ring = state.bytesMut(&mut s.ringbuffer)
+        let literalHtree = s.literalHtree
+        if !safe {
+          let mut bits: u64 = 0
+          let mut value: u64 = 0
+          preloadSymbol(table, literalHtree, &mut br, src, &mut bits, &mut value)
+          // This is the hottest part of the decode, so the loop below is copied and optimized by
+          // calculating the number of steps where all checks evaluate to false (ring buffer
+          // size/block size/input size). Since all checks are loop invariant, we just need to
+          // find the minimal number of iterations for a simple loop, and run the full version
+          // for the remainder.
+          let mut numSteps = i32.wrappingSubtract(i, 1)
+          if numSteps > 0 && i32.toU64(numSteps) > s.blockLength[0] {
+            // Safe cast, since block_length < steps.
+            numSteps = toInt(s.blockLength[0])
+          }
+          if ringSize >= pos && usize.toI32(ringSize - pos) <= numSteps {
+            numSteps = i32.wrappingSubtract(usize.toI32(ringSize - pos), 1)
+          }
+          if numSteps < 0 { numSteps = 0 }
+          numSteps = copyPreloadedSymbolsToU8(table, literalHtree, &mut br, src, &mut bits, &mut value, &mut ring, pos, numSteps)
+          pos = usize.wrappingAdd(pos, i32.toUsize(numSteps))
+          s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], i32.toU64(numSteps))
+          i = i32.wrappingSubtract(i, numSteps)
+          while true {
+            if !bit_reader.checkInputAmount(&br) {
+              s.state = state.STATE_COMMAND_INNER
+              result = NEEDS_MORE_INPUT
+              label = LABEL_SAVE
+              break
+            }
+            if s.blockLength[0] == 0 {
+              label = LABEL_NEXT_LITERAL_BLOCK
+              break
+            }
+            let _copied = copyPreloadedSymbolsToU8(table, literalHtree, &mut br, src, &mut bits, &mut value, &mut ring, pos, 1)
+            s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], 1)
+            pos = usize.wrappingAdd(pos, 1)
+            if pos == ringSize {
+              s.state = state.STATE_COMMAND_INNER_WRITE
+              i = i32.wrappingSubtract(i, 1)
+              label = LABEL_SAVE
+              break
+            }
+            i = i32.wrappingSubtract(i, 1)
+            if i == 0 { break }
+          }
+        } else {
+          while true {
+            if s.blockLength[0] == 0 {
+              label = LABEL_NEXT_LITERAL_BLOCK
+              break
+            }
+            let mut literal: u64 = 0
+            if !safeReadSymbol(table, literalHtree, &mut br, src, &mut literal) {
+              result = NEEDS_MORE_INPUT
+              label = LABEL_SAVE
+              break
+            }
+            ring[pos] = u64.wrappingToU8(literal)
+            s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], 1)
+            pos = usize.wrappingAdd(pos, 1)
+            if pos == ringSize {
+              s.state = state.STATE_COMMAND_INNER_WRITE
+              i = i32.wrappingSubtract(i, 1)
+              label = LABEL_SAVE
+              break
+            }
+            i = i32.wrappingSubtract(i, 1)
+            if i == 0 { break }
+          }
+        }
+      } else {
+        let table = state.words(&s.literalHgroup.codes)
+        // The 64 contexts of the block type, and the two halves of the lookup table of the
+        // context mode.
+        let contextMap = Slice.view<u8>(state.bytes(&s.contextMap), s.contextMapSlice, 64)
+        let lookup1 = Slice.view<u8>(brotli_tables.contextLookup(), s.contextLookup, 256)
+        let lookup2 = Slice.view<u8>(brotli_tables.contextLookup(), s.contextLookup + 256, 256)
+        let ring = state.bytesMut(&mut s.ringbuffer)
+        let mut p1 = ring[usize.wrappingSubtract(pos, 1) & mask]
+        let mut p2 = ring[usize.wrappingSubtract(pos, 2) & mask]
+        while true {
+          if !safe && !bit_reader.checkInputAmount(&br) {
+            s.state = state.STATE_COMMAND_INNER
+            result = NEEDS_MORE_INPUT
+            label = LABEL_SAVE
+            break
+          }
+          if s.blockLength[0] == 0 {
+            label = LABEL_NEXT_LITERAL_BLOCK
+            break
+          }
+          let context = lookup1[u8.toUsize(p1)] | lookup2[u8.toUsize(p2)]
+          let hc = u32.toUsize(table[u8.toUsize(contextMap[u8.toUsize(context) & 63])])
+          p2 = p1
+          if !safe {
+            p1 = u64.wrappingToU8(readSymbol(table, hc, &mut br, src))
+          } else {
+            let mut literal: u64 = 0
+            if !safeReadSymbol(table, hc, &mut br, src, &mut literal) {
+              result = NEEDS_MORE_INPUT
+              label = LABEL_SAVE
+              break
+            }
+            p1 = u64.wrappingToU8(literal)
+          }
+          ring[pos] = p1
+          s.blockLength[0] = u64.wrappingSubtract(s.blockLength[0], 1)
+          pos = usize.wrappingAdd(pos, 1)
+          if pos == ringSize {
+            s.state = state.STATE_COMMAND_INNER_WRITE
+            i = i32.wrappingSubtract(i, 1)
+            label = LABEL_SAVE
+            break
+          }
+          i = i32.wrappingSubtract(i, 1)
+          if i == 0 { break }
+        }
+      }
+      if label == LABEL_INNER {
+        if s.metaBlockRemainingLen <= 0 {
+          s.state = state.STATE_METABLOCK_DONE
+          label = LABEL_SAVE
+        } else {
+          label = LABEL_POST_DECODE_LITERALS
+        }
+      }
+    }
+
+    if label == LABEL_POST_DECODE_LITERALS {
+      if safe { s.state = state.STATE_COMMAND_POST_DECODE_LITERALS }
+      if s.distanceCode >= 0 {
+        // Implicit distance case.
+        if s.distanceCode != 0 { s.distanceContext = 0 } else { s.distanceContext = 1 }
+        s.distRbIdx = i32.wrappingSubtract(s.distRbIdx, 1)
+        s.distanceCode = s.distRb[i32.toUsize(s.distRbIdx & 3)]
+      } else {
+        // Read the distance code in the command, unless it was implicitly zero.
+        if s.blockLength[2] == 0 {
+          let mut status = SUCCESS
+          s.br = br
+          if safe { status = safeDecodeDistanceBlockSwitch(&mut s, src) } else { status = decodeDistanceBlockSwitch(&mut s, src) }
+          br = s.br
+          if status != SUCCESS {
+            result = status
+            break
+          }
+        }
+        if safe {
+          if !readDistanceInternal(true, &mut s, &mut br, src) {
+            result = NEEDS_MORE_INPUT
+            break
+          }
+        } else {
+          let _read = readDistanceInternal(false, &mut s, &mut br, src)
+        }
+      }
+      if s.maxDistance != s.maxBackwardDistance {
+        if pos < i32.toUsize(s.maxBackwardDistance) { s.maxDistance = usize.toI32(pos) } else { s.maxDistance = s.maxBackwardDistance }
+      }
+      i = s.copyLength
+      // Apply the copy of an LZ77 back-reference, or a static dictionary reference if the
+      // distance is larger than the max LZ77 distance.
+      if s.distanceCode > s.maxDistance {
+        // The maximum allowed distance is 0x7FFFFFFC. With this choice, no signed overflow can
+        // occur after decoding a special distance code (e.g., after adding 3 to the last
+        // distance).
+        if s.distanceCode > MAX_ALLOWED_DISTANCE {
+            result = ERROR_FORMAT_DISTANCE
+            break
+          }
+        if s.distanceCode - s.maxDistance - 1 < compoundDictionarySize {
+          let address = compoundDictionarySize - (s.distanceCode - s.maxDistance)
+          if !initializeCompoundDictionaryCopy(&mut s, address, i) {
+            result = ERROR_COMPOUND_DICTIONARY
+            break
+          }
+          pos = pos + i32.toUsize(copyFromCompoundDictionary(&mut s, usize.toI32(pos)))
+          if pos >= ringSize {
+            s.state = state.STATE_COMMAND_POST_WRITE_1
+            break
+          }
+        } else if i >= MIN_DICTIONARY_WORD_LENGTH && i <= MAX_DICTIONARY_WORD_LENGTH {
+          // A build without `BROTLI_EXPERIMENTAL` has exactly one static dictionary, the one of
+          // RFC 7932, with its 121 transforms and no context map; C's selection among several
+          // dictionaries reduces to this.
+          let wordLength = i32.toUsize(i)
+          let shift = brotli_tables.wordSizeBits(wordLength)
+          let address = s.distanceCode - s.maxDistance - 1 - compoundDictionarySize
+          let wordMask = u32.toI32(u32.shiftLeft(1, shift & 31) - 1)
+          let wordIdx = address & wordMask
+          let transformIdx = i32.shiftRight(address, u32.toI32(shift & 31))
+          // Compensate the double distance-ring-buffer roll.
+          s.distRbIdx = i32.wrappingAdd(s.distRbIdx, s.distanceContext)
+          if shift == 0 {
+            result = ERROR_FORMAT_DICTIONARY
+            break
+          }
+          let offset = brotli_tables.wordOffset(wordLength) + i32.toUsize(wordIdx) * wordLength
+          if transformIdx < usize.toI32(brotli_tables.transformCount()) {
+            let ring = state.bytesMut(&mut s.ringbuffer)
+            let mut len = wordLength
+            if transformIdx == 0 {
+              Slice.copyInto<u8>(&mut ring, pos, Slice.view<u8>(brotli_tables.words(), offset, wordLength))
+            } else {
+              len = transform.transformDictionaryWord(&mut ring, pos, brotli_tables.words(), offset, wordLength, i32.toUsize(transformIdx))
+              if len == 0 && s.distanceCode <= 120 {
+            result = ERROR_FORMAT_TRANSFORM
+            break
+          }
+            }
+            pos = pos + len
+            s.metaBlockRemainingLen = s.metaBlockRemainingLen - usize.toI32(len)
+            if pos >= ringSize {
+              s.state = state.STATE_COMMAND_POST_WRITE_1
+              break
+            }
+          } else {
+            result = ERROR_FORMAT_TRANSFORM
+            break
+          }
+        } else {
+          result = ERROR_FORMAT_DICTIONARY
+          break
+        }
+      } else {
+        // The distance is positive here: it is one of the last distances, which are, or it was
+        // read with its extra bits.
+        // A copy length is at least 2 and below 2^25.
+        let copyLength = i32.toUsize(i & 33554431)
+        let srcStart = usize.wrappingSubtract(pos, i32.wrappingToUsize(s.distanceCode)) & mask
+        let dstEnd = usize.wrappingAdd(pos, copyLength)
+        let srcEnd = usize.wrappingAdd(srcStart, copyLength)
+        // Update the recent distances cache.
+        s.distRb[i32.toUsize(s.distRbIdx & 3)] = s.distanceCode
+        s.distRbIdx = i32.wrappingAdd(s.distRbIdx, 1)
+        s.metaBlockRemainingLen = i32.wrappingSubtract(s.metaBlockRemainingLen, i)
+        // There are 32+ bytes of slack in the ring buffer allocation. Also, we have 16 short
+        // codes, that make these 16 bytes irrelevant in the ring buffer. Let's copy over them as
+        // a first guess.
+        let ring = state.bytesMut(&mut s.ringbuffer)
+        memory.move16(&mut ring, pos, srcStart)
+        if srcEnd > pos && dstEnd > srcStart {
+          // The regions intersect.
+          label = LABEL_POST_WRAP_COPY
+        } else if dstEnd >= ringSize || srcEnd >= ringSize {
+          // At least one region wraps.
+          label = LABEL_POST_WRAP_COPY
+        } else {
+          if copyLength > 16 {
+            if copyLength > 32 {
+              memory.copyWithin(&mut s.ringbuffer, usize.wrappingAdd(pos, 16), usize.wrappingAdd(srcStart, 16), copyLength - 16)
+            } else {
+              // This branch covers about 45% cases. A fixed size short copy allows more compiler
+              // optimizations.
+              memory.move16(&mut ring, usize.wrappingAdd(pos, 16), usize.wrappingAdd(srcStart, 16))
+            }
+          }
+          pos = dstEnd
+        }
+      }
+      if label == LABEL_POST_DECODE_LITERALS {
+        if s.metaBlockRemainingLen <= 0 {
+          // Next meta-block, if any.
+          s.state = state.STATE_METABLOCK_DONE
+          break
+        }
+        label = LABEL_BEGIN
+        continue
+      }
+    }
+
+    if label == LABEL_POST_WRAP_COPY {
+      // C copies byte by byte while `--i >= 0` and suspends when the ring buffer is full. The
+      // number of bytes until then is known up front.
+      let count = i32.toUsize(i)
+      let wrapGuard = usize.wrappingSubtract(ringSize, pos)
+      let distance = i32.wrappingToUsize(s.distanceCode)
+      let ring = state.bytesMut(&mut s.ringbuffer)
+      if wrapGuard != 0 && wrapGuard <= count {
+        memory.copyBackward(&mut ring, pos, distance, mask, wrapGuard)
+        pos = usize.wrappingAdd(pos, wrapGuard)
+        i = usize.toI32(count - wrapGuard)
+        s.state = state.STATE_COMMAND_POST_WRITE_2
+        break
+      }
+      memory.copyBackward(&mut ring, pos, distance, mask, count)
+      pos = usize.wrappingAdd(pos, count)
+      i = -1
+      if s.metaBlockRemainingLen <= 0 {
+        // Next meta-block, if any.
+        s.state = state.STATE_METABLOCK_DONE
+        break
+      }
+      label = LABEL_BEGIN
+      continue
+    }
+
+    if label == LABEL_NEXT_LITERAL_BLOCK {
+      let mut status = SUCCESS
+      s.br = br
+          if safe { status = safeDecodeLiteralBlockSwitch(&mut s, src) } else { status = decodeLiteralBlockSwitch(&mut s, src) }
+          br = s.br
+      if status != SUCCESS {
+        result = status
+        break
+      }
+      label = LABEL_INNER
+    }
+  }
+
+  s.br = br
+  s.pos = usize.toI32(pos)
+  s.loopCounter = i
+  return result
+}
+
+@inlineNever
+fn processCommands(s: &mut State, src: &[u8]) -> i32 {
+  return processCommandsInternal(false, &mut s, src)
+}
+
+@inlineNever
+fn safeProcessCommands(s: &mut State, src: &[u8]) -> i32 {
+  return processCommandsInternal(true, &mut s, src)
+}
+
+// `BrotliCalculateDistanceCodeLimit` of `c/common/constants.h`: the maximal size of the distance
+// alphabet such that distances greater than `maxDistance` can not be represented.
+fn distanceAlphabetSizeLimit(maxDistance: u32, npostfix: u32, ndirect: u32) -> u32 {
+  if maxDistance <= ndirect {
+    // This case never happens / exists only for the sake of completeness.
+    return maxDistance + 16
+  }
+  // The first prohibited value.
+  let forbiddenDistance = maxDistance + 1
+  // Subtract the "directly" encoded region.
+  let mut offset = forbiddenDistance - ndirect - 1
+  let mut ndistbits: u32 = 0
+  // The postfix for the last dcode in the group.
+  let postfix = u32.shiftLeft(1, npostfix) - 1
+  // Remove the postfix and "head-start".
+  offset = u32.shiftRight(offset, npostfix) + 4
+  // Calculate the number of distance bits.
+  let mut tmp = offset / 2
+  // Poor-man's log2floor, to avoid extra dependencies.
+  while tmp != 0 {
+    ndistbits = ndistbits + 1
+    tmp = u32.shiftRight(tmp, 1)
+  }
+  // One bit is covered with subrange addressing ("half").
+  ndistbits = ndistbits - 1
+  // Find the subrange.
+  let half = u32.shiftRight(offset, ndistbits) & 1
+  // Calculate the "group" part of dcode.
+  let mut group = u32.shiftLeft(ndistbits - 1, 1) | half
+  // The calculated "group" covers the prohibited distance value.
+  if group == 0 {
+    // This case is added for correctness; does not occur for limit > 128.
+    return ndirect + 16
+  }
+  // Decrement "group", so it is the last permitted "group".
+  group = group - 1
+  // Calculate the alphabet size.
+  return (u32.shiftLeft(group, npostfix) | postfix) + ndirect + 16 + 1
+}
+
+// Runs the state machine from `s.state` until C's switch would `break`, and returns the result
+// that the main loop then examines. `returned` is set where C returns from the function directly.
+effect fn step(s: &mut State, src: &[u8], output: &mut [u8], returned: &mut bool) -> i32 ? &mut Allocator {
+  while true {
+    let current = s.state
+    if current == state.STATE_UNINITED {
+      // Prepare to the first read.
+      if !bit_reader.warmup(&mut s.br, src) { return NEEDS_MORE_INPUT }
+      // Decode the window size. Reads 1..8 bits.
+      let result = decodeWindowBits(&mut s)
+      if result != SUCCESS { return result }
+      if s.largeWindow {
+        s.state = state.STATE_LARGE_WINDOW_BITS
+        return SUCCESS
+      }
+      s.state = state.STATE_INITIALIZE
+      return SUCCESS
+    }
+
+    if current == state.STATE_LARGE_WINDOW_BITS {
+      let mut bits: u64 = 0
+      if !bit_reader.safeReadBits(&mut s.br, src, 6, &mut bits) { return NEEDS_MORE_INPUT }
+      s.windowBits = u64.wrappingToU32(bits) & 63
+      if s.windowBits < LARGE_MIN_WBITS || s.windowBits > LARGE_MAX_WBITS { return ERROR_FORMAT_WINDOW_BITS }
+      s.state = state.STATE_INITIALIZE
+      continue
+    }
+
+    if current == state.STATE_INITIALIZE {
+      // Maximum distance, see section 9.1. of the spec.
+      s.maxBackwardDistance = i32.shiftLeft(1, u32.wrappingToI32(s.windowBits)) - WINDOW_GAP
+      // Allocate memory for both the block type trees and the block length trees.
+      match run Effect.result(state.allocWords(3 * (huffman.MAX_SIZE_258 + huffman.MAX_SIZE_26))) {
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Success { value } => { s.blockTrees = move value }
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Failure {..} => { return ERROR_ALLOC_BLOCK_TYPE_TREES }
+      }
+      s.state = state.STATE_METABLOCK_BEGIN
+      continue
+    }
+
+    if current == state.STATE_METABLOCK_BEGIN {
+      state.metablockBegin(&mut s)
+      s.state = state.STATE_METABLOCK_HEADER
+      continue
+    }
+
+    if current == state.STATE_METABLOCK_HEADER {
+      // Reads 2 - 31 bits.
+      let result = decodeMetaBlockLength(&mut s, src)
+      if result != SUCCESS { return result }
+      if s.isMetadata || s.isUncompressed {
+        if !bit_reader.jumpToByteBoundary(&mut s.br) { return ERROR_FORMAT_PADDING_1 }
+      }
+      if s.isMetadata {
+        s.state = state.STATE_METADATA
+        return SUCCESS
+      }
+      if s.metaBlockRemainingLen == 0 {
+        s.state = state.STATE_METABLOCK_DONE
+        return SUCCESS
+      }
+      calculateRingBufferSize(&mut s)
+      if s.isUncompressed {
+        s.state = state.STATE_UNCOMPRESSED
+        return SUCCESS
+      }
+      s.state = state.STATE_BEFORE_COMPRESSED_METABLOCK_HEADER
+      continue
+    }
+
+    if current == state.STATE_BEFORE_COMPRESSED_METABLOCK_HEADER {
+      s.loopCounter = 0
+      // Initialize the compressed meta-block header arena.
+      s.subLoopCounter = 0
+      s.substateHuffman = state.HUFFMAN_NONE
+      s.substateTreeGroup = state.TREE_GROUP_NONE
+      s.substateContextMap = state.CONTEXT_MAP_NONE
+      s.state = state.STATE_HUFFMAN_CODE_0
+      continue
+    }
+
+    if current == state.STATE_HUFFMAN_CODE_0 {
+      if s.loopCounter >= 3 {
+        s.state = state.STATE_METABLOCK_HEADER_2
+        return SUCCESS
+      }
+      // Reads 1..11 bits.
+      let index = i32.toUsize(s.loopCounter)
+      let mut count = s.numBlockTypes[index]
+      let result = decodeVarLenUint8(&mut s, src, &mut count)
+      if result == SUCCESS { count = count + 1 }
+      s.numBlockTypes[index] = count
+      if result != SUCCESS { return result }
+      if count < 2 {
+        s.loopCounter = s.loopCounter + 1
+        return SUCCESS
+      }
+      s.state = state.STATE_HUFFMAN_CODE_1
+      continue
+    }
+
+    if current == state.STATE_HUFFMAN_CODE_1 {
+      let index = i32.toUsize(s.loopCounter)
+      let alphabetSize = s.numBlockTypes[index] + 2
+      let mut tableSize: u64 = 0
+      let result = readHuffmanCode(alphabetSize, alphabetSize, TABLE_BLOCK_TREES, index * huffman.MAX_SIZE_258, &mut tableSize, &mut s, src)
+      if result != SUCCESS { return result }
+      s.state = state.STATE_HUFFMAN_CODE_2
+      continue
+    }
+
+    if current == state.STATE_HUFFMAN_CODE_2 {
+      let index = i32.toUsize(s.loopCounter)
+      let mut tableSize: u64 = 0
+      let result = readHuffmanCode(NUM_BLOCK_LEN_SYMBOLS, NUM_BLOCK_LEN_SYMBOLS, TABLE_BLOCK_TREES, 3 * huffman.MAX_SIZE_258 + index * huffman.MAX_SIZE_26, &mut tableSize, &mut s, src)
+      if result != SUCCESS { return result }
+      s.state = state.STATE_HUFFMAN_CODE_3
+      continue
+    }
+
+    if current == state.STATE_HUFFMAN_CODE_3 {
+      let index = i32.toUsize(s.loopCounter)
+      let mut length: u64 = 0
+      if !safeReadBlockLength(&mut s, src, 3 * huffman.MAX_SIZE_258 + index * huffman.MAX_SIZE_26, &mut length) { return NEEDS_MORE_INPUT }
+      s.blockLength[index] = length
+      s.loopCounter = s.loopCounter + 1
+      s.state = state.STATE_HUFFMAN_CODE_0
+      return SUCCESS
+    }
+
+    if current == state.STATE_UNCOMPRESSED {
+      let result = run copyUncompressedBlockToOutput(&mut s, src, &mut output)
+      if result != SUCCESS { return result }
+      s.state = state.STATE_METABLOCK_DONE
+      return SUCCESS
+    }
+
+    if current == state.STATE_METADATA {
+      let result = skipMetadataBlock(&mut s, src)
+      if result != SUCCESS { return result }
+      s.state = state.STATE_METABLOCK_DONE
+      return SUCCESS
+    }
+
+    if current == state.STATE_METABLOCK_HEADER_2 {
+      let mut bits: u64 = 0
+      if !bit_reader.safeReadBits(&mut s.br, src, 6, &mut bits) { return NEEDS_MORE_INPUT }
+      s.distancePostfixBits = bits & 3
+      bits = u64.shiftRight(bits, 2)
+      s.numDirectDistanceCodes = u64.shiftLeft(bits, s.distancePostfixBits)
+      match run Effect.result(state.allocBytes(u64.wrappingToUsize(s.numBlockTypes[0]))) {
+        Result<Intrinsic.RawBuffer<u8>, OutOfMemoryError>.Success { value } => { s.contextModes = move value }
+        Result<Intrinsic.RawBuffer<u8>, OutOfMemoryError>.Failure {..} => { return ERROR_ALLOC_CONTEXT_MODES }
+      }
+      s.loopCounter = 0
+      s.state = state.STATE_CONTEXT_MODES
+      continue
+    }
+
+    if current == state.STATE_CONTEXT_MODES {
+      let result = readContextModes(&mut s, src)
+      if result != SUCCESS { return result }
+      s.state = state.STATE_CONTEXT_MAP_1
+      continue
+    }
+
+    if current == state.STATE_CONTEXT_MAP_1 {
+      let result = run decodeContextMap(u64.shiftLeft(s.numBlockTypes[0], LITERAL_CONTEXT_BITS), false, &mut s, src)
+      if result != SUCCESS { return result }
+      detectTrivialLiteralBlockTypes(&mut s)
+      s.state = state.STATE_CONTEXT_MAP_2
+      continue
+    }
+
+    if current == state.STATE_CONTEXT_MAP_2 {
+      let npostfix = s.distancePostfixBits
+      let ndirect = s.numDirectDistanceCodes
+      let mut distanceAlphabetSizeMax = NUM_DISTANCE_SHORT_CODES + ndirect + u64.shiftLeft(MAX_DISTANCE_BITS, npostfix + 1)
+      let mut distanceAlphabetSizeLimit = distanceAlphabetSizeMax
+      if s.largeWindow {
+        distanceAlphabetSizeMax = NUM_DISTANCE_SHORT_CODES + ndirect + u64.shiftLeft(LARGE_MAX_DISTANCE_BITS, npostfix + 1)
+        distanceAlphabetSizeLimit = u32.toU64(distanceAlphabetSizeLimit32(npostfix, ndirect))
+      }
+      let result = run decodeContextMap(u64.shiftLeft(s.numBlockTypes[2], DISTANCE_CONTEXT_BITS), true, &mut s, src)
+      if result != SUCCESS { return result }
+      let mut allocationSuccess = true
+      match run Effect.result(state.huffmanTreeGroupBuffer(NUM_LITERAL_SYMBOLS, s.numLiteralHtrees)) {
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Success { value } => { s.literalHgroup.codes = move value }
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Failure {..} => { allocationSuccess = false }
+      }
+      s.literalHgroup.alphabetSizeMax = NUM_LITERAL_SYMBOLS
+      s.literalHgroup.alphabetSizeLimit = NUM_LITERAL_SYMBOLS
+      s.literalHgroup.numHtrees = s.numLiteralHtrees
+      match run Effect.result(state.huffmanTreeGroupBuffer(NUM_COMMAND_SYMBOLS, s.numBlockTypes[1])) {
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Success { value } => { s.insertCopyHgroup.codes = move value }
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Failure {..} => { allocationSuccess = false }
+      }
+      s.insertCopyHgroup.alphabetSizeMax = NUM_COMMAND_SYMBOLS
+      s.insertCopyHgroup.alphabetSizeLimit = NUM_COMMAND_SYMBOLS
+      s.insertCopyHgroup.numHtrees = s.numBlockTypes[1]
+      match run Effect.result(state.huffmanTreeGroupBuffer(distanceAlphabetSizeLimit, s.numDistHtrees)) {
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Success { value } => { s.distanceHgroup.codes = move value }
+        Result<Intrinsic.RawBuffer<u32>, OutOfMemoryError>.Failure {..} => { allocationSuccess = false }
+      }
+      s.distanceHgroup.alphabetSizeMax = distanceAlphabetSizeMax & 65535
+      s.distanceHgroup.alphabetSizeLimit = distanceAlphabetSizeLimit & 65535
+      s.distanceHgroup.numHtrees = s.numDistHtrees
+      if !allocationSuccess {
+        returned.* = true
+        return ERROR_ALLOC_TREE_GROUPS
+      }
+      s.loopCounter = 0
+      s.state = state.STATE_TREE_GROUP
+      continue
+    }
+
+    if current == state.STATE_TREE_GROUP {
+      let mut dest = TABLE_DISTANCE_GROUP
+      if s.loopCounter == 0 {
+        dest = TABLE_LITERAL_GROUP
+      } else if s.loopCounter == 1 {
+        dest = TABLE_INSERT_COPY_GROUP
+      } else if s.loopCounter != 2 {
+        returned.* = true
+        return ERROR_UNREACHABLE
+      }
+      let result = huffmanTreeGroupDecode(dest, &mut s, src)
+      if result != SUCCESS { return result }
+      s.loopCounter = s.loopCounter + 1
+      if s.loopCounter < 3 { return SUCCESS }
+      s.state = state.STATE_BEFORE_COMPRESSED_METABLOCK_BODY
+      continue
+    }
+
+    if current == state.STATE_BEFORE_COMPRESSED_METABLOCK_BODY {
+      prepareLiteralDecoding(&mut s)
+      s.distContextMapSlice = 0
+      s.htreeCommand = htree(&s.insertCopyHgroup.codes, 0)
+      if !(run ensureRingBuffer(&mut s)) { return ERROR_ALLOC_RING_BUFFER_2 }
+      calculateDistanceLut(&mut s)
+      s.state = state.STATE_COMMAND_BEGIN
+      continue
+    }
+
+    if current == state.STATE_COMMAND_BEGIN || current == state.STATE_COMMAND_INNER
+      || current == state.STATE_COMMAND_POST_DECODE_LITERALS || current == state.STATE_COMMAND_POST_WRAP_COPY {
+      let mut result = processCommands(&mut s, src)
+      if result == NEEDS_MORE_INPUT {
+        result = safeProcessCommands(&mut s, src)
+      }
+      return result
+    }
+
+    if current == state.STATE_COMMAND_INNER_WRITE || current == state.STATE_COMMAND_POST_WRITE_1
+      || current == state.STATE_COMMAND_POST_WRITE_2 {
+      let result = writeRingBuffer(&mut s, &mut output, false)
+      if result != SUCCESS { return result }
+      wrapRingBuffer(&mut s)
+      if s.ringbufferSize == i32.shiftLeft(1, u32.wrappingToI32(s.windowBits)) {
+        s.maxDistance = s.maxBackwardDistance
+      }
+      if s.state == state.STATE_COMMAND_POST_WRITE_1 {
+        if s.compound.numChunks != 0 && s.compound.brLength != s.compound.brCopied {
+          let position = s.pos
+          let copied = copyFromCompoundDictionary(&mut s, position)
+          s.pos = position + copied
+          if s.pos >= s.ringbufferSize { return SUCCESS }
+        }
+        if s.metaBlockRemainingLen == 0 {
+          // Next meta-block, if any.
+          s.state = state.STATE_METABLOCK_DONE
+        } else {
+          s.state = state.STATE_COMMAND_BEGIN
+        }
+        return SUCCESS
+      } else if s.state == state.STATE_COMMAND_POST_WRITE_2 {
+        s.state = state.STATE_COMMAND_POST_WRAP_COPY
+      } else {
+        // STATE_COMMAND_INNER_WRITE
+        if s.loopCounter == 0 {
+          if s.metaBlockRemainingLen == 0 {
+            s.state = state.STATE_METABLOCK_DONE
+          } else {
+            s.state = state.STATE_COMMAND_POST_DECODE_LITERALS
+          }
+          return SUCCESS
+        }
+        s.state = state.STATE_COMMAND_INNER
+      }
+      return SUCCESS
+    }
+
+    if current == state.STATE_METABLOCK_DONE {
+      if s.metaBlockRemainingLen < 0 { return ERROR_FORMAT_BLOCK_LENGTH_2 }
+      state.cleanupAfterMetablock(&mut s)
+      if !s.isLastMetablock {
+        s.state = state.STATE_METABLOCK_BEGIN
+        return SUCCESS
+      }
+      if !bit_reader.jumpToByteBoundary(&mut s.br) { return ERROR_FORMAT_PADDING_2 }
+      if s.bufferLength == 0 {
+        // The source is the caller's input: give the whole bytes of the accumulator back.
+        bit_reader.unload(&mut s.br)
+        s.inPos = s.br.next
+      }
+      s.state = state.STATE_DONE
+      continue
+    }
+
+    if current == state.STATE_DONE {
+      if RawBuffer.count<u8>(&s.ringbuffer) != 0 {
+        let result = writeRingBuffer(&mut s, &mut output, true)
+        if result != SUCCESS { return result }
+      }
+      returned.* = true
+      return SUCCESS
+    }
+
+    returned.* = true
+    return ERROR_UNREACHABLE
+  }
+  return ERROR_UNREACHABLE
+}
+
+@inlineAlways
+fn distanceAlphabetSizeLimit32(npostfix: u64, ndirect: u64) -> u32 {
+  return distanceAlphabetSizeLimit(2147483644, u64.wrappingToU32(npostfix), u64.wrappingToU32(ndirect))
+}
+
+// `BrotliDecoderDecompressStream`.
+//
+// Invariant: the input stream is never overconsumed:
+//  - invalid input implies that the whole stream is invalid -> any amount of input could be read
+//    and discarded
+//  - when the result is "needs more input", then at least one more byte is REQUIRED to complete
+//    decoding; all input data MUST be consumed by the decoder, so the client could swap the
+//    input buffer
+//  - when the result is "needs more output" the decoder MUST ensure that it doesn't hold more
+//    than 7 bits in the bit reader; this saves the client from swapping the input buffer ahead
+//    of time
+//  - when the result is "success" the decoder MUST return all unused data back to the input
+//    buffer; this is possible because the invariant is held on enter
+effect fn decompress(s: &mut State, input: &[u8], output: &mut [u8]) -> u32 ? &mut Allocator {
+  let mut result = SUCCESS
+  s.inPos = 0
+  s.outPos = 0
+  // Do not try to process further in a case of unrecoverable error.
+  if s.errorCode < 0 { return RESULT_ERROR }
+  // The bytes the bit reader's positions refer to: the caller's input, or this copy of the
+  // internal buffer.
+  let mut carry: [u8; 8] = s.buffer
+  let mut fromCarry = false
+  if s.bufferLength == 0 {
+    // Just connect the bit reader to the input stream.
+    bit_reader.setInput(&mut s.br, 0, input.length)
+  } else {
+    // At least one byte of input is required. More than one byte of input may be required to
+    // complete the transaction -> reading more data must be done in a loop -> do it in the main
+    // loop.
+    result = NEEDS_MORE_INPUT
+    fromCarry = true
+    bit_reader.setInput(&mut s.br, 0, s.bufferLength)
+  }
+  // State machine.
+  while true {
+    if result != SUCCESS {
+      // Error, needs more input/output.
+      if result == NEEDS_MORE_INPUT {
+        if RawBuffer.count<u8>(&s.ringbuffer) != 0 {
+          // Pro-actively push output. `writeRingBuffer` checks the validity of
+          // `s.metaBlockRemainingLen`.
+          let intermediateResult = writeRingBuffer(&mut s, &mut output, true)
+          if intermediateResult < 0 {
+            result = intermediateResult
+            break
+          }
+        }
+        if s.bufferLength != 0 {
+          // Used with the internal buffer.
+          if s.br.next == s.br.last {
+            // Successfully finished the read transaction. The accumulator contains less than 8
+            // bits, because the internal buffer is expanded byte-by-byte until it is enough to
+            // complete the read.
+            s.bufferLength = 0
+            // Switch to the input stream and restart.
+            result = SUCCESS
+            fromCarry = false
+            bit_reader.setInput(&mut s.br, s.inPos, input.length - s.inPos)
+            continue
+          } else if s.inPos < input.length {
+            // Not enough data in the buffer, but can take one more byte from the input stream.
+            result = SUCCESS
+            s.buffer[s.bufferLength] = input[s.inPos]
+            s.bufferLength = s.bufferLength + 1
+            carry = s.buffer
+            bit_reader.setInput(&mut s.br, 0, s.bufferLength)
+            s.inPos = s.inPos + 1
+            // Retry with more data in the buffer.
+            continue
+          }
+          // Can't finish reading and no more input.
+          break
+        } else {
+          // The input stream doesn't contain enough input. Copy the tail to the internal buffer
+          // and return.
+          s.inPos = s.br.next
+          while s.inPos < input.length {
+            s.buffer[s.bufferLength] = input[s.inPos]
+            s.bufferLength = s.bufferLength + 1
+            s.inPos = s.inPos + 1
+          }
+          break
+        }
+      }
+      // Fail or needs more output.
+      if s.bufferLength != 0 {
+        // Just consumed the buffered input and produced some output. Otherwise it would result
+        // in "needs more input". Reset the internal buffer.
+        s.bufferLength = 0
+      } else {
+        // Using the input stream in the last iteration. When the decoder switches to the input
+        // stream it has less than 8 bits in the accumulator, so it is safe to return the unused
+        // accumulator bits there.
+        bit_reader.unload(&mut s.br)
+        s.inPos = s.br.next
+      }
+      break
+    }
+    let mut returned = false
+    if fromCarry {
+      result = run step(&mut s, &carry, &mut output, &mut returned)
+    } else {
+      result = run step(&mut s, input, &mut output, &mut returned)
+    }
+    if returned { break }
+  }
+  return saveErrorCode(&mut s, result)
 }

@@ -1,14 +1,87 @@
-//! The Brotli encoder: a port of google/brotli v1.2.0 `c/enc`. For the same parameters and the
-//! same calls it writes the same bytes as the C library.
+//! The Brotli encoder: a port of google/brotli v1.2.0 `c/enc/encode.c` and `state.h`. For the
+//! same parameters and the same calls it writes the same bytes as the C library.
+//!
+//! PORTED: the encoder state, the parameters, the stream state machine with all four operations,
+//! and qualities 0 and 1 (`enc.compress_fragment`, `enc.compress_fragment_two_pass`).
+//!
+//! NOT PORTED YET: the match finders, the meta-block builders and prepared dictionaries, which
+//! qualities 2 to 11 need. The places where they plug in are marked `SEAM`. Until then those
+//! qualities run the same state machine with a reference search that finds no match, and store
+//! each meta-block with literals only (qualities 2 and 3) or uncompressed (4 to 11): a valid
+//! stream, but not the bytes of the C encoder.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
+import enc.backward_references { createBackwardReferences }
+import enc.bit_cost { bitsEntropy }
+import enc.bit_stream { storeMetaBlockFast, storeMetaBlockTrivial, storeUncompressedMetaBlock }
+import enc.command { Command, getLengthCode }
+import enc.compress_fragment { OnePassArena, compressFragmentFast }
+import enc.compress_fragment_two_pass { COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE, TwoPassArena, compressFragmentTwoPass }
+import enc.constants { CONTEXT_SIGNED, CONTEXT_UTF8, MAX_NDIRECT, MAX_NPOSTFIX, MAX_STATIC_CONTEXTS, MODE_FONT, WINDOW_GAP, context, contextLookupTable, maxBackwardLimit }
+import enc.fast_log { fastLog2, fastLog2u32, log2FloorNonZero32 }
+import enc.hash { Hasher }
+import enc.memory { bytes, bytesMut, uninitializedBytes, uninitializedWords, wordsMut, zeroedWords }
+import enc.metablock { BUILDERS_PORTED }
+import enc.params { EncoderParams, FAST_ONE_PASS_COMPRESSION_QUALITY, FAST_TWO_PASS_COMPRESSION_QUALITY, MAX_NUM_DELAYED_SYMBOLS, MAX_QUALITY_FOR_STATIC_ENTROPY_CODES, MIN_QUALITY_FOR_BLOCK_SPLIT, MIN_QUALITY_FOR_CONTEXT_MODELING, MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING, MIN_QUALITY_FOR_HQ_CONTEXT_MODELING, MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS, computeLgBlock, initDistanceParams, maxHashTableSize, maxMetablockSize, sanitizeParams }
+import enc.ringbuffer { RingBuffer }
+import enc.utf8_util { MIN_UTF8_RATIO, isMostlyUtf8 }
+import enc.write_bits { writeBits }
 
 /// `BROTLI_OPERATION_*`.
 pub const OPERATION_PROCESS: u32 = 0
 pub const OPERATION_FLUSH: u32 = 1
 pub const OPERATION_FINISH: u32 = 2
 pub const OPERATION_EMIT_METADATA: u32 = 3
+
+/// `BROTLI_PARAM_*`.
+pub const PARAM_MODE: u32 = 0
+pub const PARAM_QUALITY: u32 = 1
+pub const PARAM_LGWIN: u32 = 2
+pub const PARAM_LGBLOCK: u32 = 3
+pub const PARAM_DISABLE_LITERAL_CONTEXT_MODELING: u32 = 4
+pub const PARAM_SIZE_HINT: u32 = 5
+pub const PARAM_LARGE_WINDOW: u32 = 6
+pub const PARAM_NPOSTFIX: u32 = 7
+pub const PARAM_NDIRECT: u32 = 8
+pub const PARAM_STREAM_OFFSET: u32 = 9
+
+// `BrotliEncoderStreamState`.
+// Default state.
+const STREAM_PROCESSING: u32 = 0
+// Intermediate state; after next block is emitted, byte-padding should be performed before
+// getting back to default state.
+const STREAM_FLUSH_REQUESTED: u32 = 1
+// Last metablock was produced; no more input is acceptable.
+const STREAM_FINISHED: u32 = 2
+// Flushing compressed block and writing meta-data block header.
+const STREAM_METADATA_HEAD: u32 = 3
+// Writing metadata block body.
+const STREAM_METADATA_BODY: u32 = 4
+
+// `BrotliEncoderFlintState`. "Flint" is a tiny uncompressed block emitted before the continuation
+// block to unwire literal context from previous data.
+const FLINT_NEEDS_2_BYTES: i32 = 2
+const FLINT_WAITING_FOR_PROCESSING: i32 = 0
+const FLINT_WAITING_FOR_FLUSHING: i32 = -1
+const FLINT_DONE: i32 = -2
+
+// Where `next_out_` points.
+const OUT_NONE: u32 = 0
+const OUT_STORAGE: u32 = 1
+const OUT_TINY: u32 = 2
+
+const UINT32_MAX: u32 = 0xffffffff
 
 /// What one call to [`BrotliEncoder.compressStream`] did.
 pub struct EncodeStep {
@@ -21,51 +94,1431 @@ pub struct EncodeStep {
 }
 
 /// A dictionary prepared for the encoder, `BrotliEncoderPreparedDictionary` of the C API.
+///
+/// NOT PORTED YET: this is the seam for `compound_dictionary.c` and `encoder_dict.c`.
 pub struct PreparedDictionary {
   kind: u32,
 }
 
 impl PreparedDictionary {
   /// `BrotliEncoderPrepareDictionary`. It keeps its own copy of `data`.
+  ///
+  /// PLACEHOLDER: the result is empty and cannot be attached.
   pub effect fn prepare(kind: u32, data: &[u8], quality: u32) -> PreparedDictionary ! OutOfMemoryError ? &mut Allocator {
     return PreparedDictionary { kind: kind }
   }
 }
 
+/// `BrotliEncoderMaxCompressedSize`: an upper bound of the size of the stream for `inputSize`
+/// bytes at lgwin 16 or more, or 0 if it does not fit a `usize`.
+pub fn maxCompressedSize(inputSize: usize) -> usize {
+  // [window bits / empty metadata] + N * [uncompressed] + [last empty]
+  let numLargeBlocks = usize.shiftRight(inputSize, 14)
+  let overhead = 2 + (4 * numLargeBlocks) + 3 + 1
+  let result = usize.wrappingAdd(inputSize, overhead)
+  if inputSize == 0 { return 2 }
+  if result < inputSize { return 0 }
+  return result
+}
+
+/// `kStaticContextMapContinuation` of `ChooseContextMap`.
+pub const STATIC_CONTEXT_MAP_CONTINUATION: [u32; 64] = [
+  1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+/// `kStaticContextMapSimpleUTF8` of `ChooseContextMap`.
+pub const STATIC_CONTEXT_MAP_SIMPLE_UTF8: [u32; 64] = [
+  0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+/// `kStaticContextMapComplexUTF8` of `ShouldUseComplexStaticContextMap`.
+pub const STATIC_CONTEXT_MAP_COMPLEX_UTF8: [u32; 64] = [
+  // 0 special
+  11, 11, 12, 12,
+  // 4 lf
+  0, 0, 0, 0,
+  // 8 space
+  1, 1, 9, 9,
+  // !, first after space/lf and after something else.
+  2, 2, 2, 2,
+  // "
+  1, 1, 1, 1,
+  // %
+  8, 3, 3, 3,
+  // ({[
+  1, 1, 1, 1,
+  // }])
+  2, 2, 2, 2,
+  // :;
+  8, 4, 4, 4,
+  // .
+  8, 7, 4, 4,
+  // >
+  8, 0, 0, 0,
+  // [0..9]
+  3, 3, 3, 3,
+  // [A-Z]
+  5, 5, 10, 5,
+  5, 5, 10, 5,
+  // [a-z]
+  6, 6, 6, 6,
+  6, 6, 6, 6,
+]
+
+/// The literal context map that `DecideOverLiteralContextModeling` chose: none, or one of the
+/// `STATIC_CONTEXT_MAP_*` tables.
+pub const CONTEXT_MAP_NONE: u32 = 0
+pub const CONTEXT_MAP_CONTINUATION: u32 = 1
+pub const CONTEXT_MAP_SIMPLE_UTF8: u32 = 2
+pub const CONTEXT_MAP_COMPLEX_UTF8: u32 = 3
+
+/// The outcome of `DecideOverLiteralContextModeling`: `num_literal_contexts` and which table
+/// `literal_context_map` points to.
+pub struct LiteralContextModel {
+  pub numLiteralContexts: usize,
+  pub literalContextMap: u32,
+}
+
+// `WrapPosition`: wraps a 64-bit input position to a 32-bit ring-buffer position preserving the
+// "not-a-first-lap" feature.
+fn wrapPosition(position: u64) -> u32 {
+  let mut result = u64.wrappingToU32(position)
+  let gb = u64.shiftRight(position, 30)
+  if gb > 2 {
+    // Wrap every 2GiB; The first 3GB are continuous.
+    result = (result & 0x3fffffff) | u32.shiftLeft(u64.wrappingToU32((gb - 1) & 1) + 1, 30)
+  }
+  return result
+}
+
+// `HashTableSize`.
+fn hashTableSize(maxTableSize: usize, inputSize: usize) -> usize {
+  let mut htsize: usize = 256
+  while htsize < maxTableSize && htsize < inputSize {
+    htsize = usize.shiftLeft(htsize, 1)
+  }
+  return htsize
+}
+
+// `EncodeWindowBits`: the stream header in the low `bits` bits of the result, with the number of
+// bits above bit 16.
+fn encodeWindowBits(lgwin: i32, largeWindow: bool) -> u32 {
+  let w = i32.toU32(lgwin)
+  if largeWindow {
+    return (u32.shiftLeft(w & 0x3f, 8) | 0x11) | u32.shiftLeft(14, 16)
+  }
+  if lgwin == 16 {
+    return u32.shiftLeft(1, 16)
+  } else if lgwin == 17 {
+    return 1 | u32.shiftLeft(7, 16)
+  } else if lgwin > 17 {
+    return (u32.shiftLeft(w - 17, 1) | 0x01) | u32.shiftLeft(4, 16)
+  }
+  return (u32.shiftLeft(w - 8, 4) | 0x01) | u32.shiftLeft(7, 16)
+}
+
+// `EstimateEntropy`.
+fn estimateEntropy(population: &[u32], from: usize, size: usize) -> f64 {
+  let mut total: usize = 0
+  let mut result: f64 = 0.0
+  let mut i: usize = 0
+  while i < size {
+    let p = population[from + i]
+    total = total + u32.toUsize(p)
+    result = result + u32.toF64(p) * fastLog2u32(p)
+    i = i + 1
+  }
+  result = usize.toF64(total) * fastLog2(total) - result
+  return result
+}
+
+// `ChooseContextMap`: decides about the context map based on the ability of the prediction
+// ability of the previous byte UTF8-prefix on the next byte. The prediction ability is calculated
+// as Shannon entropy. Here we need Shannon entropy instead of 'BrotliBitsEntropy' since the prefix
+// will be encoded with the remaining 6 bits of the following byte, and BrotliBitsEntropy will
+// assume that symbol to be stored alone using Huffman coding.
+fn chooseContextMap(quality: i32, bigramHisto: &[u32], model: &mut LiteralContextModel) -> () {
+  let mut monogramHisto: [u32; 3] = [0; 3]
+  let mut twoPrefixHisto: [u32; 6] = [0; 6]
+  let mut entropy: [f64; 4] = [0.0; 4]
+  let mut i: usize = 0
+  while i < 9 {
+    monogramHisto[i % 3] = u32.wrappingAdd(monogramHisto[i % 3], bigramHisto[i])
+    twoPrefixHisto[i % 6] = u32.wrappingAdd(twoPrefixHisto[i % 6], bigramHisto[i])
+    i = i + 1
+  }
+  entropy[1] = estimateEntropy(&monogramHisto, 0, 3)
+  entropy[2] = estimateEntropy(&twoPrefixHisto, 0, 3) + estimateEntropy(&twoPrefixHisto, 3, 3)
+  entropy[3] = 0.0
+  i = 0
+  while i < 3 {
+    entropy[3] = entropy[3] + estimateEntropy(bigramHisto, 3 * i, 3)
+    i = i + 1
+  }
+
+  // The sum is 32-bit arithmetic in C.
+  let total = u32.toUsize(u32.wrappingAdd(u32.wrappingAdd(monogramHisto[0], monogramHisto[1]), monogramHisto[2]))
+  entropy[0] = 1.0 / usize.toF64(total)
+  entropy[1] = entropy[1] * entropy[0]
+  entropy[2] = entropy[2] * entropy[0]
+  entropy[3] = entropy[3] * entropy[0]
+
+  if quality < MIN_QUALITY_FOR_HQ_CONTEXT_MODELING {
+    // 3 context models is a bit slower, don't use it at lower qualities.
+    entropy[3] = entropy[1] * 10.0
+  }
+  // If expected savings by symbol are less than 0.2 bits, skip the context modeling -- in exchange
+  // for faster decoding speed.
+  if entropy[1] - entropy[2] < 0.2 && entropy[1] - entropy[3] < 0.2 {
+    model.numLiteralContexts = 1
+  } else if entropy[2] - entropy[3] < 0.02 {
+    model.numLiteralContexts = 2
+    model.literalContextMap = CONTEXT_MAP_SIMPLE_UTF8
+  } else {
+    model.numLiteralContexts = 3
+    model.literalContextMap = CONTEXT_MAP_CONTINUATION
+  }
+}
+
+// `ShouldUseComplexStaticContextMap`: decides if we want to use a more complex static context map
+// containing 13 context values, based on the entropy reduction of histograms over the first 5
+// bits of literals.
+fn shouldUseComplexStaticContextMap(input: &[u8], start: usize, length: usize, mask: usize, sizeHint: usize, model: &mut LiteralContextModel, arena: &mut [u32]) -> bool {
+  // Try the more complex static context map only for long data.
+  if sizeHint < 1048576 {
+    return false
+  }
+  let mut startPos = start
+  let endPos = startPos + length
+  // To make entropy calculations faster, we collect histograms over the 5 most significant bits
+  // of literals. One histogram without context (at 0) and 13 additional histograms for each
+  // context value (from 32).
+  let mut total: u32 = 0
+  let mut entropy: [f64; 3] = [0.0; 3]
+  let lookup = contextLookupTable()
+  let utf8Lut = usize.shiftLeft(u32.toUsize(CONTEXT_UTF8), 9)
+  let mut i: usize = 0
+  while i < 32 * (MAX_STATIC_CONTEXTS + 1) {
+    arena[i] = 0
+    i = i + 1
+  }
+  while startPos + 64 <= endPos {
+    let strideEndPos = startPos + 64
+    let mut prev2 = input[startPos & mask]
+    let mut prev1 = input[(startPos + 1) & mask]
+    // To make the analysis of the data faster we only examine 64 byte long strides at every 4kB
+    // intervals.
+    let mut pos = startPos + 2
+    while pos < strideEndPos {
+      let literal = input[pos & mask]
+      let contextValue = STATIC_CONTEXT_MAP_COMPLEX_UTF8[u8.toUsize(context(lookup, utf8Lut, prev1, prev2))] & 0xff
+      total = u32.wrappingAdd(total, 1)
+      let combined = u8.toUsize(literal) / 8
+      arena[combined] = arena[combined] + 1
+      let slot = 32 + usize.shiftLeft(u32.toUsize(contextValue), 5) + combined
+      arena[slot] = arena[slot] + 1
+      prev2 = prev1
+      prev1 = literal
+      pos = pos + 1
+    }
+    startPos = startPos + 4096
+  }
+  entropy[1] = estimateEntropy(&arena, 0, 32)
+  entropy[2] = 0.0
+  i = 0
+  while i < MAX_STATIC_CONTEXTS {
+    entropy[2] = entropy[2] + estimateEntropy(&arena, 32 + usize.shiftLeft(i, 5), 32)
+    i = i + 1
+  }
+  entropy[0] = 1.0 / u32.toF64(total)
+  entropy[1] = entropy[1] * entropy[0]
+  entropy[2] = entropy[2] * entropy[0]
+  // The triggering heuristics below were tuned by compressing the individual files of the silesia
+  // corpus. If we skip this kind of context modeling for not very well compressible input (i.e.
+  // entropy using context modeling is 60% of maximal entropy) or if expected savings by symbol
+  // are less than 0.2 bits, then in every case when it triggers, the final compression ratio is
+  // improved. Note however that this heuristics might be too strict for some cases and could be
+  // tuned further.
+  if entropy[2] > 3.0 || entropy[1] - entropy[2] < 0.2 {
+    return false
+  }
+  model.numLiteralContexts = MAX_STATIC_CONTEXTS
+  model.literalContextMap = CONTEXT_MAP_COMPLEX_UTF8
+  return true
+}
+
+const BIGRAM_LUT: [usize; 4] = [0, 0, 1, 2]
+
+/// `DecideOverLiteralContextModeling`. `arena` holds `32 * (MAX_STATIC_CONTEXTS + 1)` counts.
+pub fn decideOverLiteralContextModeling(
+  input: &[u8],
+  start: usize,
+  length: usize,
+  mask: usize,
+  quality: i32,
+  sizeHint: usize,
+  model: &mut LiteralContextModel,
+  arena: &mut [u32],
+) -> () {
+  if quality < MIN_QUALITY_FOR_CONTEXT_MODELING || length < 64 {
+    return ()
+  } else if shouldUseComplexStaticContextMap(input, start, length, mask, sizeHint, &mut model, &mut arena) {
+    // Context map was already set, nothing else to do.
+  } else {
+    // Gather bi-gram data of the UTF8 byte prefixes. To make the analysis of UTF8 data faster we
+    // only examine 64 byte long strides at every 4kB intervals.
+    let mut startPos = start
+    let endPos = startPos + length
+    let mut i: usize = 0
+    while i < 9 {
+      arena[i] = 0
+      i = i + 1
+    }
+    while startPos + 64 <= endPos {
+      let strideEndPos = startPos + 64
+      let mut prev = BIGRAM_LUT[u8.toUsize(input[startPos & mask]) / 64] * 3
+      let mut pos = startPos + 1
+      while pos < strideEndPos {
+        let literal = input[pos & mask]
+        let slot = prev + BIGRAM_LUT[u8.toUsize(literal) / 64]
+        arena[slot] = arena[slot] + 1
+        prev = BIGRAM_LUT[u8.toUsize(literal) / 64] * 3
+        pos = pos + 1
+      }
+      startPos = startPos + 4096
+    }
+    chooseContextMap(quality, &arena, &mut model)
+  }
+}
+
+// `ShouldCompress` of encode.c.
+fn shouldCompress(data: &[u8], mask: usize, lastFlushPos: u64, size: usize, numLiterals: usize, numCommands: usize) -> bool {
+  if size <= 2 { return false }
+  if numCommands < usize.shiftRight(size, 8) + 2 {
+    if usize.toF64(numLiterals) > 0.99 * usize.toF64(size) {
+      let mut literalHisto: [u32; 256] = [0; 256]
+      let sampleRate: u32 = 13
+      let invSampleRate: f64 = 1.0 / 13.0
+      let minEntropy: f64 = 7.92
+      let bitCostThreshold = usize.toF64(size) * minEntropy * invSampleRate
+      let t = (size + 13 - 1) / 13
+      let mut pos = u64.wrappingToU32(lastFlushPos)
+      let mut i: usize = 0
+      while i < t {
+        let symbol = u8.toUsize(data[u32.toUsize(pos) & mask])
+        literalHisto[symbol] = literalHisto[symbol] + 1
+        pos = u32.wrappingAdd(pos, sampleRate)
+        i = i + 1
+      }
+      if bitsEntropy(&literalHisto, 256) > bitCostThreshold {
+        return false
+      }
+    }
+  }
+  return true
+}
+
+// `ChooseContextMode`: chooses the literal context mode for a metablock.
+fn chooseContextMode(params: &EncoderParams, data: &[u8], pos: usize, mask: usize, length: usize) -> u32 {
+  // We only do the computation for the option of something else than CONTEXT_UTF8 for the highest
+  // qualities.
+  if params.quality >= MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING {
+    if !isMostlyUtf8(data, pos, mask, length, MIN_UTF8_RATIO) {
+      return CONTEXT_SIGNED
+    }
+  }
+  return CONTEXT_UTF8
+}
+
+// `WriteMetaBlockInternal`.
+effect fn writeMetaBlockInternal(
+  data: &[u8],
+  mask: usize,
+  lastFlushPos: u64,
+  size: usize,
+  isLast: bool,
+  literalContextMode: u32,
+  params: &EncoderParams,
+  prevByte: u8,
+  prevByte2: u8,
+  numLiterals: usize,
+  numCommands: usize,
+  commands: &[Command],
+  savedDistCache: &[i32; 4],
+  distCache: &mut [i32; 16],
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let wrappedLastFlushPos = u32.toUsize(wrapPosition(lastFlushPos))
+
+  if size == 0 {
+    // Write the ISLAST and ISEMPTY bits.
+    writeBits(2, 3, &mut storageIx, &mut storage)
+    storageIx.* = (storageIx.* + 7) & usize.bitNot(7)
+    return ()
+  }
+
+  if !shouldCompress(data, mask, lastFlushPos, size, numLiterals, numCommands) {
+    // Restore the distance cache, as its last update by CreateBackwardReferences is now unused.
+    restoreDistCache(&mut distCache, savedDistCache)
+    storeUncompressedMetaBlock(isLast, data, wrappedLastFlushPos, mask, size, &mut storageIx, &mut storage)
+    return ()
+  }
+
+  let lastBytes = u16.shiftLeft(u8.toU16(storage[1]), 8) | u8.toU16(storage[0])
+  let lastBytesBits = storageIx.*
+  let mut stored = true
+  if params.quality <= MAX_QUALITY_FOR_STATIC_ENTROPY_CODES {
+    storeMetaBlockFast(data, wrappedLastFlushPos, size, mask, isLast, params, commands, numCommands, &mut storageIx, &mut storage)
+  } else if params.quality < MIN_QUALITY_FOR_BLOCK_SPLIT {
+    storeMetaBlockTrivial(data, wrappedLastFlushPos, size, mask, isLast, params, commands, numCommands, &mut storageIx, &mut storage)
+  } else {
+    if params.quality < MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING {
+      let mut model = LiteralContextModel { numLiteralContexts: 1, literalContextMap: CONTEXT_MAP_NONE }
+      if !params.disableLiteralContextModeling {
+        let mut arena = List<u32>.make()
+        run List<u32>.appendRepeated(&mut arena, 0, 32 * (MAX_STATIC_CONTEXTS + 1))
+        decideOverLiteralContextModeling(data, wrappedLastFlushPos, size, mask, params.quality, params.sizeHint, &mut model, List<u32>.asMutSlice(&mut arena))
+      }
+      // SEAM: `BrotliBuildMetaBlockGreedy(m, data, wrapped_last_flush_pos, mask, prev_byte,
+      // prev_byte2, literal_context_lut, model.numLiteralContexts, model.literalContextMap,
+      // commands, num_commands, &mb)` goes here.
+      stored = BUILDERS_PORTED && model.numLiteralContexts != 0
+    } else {
+      // SEAM: `BrotliBuildMetaBlock(m, data, wrapped_last_flush_pos, mask, &block_params,
+      // prev_byte, prev_byte2, commands, num_commands, literal_context_mode, &mb)` goes here.
+      stored = BUILDERS_PORTED && literalContextMode != 0 && prevByte == prevByte2
+    }
+    // SEAM: for quality >= MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS,
+    // `BrotliOptimizeHistograms(block_params.dist.alphabet_size_limit, &mb)`, and then
+    // `enc.bit_stream.storeMetaBlock(data, wrapped_last_flush_pos, bytes, mask, prev_byte,
+    // prev_byte2, is_last, &block_params, literal_context_mode, commands, num_commands, &mb,
+    // storage_ix, storage)` go here.
+  }
+  // PLACEHOLDER: a meta-block that could not be built is stored uncompressed, like one that did
+  // not shrink.
+  if !stored || size + 4 < usize.shiftRight(storageIx.*, 3) {
+    // Restore the distance cache and last byte.
+    restoreDistCache(&mut distCache, savedDistCache)
+    storage[0] = u16.wrappingToU8(lastBytes)
+    storage[1] = u16.wrappingToU8(u16.shiftRight(lastBytes, 8))
+    storageIx.* = lastBytesBits
+    storeUncompressedMetaBlock(isLast, data, wrappedLastFlushPos, mask, size, &mut storageIx, &mut storage)
+  }
+}
+
+fn restoreDistCache(distCache: &mut [i32; 16], savedDistCache: &[i32; 4]) -> () {
+  distCache[0] = savedDistCache[0]
+  distCache[1] = savedDistCache[1]
+  distCache[2] = savedDistCache[2]
+  distCache[3] = savedDistCache[3]
+}
+
+// `ChooseDistanceParams`.
+fn chooseDistanceParams(params: &mut EncoderParams) -> () {
+  let mut distancePostfixBits: u32 = 0
+  let mut numDirectDistanceCodes: u32 = 0
+
+  if params.quality >= MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS {
+    if params.mode == MODE_FONT {
+      distancePostfixBits = 1
+      numDirectDistanceCodes = 12
+    } else {
+      distancePostfixBits = params.dist.distancePostfixBits
+      numDirectDistanceCodes = params.dist.numDirectDistanceCodes
+    }
+    // A shift count of 32 or more is undefined in C; any such postfix is rejected below, as it
+    // is with the x86 shift that the reference build uses.
+    let ndirectMsb = u32.shiftRight(numDirectDistanceCodes, distancePostfixBits & 31) & 0x0f
+    if distancePostfixBits > MAX_NPOSTFIX || numDirectDistanceCodes > MAX_NDIRECT || u32.shiftLeft(ndirectMsb, distancePostfixBits & 31) != numDirectDistanceCodes {
+      distancePostfixBits = 0
+      numDirectDistanceCodes = 0
+    }
+  }
+
+  initDistanceParams(&mut params.dist, distancePostfixBits, numDirectDistanceCodes, params.largeWindow)
+}
+
+// The result of `EncodeData`: whether it succeeded, and where its output is if it produced any
+// (`*output` and `*out_size` of the C function; `kind` is `OUT_NONE` when `*output` is not set).
+struct Encoded {
+  ok: bool,
+  kind: u32,
+  size: usize,
+}
+
 /// A streaming encoder, `BrotliEncoderState` of the C API.
 pub struct BrotliEncoder {
-  finished: bool,
+  params: EncoderParams,
+  inputPos: u64,
+  ringbuffer: RingBuffer,
+  // `commands_` and `cmd_alloc_size_`.
+  commands: Intrinsic.RawBuffer<Command>,
+  cmdAllocSize: usize,
+  numCommands: usize,
+  numLiterals: usize,
+  lastInsertLen: usize,
+  lastFlushPos: u64,
+  lastProcessedPos: u64,
+  distCache: [i32; 16],
+  savedDistCache: [i32; 4],
+  lastBytes: u16,
+  lastBytesBits: u8,
+  // `BrotliEncoderFlintState`.
+  flint: i32,
+  prevByte: u8,
+  prevByte2: u8,
+  // `storage_` and `storage_size_`.
+  storage: Intrinsic.RawBuffer<u8>,
+  storageSize: usize,
+  hasher: Hasher,
+  // Hash table for FAST_ONE_PASS_COMPRESSION_QUALITY mode: 4KiB.
+  smallTable: [u32; 1024],
+  // Allocated only when needed.
+  largeTable: Intrinsic.RawBuffer<u32>,
+  largeTableSize: usize,
+  // `one_pass_arena_` and `two_pass_arena_`: empty until the encoder starts at that quality.
+  onePassArena: List<OnePassArena>,
+  twoPassArena: List<TwoPassArena>,
+  // Command and literal buffers for FAST_TWO_PASS_COMPRESSION_QUALITY.
+  commandBuf: Intrinsic.RawBuffer<u32>,
+  literalBuf: Intrinsic.RawBuffer<u8>,
+  hasCommandBuf: bool,
+  totalIn: u64,
+  // `next_out_`: `OUT_NONE`, or an offset into `storage` or into `tinyBuf`.
+  nextOutKind: u32,
+  nextOutOffset: usize,
+  availableOut: usize,
+  totalOut: u64,
+  // `tiny_buf_`: temporary buffer for padding flush bits or metadata block header / body, in the
+  // first 16 bytes. The 4 bytes after it are `remaining_metadata_bytes_`, as in the C structure
+  // on x86-64: a byte padding block that is appended to 16 bytes of metadata body in this buffer
+  // lands there in C, and with this layout it does the same here.
+  tinyBuf: [u8; 20],
+  streamState: u32,
+  isLastBlockEmitted: bool,
+  isInitialized: bool,
+  // The input consumed and the output written by the current call.
+  callConsumed: usize,
+  callWritten: usize,
 }
 
 impl BrotliEncoder {
   /// `BrotliEncoderCreateInstance`.
   pub effect fn make() -> BrotliEncoder ! OutOfMemoryError ? &mut Allocator {
-    return BrotliEncoder { finished: false }
+    let commandLayout = Layout { bytes: 0, alignment: 4 }
+    let commandAllocation = run Allocator.allocate(move commandLayout)
+    return BrotliEncoder {
+      params: EncoderParams.make(),
+      inputPos: 0,
+      ringbuffer: run RingBuffer.make(),
+      // No command is stored in an empty buffer.
+      commands: unsafe RawBuffer.from<Command>(move commandAllocation, 0),
+      cmdAllocSize: 0,
+      numCommands: 0,
+      numLiterals: 0,
+      lastInsertLen: 0,
+      lastFlushPos: 0,
+      lastProcessedPos: 0,
+      // Initialize distance cache.
+      distCache: [4, 11, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      // Save the state of the distance cache in case we need to restore it for emitting an
+      // uncompressed block.
+      savedDistCache: [4, 11, 15, 16],
+      lastBytes: 0,
+      lastBytesBits: 0,
+      flint: FLINT_DONE,
+      prevByte: 0,
+      prevByte2: 0,
+      storage: run uninitializedBytes(0),
+      storageSize: 0,
+      hasher: Hasher.make(),
+      smallTable: [0; 1024],
+      largeTable: run zeroedWords(0),
+      largeTableSize: 0,
+      onePassArena: List<OnePassArena>.make(),
+      twoPassArena: List<TwoPassArena>.make(),
+      commandBuf: run uninitializedWords(0),
+      literalBuf: run uninitializedBytes(0),
+      hasCommandBuf: false,
+      totalIn: 0,
+      nextOutKind: OUT_NONE,
+      nextOutOffset: 0,
+      availableOut: 0,
+      totalOut: 0,
+      tinyBuf: [0; 20],
+      streamState: STREAM_PROCESSING,
+      isLastBlockEmitted: false,
+      isInitialized: false,
+      callConsumed: 0,
+      callWritten: 0,
+    }
   }
 
   /// `BrotliEncoderSetParameter`: false when the encoder has started or the parameter is unknown.
   pub fn setParameter(self: &mut Self, parameter: u32, value: u32) -> bool {
+    // Changing parameters on the fly is not implemented yet.
+    if self.isInitialized { return false }
+    if parameter == PARAM_MODE {
+      self.params.mode = value
+      return true
+    } else if parameter == PARAM_QUALITY {
+      self.params.quality = u32.wrappingToI32(value)
+      return true
+    } else if parameter == PARAM_LGWIN {
+      self.params.lgwin = u32.wrappingToI32(value)
+      return true
+    } else if parameter == PARAM_LGBLOCK {
+      self.params.lgblock = u32.wrappingToI32(value)
+      return true
+    } else if parameter == PARAM_DISABLE_LITERAL_CONTEXT_MODELING {
+      if value != 0 && value != 1 { return false }
+      self.params.disableLiteralContextModeling = value != 0
+      return true
+    } else if parameter == PARAM_SIZE_HINT {
+      self.params.sizeHint = u32.toUsize(value)
+      return true
+    } else if parameter == PARAM_LARGE_WINDOW {
+      self.params.largeWindow = value != 0
+      return true
+    } else if parameter == PARAM_NPOSTFIX {
+      self.params.dist.distancePostfixBits = value
+      return true
+    } else if parameter == PARAM_NDIRECT {
+      self.params.dist.numDirectDistanceCodes = value
+      return true
+    } else if parameter == PARAM_STREAM_OFFSET {
+      if value > 1073741824 { return false }
+      self.params.streamOffset = u32.toUsize(value)
+      return true
+    }
     return false
   }
 
   /// `BrotliEncoderAttachPreparedDictionary`. The encoder takes the dictionary.
+  ///
+  /// PLACEHOLDER: prepared dictionaries are not ported; nothing is attached.
   pub effect fn attachPreparedDictionary(self: &mut Self, dictionary: PreparedDictionary) -> bool ? &mut Allocator {
     drop dictionary
     return false
   }
 
-  /// `BrotliEncoderCompressStream` with `next_out` set.
+  /// `BrotliEncoderCompressStream` with `next_out` set: compresses `input` into `output` under
+  /// `operation` (one of `OPERATION_*`), as far as the output space allows.
   pub effect fn compressStream(self: &mut Self, operation: u32, input: &[u8], output: &mut [u8]) -> EncodeStep ? &mut Allocator {
-    return EncodeStep { ok: false, consumed: 0, written: 0 }
+    self.callConsumed = 0
+    self.callWritten = 0
+    // The C encoder turns an allocation failure into a failed call.
+    let ok = match move run Effect.result(BrotliEncoder.compressStreamInner(&mut self, operation, input, &mut output)) {
+      Result<bool, OutOfMemoryError>.Success { value } => value
+      Result<bool, OutOfMemoryError>.Failure { .. } => false
+    }
+    return EncodeStep { ok: ok, consumed: self.callConsumed, written: self.callWritten }
   }
 
   /// `BrotliEncoderIsFinished`.
   pub fn isFinished(self: &Self) -> bool {
-    return self.finished
+    return self.streamState == STREAM_FINISHED && !BrotliEncoder.hasMoreOutput(&self)
   }
 
   /// `BrotliEncoderHasMoreOutput`.
   pub fn hasMoreOutput(self: &Self) -> bool {
+    return self.availableOut != 0
+  }
+
+  // `remaining_metadata_bytes_`; see `tinyBuf`.
+  fn remainingMetadataBytes(self: &Self) -> u32 {
+    return u8.toU32(self.tinyBuf[16]) | u32.shiftLeft(u8.toU32(self.tinyBuf[17]), 8)
+      | u32.shiftLeft(u8.toU32(self.tinyBuf[18]), 16)
+      | u32.shiftLeft(u8.toU32(self.tinyBuf[19]), 24)
+  }
+
+  fn setRemainingMetadataBytes(self: &mut Self, value: u32) -> () {
+    self.tinyBuf[16] = u32.wrappingToU8(value)
+    self.tinyBuf[17] = u32.wrappingToU8(u32.shiftRight(value, 8))
+    self.tinyBuf[18] = u32.wrappingToU8(u32.shiftRight(value, 16))
+    self.tinyBuf[19] = u32.wrappingToU8(u32.shiftRight(value, 24))
+  }
+
+  // `InputBlockSize`.
+  fn inputBlockSize(self: &Self) -> usize {
+    return usize.shiftLeft(1, i32.toUsize(self.params.lgblock))
+  }
+
+  // `UnprocessedInputSize`.
+  fn unprocessedInputSize(self: &Self) -> u64 {
+    return self.inputPos - self.lastProcessedPos
+  }
+
+  // `RemainingInputBlockSize`.
+  fn remainingInputBlockSize(self: &Self) -> usize {
+    let delta = BrotliEncoder.unprocessedInputSize(&self)
+    let blockSize = BrotliEncoder.inputBlockSize(&self)
+    if delta >= usize.toU64(blockSize) { return 0 }
+    return blockSize - u64.toUsize(delta)
+  }
+
+  // `GetBrotliStorage`: storage of at least `size` bytes. Its old content is not kept.
+  effect fn getBrotliStorage(self: &mut Self, size: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.storageSize < size {
+      // Free the old storage first, as C does.
+      self.storage = run uninitializedBytes(0)
+      self.storageSize = 0
+      self.storage = run uninitializedBytes(size)
+      self.storageSize = size
+    }
+  }
+
+  // `GetHashTable`: clears the hash table for `inputSize` bytes at `quality` and returns its
+  // size. It is the start of `smallTable` when that is large enough, else of `largeTable`.
+  effect fn getHashTable(self: &mut Self, quality: i32, inputSize: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+    // Use smaller hash table when input.size() is smaller, since we fill the table, incurring
+    // O(hash table size) overhead for compression, and if the input is short, we won't need that
+    // many hash table entries anyway.
+    let maxTableSize = maxHashTableSize(quality)
+    let mut htsize = hashTableSize(maxTableSize, inputSize)
+    if quality == FAST_ONE_PASS_COMPRESSION_QUALITY {
+      // Only odd shifts are supported by fast-one-pass.
+      if (htsize & 0xaaaaa) == 0 {
+        htsize = usize.shiftLeft(htsize, 1)
+      }
+    }
+    if htsize <= 1024 {
+      let table = Slice.viewMut<u32>(&mut self.smallTable, 0, htsize)
+      let mut i: usize = 0
+      while i < htsize {
+        table[i] = 0
+        i = i + 1
+      }
+    } else {
+      if htsize > self.largeTableSize {
+        self.largeTableSize = htsize
+        self.largeTable = run zeroedWords(0)
+        self.largeTable = run zeroedWords(htsize)
+      }
+      let table = Slice.viewMut<u32>(wordsMut(&mut self.largeTable), 0, htsize)
+      let mut i: usize = 0
+      while i < htsize {
+        table[i] = 0
+        i = i + 1
+      }
+    }
+    return htsize
+  }
+
+  // `EnsureInitialized`.
+  effect fn ensureInitialized(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.isInitialized { return () }
+
+    self.lastBytesBits = 0
+    self.lastBytes = 0
+    self.flint = FLINT_DONE
+    BrotliEncoder.setRemainingMetadataBytes(&mut self, UINT32_MAX)
+
+    sanitizeParams(&mut self.params)
+    self.params.lgblock = computeLgBlock(&self.params)
+    chooseDistanceParams(&mut self.params)
+
+    if self.params.streamOffset != 0 {
+      self.flint = FLINT_NEEDS_2_BYTES
+      // Poison the distance cache. -16 +- 3 is still less than zero (invalid).
+      self.distCache[0] = -16
+      self.distCache[1] = -16
+      self.distCache[2] = -16
+      self.distCache[3] = -16
+      self.savedDistCache = [-16, -16, -16, -16]
+    }
+
+    RingBuffer.setup(&mut self.ringbuffer, &self.params)
+
+    // Initialize last byte with stream header.
+    let mut lgwin = self.params.lgwin
+    if self.params.quality == FAST_ONE_PASS_COMPRESSION_QUALITY || self.params.quality == FAST_TWO_PASS_COMPRESSION_QUALITY {
+      if lgwin < 18 { lgwin = 18 }
+    }
+    if self.params.streamOffset == 0 {
+      let header = encodeWindowBits(lgwin, self.params.largeWindow)
+      self.lastBytes = u32.wrappingToU16(header)
+      self.lastBytesBits = u32.wrappingToU8(u32.shiftRight(header, 16))
+    } else {
+      // Bigger values have the same effect, but could cause overflows.
+      let limit = maxBackwardLimit(i32.toU32(lgwin))
+      if self.params.streamOffset > limit { self.params.streamOffset = limit }
+    }
+
+    if self.params.quality == FAST_ONE_PASS_COMPRESSION_QUALITY {
+      run List<OnePassArena>.append(&mut self.onePassArena, OnePassArena.make())
+    } else if self.params.quality == FAST_TWO_PASS_COMPRESSION_QUALITY {
+      run List<TwoPassArena>.append(&mut self.twoPassArena, TwoPassArena.make())
+    }
+
+    self.isInitialized = true
+  }
+
+  // `CopyInputToRingBuffer`: copies the given input data to the internal ring buffer of the
+  // compressor. No processing of the data occurs at this time and this function can be called
+  // multiple times before calling `encodeData` to process the accumulated input. At most
+  // `inputBlockSize()` bytes of input data can be copied to the ring buffer, otherwise the next
+  // `encodeData` will fail.
+  effect fn copyInputToRingBuffer(self: &mut Self, input: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run RingBuffer.write(&mut self.ringbuffer, input)
+    self.inputPos = self.inputPos + usize.toU64(input.length)
+
+    // TL;DR: If needed, initialize 7 more bytes in the ring buffer to make the hashing not depend
+    // on uninitialized data. This makes compression deterministic and it prevents uninitialized
+    // memory warnings in Valgrind. Even without erasing, the output would be valid (but
+    // nondeterministic).
+    //
+    // Background information: The compressor stores short (at most 8 bytes) substrings of the
+    // input already read in a hash table, and detects repetitions by looking up such substrings
+    // in the hash table. If it can find a substring, it checks whether the substring is really
+    // there in the ring buffer (or it's just a hash collision). Should the hash table become
+    // corrupt, this check makes sure that the output is still valid, albeit the compression ratio
+    // would be bad.
+    //
+    // The compressor populates the hash table from the ring buffer as it's reading new bytes from
+    // the input. However, at the last few indexes of the ring buffer, there are not enough bytes
+    // to build full-length substrings from. Since the hash table always contains full-length
+    // substrings, we overwrite with zeros here to make sure that those substrings will contain
+    // zeros at the end instead of uninitialized data.
+    //
+    // Please note that erasing is not necessary (because the memory region is already initialized
+    // since the ring buffer has a `tail' that holds a copy of the beginning,) so we skip erasing
+    // if we have already gone around at least once in the ring buffer.
+    //
+    // Only clear during the first round of ring-buffer writes. On subsequent rounds data in the
+    // ring-buffer would be affected.
+    if self.ringbuffer.pos <= self.ringbuffer.mask {
+      // This is the first time when the ring buffer is being written. We clear 7 bytes just after
+      // the bytes that have been copied from the input buffer.
+      //
+      // The ring-buffer has a "tail" that holds a copy of the beginning, but only once the ring
+      // buffer has been fully written once, i.e., pos <= mask. For the first time, we need to
+      // write values in this tail (where index may be larger than mask), so that we have exactly
+      // defined behavior and don't read uninitialized memory. Due to performance reasons, hashing
+      // reads data using a LOAD64, which can go 7 bytes beyond the bytes written in the
+      // ring-buffer.
+      RingBuffer.clearSlack(&mut self.ringbuffer)
+    }
+  }
+
+  // `UpdateLastProcessedPos`: marks all input as processed. Returns true if position wrapping
+  // occurs.
+  fn updateLastProcessedPos(self: &mut Self) -> bool {
+    let wrappedLastProcessedPos = wrapPosition(self.lastProcessedPos)
+    let wrappedInputPos = wrapPosition(self.inputPos)
+    self.lastProcessedPos = self.inputPos
+    return wrappedInputPos < wrappedLastProcessedPos
+  }
+
+  // `ExtendLastCommand`: extends the copy of the last command over the start of the new input
+  // while it keeps matching. Returns the number of bytes that the copy took; the caller advances
+  // `bytes` and `wrapped_last_processed_pos` by it.
+  fn extendLastCommand(self: &mut Self, size: u32, wrappedLastProcessedPos: u32) -> u32 {
+    let commands = unsafe RawBuffer.viewMut<Command>(&mut self.commands, 0, self.numCommands)
+    let last = self.numCommands - 1
+    let data = RingBuffer.buffer(&self.ringbuffer)
+    let mask = u32.toU64(self.ringbuffer.mask)
+    let maxBackwardDistance = u64.shiftLeft(1, i32.toU64(self.params.lgwin)) - usize.toU64(WINDOW_GAP)
+    let lastCopyLen = u32.toU64(commands[last].copyLen & 0x1ffffff)
+    let lastProcessedPos = u64.wrappingSubtract(self.lastProcessedPos, lastCopyLen)
+    let maxDistance = if lastProcessedPos < maxBackwardDistance { lastProcessedPos } else { maxBackwardDistance }
+    // The `int` is converted to `uint64_t`, with its sign.
+    let cmdDist = i32.wrappingToU64(self.distCache[0])
+    let distanceCode = Command.restoreDistanceCode(&commands[last], &self.params.dist)
+    let mut taken: u32 = 0
+    if distanceCode < 16 || u32.toU64(distanceCode - 15) == cmdDist {
+      if cmdDist <= maxDistance {
+        let mut position = u32.toU64(wrappedLastProcessedPos)
+        while taken != size && data[u64.toUsize(position & mask)] == data[u64.toUsize(u64.wrappingSubtract(position, cmdDist) & mask)] {
+          commands[last].copyLen = u32.wrappingAdd(commands[last].copyLen, 1)
+          taken = taken + 1
+          // The position is a 32-bit value in C.
+          position = (position + 1) & 0xffffffff
+        }
+      } else {
+        // SEAM: the copy continues in an attached compound dictionary
+        // (`params.dictionary.compound`); without one, `compound.total_size` is 0 and nothing
+        // matches.
+      }
+      // The copy length is at most the metablock size, and thus expressible.
+      let copyLen = commands[last].copyLen
+      let codeLength = i32.wrappingToUsize(i32.wrappingAdd(u32.wrappingToI32(copyLen & 0x1ffffff), u32.wrappingToI32(u32.shiftRight(copyLen, 25))))
+      commands[last].cmdPrefix = getLengthCode(u32.toUsize(commands[last].insertLen), codeLength, (commands[last].distPrefix & 0x3ff) == 0)
+    }
+    return taken
+  }
+
+  // `EncodeData`: processes the accumulated input data and reports the new output meta-block, or
+  // a size of zero if no new output meta-block has been created (in this case the processed input
+  // data is buffered internally). If `isLast` or `forceFlush`, an output meta-block is always
+  // created. However, until `isLast` the encoder may retain up to 7 bits of the last byte of
+  // output. Byte-alignment could be enforced by emitting an empty meta-data block. Fails if the
+  // size of the input data is larger than `inputBlockSize()`.
+  effect fn encodeData(self: &mut Self, isLast: bool, forceFlush: bool) -> Encoded ! OutOfMemoryError ? &mut Allocator {
+    let delta = BrotliEncoder.unprocessedInputSize(&self)
+    let mut size = u64.wrappingToU32(delta)
+    let mut wrappedLastProcessedPos = wrapPosition(self.lastProcessedPos)
+    let mask = u32.toUsize(self.ringbuffer.mask)
+    let fastCompress = self.params.quality == FAST_ONE_PASS_COMPRESSION_QUALITY || self.params.quality == FAST_TWO_PASS_COMPRESSION_QUALITY
+
+    if delta == 0 {
+      // No new input; still might want to flush or finish.
+      if !self.ringbuffer.allocated {
+        // No input has been processed so far.
+        if isLast {
+          // Emit complete finalized stream.
+          self.lastBytes = self.lastBytes | u32.wrappingToU16(u32.shiftLeft(3, u8.toU32(self.lastBytesBits)))
+          self.lastBytesBits = self.lastBytesBits + 2
+          self.tinyBuf[0] = u16.wrappingToU8(self.lastBytes)
+          self.tinyBuf[1] = u16.wrappingToU8(u16.shiftRight(self.lastBytes, 8))
+          return Encoded { ok: true, kind: OUT_TINY, size: usize.shiftRight(u8.toUsize(self.lastBytesBits) + 7, 3) }
+        } else {
+          // No data, not last -> no-op.
+          return Encoded { ok: true, kind: OUT_NONE, size: 0 }
+        }
+      } else {
+        // Fast compress performs flush every block -> flush is no-op.
+        if !isLast && (!forceFlush || fastCompress) {
+          // Another no-op.
+          return Encoded { ok: true, kind: OUT_NONE, size: 0 }
+        }
+      }
+    }
+
+    if self.params.quality > self.params.dictionary.maxQuality { return Encoded { ok: false, kind: OUT_NONE, size: 0 } }
+    // Adding more blocks after "last" block is forbidden.
+    if self.isLastBlockEmitted { return Encoded { ok: false, kind: OUT_NONE, size: 0 } }
+    if isLast { self.isLastBlockEmitted = true }
+
+    if delta > usize.toU64(BrotliEncoder.inputBlockSize(&self)) {
+      return Encoded { ok: false, kind: OUT_NONE, size: 0 }
+    }
+    if self.params.quality == FAST_TWO_PASS_COMPRESSION_QUALITY && !self.hasCommandBuf {
+      self.commandBuf = run uninitializedWords(COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE)
+      self.literalBuf = run uninitializedBytes(COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE)
+      self.hasCommandBuf = true
+    }
+
+    if fastCompress {
+      let mut storageIx = u8.toUsize(self.lastBytesBits)
+      let length = u32.toUsize(size)
+      run BrotliEncoder.getBrotliStorage(&mut self, 2 * length + 503)
+      let quality = self.params.quality
+      let tableSize = run BrotliEncoder.getHashTable(&mut self, quality, length)
+      let storage = bytesMut(&mut self.storage)
+      storage[0] = u16.wrappingToU8(self.lastBytes)
+      storage[1] = u16.wrappingToU8(u16.shiftRight(self.lastBytes, 8))
+      let block = Slice.view<u8>(RingBuffer.buffer(&self.ringbuffer), u32.toUsize(wrappedLastProcessedPos) & mask, length)
+      let table = if tableSize <= 1024 { Slice.viewMut<u32>(&mut self.smallTable, 0, tableSize) } else { Slice.viewMut<u32>(wordsMut(&mut self.largeTable), 0, tableSize) }
+      if self.params.quality == FAST_ONE_PASS_COMPRESSION_QUALITY {
+        compressFragmentFast(&mut List<OnePassArena>.asMutSlice(&mut self.onePassArena)[0], block, isLast, &mut table, &mut storageIx, &mut storage)
+      } else {
+        compressFragmentTwoPass(
+          &mut List<TwoPassArena>.asMutSlice(&mut self.twoPassArena)[0],
+          block,
+          isLast,
+          wordsMut(&mut self.commandBuf),
+          bytesMut(&mut self.literalBuf),
+          &mut table,
+          &mut storageIx,
+          &mut storage,
+        )
+      }
+      self.lastBytes = u8.toU16(storage[usize.shiftRight(storageIx, 3)])
+      self.lastBytesBits = usize.wrappingToU8(storageIx & 7)
+      drop BrotliEncoder.updateLastProcessedPos(&mut self)
+      return Encoded { ok: true, kind: OUT_STORAGE, size: usize.shiftRight(storageIx, 3) }
+    }
+
+    // Theoretical max number of commands is 1 per 2 bytes.
+    let mut newsize = self.numCommands + u32.toUsize(size) / 2 + 1
+    if newsize > self.cmdAllocSize {
+      // Reserve a bit more memory to allow merging with a next block without reallocation: that
+      // would impact speed.
+      newsize = newsize + (u32.toUsize(size) / 4) + 16
+      self.cmdAllocSize = newsize
+      // 16 bytes for each command, as in C; the commands are written before they are read.
+      let allocation = run Allocator.allocate(Layout { bytes: newsize * 16, alignment: 4 })
+      let mut newCommands = unsafe RawBuffer.from<Command>(move allocation, newsize)
+      let count = self.numCommands
+      if count != 0 {
+        let old = unsafe RawBuffer.view<Command>(&self.commands, 0, count)
+        Slice.copyInto<Command>(unsafe RawBuffer.viewMut<Command>(&mut newCommands, 0, count), 0, old)
+      }
+      self.commands = move newCommands
+    }
+
+    run Hasher.initOrStitchToPreviousBlock(&mut self.hasher, RingBuffer.buffer(&self.ringbuffer), mask, &mut self.params, u32.toUsize(wrappedLastProcessedPos), u32.toUsize(size), isLast)
+
+    let literalContextMode = chooseContextMode(
+      &self.params,
+      RingBuffer.buffer(&self.ringbuffer),
+      u32.toUsize(wrapPosition(self.lastFlushPos)),
+      mask,
+      u64.toUsize(self.inputPos - self.lastFlushPos),
+    )
+    let literalContextLut = usize.shiftLeft(u32.toUsize(literalContextMode), 9)
+
+    if self.numCommands != 0 && self.lastInsertLen == 0 {
+      let taken = BrotliEncoder.extendLastCommand(&mut self, size, wrappedLastProcessedPos)
+      size = size - taken
+      wrappedLastProcessedPos = u32.wrappingAdd(wrappedLastProcessedPos, taken)
+    }
+
+    // SEAM: `BrotliCreateZopfliBackwardReferences` at quality 10 and
+    // `BrotliCreateHqZopfliBackwardReferences` at quality 11 take the same arguments; both are
+    // served by the placeholder until they are ported.
+    let allocated = self.cmdAllocSize
+    let first = self.numCommands
+    createBackwardReferences(
+      u32.toUsize(size),
+      u32.toUsize(wrappedLastProcessedPos),
+      RingBuffer.buffer(&self.ringbuffer),
+      mask,
+      literalContextLut,
+      &self.params,
+      &mut self.hasher,
+      &mut self.distCache,
+      &mut self.lastInsertLen,
+      unsafe RawBuffer.viewMut<Command>(&mut self.commands, first, allocated - first),
+      &mut self.numCommands,
+      &mut self.numLiterals,
+    )
+
+    let maxLength = maxMetablockSize(&self.params)
+    let maxLiterals = maxLength / 8
+    let maxCommands = maxLength / 8
+    let processedBytes = u64.toUsize(self.inputPos - self.lastFlushPos)
+    // If maximal possible additional block doesn't fit metablock, flush now.
+    let nextInputFitsMetablock = processedBytes + BrotliEncoder.inputBlockSize(&self) <= maxLength
+    // If block splitting is not used, then flush as soon as there is some amount of commands /
+    // literals produced.
+    let shouldFlush = self.params.quality < MIN_QUALITY_FOR_BLOCK_SPLIT && self.numLiterals + self.numCommands >= MAX_NUM_DELAYED_SYMBOLS
+    if !isLast && !forceFlush && !shouldFlush && nextInputFitsMetablock && self.numLiterals < maxLiterals && self.numCommands < maxCommands {
+      // Merge with next input block. Everything will happen later.
+      if BrotliEncoder.updateLastProcessedPos(&mut self) {
+        Hasher.reset(&mut self.hasher)
+      }
+      return Encoded { ok: true, kind: OUT_NONE, size: 0 }
+    }
+
+    // Create the last insert-only command.
+    if self.lastInsertLen > 0 {
+      let commands = unsafe RawBuffer.viewMut<Command>(&mut self.commands, 0, allocated)
+      commands[self.numCommands] = Command.makeInsert(self.lastInsertLen)
+      self.numCommands = self.numCommands + 1
+      self.numLiterals = self.numLiterals + self.lastInsertLen
+      self.lastInsertLen = 0
+    }
+
+    if !isLast && self.inputPos == self.lastFlushPos {
+      // We have no new input data and we don't have to finish the stream, so nothing to do.
+      return Encoded { ok: true, kind: OUT_NONE, size: 0 }
+    }
+    let metablockSize = u64.toUsize((self.inputPos - self.lastFlushPos) & 0xffffffff)
+    run BrotliEncoder.getBrotliStorage(&mut self, 2 * metablockSize + 503)
+    let mut storageIx = u8.toUsize(self.lastBytesBits)
+    let storage = bytesMut(&mut self.storage)
+    storage[0] = u16.wrappingToU8(self.lastBytes)
+    storage[1] = u16.wrappingToU8(u16.shiftRight(self.lastBytes, 8))
+    run writeMetaBlockInternal(
+      RingBuffer.buffer(&self.ringbuffer),
+      mask,
+      self.lastFlushPos,
+      metablockSize,
+      isLast,
+      literalContextMode,
+      &self.params,
+      self.prevByte,
+      self.prevByte2,
+      self.numLiterals,
+      self.numCommands,
+      unsafe RawBuffer.view<Command>(&self.commands, 0, self.numCommands),
+      &self.savedDistCache,
+      &mut self.distCache,
+      &mut storageIx,
+      &mut storage,
+    )
+    self.lastBytes = u8.toU16(storage[usize.shiftRight(storageIx, 3)])
+    self.lastBytesBits = usize.wrappingToU8(storageIx & 7)
+    self.lastFlushPos = self.inputPos
+    if BrotliEncoder.updateLastProcessedPos(&mut self) {
+      Hasher.reset(&mut self.hasher)
+    }
+    let data = RingBuffer.buffer(&self.ringbuffer)
+    if self.lastFlushPos > 0 {
+      self.prevByte = data[u32.toUsize(u32.wrappingSubtract(u64.wrappingToU32(self.lastFlushPos), 1)) & mask]
+    }
+    if self.lastFlushPos > 1 {
+      self.prevByte2 = data[u32.toUsize(u64.wrappingToU32(self.lastFlushPos - 2)) & mask]
+    }
+    self.numCommands = 0
+    self.numLiterals = 0
+    // Save the state of the distance cache in case we need to restore it for emitting an
+    // uncompressed block.
+    self.savedDistCache = [self.distCache[0], self.distCache[1], self.distCache[2], self.distCache[3]]
+    return Encoded { ok: true, kind: OUT_STORAGE, size: usize.shiftRight(storageIx, 3) }
+  }
+
+  // `EncodeData(s, is_last, force_flush, &s->available_out_, &s->next_out_)`.
+  effect fn encodeDataToOutput(self: &mut Self, isLast: bool, forceFlush: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let encoded = run BrotliEncoder.encodeData(&mut self, isLast, forceFlush)
+    if !encoded.ok { return false }
+    self.availableOut = encoded.size
+    if encoded.kind != OUT_NONE {
+      self.nextOutKind = encoded.kind
+      self.nextOutOffset = 0
+    }
+    return true
+  }
+
+  // `WriteMetadataHeader`: dumps remaining output bits and metadata header to `tinyBuf`. Returns
+  // the number of produced bytes. REQUIRED: `blockSize` <= (1 << 24).
+  fn writeMetadataHeader(self: &mut Self, blockSize: usize) -> usize {
+    let mut storageIx = u8.toUsize(self.lastBytesBits)
+    let header = Slice.viewMut<u8>(&mut self.tinyBuf, 0, 16)
+    header[0] = u16.wrappingToU8(self.lastBytes)
+    header[1] = u16.wrappingToU8(u16.shiftRight(self.lastBytes, 8))
+    self.lastBytes = 0
+    self.lastBytesBits = 0
+
+    writeBits(1, 0, &mut storageIx, &mut header)
+    writeBits(2, 3, &mut storageIx, &mut header)
+    writeBits(1, 0, &mut storageIx, &mut header)
+    if blockSize == 0 {
+      writeBits(2, 0, &mut storageIx, &mut header)
+    } else {
+      let nbits: u32 = if blockSize == 1 { 1 } else { log2FloorNonZero32(usize.wrappingToU32(blockSize) - 1) + 1 }
+      let nbytes = (nbits + 7) / 8
+      writeBits(2, u32.toU64(nbytes), &mut storageIx, &mut header)
+      writeBits(u32.toUsize(8 * nbytes), usize.toU64(blockSize - 1), &mut storageIx, &mut header)
+    }
+    return usize.shiftRight(storageIx + 7, 3)
+  }
+
+  // `InjectBytePaddingBlock`.
+  fn injectBytePaddingBlock(self: &mut Self) -> () {
+    let mut seal = u16.toU32(self.lastBytes)
+    let mut sealBits = u8.toUsize(self.lastBytesBits)
+    self.lastBytes = 0
+    self.lastBytesBits = 0
+    // is_last = 0, data_nibbles = 11, reserved = 0, meta_nibbles = 00
+    seal = seal | u32.shiftLeft(0x6, usize.toU32(sealBits))
+    sealBits = sealBits + 6
+    // If we have already created storage, then append to it. Storage is valid until next block is
+    // being compressed.
+    if self.nextOutKind == OUT_NONE {
+      self.nextOutKind = OUT_TINY
+      self.nextOutOffset = 0
+    }
+    let at = self.nextOutOffset + self.availableOut
+    if self.nextOutKind == OUT_STORAGE {
+      let destination = bytesMut(&mut self.storage)
+      destination[at] = u32.wrappingToU8(seal)
+      if sealBits > 8 { destination[at + 1] = u32.wrappingToU8(u32.shiftRight(seal, 8)) }
+      if sealBits > 16 { destination[at + 2] = u32.wrappingToU8(u32.shiftRight(seal, 16)) }
+    } else {
+      self.tinyBuf[at] = u32.wrappingToU8(seal)
+      if sealBits > 8 { self.tinyBuf[at + 1] = u32.wrappingToU8(u32.shiftRight(seal, 8)) }
+      if sealBits > 16 { self.tinyBuf[at + 2] = u32.wrappingToU8(u32.shiftRight(seal, 16)) }
+    }
+    self.availableOut = self.availableOut + usize.shiftRight(sealBits + 7, 3)
+  }
+
+  // `InjectFlushOrPushOutput`: injects padding bits or pushes compressed data to output. Returns
+  // false if nothing is done.
+  fn injectFlushOrPushOutput(self: &mut Self, output: &mut [u8]) -> bool {
+    if self.streamState == STREAM_FLUSH_REQUESTED && self.lastBytesBits != 0 {
+      BrotliEncoder.injectBytePaddingBlock(&mut self)
+      return true
+    }
+
+    let space = output.length - self.callWritten
+    if self.availableOut != 0 && space != 0 {
+      let copyOutputSize = if self.availableOut < space { self.availableOut } else { space }
+      if self.nextOutKind == OUT_STORAGE {
+        Slice.copyInto<u8>(&mut output, self.callWritten, Slice.view<u8>(bytes(&self.storage), self.nextOutOffset, copyOutputSize))
+      } else {
+        Slice.copyInto<u8>(&mut output, self.callWritten, Slice.view<u8>(&self.tinyBuf, self.nextOutOffset, copyOutputSize))
+      }
+      self.callWritten = self.callWritten + copyOutputSize
+      self.nextOutOffset = self.nextOutOffset + copyOutputSize
+      self.availableOut = self.availableOut - copyOutputSize
+      self.totalOut = self.totalOut + usize.toU64(copyOutputSize)
+      return true
+    }
+
     return false
+  }
+
+  // `CheckFlushComplete`.
+  fn checkFlushComplete(self: &mut Self) -> () {
+    if self.streamState == STREAM_FLUSH_REQUESTED && self.availableOut == 0 {
+      self.streamState = STREAM_PROCESSING
+      self.nextOutKind = OUT_NONE
+      self.nextOutOffset = 0
+    }
+  }
+
+  // `BrotliEncoderCompressStreamFast`: qualities 0 and 1 compress each piece of input on its own,
+  // straight from the caller's input and, where the output space allows, into the caller's
+  // output.
+  effect fn compressStreamFast(self: &mut Self, op: u32, input: &[u8], output: &mut [u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let blockSizeLimit = usize.shiftLeft(1, i32.toUsize(self.params.lgwin))
+    let wanted = if input.length < blockSizeLimit { input.length } else { blockSizeLimit }
+    let bufSize = if COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE < wanted { COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE } else { wanted }
+    let quality = self.params.quality
+    if quality != FAST_ONE_PASS_COMPRESSION_QUALITY && quality != FAST_TWO_PASS_COMPRESSION_QUALITY {
+      return false
+    }
+    // The command and literal buffers of this call when the encoder has none of its own.
+    let mut tmpCommandBuf = run uninitializedWords(0)
+    let mut tmpLiteralBuf = run uninitializedBytes(0)
+    if quality == FAST_TWO_PASS_COMPRESSION_QUALITY {
+      if !self.hasCommandBuf && bufSize == COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE {
+        self.commandBuf = run uninitializedWords(COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE)
+        self.literalBuf = run uninitializedBytes(COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE)
+        self.hasCommandBuf = true
+      }
+      if !self.hasCommandBuf {
+        tmpCommandBuf = run uninitializedWords(bufSize)
+        tmpLiteralBuf = run uninitializedBytes(bufSize)
+      }
+    }
+
+    while true {
+      if BrotliEncoder.injectFlushOrPushOutput(&mut self, &mut output) {
+        continue
+      }
+      let availableIn = input.length - self.callConsumed
+
+      // Compress block only when internal output buffer is empty, stream is not finished, there is
+      // no pending flush request, and there is either additional input or pending operation.
+      if self.availableOut == 0 && self.streamState == STREAM_PROCESSING && (availableIn != 0 || op != OPERATION_PROCESS) {
+        let blockSize = if blockSizeLimit < availableIn { blockSizeLimit } else { availableIn }
+        let isLast = availableIn == blockSize && op == OPERATION_FINISH
+        let forceFlush = availableIn == blockSize && op == OPERATION_FLUSH
+        let maxOutSize = 2 * blockSize + 503
+        let mut storageIx = u8.toUsize(self.lastBytesBits)
+
+        if forceFlush && blockSize == 0 {
+          self.streamState = STREAM_FLUSH_REQUESTED
+          continue
+        }
+        let availableOut = output.length - self.callWritten
+        let inplace = maxOutSize <= availableOut
+        if !inplace {
+          run BrotliEncoder.getBrotliStorage(&mut self, maxOutSize)
+        }
+        let tableSize = run BrotliEncoder.getHashTable(&mut self, quality, blockSize)
+        let storage = if inplace { Slice.viewMut<u8>(&mut output, self.callWritten, availableOut) } else { bytesMut(&mut self.storage) }
+        storage[0] = u16.wrappingToU8(self.lastBytes)
+        storage[1] = u16.wrappingToU8(u16.shiftRight(self.lastBytes, 8))
+        let table = if tableSize <= 1024 { Slice.viewMut<u32>(&mut self.smallTable, 0, tableSize) } else { Slice.viewMut<u32>(wordsMut(&mut self.largeTable), 0, tableSize) }
+        let block = Slice.view<u8>(input, self.callConsumed, blockSize)
+
+        if quality == FAST_ONE_PASS_COMPRESSION_QUALITY {
+          compressFragmentFast(&mut List<OnePassArena>.asMutSlice(&mut self.onePassArena)[0], block, isLast, &mut table, &mut storageIx, &mut storage)
+        } else {
+          let commandBuf = if self.hasCommandBuf { wordsMut(&mut self.commandBuf) } else { wordsMut(&mut tmpCommandBuf) }
+          let literalBuf = if self.hasCommandBuf { bytesMut(&mut self.literalBuf) } else { bytesMut(&mut tmpLiteralBuf) }
+          compressFragmentTwoPass(&mut List<TwoPassArena>.asMutSlice(&mut self.twoPassArena)[0], block, isLast, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+        }
+        self.lastBytes = u8.toU16(storage[usize.shiftRight(storageIx, 3)])
+        self.lastBytesBits = usize.wrappingToU8(storageIx & 7)
+        if blockSize != 0 {
+          self.callConsumed = self.callConsumed + blockSize
+          self.totalIn = self.totalIn + usize.toU64(blockSize)
+        }
+        let outBytes = usize.shiftRight(storageIx, 3)
+        if inplace {
+          self.callWritten = self.callWritten + outBytes
+          self.totalOut = self.totalOut + usize.toU64(outBytes)
+        } else {
+          self.nextOutKind = OUT_STORAGE
+          self.nextOutOffset = 0
+          self.availableOut = outBytes
+        }
+
+        if forceFlush { self.streamState = STREAM_FLUSH_REQUESTED }
+        if isLast { self.streamState = STREAM_FINISHED }
+        continue
+      }
+      break
+    }
+    BrotliEncoder.checkFlushComplete(&mut self)
+    return true
+  }
+
+  // `ProcessMetadata`.
+  effect fn processMetadata(self: &mut Self, input: &[u8], output: &mut [u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if input.length > 16777216 { return false }
+    // Switch to metadata block workflow, if required.
+    if self.streamState == STREAM_PROCESSING {
+      BrotliEncoder.setRemainingMetadataBytes(&mut self, usize.wrappingToU32(input.length))
+      self.streamState = STREAM_METADATA_HEAD
+    }
+    if self.streamState != STREAM_METADATA_HEAD && self.streamState != STREAM_METADATA_BODY {
+      return false
+    }
+
+    while true {
+      if BrotliEncoder.injectFlushOrPushOutput(&mut self, &mut output) {
+        continue
+      }
+      if self.availableOut != 0 { break }
+
+      if self.inputPos != self.lastFlushPos {
+        let result = run BrotliEncoder.encodeDataToOutput(&mut self, false, true)
+        if !result { return false }
+        continue
+      }
+
+      if self.streamState == STREAM_METADATA_HEAD {
+        self.nextOutKind = OUT_TINY
+        self.nextOutOffset = 0
+        let remaining = BrotliEncoder.remainingMetadataBytes(&self)
+        self.availableOut = BrotliEncoder.writeMetadataHeader(&mut self, u32.toUsize(remaining))
+        self.streamState = STREAM_METADATA_BODY
+        continue
+      } else {
+        // Exit workflow only when there is no more input and no more output. Otherwise client may
+        // continue producing empty metadata blocks.
+        let remaining = BrotliEncoder.remainingMetadataBytes(&self)
+        if remaining == 0 {
+          BrotliEncoder.setRemainingMetadataBytes(&mut self, UINT32_MAX)
+          self.streamState = STREAM_PROCESSING
+          break
+        }
+        let space = output.length - self.callWritten
+        if space != 0 {
+          // Directly copy input to output.
+          let copy = if u32.toUsize(remaining) < space { u32.toUsize(remaining) } else { space }
+          Slice.copyInto<u8>(&mut output, self.callWritten, Slice.view<u8>(input, self.callConsumed, copy))
+          self.callConsumed = self.callConsumed + copy
+          // not actually data input, though
+          self.totalIn = self.totalIn + usize.toU64(copy)
+          BrotliEncoder.setRemainingMetadataBytes(&mut self, remaining - usize.wrappingToU32(copy))
+          self.callWritten = self.callWritten + copy
+        } else {
+          // This guarantees progress in "TakeOutput" workflow.
+          let copy: usize = if remaining < 16 { u32.toUsize(remaining) } else { 16 }
+          self.nextOutKind = OUT_TINY
+          self.nextOutOffset = 0
+          Slice.copyInto<u8>(&mut self.tinyBuf, 0, Slice.view<u8>(input, self.callConsumed, copy))
+          self.callConsumed = self.callConsumed + copy
+          // not actually data input, though
+          self.totalIn = self.totalIn + usize.toU64(copy)
+          BrotliEncoder.setRemainingMetadataBytes(&mut self, remaining - usize.wrappingToU32(copy))
+          self.availableOut = copy
+        }
+        continue
+      }
+    }
+
+    return true
+  }
+
+  // `UpdateSizeHint`.
+  fn updateSizeHint(self: &mut Self, availableIn: usize) -> () {
+    if self.params.sizeHint == 0 {
+      let delta = BrotliEncoder.unprocessedInputSize(&self)
+      let tail = usize.toU64(availableIn)
+      let limit: u64 = 1073741824
+      let mut total = limit
+      if !(delta >= limit || tail >= limit || (delta + tail) >= limit) {
+        total = delta + tail
+      }
+      self.params.sizeHint = u64.toUsize(total)
+    }
+  }
+
+  // `BrotliEncoderCompressStream`. The counts of the call are in `callConsumed` and
+  // `callWritten`.
+  effect fn compressStreamInner(self: &mut Self, op: u32, input: &[u8], output: &mut [u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    run BrotliEncoder.ensureInitialized(&mut self)
+
+    // Unfinished metadata block; check requirements.
+    let remainingMetadata = BrotliEncoder.remainingMetadataBytes(&self)
+    if remainingMetadata != UINT32_MAX {
+      if input.length != u32.toUsize(remainingMetadata) { return false }
+      if op != OPERATION_EMIT_METADATA { return false }
+    }
+
+    if op == OPERATION_EMIT_METADATA {
+      // First data metablock might be emitted here.
+      BrotliEncoder.updateSizeHint(&mut self, 0)
+      return run BrotliEncoder.processMetadata(&mut self, input, &mut output)
+    }
+
+    if self.streamState == STREAM_METADATA_HEAD || self.streamState == STREAM_METADATA_BODY {
+      return false
+    }
+
+    if self.streamState != STREAM_PROCESSING && input.length != 0 {
+      return false
+    }
+    if self.params.quality == FAST_ONE_PASS_COMPRESSION_QUALITY || self.params.quality == FAST_TWO_PASS_COMPRESSION_QUALITY {
+      return run BrotliEncoder.compressStreamFast(&mut self, op, input, &mut output)
+    }
+    while true {
+      let mut remainingBlockSize = BrotliEncoder.remainingInputBlockSize(&self)
+      let availableIn = input.length - self.callConsumed
+      // Shorten input to flint size.
+      if self.flint >= 0 && remainingBlockSize > i32.toUsize(self.flint) {
+        remainingBlockSize = i32.toUsize(self.flint)
+      }
+
+      if remainingBlockSize != 0 && availableIn != 0 {
+        let copyInputSize = if remainingBlockSize < availableIn { remainingBlockSize } else { availableIn }
+        let consumed = self.callConsumed
+        run BrotliEncoder.copyInputToRingBuffer(&mut self, Slice.view<u8>(input, consumed, copyInputSize))
+        self.callConsumed = self.callConsumed + copyInputSize
+        self.totalIn = self.totalIn + usize.toU64(copyInputSize)
+        if self.flint > 0 { self.flint = self.flint - usize.toI32(copyInputSize) }
+        continue
+      }
+
+      if BrotliEncoder.injectFlushOrPushOutput(&mut self, &mut output) {
+        // Exit the "emit flint" workflow.
+        if self.flint == FLINT_WAITING_FOR_FLUSHING {
+          BrotliEncoder.checkFlushComplete(&mut self)
+          if self.streamState == STREAM_PROCESSING {
+            self.flint = FLINT_DONE
+          }
+        }
+        continue
+      }
+
+      // Compress data only when internal output buffer is empty, stream is not finished and there
+      // is no pending flush request.
+      if self.availableOut == 0 && self.streamState == STREAM_PROCESSING {
+        if remainingBlockSize == 0 || op != OPERATION_PROCESS {
+          let isLast = availableIn == 0 && op == OPERATION_FINISH
+          let mut forceFlush = availableIn == 0 && op == OPERATION_FLUSH
+          // Force emitting (uncompressed) piece containing flint.
+          if !isLast && self.flint == FLINT_WAITING_FOR_PROCESSING {
+            self.flint = FLINT_WAITING_FOR_FLUSHING
+            forceFlush = true
+          }
+          BrotliEncoder.updateSizeHint(&mut self, availableIn)
+          let result = run BrotliEncoder.encodeDataToOutput(&mut self, isLast, forceFlush)
+          if !result { return false }
+          if forceFlush { self.streamState = STREAM_FLUSH_REQUESTED }
+          if isLast { self.streamState = STREAM_FINISHED }
+          continue
+        }
+      }
+      break
+    }
+    BrotliEncoder.checkFlushComplete(&mut self)
+    return true
   }
 }

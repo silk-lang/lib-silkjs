@@ -1,0 +1,1187 @@
+//! Writing the Brotli bit stream format: a port of google/brotli v1.2.0
+//! `c/enc/brotli_bit_stream.h`, `brotli_bit_stream.c` and `block_encoder_inc.h`.
+//!
+//! Every function takes the bit position and the byte array of the output as a pair, as the C
+//! code does (`storage_ix`, `storage`); see `enc.write_bits` for what a write clobbers.
+//!
+//! Differences in structure: the block encoders do not keep pointers to the block split they
+//! walk (the split is passed to each call), and the per-call arenas of the C code
+//! (`MetablockArena`, `StoreMetablockArena`) are locals.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import enc.block_splitter { BlockSplit }
+import enc.command { COPY_BASE, COPY_EXTRA, Command, INS_BASE, INS_EXTRA, getCopyLengthCode, getInsertLengthCode }
+import enc.constants { BLOCK_LENGTH_NBITS, BLOCK_LENGTH_OFFSET, DISTANCE_CONTEXT_BITS, LITERAL_CONTEXT_BITS, context, contextLookupTable }
+import enc.entropy_encode { HuffmanTree, convertBitDepthsToSymbols, createHuffmanTree, setDepth, sortHuffmanTreeItems, writeHuffmanTree }
+import enc.entropy_encode_static { CODE_LENGTH_BITS, CODE_LENGTH_DEPTH, NON_ZERO_REPS_BITS, NON_ZERO_REPS_DEPTH, STATIC_COMMAND_CODE_BITS, STATIC_COMMAND_CODE_DEPTH, STATIC_DISTANCE_CODE_BITS, STATIC_DISTANCE_CODE_DEPTH, ZERO_REPS_BITS, ZERO_REPS_DEPTH, storeStaticCodeLengthCode, storeStaticCommandHuffmanTree, storeStaticDistanceHuffmanTree }
+import enc.fast_log { log2FloorNonZero, log2FloorNonZero32 }
+import enc.histogram { HistogramCommand, HistogramDistance, HistogramLiteral }
+import enc.metablock { MetaBlockSplit }
+import enc.params { EncoderParams }
+import enc.write_bits { writeBits, writeBitsPrepareStorage }
+
+/// `MAX_HUFFMAN_TREE_SIZE`: the nodes of a Huffman tree over the command alphabet.
+pub const MAX_HUFFMAN_TREE_SIZE: usize = 1409
+
+// `BlockLengthPrefixCode`.
+@inlineAlways
+fn blockLengthPrefixCode(len: u32) -> usize {
+  let mut code: usize = if len >= 177 { if len >= 753 { 20 } else { 14 } } else if len >= 41 { 7 } else { 0 }
+  while code < 25 && len >= BLOCK_LENGTH_OFFSET[code + 1] { code = code + 1 }
+  return code
+}
+
+/// `BlockTypeCodeCalculator` and the codes of `BlockSplitCode`: almost everything that is needed
+/// to encode each block switch command.
+pub struct BlockSplitCode {
+  lastType: usize,
+  secondLastType: usize,
+  typeDepths: [u8; 258],
+  typeBits: [u16; 258],
+  lengthDepths: [u8; 26],
+  lengthBits: [u16; 26],
+}
+
+impl BlockSplitCode {
+  // With `InitBlockTypeCodeCalculator`.
+  fn make() -> BlockSplitCode {
+    return BlockSplitCode { lastType: 1, secondLastType: 0, typeDepths: [0; 258], typeBits: [0; 258], lengthDepths: [0; 26], lengthBits: [0; 26] }
+  }
+
+  // `NextBlockTypeCode`.
+  @inlineAlways
+  fn nextBlockTypeCode(self: &mut Self, blockType: u8) -> usize {
+    let value = u8.toUsize(blockType)
+    let typeCode: usize = if value == self.lastType + 1 { 1 } else if value == self.secondLastType { 0 } else { value + 2 }
+    self.secondLastType = self.lastType
+    self.lastType = value
+    return typeCode
+  }
+}
+
+// `StoreCommandExtra`.
+@inlineAlways
+fn storeCommandExtra(cmd: &Command, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  let copylenCode = Command.copyLenCode(cmd)
+  let inscode = u16.toUsize(getInsertLengthCode(u32.toUsize(cmd.insertLen)))
+  let copycode = u16.toUsize(getCopyLengthCode(u32.toUsize(copylenCode)))
+  let insnumextra = INS_EXTRA[inscode]
+  let insextraval = u32.toU64(u32.wrappingSubtract(cmd.insertLen, INS_BASE[inscode]))
+  let copyextraval = u32.toU64(u32.wrappingSubtract(copylenCode, COPY_BASE[copycode]))
+  let bits = u64.shiftLeft(copyextraval, u32.toU64(insnumextra)) | insextraval
+  writeBits(u32.toUsize(insnumextra + COPY_EXTRA[copycode]), bits, &mut storageIx, &mut storage)
+}
+
+// `StoreVarLenUint8`: stores a number between 0 and 255.
+fn storeVarLenUint8(n: usize, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  if n == 0 {
+    writeBits(1, 0, &mut storageIx, &mut storage)
+  } else {
+    let nbits = u32.toUsize(log2FloorNonZero(n))
+    writeBits(1, 1, &mut storageIx, &mut storage)
+    writeBits(3, usize.toU64(nbits), &mut storageIx, &mut storage)
+    writeBits(nbits, usize.toU64(n - usize.shiftLeft(1, nbits)), &mut storageIx, &mut storage)
+  }
+}
+
+// `BrotliEncodeMlen`: the number of nibbles of MLEN - 1 for `length` (1 to 1 << 24).
+@inlineAlways
+fn mlenNibbles(length: usize) -> usize {
+  let lg: usize = if length == 1 { 1 } else { u32.toUsize(log2FloorNonZero32(usize.wrappingToU32(length - 1))) + 1 }
+  return (if lg < 16 { 16 } else { lg + 3 }) / 4
+}
+
+// `StoreCompressedMetaBlockHeader`. `length` is 1 to 1 << 24.
+fn storeCompressedMetaBlockHeader(isFinalBlock: bool, length: usize, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  // Write ISLAST bit.
+  writeBits(1, if isFinalBlock { 1 } else { 0 }, &mut storageIx, &mut storage)
+  // Write ISEMPTY bit.
+  if isFinalBlock {
+    writeBits(1, 0, &mut storageIx, &mut storage)
+  }
+  let mnibbles = mlenNibbles(length)
+  writeBits(2, usize.toU64(mnibbles - 4), &mut storageIx, &mut storage)
+  writeBits(mnibbles * 4, usize.toU64(length - 1), &mut storageIx, &mut storage)
+  if !isFinalBlock {
+    // Write ISUNCOMPRESSED bit.
+    writeBits(1, 0, &mut storageIx, &mut storage)
+  }
+}
+
+// `BrotliStoreUncompressedMetaBlockHeader`. `length` is 1 to 1 << 24.
+fn storeUncompressedMetaBlockHeader(length: usize, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  // Write ISLAST bit. Uncompressed block cannot be the last one, so set to 0.
+  writeBits(1, 0, &mut storageIx, &mut storage)
+  let mnibbles = mlenNibbles(length)
+  writeBits(2, usize.toU64(mnibbles - 4), &mut storageIx, &mut storage)
+  writeBits(mnibbles * 4, usize.toU64(length - 1), &mut storageIx, &mut storage)
+  // Write ISUNCOMPRESSED bit.
+  writeBits(1, 1, &mut storageIx, &mut storage)
+}
+
+const STORAGE_ORDER: [usize; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+// The bit lengths of the Huffman code over the code length alphabet are compressed with the
+// following static Huffman code:
+//   Symbol   Code
+//   ------   ----
+//   0          00
+//   1        1110
+//   2         110
+//   3          01
+//   4          10
+//   5        1111
+const BIT_LENGTH_CODE_SYMBOLS: [u64; 6] = [0, 7, 3, 2, 1, 15]
+
+const BIT_LENGTH_CODE_BIT_LENGTHS: [usize; 6] = [2, 4, 3, 2, 2, 4]
+
+// `BrotliStoreHuffmanTreeOfHuffmanTreeToBitMask`.
+fn storeHuffmanTreeOfHuffmanTreeToBitMask(numCodes: i32, codeLengthBitdepth: &[u8], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  let mut skipSome: usize = 0
+  // Throw away trailing zeros:
+  let mut codesToStore: usize = 18
+  if numCodes > 1 {
+    while codesToStore > 0 {
+      if codeLengthBitdepth[STORAGE_ORDER[codesToStore - 1]] != 0 { break }
+      codesToStore = codesToStore - 1
+    }
+  }
+  if codeLengthBitdepth[STORAGE_ORDER[0]] == 0 && codeLengthBitdepth[STORAGE_ORDER[1]] == 0 {
+    skipSome = 2
+    if codeLengthBitdepth[STORAGE_ORDER[2]] == 0 {
+      skipSome = 3
+    }
+  }
+  writeBits(2, usize.toU64(skipSome), &mut storageIx, &mut storage)
+  let mut i = skipSome
+  while i < codesToStore {
+    let l = u8.toUsize(codeLengthBitdepth[STORAGE_ORDER[i]])
+    writeBits(BIT_LENGTH_CODE_BIT_LENGTHS[l], BIT_LENGTH_CODE_SYMBOLS[l], &mut storageIx, &mut storage)
+    i = i + 1
+  }
+}
+
+// `BrotliStoreHuffmanTreeToBitMask`.
+fn storeHuffmanTreeToBitMask(
+  huffmanTreeSize: usize,
+  huffmanTree: &[u8],
+  huffmanTreeExtraBits: &[u8],
+  codeLengthBitdepth: &[u8],
+  codeLengthBitdepthSymbols: &[u16],
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut i: usize = 0
+  while i < huffmanTreeSize {
+    let ix = u8.toUsize(huffmanTree[i])
+    writeBits(u8.toUsize(codeLengthBitdepth[ix]), u16.toU64(codeLengthBitdepthSymbols[ix]), &mut storageIx, &mut storage)
+    // Extra bits
+    if ix == 16 {
+      writeBits(2, u8.toU64(huffmanTreeExtraBits[i]), &mut storageIx, &mut storage)
+    } else if ix == 17 {
+      writeBits(3, u8.toU64(huffmanTreeExtraBits[i]), &mut storageIx, &mut storage)
+    }
+    i = i + 1
+  }
+}
+
+// The shared tail of `StoreSimpleHuffmanTree` and of `BrotliBuildAndStoreHuffmanTreeFast`: a
+// simple prefix code of 2 to 4 symbols.
+fn storeSimpleHuffmanTree(depths: &[u8], symbols: &mut [usize; 4], numSymbols: usize, maxBits: usize, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  // value of 1 indicates a simple Huffman code
+  writeBits(2, 1, &mut storageIx, &mut storage)
+  // NSYM - 1
+  writeBits(2, usize.toU64(numSymbols - 1), &mut storageIx, &mut storage)
+  // Sort
+  let mut i: usize = 0
+  while i < numSymbols {
+    let mut j = i + 1
+    while j < numSymbols {
+      if depths[symbols[j]] < depths[symbols[i]] {
+        let tmp = symbols[j]
+        symbols[j] = symbols[i]
+        symbols[i] = tmp
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  if numSymbols == 2 {
+    writeBits(maxBits, usize.toU64(symbols[0]), &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[1]), &mut storageIx, &mut storage)
+  } else if numSymbols == 3 {
+    writeBits(maxBits, usize.toU64(symbols[0]), &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[1]), &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[2]), &mut storageIx, &mut storage)
+  } else {
+    writeBits(maxBits, usize.toU64(symbols[0]), &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[1]), &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[2]), &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[3]), &mut storageIx, &mut storage)
+    // tree-select
+    writeBits(1, if depths[symbols[0]] == 1 { 1 } else { 0 }, &mut storageIx, &mut storage)
+  }
+}
+
+/// `BrotliStoreHuffmanTree`: writes the code lengths `depths[0..num]` as a complex prefix code.
+/// `num` is at most the command alphabet (704); `tree` needs `2 * 18 + 1` nodes.
+pub fn storeHuffmanTree(depths: &[u8], num: usize, tree: &mut [HuffmanTree], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  // Write the Huffman tree into the brotli-representation. The command alphabet is the largest,
+  // so this allocation will fit all alphabets.
+  let mut huffmanTree: [u8; 704] = [0; 704]
+  let mut huffmanTreeExtraBits: [u8; 704] = [0; 704]
+  let mut huffmanTreeSize: usize = 0
+  let mut codeLengthBitdepth: [u8; 18] = [0; 18]
+  let mut codeLengthBitdepthSymbols: [u16; 18] = [0; 18]
+  let mut huffmanTreeHistogram: [u32; 18] = [0; 18]
+  let mut numCodes: i32 = 0
+  let mut code: usize = 0
+  writeHuffmanTree(depths, num, &mut huffmanTreeSize, &mut huffmanTree, &mut huffmanTreeExtraBits)
+  // Calculate the statistics of the Huffman tree in brotli-representation.
+  let mut i: usize = 0
+  while i < huffmanTreeSize {
+    let symbol = u8.toUsize(huffmanTree[i])
+    huffmanTreeHistogram[symbol] = huffmanTreeHistogram[symbol] + 1
+    i = i + 1
+  }
+  i = 0
+  while i < 18 {
+    if huffmanTreeHistogram[i] != 0 {
+      if numCodes == 0 {
+        code = i
+        numCodes = 1
+      } else if numCodes == 1 {
+        numCodes = 2
+        break
+      }
+    }
+    i = i + 1
+  }
+  // Calculate another Huffman tree to use for compressing both the earlier Huffman tree with.
+  createHuffmanTree(&huffmanTreeHistogram, 18, 5, &mut tree, &mut codeLengthBitdepth)
+  convertBitDepthsToSymbols(&codeLengthBitdepth, 18, &mut codeLengthBitdepthSymbols)
+  // Now, we have all the data, let's start storing it
+  storeHuffmanTreeOfHuffmanTreeToBitMask(numCodes, &codeLengthBitdepth, &mut storageIx, &mut storage)
+  if numCodes == 1 {
+    codeLengthBitdepth[code] = 0
+  }
+  // Store the real Huffman tree now.
+  storeHuffmanTreeToBitMask(
+    huffmanTreeSize,
+    &huffmanTree,
+    &huffmanTreeExtraBits,
+    &codeLengthBitdepth,
+    &codeLengthBitdepthSymbols,
+    &mut storageIx,
+    &mut storage,
+  )
+}
+
+// `BuildAndStoreHuffmanTree`: builds a Huffman tree from `histogram[0..histogramLength]` into
+// `depth` and `bits` and stores the encoded tree to the bit stream.
+fn buildAndStoreHuffmanTree(
+  histogram: &[u32],
+  histogramLength: usize,
+  alphabetSize: usize,
+  tree: &mut [HuffmanTree],
+  depth: &mut [u8],
+  bits: &mut [u16],
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut count: usize = 0
+  let mut s4: [usize; 4] = [0; 4]
+  let mut maxBits: usize = 0
+  let mut i: usize = 0
+  while i < histogramLength {
+    if histogram[i] != 0 {
+      if count < 4 {
+        s4[count] = i
+      } else if count > 4 {
+        break
+      }
+      count = count + 1
+    }
+    i = i + 1
+  }
+  let mut maxBitsCounter = alphabetSize - 1
+  while maxBitsCounter != 0 {
+    maxBitsCounter = usize.shiftRight(maxBitsCounter, 1)
+    maxBits = maxBits + 1
+  }
+  if count <= 1 {
+    writeBits(4, 1, &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(s4[0]), &mut storageIx, &mut storage)
+    depth[s4[0]] = 0
+    bits[s4[0]] = 0
+    return ()
+  }
+  i = 0
+  while i < histogramLength {
+    depth[i] = 0
+    i = i + 1
+  }
+  createHuffmanTree(histogram, histogramLength, 15, &mut tree, &mut depth)
+  convertBitDepthsToSymbols(&depth, histogramLength, &mut bits)
+  if count <= 4 {
+    storeSimpleHuffmanTree(&depth, &mut s4, count, maxBits, &mut storageIx, &mut storage)
+  } else {
+    storeHuffmanTree(&depth, histogramLength, &mut tree, &mut storageIx, &mut storage)
+  }
+}
+
+/// `BrotliBuildAndStoreHuffmanTreeFast`: builds a prefix code of at most 14 bits for the counts
+/// in `histogram`, which add up to `histogramTotal`, and stores it. `tree` needs twice the
+/// number of used symbols plus one nodes.
+pub fn buildAndStoreHuffmanTreeFast(
+  tree: &mut [HuffmanTree],
+  histogram: &[u32],
+  histogramTotal: usize,
+  maxBits: usize,
+  depth: &mut [u8],
+  bits: &mut [u16],
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut count: usize = 0
+  let mut symbols: [usize; 4] = [0; 4]
+  let mut length: usize = 0
+  let mut total = histogramTotal
+  while total != 0 {
+    if histogram[length] != 0 {
+      if count < 4 {
+        symbols[count] = length
+      }
+      count = count + 1
+      total = total - u32.toUsize(histogram[length])
+    }
+    length = length + 1
+  }
+  if count <= 1 {
+    writeBits(4, 1, &mut storageIx, &mut storage)
+    writeBits(maxBits, usize.toU64(symbols[0]), &mut storageIx, &mut storage)
+    depth[symbols[0]] = 0
+    bits[symbols[0]] = 0
+    return ()
+  }
+  let mut i: usize = 0
+  while i < length {
+    depth[i] = 0
+    i = i + 1
+  }
+  let sentinel = HuffmanTree.make(0xffffffff, -1, -1)
+  let mut countLimit: u32 = 1
+  while true {
+    let mut node: usize = 0
+    let mut l = length
+    while l != 0 {
+      l = l - 1
+      if histogram[l] != 0 {
+        if histogram[l] >= countLimit {
+          tree[node] = HuffmanTree.make(histogram[l], -1, usize.wrappingToI16(l))
+        } else {
+          tree[node] = HuffmanTree.make(countLimit, -1, usize.wrappingToI16(l))
+        }
+        node = node + 1
+      }
+    }
+    let n = node
+    // Points to the next leaf node.
+    let mut left: usize = 0
+    // Points to the next non-leaf node.
+    let mut right = n + 1
+    sortHuffmanTreeItems(&mut tree, n, false)
+    // The nodes are:
+    //   [0, n): the sorted leaf nodes that we start with.
+    //   [n]: we add a sentinel here.
+    //   [n + 1, 2n): new parent nodes are added here, starting from (n+1). These are naturally
+    //                in ascending order.
+    //   [2n]: we add a sentinel at the end as well.
+    // There will be (2n+1) elements at the end.
+    tree[node] = sentinel
+    tree[node + 1] = sentinel
+    node = node + 2
+    let mut k = n - 1
+    while k > 0 {
+      let mut first: usize = 0
+      let mut second: usize = 0
+      if tree[left].totalCount <= tree[right].totalCount {
+        first = left
+        left = left + 1
+      } else {
+        first = right
+        right = right + 1
+      }
+      if tree[left].totalCount <= tree[right].totalCount {
+        second = left
+        left = left + 1
+      } else {
+        second = right
+        right = right + 1
+      }
+      // The sentinel node becomes the parent node.
+      tree[node - 1] = HuffmanTree.make(
+        u32.wrappingAdd(tree[first].totalCount, tree[second].totalCount),
+        usize.wrappingToI16(first),
+        usize.wrappingToI16(second),
+      )
+      // Add back the last sentinel node.
+      tree[node] = sentinel
+      node = node + 1
+      k = k - 1
+    }
+    if setDepth(usize.toI32(2 * n - 1), &tree, &mut depth, 14) {
+      // We need to pack the Huffman tree in 14 bits. If this was not successful, add fake
+      // entities to the lowest values and retry.
+      break
+    }
+    countLimit = u32.wrappingMultiply(countLimit, 2)
+  }
+  convertBitDepthsToSymbols(&depth, length, &mut bits)
+  if count <= 4 {
+    storeSimpleHuffmanTree(&depth, &mut symbols, count, maxBits, &mut storageIx, &mut storage)
+  } else {
+    let mut previousValue: u8 = 8
+    // Complex Huffman Tree
+    storeStaticCodeLengthCode(&mut storageIx, &mut storage)
+    // Actual RLE coding.
+    i = 0
+    while i < length {
+      let value = depth[i]
+      let mut reps: usize = 1
+      let mut k = i + 1
+      while k < length && depth[k] == value {
+        reps = reps + 1
+        k = k + 1
+      }
+      i = i + reps
+      if value == 0 {
+        writeBits(u32.toUsize(ZERO_REPS_DEPTH[reps]), ZERO_REPS_BITS[reps], &mut storageIx, &mut storage)
+      } else {
+        let v = u8.toUsize(value)
+        if previousValue != value {
+          writeBits(u8.toUsize(CODE_LENGTH_DEPTH[v]), u32.toU64(CODE_LENGTH_BITS[v]), &mut storageIx, &mut storage)
+          reps = reps - 1
+        }
+        if reps < 3 {
+          while reps != 0 {
+            reps = reps - 1
+            writeBits(u8.toUsize(CODE_LENGTH_DEPTH[v]), u32.toU64(CODE_LENGTH_BITS[v]), &mut storageIx, &mut storage)
+          }
+        } else {
+          reps = reps - 3
+          writeBits(u32.toUsize(NON_ZERO_REPS_DEPTH[reps]), NON_ZERO_REPS_BITS[reps], &mut storageIx, &mut storage)
+        }
+        previousValue = value
+      }
+    }
+  }
+}
+
+fn indexOf(v: &[u8], vSize: usize, value: u8) -> usize {
+  let mut i: usize = 0
+  while i < vSize {
+    if v[i] == value { return i }
+    i = i + 1
+  }
+  return i
+}
+
+fn moveToFront(v: &mut [u8], index: usize) -> () {
+  let value = v[index]
+  let mut i = index
+  while i != 0 {
+    v[i] = v[i - 1]
+    i = i - 1
+  }
+  v[0] = value
+}
+
+// `MoveToFrontTransform`.
+fn moveToFrontTransform(vIn: &[u32], vSize: usize, vOut: &mut [u32]) -> () {
+  let mut mtf: [u8; 256] = [0; 256]
+  if vSize == 0 { return () }
+  let mut maxValue = vIn[0]
+  let mut i: usize = 1
+  while i < vSize {
+    if vIn[i] > maxValue { maxValue = vIn[i] }
+    i = i + 1
+  }
+  i = 0
+  while i <= u32.toUsize(maxValue) {
+    mtf[i] = usize.wrappingToU8(i)
+    i = i + 1
+  }
+  let mtfSize = u32.toUsize(maxValue) + 1
+  i = 0
+  while i < vSize {
+    let index = indexOf(&mtf, mtfSize, u32.wrappingToU8(vIn[i]))
+    vOut[i] = usize.wrappingToU32(index)
+    moveToFront(&mut mtf, index)
+    i = i + 1
+  }
+}
+
+// `RunLengthCodeZeros`: finds runs of zeros in `v[0..inSize)` and replaces them with a prefix code
+// of the run length plus extra bits (lower 9 bits is the prefix code and the rest are the extra
+// bits). Non-zero values in `v` are shifted by `*maxRunLengthPrefix`. Will not create prefix codes
+// bigger than the initial value of `*maxRunLengthPrefix`. The prefix code of run length L is
+// simply Log2Floor(L) and the number of extra bits is the same as the prefix code.
+fn runLengthCodeZeros(inSize: usize, v: &mut [u32], outSize: &mut usize, maxRunLengthPrefix: &mut u32) -> () {
+  let mut maxReps: u32 = 0
+  let mut i: usize = 0
+  while i < inSize {
+    let mut reps: u32 = 0
+    while i < inSize && v[i] != 0 { i = i + 1 }
+    while i < inSize && v[i] == 0 {
+      reps = reps + 1
+      i = i + 1
+    }
+    if reps > maxReps { maxReps = reps }
+  }
+  let mut maxPrefix: u32 = if maxReps > 0 { log2FloorNonZero32(maxReps) } else { 0 }
+  if maxPrefix > maxRunLengthPrefix.* { maxPrefix = maxRunLengthPrefix.* }
+  maxRunLengthPrefix.* = maxPrefix
+  let mut out: usize = 0
+  i = 0
+  while i < inSize {
+    if v[i] != 0 {
+      v[out] = v[i] + maxPrefix
+      i = i + 1
+      out = out + 1
+    } else {
+      let mut reps: u32 = 1
+      let mut k = i + 1
+      while k < inSize && v[k] == 0 {
+        reps = reps + 1
+        k = k + 1
+      }
+      i = i + u32.toUsize(reps)
+      while reps != 0 {
+        if reps < u32.shiftLeft(2, maxPrefix) {
+          let runLengthPrefix = log2FloorNonZero32(reps)
+          let extraBits = reps - u32.shiftLeft(1, runLengthPrefix)
+          v[out] = runLengthPrefix + u32.shiftLeft(extraBits, 9)
+          out = out + 1
+          break
+        } else {
+          let extraBits = u32.shiftLeft(1, maxPrefix) - 1
+          v[out] = maxPrefix + u32.shiftLeft(extraBits, 9)
+          reps = reps - (u32.shiftLeft(2, maxPrefix) - 1)
+          out = out + 1
+        }
+      }
+    }
+  }
+  outSize.* = out
+}
+
+const SYMBOL_BITS: u32 = 9
+
+/// `EncodeContextMapArena`.
+pub struct EncodeContextMapArena {
+  histogram: [u32; 272],
+  depths: [u8; 272],
+  bits: [u16; 272],
+}
+
+impl EncodeContextMapArena {
+  pub fn make() -> EncodeContextMapArena {
+    return EncodeContextMapArena { histogram: [0; 272], depths: [0; 272], bits: [0; 272] }
+  }
+}
+
+// `EncodeContextMap`.
+effect fn encodeContextMap(
+  arena: &mut EncodeContextMapArena,
+  contextMap: &[u32],
+  contextMapSize: usize,
+  numClusters: usize,
+  tree: &mut [HuffmanTree],
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut maxRunLengthPrefix: u32 = 6
+  let mut numRleSymbols: usize = 0
+  let symbolMask: u32 = 511
+  storeVarLenUint8(numClusters - 1, &mut storageIx, &mut storage)
+  if numClusters == 1 { return () }
+  let mut rleSymbolList = List<u32>.make()
+  run List<u32>.appendRepeated(&mut rleSymbolList, 0, contextMapSize)
+  let rleSymbols = List<u32>.asMutSlice(&mut rleSymbolList)
+  moveToFrontTransform(contextMap, contextMapSize, &mut rleSymbols)
+  runLengthCodeZeros(contextMapSize, &mut rleSymbols, &mut numRleSymbols, &mut maxRunLengthPrefix)
+  let mut i: usize = 0
+  while i < 272 {
+    arena.histogram[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < numRleSymbols {
+    let symbol = u32.toUsize(rleSymbols[i] & symbolMask)
+    arena.histogram[symbol] = arena.histogram[symbol] + 1
+    i = i + 1
+  }
+  let useRle = maxRunLengthPrefix > 0
+  writeBits(1, if useRle { 1 } else { 0 }, &mut storageIx, &mut storage)
+  if useRle {
+    writeBits(4, u32.toU64(maxRunLengthPrefix - 1), &mut storageIx, &mut storage)
+  }
+  let alphabet = numClusters + u32.toUsize(maxRunLengthPrefix)
+  buildAndStoreHuffmanTree(&arena.histogram, alphabet, alphabet, &mut tree, &mut arena.depths, &mut arena.bits, &mut storageIx, &mut storage)
+  i = 0
+  while i < numRleSymbols {
+    let rleSymbol = rleSymbols[i] & symbolMask
+    let extraBitsVal = u32.shiftRight(rleSymbols[i], SYMBOL_BITS)
+    writeBits(u8.toUsize(arena.depths[u32.toUsize(rleSymbol)]), u16.toU64(arena.bits[u32.toUsize(rleSymbol)]), &mut storageIx, &mut storage)
+    if rleSymbol > 0 && rleSymbol <= maxRunLengthPrefix {
+      writeBits(u32.toUsize(rleSymbol), u32.toU64(extraBitsVal), &mut storageIx, &mut storage)
+    }
+    i = i + 1
+  }
+  // use move-to-front
+  writeBits(1, 1, &mut storageIx, &mut storage)
+}
+
+// `StoreBlockSwitch`: stores the block switch command to the bit stream.
+@inlineAlways
+fn storeBlockSwitch(code: &mut BlockSplitCode, blockLen: u32, blockType: u8, isFirstBlock: bool, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  let typecode = BlockSplitCode.nextBlockTypeCode(&mut code, blockType)
+  if !isFirstBlock {
+    writeBits(u8.toUsize(code.typeDepths[typecode]), u16.toU64(code.typeBits[typecode]), &mut storageIx, &mut storage)
+  }
+  // `GetBlockLengthPrefixCode`.
+  let lencode = blockLengthPrefixCode(blockLen)
+  let lenNextra = BLOCK_LENGTH_NBITS[lencode]
+  let lenExtra = blockLen - BLOCK_LENGTH_OFFSET[lencode]
+  writeBits(u8.toUsize(code.lengthDepths[lencode]), u16.toU64(code.lengthBits[lencode]), &mut storageIx, &mut storage)
+  writeBits(u32.toUsize(lenNextra), u32.toU64(lenExtra), &mut storageIx, &mut storage)
+}
+
+// `BuildAndStoreBlockSplitCode`: builds a `BlockSplitCode` from the block split given by the
+// vector of block types and block lengths and stores it to the bit stream.
+fn buildAndStoreBlockSplitCode(
+  types: &[u8],
+  lengths: &[u32],
+  numBlocks: usize,
+  numTypes: usize,
+  tree: &mut [HuffmanTree],
+  code: &mut BlockSplitCode,
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut typeHisto: [u32; 258] = [0; 258]
+  let mut lengthHisto: [u32; 26] = [0; 26]
+  let mut calculator = BlockSplitCode.make()
+  let mut i: usize = 0
+  while i < numBlocks {
+    let typeCode = BlockSplitCode.nextBlockTypeCode(&mut calculator, types[i])
+    if i != 0 { typeHisto[typeCode] = typeHisto[typeCode] + 1 }
+    let lengthCode = blockLengthPrefixCode(lengths[i])
+    lengthHisto[lengthCode] = lengthHisto[lengthCode] + 1
+    i = i + 1
+  }
+  storeVarLenUint8(numTypes - 1, &mut storageIx, &mut storage)
+  if numTypes > 1 {
+    buildAndStoreHuffmanTree(&typeHisto, numTypes + 2, numTypes + 2, &mut tree, &mut code.typeDepths, &mut code.typeBits, &mut storageIx, &mut storage)
+    buildAndStoreHuffmanTree(&lengthHisto, 26, 26, &mut tree, &mut code.lengthDepths, &mut code.lengthBits, &mut storageIx, &mut storage)
+    storeBlockSwitch(&mut code, lengths[0], types[0], true, &mut storageIx, &mut storage)
+  }
+}
+
+// `StoreTrivialContextMap`: stores a context map where the histogram type is always the block
+// type.
+fn storeTrivialContextMap(arena: &mut EncodeContextMapArena, numTypes: usize, contextBits: usize, tree: &mut [HuffmanTree], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  storeVarLenUint8(numTypes - 1, &mut storageIx, &mut storage)
+  if numTypes > 1 {
+    let repeatCode = contextBits - 1
+    let repeatBits = usize.shiftLeft(1, repeatCode) - 1
+    let alphabetSize = numTypes + repeatCode
+    let mut i: usize = 0
+    while i < alphabetSize {
+      arena.histogram[i] = 0
+      i = i + 1
+    }
+    // Write RLEMAX.
+    writeBits(1, 1, &mut storageIx, &mut storage)
+    writeBits(4, usize.toU64(repeatCode - 1), &mut storageIx, &mut storage)
+    arena.histogram[repeatCode] = usize.wrappingToU32(numTypes)
+    arena.histogram[0] = 1
+    i = contextBits
+    while i < alphabetSize {
+      arena.histogram[i] = 1
+      i = i + 1
+    }
+    buildAndStoreHuffmanTree(&arena.histogram, alphabetSize, alphabetSize, &mut tree, &mut arena.depths, &mut arena.bits, &mut storageIx, &mut storage)
+    i = 0
+    while i < numTypes {
+      let code: usize = if i == 0 { 0 } else { i + contextBits - 1 }
+      writeBits(u8.toUsize(arena.depths[code]), u16.toU64(arena.bits[code]), &mut storageIx, &mut storage)
+      writeBits(u8.toUsize(arena.depths[repeatCode]), u16.toU64(arena.bits[repeatCode]), &mut storageIx, &mut storage)
+      writeBits(repeatCode, usize.toU64(repeatBits), &mut storageIx, &mut storage)
+      i = i + 1
+    }
+    // Write IMTF (inverse-move-to-front) bit.
+    writeBits(1, 1, &mut storageIx, &mut storage)
+  }
+}
+
+/// `BlockEncoder`: manages the encoding of one block category (literal, command or distance).
+/// The block split it walks is passed to each call.
+pub struct BlockEncoder {
+  histogramLength: usize,
+  blockSplitCode: BlockSplitCode,
+  blockIx: usize,
+  blockLen: usize,
+  entropyIx: usize,
+  depths: List<u8>,
+  bits: List<u16>,
+}
+
+impl BlockEncoder {
+  // `InitBlockEncoder`.
+  fn make(histogramLength: usize, split: &BlockSplit) -> BlockEncoder {
+    return BlockEncoder {
+      histogramLength: histogramLength,
+      blockSplitCode: BlockSplitCode.make(),
+      blockIx: 0,
+      blockLen: if split.numBlocks == 0 { 0 } else { u32.toUsize(List<u32>.asSlice(&split.lengths)[0]) },
+      entropyIx: 0,
+      depths: List<u8>.make(),
+      bits: List<u16>.make(),
+    }
+  }
+
+  // `BuildAndStoreBlockSwitchEntropyCodes`: creates entropy codes of block lengths and block types
+  // and stores them to the bit stream.
+  fn buildAndStoreBlockSwitchEntropyCodes(self: &mut Self, split: &BlockSplit, tree: &mut [HuffmanTree], storageIx: &mut usize, storage: &mut [u8]) -> () {
+    buildAndStoreBlockSplitCode(
+      List<u8>.asSlice(&split.types),
+      List<u32>.asSlice(&split.lengths),
+      split.numBlocks,
+      split.numTypes,
+      &mut tree,
+      &mut self.blockSplitCode,
+      &mut storageIx,
+      &mut storage,
+    )
+  }
+
+  // The allocation of `BuildAndStoreEntropyCodes*` of block_encoder_inc.h.
+  effect fn allocateCodes(self: &mut Self, histogramsSize: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let tableSize = histogramsSize * self.histogramLength
+    run List<u8>.appendRepeated(&mut self.depths, 0, tableSize)
+    run List<u16>.appendRepeated(&mut self.bits, 0, tableSize)
+  }
+
+  // One step of the loop of `BuildAndStoreEntropyCodes*`: the code of histogram `index`.
+  fn buildAndStoreEntropyCode(self: &mut Self, index: usize, histogram: &[u32], alphabetSize: usize, tree: &mut [HuffmanTree], storageIx: &mut usize, storage: &mut [u8]) -> () {
+    let ix = index * self.histogramLength
+    let length = self.histogramLength
+    buildAndStoreHuffmanTree(
+      histogram,
+      length,
+      alphabetSize,
+      &mut tree,
+      Slice.viewMut<u8>(List<u8>.asMutSlice(&mut self.depths), ix, length),
+      Slice.viewMut<u16>(List<u16>.asMutSlice(&mut self.bits), ix, length),
+      &mut storageIx,
+      &mut storage,
+    )
+  }
+
+  // `StoreSymbol`: stores the next symbol with the entropy code of the current block type. Updates
+  // the block type and block length at block boundaries.
+  @inlineAlways
+  fn storeSymbol(self: &mut Self, split: &BlockSplit, symbol: usize, storageIx: &mut usize, storage: &mut [u8]) -> () {
+    if self.blockLen == 0 {
+      self.blockIx = self.blockIx + 1
+      let blockLen = List<u32>.asSlice(&split.lengths)[self.blockIx]
+      let blockType = List<u8>.asSlice(&split.types)[self.blockIx]
+      self.blockLen = u32.toUsize(blockLen)
+      self.entropyIx = u8.toUsize(blockType) * self.histogramLength
+      storeBlockSwitch(&mut self.blockSplitCode, blockLen, blockType, false, &mut storageIx, &mut storage)
+    }
+    self.blockLen = self.blockLen - 1
+    let ix = self.entropyIx + symbol
+    writeBits(u8.toUsize(List<u8>.asSlice(&self.depths)[ix]), u16.toU64(List<u16>.asSlice(&self.bits)[ix]), &mut storageIx, &mut storage)
+  }
+
+  // `StoreSymbolWithContext`: stores the next symbol with the entropy code of the current block
+  // type and context value. Updates the block type and block length at block boundaries.
+  @inlineAlways
+  fn storeSymbolWithContext(self: &mut Self, split: &BlockSplit, symbol: usize, contextValue: usize, contextMap: &[u32], storageIx: &mut usize, storage: &mut [u8], contextBits: usize) -> () {
+    if self.blockLen == 0 {
+      self.blockIx = self.blockIx + 1
+      let blockLen = List<u32>.asSlice(&split.lengths)[self.blockIx]
+      let blockType = List<u8>.asSlice(&split.types)[self.blockIx]
+      self.blockLen = u32.toUsize(blockLen)
+      self.entropyIx = usize.shiftLeft(u8.toUsize(blockType), contextBits)
+      storeBlockSwitch(&mut self.blockSplitCode, blockLen, blockType, false, &mut storageIx, &mut storage)
+    }
+    self.blockLen = self.blockLen - 1
+    let histoIx = u32.toUsize(contextMap[self.entropyIx + contextValue])
+    let ix = histoIx * self.histogramLength + symbol
+    writeBits(u8.toUsize(List<u8>.asSlice(&self.depths)[ix]), u16.toU64(List<u16>.asSlice(&self.bits)[ix]), &mut storageIx, &mut storage)
+  }
+}
+
+// `JumpToByteBoundary`.
+@inlineAlways
+fn jumpToByteBoundary(storageIx: &mut usize, storage: &mut [u8]) -> () {
+  storageIx.* = (storageIx.* + 7) & usize.bitNot(7)
+  storage[usize.shiftRight(storageIx.*, 3)] = 0
+}
+
+/// `BrotliStoreMetaBlock`: stores a meta-block with the block splits, context maps and
+/// histograms of `mb`.
+///
+/// UNTESTED: nothing builds a `MetaBlockSplit` yet (the meta-block builders are not ported), so
+/// this function has not run against the reference.
+pub effect fn storeMetaBlock(
+  input: &[u8],
+  startPos: usize,
+  length: usize,
+  mask: usize,
+  prevByteIn: u8,
+  prevByte2In: u8,
+  isLast: bool,
+  params: &EncoderParams,
+  literalContextMode: u32,
+  commands: &[Command],
+  nCommands: usize,
+  mb: &MetaBlockSplit,
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut pos = startPos
+  let mut prevByte = prevByteIn
+  let mut prevByte2 = prevByte2In
+  let numDistanceSymbols = u32.toUsize(params.dist.alphabetSizeMax)
+  let numEffectiveDistanceSymbols = u32.toUsize(params.dist.alphabetSizeLimit)
+  let lookup = contextLookupTable()
+  let literalContextLut = usize.shiftLeft(u32.toUsize(literalContextMode), 9)
+  let literalContextMap = List<u32>.asSlice(&mb.literalContextMap)
+  let distanceContextMap = List<u32>.asSlice(&mb.distanceContextMap)
+  let literalHistogramsSize = List<HistogramLiteral>.length(&mb.literalHistograms)
+  let commandHistogramsSize = List<HistogramCommand>.length(&mb.commandHistograms)
+  let distanceHistogramsSize = List<HistogramDistance>.length(&mb.distanceHistograms)
+  storeCompressedMetaBlockHeader(isLast, length, &mut storageIx, &mut storage)
+  let mut tree: [HuffmanTree; 1409] = [HuffmanTree.empty(); 1409]
+  let mut contextMapArena = EncodeContextMapArena.make()
+  let mut literalEnc = BlockEncoder.make(256, &mb.literalSplit)
+  let mut commandEnc = BlockEncoder.make(704, &mb.commandSplit)
+  let mut distanceEnc = BlockEncoder.make(numEffectiveDistanceSymbols, &mb.distanceSplit)
+  BlockEncoder.buildAndStoreBlockSwitchEntropyCodes(&mut literalEnc, &mb.literalSplit, &mut tree, &mut storageIx, &mut storage)
+  BlockEncoder.buildAndStoreBlockSwitchEntropyCodes(&mut commandEnc, &mb.commandSplit, &mut tree, &mut storageIx, &mut storage)
+  BlockEncoder.buildAndStoreBlockSwitchEntropyCodes(&mut distanceEnc, &mb.distanceSplit, &mut tree, &mut storageIx, &mut storage)
+  writeBits(2, u32.toU64(params.dist.distancePostfixBits), &mut storageIx, &mut storage)
+  writeBits(4, u32.toU64(u32.shiftRight(params.dist.numDirectDistanceCodes, params.dist.distancePostfixBits)), &mut storageIx, &mut storage)
+  let mut i: usize = 0
+  while i < mb.literalSplit.numTypes {
+    writeBits(2, u32.toU64(literalContextMode), &mut storageIx, &mut storage)
+    i = i + 1
+  }
+  if literalContextMap.length == 0 {
+    storeTrivialContextMap(&mut contextMapArena, literalHistogramsSize, LITERAL_CONTEXT_BITS, &mut tree, &mut storageIx, &mut storage)
+  } else {
+    run encodeContextMap(&mut contextMapArena, literalContextMap, literalContextMap.length, literalHistogramsSize, &mut tree, &mut storageIx, &mut storage)
+  }
+  if distanceContextMap.length == 0 {
+    storeTrivialContextMap(&mut contextMapArena, distanceHistogramsSize, DISTANCE_CONTEXT_BITS, &mut tree, &mut storageIx, &mut storage)
+  } else {
+    run encodeContextMap(&mut contextMapArena, distanceContextMap, distanceContextMap.length, distanceHistogramsSize, &mut tree, &mut storageIx, &mut storage)
+  }
+  // `BuildAndStoreEntropyCodesLiteral`, `...Command` and `...Distance`.
+  run BlockEncoder.allocateCodes(&mut literalEnc, literalHistogramsSize)
+  i = 0
+  while i < literalHistogramsSize {
+    BlockEncoder.buildAndStoreEntropyCode(&mut literalEnc, i, &List<HistogramLiteral>.asSlice(&mb.literalHistograms)[i].data, 256, &mut tree, &mut storageIx, &mut storage)
+    i = i + 1
+  }
+  run BlockEncoder.allocateCodes(&mut commandEnc, commandHistogramsSize)
+  i = 0
+  while i < commandHistogramsSize {
+    BlockEncoder.buildAndStoreEntropyCode(&mut commandEnc, i, &List<HistogramCommand>.asSlice(&mb.commandHistograms)[i].data, 704, &mut tree, &mut storageIx, &mut storage)
+    i = i + 1
+  }
+  run BlockEncoder.allocateCodes(&mut distanceEnc, distanceHistogramsSize)
+  i = 0
+  while i < distanceHistogramsSize {
+    BlockEncoder.buildAndStoreEntropyCode(&mut distanceEnc, i, &List<HistogramDistance>.asSlice(&mb.distanceHistograms)[i].data, numDistanceSymbols, &mut tree, &mut storageIx, &mut storage)
+    i = i + 1
+  }
+  i = 0
+  while i < nCommands {
+    let cmd = commands[i]
+    let cmdCode = u16.toUsize(cmd.cmdPrefix)
+    BlockEncoder.storeSymbol(&mut commandEnc, &mb.commandSplit, cmdCode, &mut storageIx, &mut storage)
+    storeCommandExtra(&cmd, &mut storageIx, &mut storage)
+    if literalContextMap.length == 0 {
+      let mut j = cmd.insertLen
+      while j != 0 {
+        BlockEncoder.storeSymbol(&mut literalEnc, &mb.literalSplit, u8.toUsize(input[pos & mask]), &mut storageIx, &mut storage)
+        pos = pos + 1
+        j = j - 1
+      }
+    } else {
+      let mut j = cmd.insertLen
+      while j != 0 {
+        let contextValue = u8.toUsize(context(lookup, literalContextLut, prevByte, prevByte2))
+        let literal = input[pos & mask]
+        BlockEncoder.storeSymbolWithContext(&mut literalEnc, &mb.literalSplit, u8.toUsize(literal), contextValue, literalContextMap, &mut storageIx, &mut storage, LITERAL_CONTEXT_BITS)
+        prevByte2 = prevByte
+        prevByte = literal
+        pos = pos + 1
+        j = j - 1
+      }
+    }
+    let copyLen = u32.toUsize(Command.copyLength(&cmd))
+    pos = pos + copyLen
+    if copyLen != 0 {
+      prevByte2 = input[usize.wrappingSubtract(pos, 2) & mask]
+      prevByte = input[usize.wrappingSubtract(pos, 1) & mask]
+      if cmd.cmdPrefix >= 128 {
+        let distCode = u16.toUsize(cmd.distPrefix & 0x3ff)
+        let distnumextra = u16.toUsize(u16.shiftRight(cmd.distPrefix, 10))
+        let distextra = u32.toU64(cmd.distExtra)
+        if distanceContextMap.length == 0 {
+          BlockEncoder.storeSymbol(&mut distanceEnc, &mb.distanceSplit, distCode, &mut storageIx, &mut storage)
+        } else {
+          let contextValue = u32.toUsize(Command.distanceContext(&cmd))
+          BlockEncoder.storeSymbolWithContext(&mut distanceEnc, &mb.distanceSplit, distCode, contextValue, distanceContextMap, &mut storageIx, &mut storage, DISTANCE_CONTEXT_BITS)
+        }
+        writeBits(distnumextra, distextra, &mut storageIx, &mut storage)
+      }
+    }
+    i = i + 1
+  }
+  if isLast {
+    jumpToByteBoundary(&mut storageIx, &mut storage)
+  }
+}
+
+// `BuildHistograms`.
+fn buildHistograms(
+  input: &[u8],
+  startPos: usize,
+  mask: usize,
+  commands: &[Command],
+  nCommands: usize,
+  litHisto: &mut HistogramLiteral,
+  cmdHisto: &mut HistogramCommand,
+  distHisto: &mut HistogramDistance,
+) -> () {
+  let mut pos = startPos
+  let mut i: usize = 0
+  while i < nCommands {
+    let cmd = commands[i]
+    HistogramCommand.add(&mut cmdHisto, u16.toUsize(cmd.cmdPrefix))
+    let mut j = cmd.insertLen
+    while j != 0 {
+      HistogramLiteral.add(&mut litHisto, u8.toUsize(input[pos & mask]))
+      pos = pos + 1
+      j = j - 1
+    }
+    let copyLen = u32.toUsize(Command.copyLength(&cmd))
+    pos = pos + copyLen
+    if copyLen != 0 && cmd.cmdPrefix >= 128 {
+      HistogramDistance.add(&mut distHisto, u16.toUsize(cmd.distPrefix & 0x3ff))
+    }
+    i = i + 1
+  }
+}
+
+// `StoreDataWithHuffmanCodes`.
+fn storeDataWithHuffmanCodes(
+  input: &[u8],
+  startPos: usize,
+  mask: usize,
+  commands: &[Command],
+  nCommands: usize,
+  litDepth: &[u8],
+  litBits: &[u16],
+  cmdDepth: &[u8],
+  cmdBits: &[u16],
+  distDepth: &[u8],
+  distBits: &[u16],
+  storageIxRef: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  // The bit position lives in a local while the data is stored, so that it stays in a register:
+  // through the reference each write to the output could change it.
+  let mut storageIx = storageIxRef.*
+  let mut pos = startPos
+  let mut i: usize = 0
+  while i < nCommands {
+    let cmd = commands[i]
+    let cmdCode = u16.toUsize(cmd.cmdPrefix)
+    writeBits(u8.toUsize(cmdDepth[cmdCode]), u16.toU64(cmdBits[cmdCode]), &mut storageIx, &mut storage)
+    storeCommandExtra(&cmd, &mut storageIx, &mut storage)
+    let mut j = cmd.insertLen
+    while j != 0 {
+      let literal = u8.toUsize(input[pos & mask])
+      writeBits(u8.toUsize(litDepth[literal]), u16.toU64(litBits[literal]), &mut storageIx, &mut storage)
+      pos = pos + 1
+      j = j - 1
+    }
+    let copyLen = u32.toUsize(Command.copyLength(&cmd))
+    pos = pos + copyLen
+    if copyLen != 0 && cmd.cmdPrefix >= 128 {
+      let distCode = u16.toUsize(cmd.distPrefix & 0x3ff)
+      let distnumextra = u16.toUsize(u16.shiftRight(cmd.distPrefix, 10))
+      let distextra = u32.toU64(cmd.distExtra)
+      writeBits(u8.toUsize(distDepth[distCode]), u16.toU64(distBits[distCode]), &mut storageIx, &mut storage)
+      writeBits(distnumextra, distextra, &mut storageIx, &mut storage)
+    }
+    i = i + 1
+  }
+  storageIxRef.* = storageIx
+}
+
+/// `BrotliStoreMetaBlockTrivial`: stores the meta-block without doing any block splitting, just
+/// collects one histogram per block category and uses that for entropy coding.
+pub fn storeMetaBlockTrivial(
+  input: &[u8],
+  startPos: usize,
+  length: usize,
+  mask: usize,
+  isLast: bool,
+  params: &EncoderParams,
+  commands: &[Command],
+  nCommands: usize,
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut litHisto = HistogramLiteral.make()
+  let mut cmdHisto = HistogramCommand.make()
+  let mut distHisto = HistogramDistance.make()
+  let mut litDepth: [u8; 256] = [0; 256]
+  let mut litBits: [u16; 256] = [0; 256]
+  let mut cmdDepth: [u8; 704] = [0; 704]
+  let mut cmdBits: [u16; 704] = [0; 704]
+  let mut distDepth: [u8; 140] = [0; 140]
+  let mut distBits: [u16; 140] = [0; 140]
+  let mut tree: [HuffmanTree; 1409] = [HuffmanTree.empty(); 1409]
+  let numDistanceSymbols = u32.toUsize(params.dist.alphabetSizeMax)
+  storeCompressedMetaBlockHeader(isLast, length, &mut storageIx, &mut storage)
+  buildHistograms(input, startPos, mask, commands, nCommands, &mut litHisto, &mut cmdHisto, &mut distHisto)
+  writeBits(13, 0, &mut storageIx, &mut storage)
+  buildAndStoreHuffmanTree(&litHisto.data, 256, 256, &mut tree, &mut litDepth, &mut litBits, &mut storageIx, &mut storage)
+  buildAndStoreHuffmanTree(&cmdHisto.data, 704, 704, &mut tree, &mut cmdDepth, &mut cmdBits, &mut storageIx, &mut storage)
+  buildAndStoreHuffmanTree(&distHisto.data, 140, numDistanceSymbols, &mut tree, &mut distDepth, &mut distBits, &mut storageIx, &mut storage)
+  storeDataWithHuffmanCodes(input, startPos, mask, commands, nCommands, &litDepth, &litBits, &cmdDepth, &cmdBits, &distDepth, &distBits, &mut storageIx, &mut storage)
+  if isLast {
+    jumpToByteBoundary(&mut storageIx, &mut storage)
+  }
+}
+
+/// `BrotliStoreMetaBlockFast`: same as `storeMetaBlockTrivial`, but uses some static prefix codes
+/// for histograms with only a few symbols and the fast builder for the rest.
+pub fn storeMetaBlockFast(
+  input: &[u8],
+  startPos: usize,
+  length: usize,
+  mask: usize,
+  isLast: bool,
+  params: &EncoderParams,
+  commands: &[Command],
+  nCommands: usize,
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut litDepth: [u8; 256] = [0; 256]
+  let mut litBits: [u16; 256] = [0; 256]
+  let mut tree: [HuffmanTree; 1409] = [HuffmanTree.empty(); 1409]
+  let numDistanceSymbols = params.dist.alphabetSizeMax
+  let distanceAlphabetBits = u32.toUsize(log2FloorNonZero32(numDistanceSymbols - 1)) + 1
+  storeCompressedMetaBlockHeader(isLast, length, &mut storageIx, &mut storage)
+  writeBits(13, 0, &mut storageIx, &mut storage)
+  if nCommands <= 128 {
+    let mut histogram: [u32; 256] = [0; 256]
+    let mut pos = startPos
+    let mut numLiterals: usize = 0
+    let mut i: usize = 0
+    while i < nCommands {
+      let cmd = commands[i]
+      let mut j = cmd.insertLen
+      while j != 0 {
+        let literal = u8.toUsize(input[pos & mask])
+        histogram[literal] = histogram[literal] + 1
+        pos = pos + 1
+        j = j - 1
+      }
+      numLiterals = numLiterals + u32.toUsize(cmd.insertLen)
+      pos = pos + u32.toUsize(Command.copyLength(&cmd))
+      i = i + 1
+    }
+    buildAndStoreHuffmanTreeFast(&mut tree, &histogram, numLiterals, 8, &mut litDepth, &mut litBits, &mut storageIx, &mut storage)
+    storeStaticCommandHuffmanTree(&mut storageIx, &mut storage)
+    storeStaticDistanceHuffmanTree(&mut storageIx, &mut storage)
+    storeDataWithHuffmanCodes(
+      input,
+      startPos,
+      mask,
+      commands,
+      nCommands,
+      &litDepth,
+      &litBits,
+      &STATIC_COMMAND_CODE_DEPTH,
+      &STATIC_COMMAND_CODE_BITS,
+      &STATIC_DISTANCE_CODE_DEPTH,
+      &STATIC_DISTANCE_CODE_BITS,
+      &mut storageIx,
+      &mut storage,
+    )
+  } else {
+    let mut litHisto = HistogramLiteral.make()
+    let mut cmdHisto = HistogramCommand.make()
+    let mut distHisto = HistogramDistance.make()
+    let mut cmdDepth: [u8; 704] = [0; 704]
+    let mut cmdBits: [u16; 704] = [0; 704]
+    let mut distDepth: [u8; 140] = [0; 140]
+    let mut distBits: [u16; 140] = [0; 140]
+    buildHistograms(input, startPos, mask, commands, nCommands, &mut litHisto, &mut cmdHisto, &mut distHisto)
+    buildAndStoreHuffmanTreeFast(&mut tree, &litHisto.data, litHisto.totalCount, 8, &mut litDepth, &mut litBits, &mut storageIx, &mut storage)
+    buildAndStoreHuffmanTreeFast(&mut tree, &cmdHisto.data, cmdHisto.totalCount, 10, &mut cmdDepth, &mut cmdBits, &mut storageIx, &mut storage)
+    buildAndStoreHuffmanTreeFast(&mut tree, &distHisto.data, distHisto.totalCount, distanceAlphabetBits, &mut distDepth, &mut distBits, &mut storageIx, &mut storage)
+    storeDataWithHuffmanCodes(input, startPos, mask, commands, nCommands, &litDepth, &litBits, &cmdDepth, &cmdBits, &distDepth, &distBits, &mut storageIx, &mut storage)
+  }
+  if isLast {
+    jumpToByteBoundary(&mut storageIx, &mut storage)
+  }
+}
+
+/// `BrotliStoreUncompressedMetaBlock`: stores `len` bytes at `position` of the ring buffer
+/// `input` as they are, and the empty last meta-block after them if `isFinalBlock`.
+pub fn storeUncompressedMetaBlock(isFinalBlock: bool, input: &[u8], position: usize, mask: usize, length: usize, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  let mut len = length
+  let mut maskedPos = position & mask
+  storeUncompressedMetaBlockHeader(len, &mut storageIx, &mut storage)
+  jumpToByteBoundary(&mut storageIx, &mut storage)
+  if maskedPos + len > mask + 1 {
+    let len1 = mask + 1 - maskedPos
+    Slice.copyInto<u8>(&mut storage, usize.shiftRight(storageIx.*, 3), Slice.view<u8>(input, maskedPos, len1))
+    storageIx.* = storageIx.* + usize.shiftLeft(len1, 3)
+    len = len - len1
+    maskedPos = 0
+  }
+  Slice.copyInto<u8>(&mut storage, usize.shiftRight(storageIx.*, 3), Slice.view<u8>(input, maskedPos, len))
+  storageIx.* = storageIx.* + usize.shiftLeft(len, 3)
+  // We need to clear the next 4 bytes to continue to be compatible with BrotliWriteBits.
+  writeBitsPrepareStorage(storageIx.*, &mut storage)
+  // Since the uncompressed block itself may not be the final block, add an empty one after this.
+  if isFinalBlock {
+    // islast
+    writeBits(1, 1, &mut storageIx, &mut storage)
+    // isempty
+    writeBits(1, 1, &mut storageIx, &mut storage)
+    jumpToByteBoundary(&mut storageIx, &mut storage)
+  }
+}

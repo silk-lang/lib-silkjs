@@ -1,0 +1,759 @@
+//! Fast two-pass compression of an input fragment, independently from the input history (quality
+//! 1): a port of google/brotli v1.2.0 `c/enc/compress_fragment_two_pass.h` and
+//! `compress_fragment_two_pass.c`.
+//!
+//! The first pass collects the commands and literals of a block, the second pass builds their
+//! prefix codes and writes them.
+//!
+//! As in `enc.compress_fragment`, the pointers of the C code are offsets into the fragment
+//! (`base_ip` is offset 0), its `goto`s are loop exits, and the hash table holds offsets as `u32`.
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import enc.bit_cost { bitsEntropy }
+import enc.bit_stream { buildAndStoreHuffmanTreeFast, storeHuffmanTree }
+import enc.compress_fragment { HASH_MUL32, rewindBitPosition, storeMetaBlockHeader }
+import enc.constants { WINDOW_GAP }
+import enc.entropy_encode { HuffmanTree, convertBitDepthsToSymbols, createHuffmanTree }
+import enc.fast_log { log2FloorNonZero, log2FloorNonZero32 }
+import enc.find_match_length { findMatchLengthWithLimitUnchecked }
+import enc.write_bits { byteUnchecked, load32Unchecked, load64Unchecked, writeBits }
+
+// `MAX_DISTANCE`: `BROTLI_MAX_BACKWARD_LIMIT(18)`.
+const MAX_DISTANCE: usize = 262128
+
+/// `kCompressFragmentTwoPassBlockSize`.
+pub const COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE: usize = 131072
+
+/// `BrotliTwoPassArena`: the scratch space of the two-pass compressor.
+pub struct TwoPassArena {
+  litHisto: [u32; 256],
+  litDepth: [u8; 256],
+  litBits: [u16; 256],
+  cmdHisto: [u32; 128],
+  cmdDepth: [u8; 128],
+  cmdBits: [u16; 128],
+  tmpTree: [HuffmanTree; 513],
+  tmpDepth: [u8; 704],
+  tmpBits: [u16; 64],
+}
+
+impl TwoPassArena {
+  pub fn make() -> TwoPassArena {
+    return TwoPassArena {
+      litHisto: [0; 256],
+      litDepth: [0; 256],
+      litBits: [0; 256],
+      cmdHisto: [0; 128],
+      cmdDepth: [0; 128],
+      cmdBits: [0; 128],
+      tmpTree: [HuffmanTree.empty(); 513],
+      tmpDepth: [0; 704],
+      tmpBits: [0; 64],
+    }
+  }
+}
+
+// The reads of the match search are not bounds-checked: the search loop keeps `ip` at or below
+// `ipLimit`, which is at least 16 bytes before the end of the fragment, and every candidate
+// before `ip`. Each use states which of these facts covers it.
+
+// `Hash`. The caller must prove that `p + 8` is at most `data.length`.
+@inlineAlways
+unsafe fn hash(data: &[u8], p: usize, shift: u64, length: u64) -> usize {
+  let h = u64.wrappingMultiply(u64.shiftLeft(unsafe load64Unchecked(data, p), (8 - length) * 8), HASH_MUL32)
+  return u64.toUsize(u64.shiftRight(h, shift))
+}
+
+@inlineAlways
+fn hashBytesAtOffset(v: u64, offset: u64, shift: u64, length: u64) -> usize {
+  let h = u64.wrappingMultiply(u64.shiftLeft(u64.shiftRight(v, 8 * offset), (8 - length) * 8), HASH_MUL32)
+  return u64.toUsize(u64.shiftRight(h, shift))
+}
+
+// `IsMatch`. The caller must prove that `p1 + 6` and `p2 + 6` are at most `data.length`.
+@inlineAlways
+unsafe fn isMatch(data: &[u8], p1: usize, p2: usize, length: usize) -> bool {
+  if unsafe load32Unchecked(data, p1) == unsafe load32Unchecked(data, p2) {
+    if length == 4 { return true }
+    return unsafe byteUnchecked(data, usize.wrappingAdd(p1, 4)) == unsafe byteUnchecked(data, usize.wrappingAdd(p2, 4))
+      && unsafe byteUnchecked(data, usize.wrappingAdd(p1, 5)) == unsafe byteUnchecked(data, usize.wrappingAdd(p2, 5))
+  }
+  return false
+}
+
+@inlineAlways
+fn copyBytes(to: &mut [u8], toAt: usize, from: &[u8], fromAt: usize, count: usize) -> () {
+  let mut i: usize = 0
+  while i < count {
+    to[toAt + i] = from[fromAt + i]
+    i = i + 1
+  }
+}
+
+@inlineAlways
+fn copyWords(to: &mut [u16], toAt: usize, from: &[u16], fromAt: usize, count: usize) -> () {
+  let mut i: usize = 0
+  while i < count {
+    to[toAt + i] = from[fromAt + i]
+    i = i + 1
+  }
+}
+
+// `BuildAndStoreCommandPrefixCode`: builds a command and distance prefix code (each 64 symbols)
+// into the arena's "depth" and "bits" based on its histogram and stores it into the bit stream.
+fn buildAndStoreCommandPrefixCode(s: &mut TwoPassArena, storageIx: &mut usize, storage: &mut [u8]) -> () {
+  // Tree size for building a tree over 64 symbols is 2 * 64 + 1.
+  let mut i: usize = 0
+  while i < 704 {
+    s.tmpDepth[i] = 0
+    i = i + 1
+  }
+  createHuffmanTree(Slice.view<u32>(&s.cmdHisto, 0, 64), 64, 15, &mut s.tmpTree, Slice.viewMut<u8>(&mut s.cmdDepth, 0, 64))
+  createHuffmanTree(Slice.view<u32>(&s.cmdHisto, 64, 64), 64, 14, &mut s.tmpTree, Slice.viewMut<u8>(&mut s.cmdDepth, 64, 64))
+  // We have to jump through a few hoops here in order to compute the command bits because the
+  // symbols are in a different order than in the full alphabet. This looks complicated, but
+  // having the symbols in this order in the command bits saves a few branches in the Emit*
+  // functions.
+  copyBytes(&mut s.tmpDepth, 0, &s.cmdDepth, 24, 24)
+  copyBytes(&mut s.tmpDepth, 24, &s.cmdDepth, 0, 8)
+  copyBytes(&mut s.tmpDepth, 32, &s.cmdDepth, 48, 8)
+  copyBytes(&mut s.tmpDepth, 40, &s.cmdDepth, 8, 8)
+  copyBytes(&mut s.tmpDepth, 48, &s.cmdDepth, 56, 8)
+  copyBytes(&mut s.tmpDepth, 56, &s.cmdDepth, 16, 8)
+  convertBitDepthsToSymbols(&s.tmpDepth, 64, &mut s.tmpBits)
+  // The C code copies bytes of 16-bit code words: 16 bytes are 8 words.
+  copyWords(&mut s.cmdBits, 0, &s.tmpBits, 24, 8)
+  copyWords(&mut s.cmdBits, 8, &s.tmpBits, 40, 8)
+  copyWords(&mut s.cmdBits, 16, &s.tmpBits, 56, 8)
+  copyWords(&mut s.cmdBits, 24, &s.tmpBits, 0, 24)
+  copyWords(&mut s.cmdBits, 48, &s.tmpBits, 32, 8)
+  copyWords(&mut s.cmdBits, 56, &s.tmpBits, 48, 8)
+  convertBitDepthsToSymbols(Slice.view<u8>(&s.cmdDepth, 64, 64), 64, Slice.viewMut<u16>(&mut s.cmdBits, 64, 64))
+  // Create the bit length array for the full command alphabet.
+  i = 0
+  while i < 64 {
+    // only 64 first values were used
+    s.tmpDepth[i] = 0
+    i = i + 1
+  }
+  copyBytes(&mut s.tmpDepth, 0, &s.cmdDepth, 24, 8)
+  copyBytes(&mut s.tmpDepth, 64, &s.cmdDepth, 32, 8)
+  copyBytes(&mut s.tmpDepth, 128, &s.cmdDepth, 40, 8)
+  copyBytes(&mut s.tmpDepth, 192, &s.cmdDepth, 48, 8)
+  copyBytes(&mut s.tmpDepth, 384, &s.cmdDepth, 56, 8)
+  i = 0
+  while i < 8 {
+    s.tmpDepth[128 + 8 * i] = s.cmdDepth[i]
+    s.tmpDepth[256 + 8 * i] = s.cmdDepth[8 + i]
+    s.tmpDepth[448 + 8 * i] = s.cmdDepth[16 + i]
+    i = i + 1
+  }
+  storeHuffmanTree(&s.tmpDepth, 704, &mut s.tmpTree, &mut storageIx, &mut storage)
+  storeHuffmanTree(Slice.view<u8>(&s.cmdDepth, 64, 64), 64, &mut s.tmpTree, &mut storageIx, &mut storage)
+}
+
+// The arithmetic of the `Emit*` functions is `uint32_t` and `size_t` arithmetic in C. These
+// helpers keep it free of overflow traps, which the lengths and distances of a fragment cannot
+// trigger: the subtractions wrap, and the shift counts, which are below 32 by construction, are
+// masked.
+@inlineAlways
+fn shl(value: u32, count: u32) -> u32 {
+  return u32.shiftLeft(value, count & 31)
+}
+
+@inlineAlways
+fn shr(value: u32, count: u32) -> u32 {
+  return u32.shiftRight(value, count & 31)
+}
+
+@inlineAlways
+fn sub(left: u32, right: u32) -> u32 {
+  return u32.wrappingSubtract(left, right)
+}
+
+@inlineAlways
+fn add(left: u32, right: u32) -> u32 {
+  return u32.wrappingAdd(left, right)
+}
+
+// `EmitInsertLen`: the command word of an insert length.
+@inlineAlways
+fn insertLenCommand(insertlen: u32) -> u32 {
+  if insertlen < 6 {
+    return insertlen
+  } else if insertlen < 130 {
+    let tail = sub(insertlen, 2)
+    let nbits = sub(log2FloorNonZero32(tail), 1)
+    let prefix = shr(tail, nbits)
+    let inscode = add(add(shl(nbits, 1), prefix), 2)
+    let extra = sub(tail, shl(prefix, nbits))
+    return inscode | shl(extra, 8)
+  } else if insertlen < 2114 {
+    let tail = sub(insertlen, 66)
+    let nbits = log2FloorNonZero32(tail)
+    let code = add(nbits, 10)
+    let extra = sub(tail, shl(1, nbits))
+    return code | shl(extra, 8)
+  } else if insertlen < 6210 {
+    let extra = sub(insertlen, 2114)
+    return 21 | shl(extra, 8)
+  } else if insertlen < 22594 {
+    let extra = sub(insertlen, 6210)
+    return 22 | shl(extra, 8)
+  }
+  let extra = sub(insertlen, 22594)
+  return 23 | shl(extra, 8)
+}
+
+// `EmitCopyLen`: the command word of a copy length. C computes it in `size_t` and truncates; a
+// copy length fits 32 bits.
+@inlineAlways
+fn copyLenCommand(length: usize) -> u32 {
+  let copylen = usize.wrappingToU32(length)
+  if copylen < 10 {
+    return add(copylen, 38)
+  } else if copylen < 134 {
+    let tail = sub(copylen, 6)
+    let nbits = sub(log2FloorNonZero32(tail), 1)
+    let prefix = shr(tail, nbits)
+    let code = add(add(shl(nbits, 1), prefix), 44)
+    let extra = sub(tail, shl(prefix, nbits))
+    return code | shl(extra, 8)
+  } else if copylen < 2118 {
+    let tail = sub(copylen, 70)
+    let nbits = log2FloorNonZero32(tail)
+    let code = add(nbits, 52)
+    let extra = sub(tail, shl(1, nbits))
+    return code | shl(extra, 8)
+  }
+  let extra = sub(copylen, 2118)
+  return 63 | shl(extra, 8)
+}
+
+// `EmitCopyLenLastDistance`: appends one or two command words at `count` and returns the new
+// count. C computes them in `size_t` and truncates; a copy length fits 32 bits.
+@inlineAlways
+fn emitCopyLenLastDistance(length: usize, commands: &mut [u32], count: usize) -> usize {
+  let copylen = usize.wrappingToU32(length)
+  if copylen < 12 {
+    commands[count] = add(copylen, 20)
+    return count + 1
+  } else if copylen < 72 {
+    let tail = sub(copylen, 8)
+    let nbits = sub(log2FloorNonZero32(tail), 1)
+    let prefix = shr(tail, nbits)
+    let code = add(add(shl(nbits, 1), prefix), 28)
+    let extra = sub(tail, shl(prefix, nbits))
+    commands[count] = code | shl(extra, 8)
+    return count + 1
+  } else if copylen < 136 {
+    let tail = sub(copylen, 8)
+    let code = add(shr(tail, 5), 54)
+    let extra = tail & 31
+    commands[count] = code | shl(extra, 8)
+    commands[count + 1] = 64
+    return count + 2
+  } else if copylen < 2120 {
+    let tail = sub(copylen, 72)
+    let nbits = log2FloorNonZero32(tail)
+    let code = add(nbits, 52)
+    let extra = sub(tail, shl(1, nbits))
+    commands[count] = code | shl(extra, 8)
+    commands[count + 1] = 64
+    return count + 2
+  }
+  let extra = sub(copylen, 2120)
+  commands[count] = 63 | shl(extra, 8)
+  commands[count + 1] = 64
+  return count + 2
+}
+
+// `EmitDistance`: the command word of a distance.
+@inlineAlways
+fn distanceCommand(distance: u32) -> u32 {
+  let d = add(distance, 3)
+  let nbits = sub(log2FloorNonZero32(d), 1)
+  let prefix = shr(d, nbits) & 1
+  let offset = shl(add(2, prefix), nbits)
+  let distcode = add(add(2 * sub(nbits, 1), prefix), 80)
+  let extra = sub(d, offset)
+  return distcode | shl(extra, 8)
+}
+
+// After a copy that ends at `ip`: updates `table` with the hashes of some positions within the
+// copy, sets the entry of `ip` and returns the candidate that it held. The caller must prove that
+// `ip + 6` is at most `data.length`; `ip` is at least 5, as a copy has 4 bytes or more and
+// follows the first byte of the block.
+//
+// `quirk` selects the variant after the first copy of a run: for 4-byte hashes it files the
+// position `ip - 1` under the hash of `ip - 3` (offset 0 where the second variant has offset 2).
+// The C code has both forms and the output depends on them.
+@inlineAlways
+unsafe fn updateTable(data: &[u8], ip: usize, table: &mut [u32], shift: u64, minMatch: u64, quirk: bool) -> usize {
+  let position = usize.wrappingToU32(ip)
+  let mut curHash: usize = 0
+  if minMatch == 4 {
+    let inputBytes = unsafe load64Unchecked(data, ip - 3)
+    curHash = hashBytesAtOffset(inputBytes, 3, shift, minMatch)
+    let mut prevHash = hashBytesAtOffset(inputBytes, 0, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 3)
+    prevHash = hashBytesAtOffset(inputBytes, 1, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 2)
+    prevHash = hashBytesAtOffset(inputBytes, if quirk { 0 } else { 2 }, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 1)
+  } else {
+    let mut inputBytes = unsafe load64Unchecked(data, ip - 5)
+    let mut prevHash = hashBytesAtOffset(inputBytes, 0, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 5)
+    prevHash = hashBytesAtOffset(inputBytes, 1, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 4)
+    prevHash = hashBytesAtOffset(inputBytes, 2, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 3)
+    inputBytes = unsafe load64Unchecked(data, ip - 2)
+    curHash = hashBytesAtOffset(inputBytes, 2, shift, minMatch)
+    prevHash = hashBytesAtOffset(inputBytes, 0, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 2)
+    prevHash = hashBytesAtOffset(inputBytes, 1, shift, minMatch)
+    table[prevHash] = u32.wrappingSubtract(position, 1)
+  }
+  let candidate = u32.toUsize(table[curHash])
+  table[curHash] = position
+  return candidate
+}
+
+// `CreateCommands`: the commands and literals of the block of `blockSize` bytes at `input` of
+// `data`, of which `inputSize` bytes remain. Sets the number of literals and of command words.
+@inlineAlways
+fn createCommands(
+  data: &[u8],
+  input: usize,
+  blockSize: usize,
+  inputSize: usize,
+  table: &mut [u32],
+  tableBits: usize,
+  minMatch: usize,
+  literals: &mut [u8],
+  numLiterals: &mut usize,
+  commands: &mut [u32],
+  numCommands: &mut usize,
+) -> () {
+  // "ip" is the input pointer.
+  let mut ip = input
+  let shift = usize.toU64(64 - tableBits)
+  let minMatch64 = usize.toU64(minMatch)
+  let ipEnd = input + blockSize
+  // "next_emit" is the first byte that is not covered by a previous copy. Bytes between
+  // "next_emit" and the start of the next copy or the end of the input will be emitted as literal
+  // bytes.
+  let mut nextEmit = input
+  // The distance of the last copy; C starts with -1, which no distance equals.
+  let mut lastDistance: usize = usize.wrappingSubtract(0, 1)
+  let inputMarginBytes = WINDOW_GAP
+  let mut literalCount: usize = 0
+  let mut commandCount: usize = 0
+
+  if blockSize >= inputMarginBytes {
+    // For the last block, we need to keep a 16 bytes margin so that we can be sure that all
+    // distances are at most window size - 16. For all other blocks, we only need to keep a margin
+    // of 5 bytes so that we don't go over the block size with a copy.
+    let lenLimit = if blockSize - minMatch < inputSize - inputMarginBytes { blockSize - minMatch } else { inputSize - inputMarginBytes }
+    let ipLimit = input + lenLimit
+    // What the unchecked reads below rely on: the search stops 16 bytes before the end of the
+    // fragment, and the block ends inside it. Both follow from the sizes above; the test makes the
+    // reads safe whatever the caller passed.
+    if ipEnd > data.length || data.length - ipLimit < 16 {
+      Intrinsic.trap("brotli: a block past the end of the fragment")
+    }
+    ip = ip + 1
+    // ip <= ipLimit: the block has at least 16 bytes.
+    let mut nextHash = unsafe hash(data, ip, shift, minMatch64)
+    let mut done = false
+    while !done {
+      // Step 1: Scan forward in the input looking for a 6-byte-long match. If we get close to
+      // exhausting the input then goto emit_remainder.
+      //
+      // Heuristic match skipping: If 32 bytes are scanned with no matches found, start looking
+      // only at every other byte. If 32 more bytes are scanned, look at every third byte, etc..
+      // When a match is found, immediately go back to looking at every byte. This is a small loss
+      // (~5% performance, ~0.1% density) for compressible data due to more bookkeeping, but for
+      // non-compressible data (such as JPEG) it's a huge win since the compressor quickly
+      // "realizes" the data is incompressible and doesn't bother looking for matches everywhere.
+      //
+      // The "skip" variable keeps track of how many bytes there are since the last match;
+      // dividing it by 32 (ie. right-shifting by five) gives the number of bytes to move ahead
+      // for each iteration.
+      let mut skip: u32 = 32
+      let mut nextIp = ip
+      let mut candidate: usize = 0
+      // trawl:
+      while true {
+        let slot = nextHash
+        let bytesBetweenHashLookups = u32.toUsize(u32.shiftRight(skip, 5))
+        skip = u32.wrappingAdd(skip, 1)
+        ip = nextIp
+        // ip <= ipLimit and the step is below 1 << 27, so the sum cannot overflow.
+        nextIp = usize.wrappingAdd(ip, bytesBetweenHashLookups)
+        if nextIp > ipLimit {
+          done = true
+          break
+        }
+        // nextIp <= ipLimit.
+        nextHash = unsafe hash(data, nextIp, shift, minMatch64)
+        candidate = usize.wrappingSubtract(ip, lastDistance)
+        if candidate < ip {
+          // candidate < ip <= ipLimit.
+          if unsafe isMatch(data, ip, candidate, minMatch) {
+            table[slot] = usize.wrappingToU32(ip)
+            // The distance is that of the last copy, so it is feasible.
+            break
+          }
+        }
+        candidate = u32.toUsize(table[slot])
+        table[slot] = usize.wrappingToU32(ip)
+        // The table holds positions before `ip` (or 0, the start of the fragment); the test keeps
+        // the reads in bounds whatever it holds.
+        if candidate < ip {
+          if unsafe isMatch(data, ip, candidate, minMatch) {
+            // Check copy distance. If candidate is not feasible, continue search. Checking is
+            // done outside of hot loop to reduce overhead.
+            if usize.wrappingSubtract(ip, candidate) <= MAX_DISTANCE { break }
+          }
+        }
+      }
+      if done { break }
+
+      // Step 2: Emit the found match together with the literal bytes from "next_emit", and then
+      // see if we can find a next match immediately afterwards. Repeat until we find no match for
+      // the input without emitting some literal bytes.
+
+      // We have a 6-byte match at ip, and we need to emit bytes in [next_emit, ip).
+      let base = ip
+      // candidate < ip, and ip + minMatch plus the limit is ipEnd, which is inside the fragment.
+      let matched = minMatch + unsafe findMatchLengthWithLimitUnchecked(data, candidate + minMatch, ip + minMatch, ipEnd - ip - minMatch)
+      let distance = base - candidate
+      let insert = base - nextEmit
+      ip = ip + matched
+      commands[commandCount] = insertLenCommand(usize.wrappingToU32(insert))
+      commandCount = commandCount + 1
+      Slice.copyInto<u8>(&mut literals, literalCount, Slice.view<u8>(data, nextEmit, insert))
+      literalCount = literalCount + insert
+      if distance == lastDistance {
+        commands[commandCount] = 64
+        commandCount = commandCount + 1
+      } else {
+        commands[commandCount] = distanceCommand(usize.wrappingToU32(distance))
+        commandCount = commandCount + 1
+        lastDistance = distance
+      }
+      commandCount = emitCopyLenLastDistance(matched, &mut commands, commandCount)
+
+      nextEmit = ip
+      if ip >= ipLimit {
+        break
+      }
+      // We could immediately start working at ip now, but to improve compression we first update
+      // "table" with the hashes of some positions within the last copy.
+      // ip < ipLimit.
+      candidate = unsafe updateTable(data, ip, &mut table, shift, minMatch64, true)
+
+      // candidate < ip < ipLimit for the reads of the test; the table holds positions before
+      // `ip`, and the test keeps the reads in bounds whatever it holds.
+      while candidate < ip && ip - candidate <= MAX_DISTANCE && unsafe isMatch(data, ip, candidate, minMatch) {
+        // We have a 6-byte match at ip, and no need to emit any literal bytes prior to ip.
+        let start = ip
+        let length = minMatch + unsafe findMatchLengthWithLimitUnchecked(data, candidate + minMatch, ip + minMatch, ipEnd - ip - minMatch)
+        ip = ip + length
+        lastDistance = start - candidate
+        commands[commandCount] = copyLenCommand(length)
+        commands[commandCount + 1] = distanceCommand(usize.wrappingToU32(lastDistance))
+        commandCount = commandCount + 2
+
+        nextEmit = ip
+        if ip >= ipLimit {
+          done = true
+          break
+        }
+        // We could immediately start working at ip now, but to improve compression we first
+        // update "table" with the hashes of some positions within the last copy.
+        candidate = unsafe updateTable(data, ip, &mut table, shift, minMatch64, false)
+      }
+      if done { break }
+
+      // ip < ipLimit before the step.
+      ip = ip + 1
+      nextHash = unsafe hash(data, ip, shift, minMatch64)
+    }
+  }
+
+  // emit_remainder:
+  // Emit the remaining bytes as literals.
+  if nextEmit < ipEnd {
+    let insert = ipEnd - nextEmit
+    commands[commandCount] = insertLenCommand(usize.wrappingToU32(insert))
+    commandCount = commandCount + 1
+    Slice.copyInto<u8>(&mut literals, literalCount, Slice.view<u8>(data, nextEmit, insert))
+    literalCount = literalCount + insert
+  }
+  numLiterals.* = literalCount
+  numCommands.* = commandCount
+}
+
+const NUM_EXTRA_BITS: [u32; 128] = [
+  0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5,
+  6, 7, 8, 9, 10, 12, 14, 24, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 1, 2, 2, 3, 3, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+  9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16,
+  17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 24, 24,
+]
+
+const INSERT_OFFSET: [u32; 24] = [
+  0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26,
+  34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210, 22594,
+]
+
+// `StoreCommands`.
+fn storeCommands(s: &mut TwoPassArena, literals: &[u8], numLiterals: usize, commands: &[u32], numCommands: usize, storageIxRef: &mut usize, storage: &mut [u8]) -> () {
+  // The bit position lives in a local while the block is stored, so that it stays in a register:
+  // through the reference each write to the output could change it.
+  let mut storageIx = storageIxRef.*
+  let mut i: usize = 0
+  while i < 256 {
+    s.litHisto[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < 128 {
+    s.cmdDepth[i] = 0
+    s.cmdBits[i] = 0
+    s.cmdHisto[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < numLiterals {
+    let symbol = u8.toUsize(literals[i])
+    s.litHisto[symbol] = u32.wrappingAdd(s.litHisto[symbol], 1)
+    i = i + 1
+  }
+  buildAndStoreHuffmanTreeFast(&mut s.tmpTree, &s.litHisto, numLiterals, 8, &mut s.litDepth, &mut s.litBits, &mut storageIx, &mut storage)
+
+  i = 0
+  while i < numCommands {
+    let code = u32.toUsize(commands[i] & 0x7f)
+    s.cmdHisto[code] = u32.wrappingAdd(s.cmdHisto[code], 1)
+    i = i + 1
+  }
+  s.cmdHisto[1] = s.cmdHisto[1] + 1
+  s.cmdHisto[2] = s.cmdHisto[2] + 1
+  s.cmdHisto[64] = s.cmdHisto[64] + 1
+  s.cmdHisto[84] = s.cmdHisto[84] + 1
+  buildAndStoreCommandPrefixCode(&mut s, &mut storageIx, &mut storage)
+
+  let mut literal: usize = 0
+  i = 0
+  while i < numCommands {
+    let cmd = commands[i]
+    // The code is the low byte of the word and is below 128.
+    let code = u32.toUsize(cmd & 0x7f)
+    let extra = u32.shiftRight(cmd, 8)
+    writeBits(u8.toUsize(s.cmdDepth[code]), u16.toU64(s.cmdBits[code]), &mut storageIx, &mut storage)
+    writeBits(u32.toUsize(NUM_EXTRA_BITS[code]), u32.toU64(extra), &mut storageIx, &mut storage)
+    if code < 24 {
+      let insert = u32.toUsize(INSERT_OFFSET[code] + extra)
+      let pending = Slice.view<u8>(literals, literal, insert)
+      let mut j: usize = 0
+      while j < insert {
+        let lit = u8.toUsize(pending[j])
+        writeBits(u8.toUsize(s.litDepth[lit]), u16.toU64(s.litBits[lit]), &mut storageIx, &mut storage)
+        j = j + 1
+      }
+      literal = literal + insert
+    }
+    i = i + 1
+  }
+  storageIxRef.* = storageIx
+}
+
+// Acceptable loss for uncompressible speedup is 2%
+const MIN_RATIO: f64 = 0.98
+const SAMPLE_RATE: usize = 43
+
+// `ShouldCompress`.
+fn shouldCompress(s: &mut TwoPassArena, input: &[u8], numLiterals: usize) -> bool {
+  let inputSize = input.length
+  let corpusSize = usize.toF64(inputSize)
+  if usize.toF64(numLiterals) < MIN_RATIO * corpusSize {
+    return true
+  }
+  let maxTotalBitCost = corpusSize * 8.0 * MIN_RATIO / 43.0
+  let mut i: usize = 0
+  while i < 256 {
+    s.litHisto[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < inputSize {
+    let symbol = u8.toUsize(input[i])
+    s.litHisto[symbol] = u32.wrappingAdd(s.litHisto[symbol], 1)
+    i = i + SAMPLE_RATE
+  }
+  return bitsEntropy(&s.litHisto, 256) < maxTotalBitCost
+}
+
+// `EmitUncompressedMetaBlock`.
+fn emitUncompressedMetaBlock(input: &[u8], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  let inputSize = input.length
+  storeMetaBlockHeader(inputSize, true, &mut storageIx, &mut storage)
+  storageIx.* = (storageIx.* + 7) & usize.bitNot(7)
+  Slice.copyInto<u8>(&mut storage, usize.shiftRight(storageIx.*, 3), input)
+  storageIx.* = storageIx.* + usize.shiftLeft(inputSize, 3)
+  storage[usize.shiftRight(storageIx.*, 3)] = 0
+}
+
+// `BrotliCompressFragmentTwoPassImpl`. `data` is the whole fragment.
+@inlineAlways
+fn compressFragmentTwoPassImpl(
+  s: &mut TwoPassArena,
+  data: &[u8],
+  commandBuf: &mut [u32],
+  literalBuf: &mut [u8],
+  table: &mut [u32],
+  tableBits: usize,
+  minMatch: usize,
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let mut input: usize = 0
+  let mut inputSize = data.length
+  while inputSize > 0 {
+    let blockSize = if inputSize < COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE { inputSize } else { COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE }
+    let mut numLiterals: usize = 0
+    let mut numCommands: usize = 0
+    createCommands(data, input, blockSize, inputSize, &mut table, tableBits, minMatch, &mut literalBuf, &mut numLiterals, &mut commandBuf, &mut numCommands)
+    let block = Slice.view<u8>(data, input, blockSize)
+    if shouldCompress(&mut s, block, numLiterals) {
+      storeMetaBlockHeader(blockSize, false, &mut storageIx, &mut storage)
+      // No block splits, no contexts.
+      writeBits(13, 0, &mut storageIx, &mut storage)
+      storeCommands(&mut s, &literalBuf, numLiterals, &commandBuf, numCommands, &mut storageIx, &mut storage)
+    } else {
+      // Since we did not find many backward references and the entropy of the data is close to 8
+      // bits, we can simply emit an uncompressed block. This makes compression speed of
+      // uncompressible data about 3x faster.
+      emitUncompressedMetaBlock(block, &mut storageIx, &mut storage)
+    }
+    input = input + blockSize
+    inputSize = inputSize - blockSize
+  }
+}
+
+// The C code bakes one copy of the compressor for each table size, so that the hash shift and
+// the match length are constants: 4-byte matches up to 15 table bits, 6-byte matches above.
+fn impl8(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 8, 4, &mut storageIx, &mut storage)
+}
+
+fn impl9(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 9, 4, &mut storageIx, &mut storage)
+}
+
+fn impl10(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 10, 4, &mut storageIx, &mut storage)
+}
+
+fn impl11(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 11, 4, &mut storageIx, &mut storage)
+}
+
+fn impl12(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 12, 4, &mut storageIx, &mut storage)
+}
+
+fn impl13(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 13, 4, &mut storageIx, &mut storage)
+}
+
+fn impl14(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 14, 4, &mut storageIx, &mut storage)
+}
+
+fn impl15(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 15, 4, &mut storageIx, &mut storage)
+}
+
+fn impl16(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 16, 6, &mut storageIx, &mut storage)
+}
+
+fn impl17(s: &mut TwoPassArena, data: &[u8], commandBuf: &mut [u32], literalBuf: &mut [u8], table: &mut [u32], storageIx: &mut usize, storage: &mut [u8]) -> () {
+  compressFragmentTwoPassImpl(&mut s, data, &mut commandBuf, &mut literalBuf, &mut table, 17, 6, &mut storageIx, &mut storage)
+}
+
+/// `BrotliCompressFragmentTwoPass`: compresses `input` to `storage` as one or more complete
+/// meta-blocks, and updates the bit position `storageIx`.
+///
+/// If `isLast`, emits an additional empty last meta-block.
+///
+/// REQUIRES: `input` is not empty, or `isLast`.
+/// REQUIRES: `input` is at most the maximal metablock size (1 << 24).
+/// REQUIRES: `commandBuf` and `literalBuf` hold at least
+///           `min(input.length, COMPRESS_FRAGMENT_TWO_PASS_BLOCK_SIZE)` entries.
+/// REQUIRES: All elements in `table` are zero.
+/// REQUIRES: `table.length` is a power of two from 1 << 8 to 1 << 17.
+/// OUTPUT: maximal copy distance <= `input.length`
+/// OUTPUT: maximal copy distance <= BROTLI_MAX_BACKWARD_LIMIT(18)
+pub fn compressFragmentTwoPass(
+  s: &mut TwoPassArena,
+  input: &[u8],
+  isLast: bool,
+  commandBuf: &mut [u32],
+  literalBuf: &mut [u8],
+  table: &mut [u32],
+  storageIx: &mut usize,
+  storage: &mut [u8],
+) -> () {
+  let initialStorageIx = storageIx.*
+  let inputSize = input.length
+  let tableBits = log2FloorNonZero(table.length)
+  if tableBits == 8 {
+    impl8(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 9 {
+    impl9(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 10 {
+    impl10(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 11 {
+    impl11(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 12 {
+    impl12(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 13 {
+    impl13(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 14 {
+    impl14(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 15 {
+    impl15(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 16 {
+    impl16(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  } else if tableBits == 17 {
+    impl17(&mut s, input, &mut commandBuf, &mut literalBuf, &mut table, &mut storageIx, &mut storage)
+  }
+
+  // If output is larger than single uncompressed block, rewrite it.
+  if storageIx.* - initialStorageIx > 31 + usize.shiftLeft(inputSize, 3) {
+    rewindBitPosition(initialStorageIx, &mut storageIx, &mut storage)
+    emitUncompressedMetaBlock(input, &mut storageIx, &mut storage)
+  }
+
+  if isLast {
+    // islast
+    writeBits(1, 1, &mut storageIx, &mut storage)
+    // isempty
+    writeBits(1, 1, &mut storageIx, &mut storage)
+    storageIx.* = (storageIx.* + 7) & usize.bitNot(7)
+  }
+}
