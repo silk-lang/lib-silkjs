@@ -78,6 +78,69 @@ the C library, is removed, and the runtime links no `ZSTD_*` symbol.
 
 ### Measurements
 
+**Final: against `main` at `d197353`** (zlib in Silk, #1277, and the libuv replacement, #1278,
+merged in; `main`'s binding now reads input and writes output in place for every codec, which
+supersedes this branch's own binding changes, `fce17c9`, `2b78cf1` and `ec34732`, listed under
+Found in the runtime's binding). Release builds, interleaved in shuffled order,
+`SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset, nothing else running.
+
+One-shot with `chunkSize` 8 MiB (`ZSTD_CHUNK=8388608`), which shows the codec; five rounds:
+
+| case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
+| --- | --- | --- | --- | --- | --- | --- |
+| c:binary:-5 | 341.1 | 347.8 | 1.02 | 119 | 120 | 10850964 / 10850964 |
+| c:binary:1 | 280.8 | 261.1 | 0.93 | 86 | 88 | 7954313 / 7954313 |
+| c:text:3 | 228.2 | 215.8 | 0.95 | 58 | 60 | 3549252 / 3549252 |
+| c:text:9 | 47.0 | 38.6 | 0.82 | 76 | 78 | 2958542 / 2958542 |
+| c:binary:9 | 38.1 | 24.7 | 0.65 | 98 | 100 | 5996711 / 5996711 |
+| c:json:19 | 1.6 | 1.5 | 0.94 | 92 | 95 | 117074 / 117074 |
+| d:binary:1 | 425.7 | 406.7 | 0.96 | 122 | 125 | 7954313 / 7954313 |
+| d:binary:3 | 403.3 | 403.6 | 1.00 | 122 | 125 | 6816591 / 6816591 |
+| d:text:1 | 461.3 | 477.6 | 1.04 | 101 | 105 | 3586493 / 3586493 |
+| d:text:3 | 421.7 | 439.1 | 1.04 | 103 | 106 | 3549252 / 3549252 |
+| d:json:3 | 939.1 | 967.1 | 1.03 | 89 | 93 | 272294 / 272294 |
+| d:binary:19 | 276.4 | 264.8 | 0.96 | 157 | 160 | 5409670 / 5409670 |
+
+The default `chunkSize`, the streams (1 KiB writes), the thread-pool calls (four at a time) and
+HTTP (a server compressing each 1 MiB response with `Content-Encoding: zstd`, a client decoding
+it with `http.get` into `createZstdDecompress`); three rounds:
+
+| case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
+| --- | --- | --- | --- | --- | --- | --- |
+| c:text:3 | 181.8 | 206.7 | 1.14 | 61 | 64 | 3556322 / 3556322 |
+| d:text:3 | 504.9 | 553.9 | 1.10 | 95 | 96 | 3556322 / 3556322 |
+| c:binary:1 | 247.4 | 241.3 | 0.98 | 97 | 98 | 7954313 / 7954313 |
+| d:binary:1 | 496.3 | 505.2 | 1.02 | 115 | 125 | 7954313 / 7954313 |
+| cs:text:3 | 17.9 | 14.4 | 0.80 | 58 | 64 | 655020 / 655029 |
+| ds:text:3 | 74.8 | 66.7 | 0.89 | 65 | 68 | 655024 / 655024 |
+| cs:binary:3 | 13.3 | 14.2 | 1.07 | 79 | 81 | 1561230 / 1561239 |
+| ds:binary:3 | 35.9 | 35.2 | 0.98 | 80 | 83 | 1561234 / 1561234 |
+| ca:text:3 | 412.6 | 383.0 | 0.93 | 114 | 119 | 3556321 / 3556321 |
+| da:text:3 | 300.0 | 288.2 | 0.96 | 236 | 244 | 3556322 / 3556322 |
+| ca:binary:1 | 342.0 | 359.8 | 1.05 | 183 | 184 | 7954312 / 7954312 |
+| da:binary:1 | 236.7 | 296.1 | 1.25 | 314 | 318 | 7954313 / 7954313 |
+| http:json:3 | 126.6 | 104.3 | 0.82 | 63 | 66 | 97337 / 97337 |
+| http:text:3 | 73.0 | 61.9 | 0.85 | 65 | 67 | 194578 / 194578 |
+| http:binary:1 | 75.9 | 62.9 | 0.83 | 78 | 81 | 404568 / 404568 |
+
+- Level with the C library: decompression at every level (0.96 to 1.04 at 8 MiB, 0.98 to 1.25
+  through the default chunk and the thread pool), compression at levels -5 to 3 and 19 (0.93 to
+  1.14).
+- Levels 5 to 12 compress at 0.65 to 0.82: the row match finder without prefetch (Compiler
+  walls 2; 0.88 to 0.94 with dev.81's prefetch, measured standalone).
+- **Open:** the HTTP rows (0.82 to 0.85) and the text streams (`cs:text:3` 0.80, `ds:text:3`
+  0.89) are below the C library by more than noise against this `main`. Each HTTP request
+  creates a compressor and a decompressor for 1 MiB, and a stream writes 1 KiB at a time, so
+  these are dominated by per-context and per-call costs (context creation, table clears) rather
+  than by the codec loops. Not yet profiled.
+- Peak RSS is within 1 to 10 MiB of the C build in every row.
+
+The measurements below were taken against `main` before #1277, whose binding still copied
+inputs and outputs; they explain the investigation and are kept for that.
+
+#### Before merging main (against `main` at the branch point)
+
+
 Release builds of `main` with the C library (`C`) and of this branch at `298ebbe` (`Silk`),
 interleaved in shuffled order, `SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset, nothing
 compiling; `bench/scripts/zstd.cjs` (one case per process; MB/s of uncompressed data, the median
