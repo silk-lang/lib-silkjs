@@ -51,7 +51,7 @@ configuration.
 
 | Milestone | State |
 | --- | --- |
-| 1. Foundational validation | Done, with one open item: two native tests fail (see below) |
+| 1. Foundational validation | Done. Two native tests fail, on `main` too (see below) |
 | 2. Scorecard | Not started. `modules/benchkit` on `main` already compares engines; see next steps |
 | 3. Differential harness | Runner, generator, minimizer and self-test done; not wired into `silk task` |
 | 4. Engine seam | Not started; design leads only |
@@ -136,20 +136,18 @@ The 60 s workspace-check timeout in the previous handoff was a slow host, not a 
 `embed.py` the runtime member fails with `Unknown module runtime.embedded`; that file is generated
 and ignored by git.
 
-### Open: two failing native tests
+### Two native tests fail on `main` as well
 
-`silk test src/tests.silk` (step 1 of `silk task check`) fails two tests, both in `js_for_in_tests`:
+`silk test src/tests.silk -o build/core-tests --optimization speed --debug false` (step 1 of
+`silk task check`) reports 562 passed, 2 failed, both in `js_for_in_tests`:
 
 - `forInAllocationFailuresReleaseInputSnapshotsAndVisitedState`: fatal trap "QuickJS invariant
   violated" at `js_array_storage_test_support:32`.
 - `forInFailSafeAndFastCompletionAreNotPermanentlyLatched`: assertion "iteration yields the
   independently expected property name" at `js_for_in_tests:141`.
 
-This branch changes two engine files, `cli_options.silk` and `qjs_launch.silk`, neither of which
-is for-in code, so the failures most likely exist on `main` too. That is not confirmed. To
-settle it, check out `main` at `d1973537`, run `silk test src/tests.silk -o build/core-tests
---optimization speed --debug false` in `modules/engine` (about 12 minutes, 13.9 GiB peak), and
-compare.
+The same command on untouched `main` at `d1973537` gives the same two failures with the same
+messages, so they predate this branch and are not caused by it. They are not fixed here.
 
 ## Operating notes for this kind of host
 
