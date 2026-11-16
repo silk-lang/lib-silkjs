@@ -68,8 +68,15 @@ silk task bench-octane                     # Octane 2, 3 interleaved rounds, bes
 silk task bench-octane richards splay      # selected benchmarks
 silk task bench-micro                      # microbench.js, best ns per test
 silk task bench-report                     # the table with the wasm columns; --native for the native-only one
+silk task bench-report --spread            # min, median and max over rounds, with peak RSS and startup
+silk task bench-startup                    # empty-script startup (30 starts), peak RSS, binary sizes
+silk task bench-warmup richards            # per-iteration ms over the first 200 iterations in one process
 silk task bench-fixed --only richards,deltablue old/silkjs new/silkjs    # A/B on fixed work
 ```
+
+`bench-octane` also writes the peak RSS of every process to `octane-rss.json`. `bench-startup`
+writes `startup.json`, `bench-warmup` writes `warmup.json` (`--iterations N`, default 200). See
+[`docs/jit/scorecard.md`](../../../docs/jit/scorecard.md) for what they measure and a recorded run.
 
 `--rounds N`, `--engine PATH` (the engine executable; default `$SILKJS_ENGINE`, else this host's
 release build), `--engines a,b` (columns; default every installed one of `silkjs`, `v8-jitless`,
