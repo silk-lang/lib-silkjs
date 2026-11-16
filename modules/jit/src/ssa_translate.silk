@@ -1,0 +1,598 @@
+//! Engine bytecode to the SSA form, for the first subset (docs/jit/ssa.md, "The translator").
+//!
+//! The output models the interpreter's counts literally: a pushed local or argument is a
+//! `retain`, a dropped operand a `release`, a local written over releases its old value, a
+//! return releases every local and leftover operand. `ssa_ownership` removes what it can prove
+//! redundant. Anything outside the subset fails with `Refusal`; nothing is guessed.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i8
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import silkjs.js_opcode_data as op
+import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
+
+/// What the translator reads about a function: plain numbers and the code bytes, nothing that
+/// points into a runtime, so it can be serialized (ahead-of-time compilation).
+pub struct FunctionInput {
+  /// The final bytecode (`FunctionBytecode.code`).
+  pub code: List<u8>,
+  /// Argument cells the frame has (`argumentCount`).
+  pub argumentCount: u32,
+  /// Locals (`variableCount`).
+  pub localCount: u32,
+  /// Closure variables (`varRefCount`) and own scope slots (`scopeSlots`): refused when nonzero.
+  pub closureVars: u32,
+  pub scopeSlots: u32,
+  /// A plain function (not a generator or async).
+  pub normal: bool,
+}
+
+/// Why a function was not translated. `pc` and `opcode` name the instruction, when one is to
+/// blame (else `pc` is NONE).
+pub struct Refusal { pub pc: u32, pub opcode: u8, pub reason: &'static [u8] }
+
+fn refuse(pc: u32, opcode: u8, reason: &'static [u8]) -> Refusal { return Refusal { pc: pc, opcode: opcode, reason: reason } }
+
+/// The opcodes the first subset translates.
+pub fn supported(opcode: u8) -> bool {
+  return opcode == op.OP_push_i32 || opcode == op.OP_push_i8 || opcode == op.OP_push_i16
+    || opcode == op.OP_push_0 || opcode == op.OP_push_1 || opcode == op.OP_undefined || opcode == op.OP_null
+    || opcode == op.OP_push_true || opcode == op.OP_push_false
+    || opcode == op.OP_drop || opcode == op.OP_dup || opcode == op.OP_nip || opcode == op.OP_swap
+    || opcode == op.OP_get_loc || opcode == op.OP_put_loc || opcode == op.OP_set_loc
+    || opcode == op.OP_get_loc8 || opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8
+    || (opcode >= op.OP_get_loc0 && opcode <= op.OP_put_loc3)
+    || opcode == op.OP_get_arg || (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3)
+    || opcode == op.OP_set_loc_uninitialized || opcode == op.OP_get_loc_check
+    || opcode == op.OP_put_loc_check || opcode == op.OP_put_loc_check_init
+    || opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_mul || opcode == op.OP_add_imm
+    || opcode == op.OP_inc || opcode == op.OP_dec || opcode == op.OP_inc_loc || opcode == op.OP_dec_loc
+    || opcode == op.OP_add_loc || opcode == op.OP_step_loc8
+    || (opcode >= op.OP_add_loc_loc8 && opcode <= op.OP_mul_top_loc8)
+    || (opcode >= op.OP_add_top_arg8 && opcode <= op.OP_mul_top_arg8)
+    || opcode == op.OP_lt || opcode == op.OP_lte || opcode == op.OP_gt || opcode == op.OP_gte
+    || opcode == op.OP_eq || opcode == op.OP_neq || opcode == op.OP_strict_eq || opcode == op.OP_strict_neq
+    || opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
+    || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
+    || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
+}
+
+fn isBranch(opcode: u8) -> bool {
+  return opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
+}
+fn isGoto(opcode: u8) -> bool { return opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16 }
+fn isReturn(opcode: u8) -> bool { return opcode == op.OP_return || opcode == op.OP_return_undef }
+
+fn byteAt(input: &FunctionInput, at: usize) -> u8 { return input.code.get(at) }
+fn u16At(input: &FunctionInput, at: usize) -> u16 { return u8.toU16(byteAt(input, at)) | u16.shiftLeft(u8.toU16(byteAt(input, at + 1)), 8) }
+fn i32At(input: &FunctionInput, at: usize) -> i32 {
+  let bits = u8.toU32(byteAt(input, at)) | u32.shiftLeft(u8.toU32(byteAt(input, at + 1)), 8)
+    | u32.shiftLeft(u8.toU32(byteAt(input, at + 2)), 16) | u32.shiftLeft(u8.toU32(byteAt(input, at + 3)), 24)
+  return u32.wrappingToI32(bits)
+}
+fn i8At(input: &FunctionInput, at: usize) -> i32 { return i8.toI32(u8.wrappingToI8(byteAt(input, at))) }
+fn i16At(input: &FunctionInput, at: usize) -> i32 { return i16.toI32(u16.wrappingToI16(u16At(input, at))) }
+
+/// The size of the instruction at `pc`, from the engine's table.
+fn sizeAt(input: &FunctionInput, pc: usize) -> usize { return u8.toUsize(op.opcodeInfo(byteAt(input, pc), true).size) }
+
+/// The target of the branch or goto at `pc`: displacements count from the first operand byte
+/// (`Machine.jump`).
+fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
+  let opcode = byteAt(input, pc)
+  let mut displacement: i32 = 0
+  if opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_goto { displacement = i32At(input, pc + 1) }
+  else if opcode == op.OP_goto16 { displacement = i16At(input, pc + 1) }
+  else { displacement = i8At(input, pc + 1) }
+  return usize.toI64(pc + 1) + i32.toI64(displacement)
+}
+
+/// Pass A: every reachable instruction start, every block leader and the operand stack depth
+/// at each leader, from the engine's pops and pushes. Fails on code outside the subset.
+struct Shape { leader: List<bool>, depth: List<i32>, start: List<bool> }
+
+effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let mut leader = List<bool>.make() run leader.appendRepeated(false, length + 1)
+  let mut start = List<bool>.make() run start.appendRepeated(false, length + 1)
+  let mut depth = List<i32>.make() run depth.appendRepeated(-1, length + 1)
+  let mut work = List<usize>.make()
+  let mut workDepth = List<i32>.make()
+  leader.set(0, true) depth.set(0, 0)
+  run work.append(0) run workDepth.append(0)
+  while work.length() > 0 {
+    let mut pc = work.pop().unwrapOr(0)
+    let mut d = workDepth.pop().unwrapOr(0)
+    let mut going = true
+    while going {
+      if pc >= length { fail refuse(usize.toU32(pc), 0, b"control falls off the end of the code") }
+      if start.get(pc) { going = false }
+      else {
+        start.set(pc, true)
+        let opcode = byteAt(input, pc)
+        if !supported(opcode) { fail refuse(usize.toU32(pc), opcode, b"opcode outside the subset") }
+        let info = op.opcodeInfo(opcode, true)
+        let size = u8.toUsize(info.size)
+        if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
+        d = d - u8.toI32(info.pops) + u8.toI32(info.pushes)
+        if d < 0 { fail refuse(usize.toU32(pc), opcode, b"operand stack underflow") }
+        if isReturn(opcode) { going = false }
+        else if isBranch(opcode) || isGoto(opcode) {
+          let target = targetOf(input, pc)
+          if target < 0 || target >= usize.toI64(length) { fail refuse(usize.toU32(pc), opcode, b"jump outside the code") }
+          let t = i64.toUsize(target)
+          run mark(&mut leader, &mut depth, &mut work, &mut workDepth, t, d, pc, opcode)
+          if isBranch(opcode) { run mark(&mut leader, &mut depth, &mut work, &mut workDepth, pc + size, d, pc, opcode) }
+          going = false
+        } else {
+          pc = pc + size
+          if leader.get(pc) {
+            run mark(&mut leader, &mut depth, &mut work, &mut workDepth, pc, d, pc, opcode)
+            going = false
+          }
+        }
+      }
+    }
+  }
+  return Shape { leader: move leader, depth: move depth, start: move start }
+}
+
+effect fn mark(leader: &mut List<bool>, depth: &mut List<i32>, work: &mut List<usize>, workDepth: &mut List<i32>,
+  pc: usize, d: i32, from: usize, opcode: u8) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
+  leader.set(pc, true)
+  let known = depth.get(pc)
+  if known >= 0 {
+    if known != d { fail refuse(usize.toU32(from), opcode, b"operand stack depths disagree at a join") }
+    return ()
+  }
+  depth.set(pc, d)
+  run work.append(pc) run workDepth.append(d)
+}
+
+/// The interpreter state the translator tracks: one SSA value per local and operand.
+struct State { locals: List<u32>, stack: List<u32> }
+
+effect fn copyList(from: &List<u32>) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u32>.make()
+  run out.appendSlice(from.asSlice())
+  return move out
+}
+
+struct Translator {
+  f: Function,
+  /// SSA block of each leader pc, or NONE.
+  blockAt: List<u32>,
+  /// The block being filled.
+  current: u32,
+  locals: List<u32>,
+  stack: List<u32>,
+}
+
+impl Translator {
+  fn isOwned(self: &Self, v: u32) -> bool { let info = self.f.value(v) return info.ty == Type.Value && info.own == Own.Owned }
+
+  effect fn release(self: &mut Self, v: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.isOwned(v) { drop run self.f.emit(self.current, Op.Release, false, Type.I32, Own.Unboxed, v, NONE, 0, pc) }
+  }
+  /// A second owner of `v` for a new slot: a retain when `v` holds a count.
+  effect fn share(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if self.isOwned(v) { return run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, v, NONE, 0, pc) }
+    return v
+  }
+  effect fn push(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator { run self.stack.append(v) }
+  fn pop(self: &mut Self) -> u32 { return self.stack.pop().unwrapOr(NONE) }
+  fn top(self: &Self, depth: usize) -> u32 { return self.stack.get(self.stack.length() - depth) }
+
+  /// Gives instruction `inst` an exit at `pc` with the current state.
+  effect fn exitHere(self: &mut Self, inst: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.f.exitFor(inst, pc, usize.toU32(self.stack.length()))
+    let mut i: usize = 0
+    while i < self.locals.length() { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
+    i = 0
+    while i < self.stack.length() { let v = self.stack.get(i) run self.slot(v) i = i + 1 }
+  }
+  effect fn slot(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let info = self.f.value(v)
+    if info.ty == Type.I32 { run self.f.slotAt(v, SlotMode.Int, NONE) }
+    else if info.ty == Type.Bool { run self.f.slotAt(v, SlotMode.Bool, NONE) }
+    else if info.own == Own.Owned { run self.f.slotAt(v, SlotMode.Move, NONE) }
+    else if info.own == Own.Imm { run self.f.slotAt(v, SlotMode.Imm, NONE) }
+    else {
+      let mut root = NONE
+      if info.rootKind == RootKind.Argument { root = info.root }
+      run self.f.slotAt(v, SlotMode.Dup, root)
+    }
+  }
+
+  /// `v` as an i32: itself, or unboxed with a guard that exits at `pc`.
+  effect fn int(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.f.value(v).ty
+    if ty == Type.I32 { return v }
+    if ty == Type.Bool { return NONE }
+    let r = run self.f.emit(self.current, Op.Unbox, true, Type.I32, Own.Unboxed, v, NONE, 0, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    return r
+  }
+  /// A guarded `add`, `sub` or `mul` of two i32 values.
+  effect fn arith(self: &mut Self, operation: Op, x: u32, y: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let r = run self.f.emit(self.current, operation, true, Type.I32, Own.Unboxed, x, y, 0, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    return r
+  }
+  effect fn constant(self: &mut Self, k: i32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    return run self.f.emit(self.current, Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, k, pc)
+  }
+  effect fn imm(self: &mut Self, k: Imm, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    return run self.f.emit(self.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, u8.toI32(Imm.value(k)), pc)
+  }
+  /// Argument `n`'s bits, borrowed from its cell.
+  effect fn argument(self: &mut Self, n: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let v = run self.f.emit(self.current, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, u32.wrappingToI32(n), pc)
+    self.f.setOwnership(v, Own.Borrowed, RootKind.Argument, n)
+    return v
+  }
+  /// `v` boxed, for a block parameter or a return.
+  effect fn boxed(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.f.value(v).ty
+    if ty == Type.I32 { return run self.f.emit(self.current, Op.BoxI32, true, Type.Value, Own.Imm, v, NONE, 0, pc) }
+    if ty == Type.Bool { return run self.f.emit(self.current, Op.BoxBool, true, Type.Value, Own.Imm, v, NONE, 0, pc) }
+    return v
+  }
+
+  /// An edge from the current block to `target` carrying the whole state.
+  effect fn edgeTo(self: &mut Self, target: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    // Boxes first: they are instructions of the current block.
+    let mut args = List<u32>.make()
+    let mut i: usize = 0
+    while i < self.locals.length() { let v = self.locals.get(i) let b = run self.boxed(v, pc) run args.append(b) i = i + 1 }
+    i = 0
+    while i < self.stack.length() { let v = self.stack.get(i) let b = run self.boxed(v, pc) run args.append(b) i = i + 1 }
+    let edge = run self.f.newEdge(target)
+    i = 0
+    while i < args.length() { run self.f.edgeArgument(args.get(i)) i = i + 1 }
+    return edge
+  }
+
+  /// The block a jump from the instruction at `pc` to `targetPc` goes to: the target's block,
+  /// or for a back edge a new latch block that polls and then jumps there.
+  effect fn destination(self: &mut Self, targetPc: usize, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let target = self.blockAt.get(targetPc)
+    if usize.toU32(targetPc) > pc { return target }
+    let latch = run self.f.block()
+    let saved = self.current
+    let savedLocals = run copyList(&self.locals)
+    let savedStack = run copyList(&self.stack)
+    // The latch's parameters mirror the state; its poll exits at the loop target.
+    self.current = latch
+    let mut i: usize = 0
+    while i < self.locals.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.locals.set(i, p) i = i + 1 }
+    i = 0
+    while i < self.stack.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.stack.set(i, p) i = i + 1 }
+    drop run self.f.emit(latch, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, pc)
+    let last = self.f.lastInst() run self.exitHere(last, usize.toU32(targetPc))
+    let edge = run self.edgeTo(target, pc)
+    run self.f.terminate(latch, Op.Jump, NONE, edge, pc)
+    self.current = saved
+    self.locals = move savedLocals
+    self.stack = move savedStack
+    return latch
+  }
+
+  /// Ends the current block with a jump to the block of `targetPc`.
+  effect fn jumpTo(self: &mut Self, targetPc: usize, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let dest = run self.destination(targetPc, pc)
+    let edge = run self.edgeTo(dest, pc)
+    run self.f.terminate(self.current, Op.Jump, NONE, edge, pc)
+  }
+
+  /// Starts filling the block of leader `pc`: its parameters are the state.
+  effect fn enter(self: &mut Self, pc: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let block = self.blockAt.get(pc)
+    self.current = block
+    let params = run self.f.paramsOf(block)
+    let local = u32.toUsize(self.f.localCount)
+    self.locals.clear() self.stack.clear()
+    let mut i: usize = 0
+    while i < params.length() {
+      if i < local { run self.locals.append(params.get(i)) } else { run self.stack.append(params.get(i)) }
+      i = i + 1
+    }
+  }
+
+  /// Releases every local and operand, for a return.
+  effect fn releaseAll(self: &mut Self, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.locals.length() { let v = self.locals.get(i) run self.release(v, pc) i = i + 1 }
+    i = 0
+    while i < self.stack.length() { let v = self.stack.get(i) run self.release(v, pc) i = i + 1 }
+  }
+
+  /// Writes `v` to local `index`, releasing what it held.
+  effect fn store(self: &mut Self, index: usize, v: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let old = self.locals.get(index)
+    self.locals.set(index, v)
+    run self.release(old, pc)
+  }
+
+  /// `add`/`sub`/`mul` or a comparison of the two top operands.
+  effect fn binary(self: &mut Self, opcode: u8, pc: u32) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let a = self.top(2) let b = self.top(1)
+    let x = run self.int(a, pc) let y = run self.int(b, pc)
+    if x == NONE || y == NONE { fail refuse(pc, opcode, b"a boolean operand of arithmetic") }
+    let mut r = NONE
+    if opcode == op.OP_add { r = run self.arith(Op.Add, x, y, pc) }
+    else if opcode == op.OP_sub { r = run self.arith(Op.Sub, x, y, pc) }
+    else if opcode == op.OP_mul { r = run self.arith(Op.Mul, x, y, pc) }
+    else {
+      let mut kind = Cmp.Lt
+      if opcode == op.OP_lte { kind = Cmp.Le }
+      else if opcode == op.OP_gt { kind = Cmp.Gt }
+      else if opcode == op.OP_gte { kind = Cmp.Ge }
+      else if opcode == op.OP_eq || opcode == op.OP_strict_eq { kind = Cmp.Eq }
+      else if opcode == op.OP_neq || opcode == op.OP_strict_neq { kind = Cmp.Ne }
+      r = run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, x, y, u8.toI32(Cmp.value(kind)), pc)
+    }
+    drop self.pop() drop self.pop()
+    run self.release(a, pc) run self.release(b, pc)
+    run self.push(r)
+  }
+
+  /// The truth of `v` for a branch: a bool as it is, an i32 compared with 0, a boxed value
+  /// guarded to be a Bool.
+  effect fn condition(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.f.value(v).ty
+    if ty == Type.Bool { return v }
+    if ty == Type.I32 {
+      let zero = run self.constant(0, pc)
+      return run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, v, zero, u8.toI32(Cmp.value(Cmp.Ne)), pc)
+    }
+    let c = run self.f.emit(self.current, Op.UnboxBool, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    return c
+  }
+
+  /// Translates the instruction at `pc` (not a terminator of control flow unless it is one).
+  /// Returns false when it ended the block.
+  effect fn instruction(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let opcode = byteAt(input, pc)
+    let at = usize.toU32(pc)
+    let size = sizeAt(input, pc)
+    if opcode == op.OP_fuse_prefix { return true }
+    if opcode == op.OP_push_i32 { let c = run self.constant(i32At(input, pc + 1), at) run self.push(c) return true }
+    if opcode == op.OP_push_i8 { let c = run self.constant(i8At(input, pc + 1), at) run self.push(c) return true }
+    if opcode == op.OP_push_i16 { let c = run self.constant(i16At(input, pc + 1), at) run self.push(c) return true }
+    if opcode == op.OP_push_0 { let c = run self.constant(0, at) run self.push(c) return true }
+    if opcode == op.OP_push_1 { let c = run self.constant(1, at) run self.push(c) return true }
+    if opcode == op.OP_undefined { let c = run self.imm(Imm.Undefined, at) run self.push(c) return true }
+    if opcode == op.OP_null { let c = run self.imm(Imm.Null, at) run self.push(c) return true }
+    if opcode == op.OP_push_true { let c = run self.imm(Imm.True, at) run self.push(c) return true }
+    if opcode == op.OP_push_false { let c = run self.imm(Imm.False, at) run self.push(c) return true }
+    if opcode == op.OP_drop { let v = self.pop() run self.release(v, at) return true }
+    if opcode == op.OP_dup { let t = self.top(1) let v = run self.share(t, at) run self.push(v) return true }
+    if opcode == op.OP_nip { let b = self.pop() let a = self.pop() run self.push(b) run self.release(a, at) return true }
+    if opcode == op.OP_swap { let b = self.pop() let a = self.pop() run self.push(b) run self.push(a) return true }
+
+    // Locals and arguments.
+    let mut index: usize = usize.MAX
+    if opcode == op.OP_get_loc || opcode == op.OP_put_loc || opcode == op.OP_set_loc || opcode == op.OP_get_arg
+      || opcode == op.OP_get_loc_check || opcode == op.OP_put_loc_check || opcode == op.OP_put_loc_check_init
+      || opcode == op.OP_set_loc_uninitialized { index = u16.toUsize(u16At(input, pc + 1)) }
+    else if opcode == op.OP_get_loc8 || opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8 || opcode == op.OP_inc_loc
+      || opcode == op.OP_dec_loc || opcode == op.OP_add_loc || opcode == op.OP_step_loc8 { index = u8.toUsize(byteAt(input, pc + 1)) }
+    else if opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3 { index = u8.toUsize(opcode - op.OP_get_loc0) }
+    else if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { index = u8.toUsize(opcode - op.OP_put_loc0) }
+    else if opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3 { index = u8.toUsize(opcode - op.OP_get_arg0) }
+    let isArgument = opcode == op.OP_get_arg || (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3)
+    if index != usize.MAX {
+      if isArgument { if index >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") } }
+      else if index >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
+    }
+    if isArgument {
+      let a = run self.argument(usize.toU32(index), at)
+      let r = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, at)
+      run self.push(r) return true
+    }
+    if opcode == op.OP_get_loc || opcode == op.OP_get_loc8 || (opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3) {
+      let l = self.locals.get(index) let v = run self.share(l, at) run self.push(v) return true
+    }
+    if opcode == op.OP_put_loc || opcode == op.OP_put_loc8 || (opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3) {
+      let v = self.pop() run self.store(index, v, at) return true
+    }
+    if opcode == op.OP_set_loc || opcode == op.OP_set_loc8 {
+      let t = self.top(1) let v = run self.share(t, at) run self.store(index, v, at) return true
+    }
+    if opcode == op.OP_set_loc_uninitialized { let u = run self.imm(Imm.Uninitialized, at) run self.store(index, u, at) return true }
+    if opcode == op.OP_get_loc_check || opcode == op.OP_put_loc_check || opcode == op.OP_put_loc_check_init {
+      // Only when the slot's state is known here: an Uninitialized constant, or a value that
+      // is not one (an i32 or bool, or an instruction other than that constant).
+      let current = self.locals.get(index)
+      let info = self.f.value(current)
+      let mut uninitialized = false
+      let mut known = info.ty != Type.Value
+      if !known && info.def != NONE {
+        let def = self.f.inst(info.def)
+        known = true
+        uninitialized = def.op == Op.Imm && def.k == u8.toI32(Imm.value(Imm.Uninitialized))
+      }
+      if !known { fail refuse(at, opcode, b"cannot prove whether a lexical slot is initialized") }
+      if opcode == op.OP_put_loc_check_init {
+        if !uninitialized { fail refuse(at, opcode, b"initializing a slot that may be initialized") }
+        let v = self.pop() run self.store(index, v, at) return true
+      }
+      if uninitialized { fail refuse(at, opcode, b"reads or writes a lexical slot before its initialization (throws)") }
+      if opcode == op.OP_get_loc_check { let v = run self.share(current, at) run self.push(v) return true }
+      let v = self.pop() run self.store(index, v, at) return true
+    }
+
+    // Arithmetic and comparisons.
+    if opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_mul || opcode == op.OP_lt || opcode == op.OP_lte
+      || opcode == op.OP_gt || opcode == op.OP_gte || opcode == op.OP_eq || opcode == op.OP_neq
+      || opcode == op.OP_strict_eq || opcode == op.OP_strict_neq {
+      run self.binary(opcode, at) return true
+    }
+    if opcode == op.OP_add_imm || opcode == op.OP_inc || opcode == op.OP_dec {
+      let a = self.top(1)
+      let x = run self.int(a, at)
+      if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+      let mut k: i32 = 1
+      if opcode == op.OP_add_imm { k = i16At(input, pc + 1) }
+      let c = run self.constant(k, at)
+      let mut operation = Op.Add
+      if opcode == op.OP_dec { operation = Op.Sub }
+      let r = run self.arith(operation, x, c, at)
+      drop self.pop() run self.release(a, at) run self.push(r)
+      return true
+    }
+    if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_step_loc8 {
+      let v = self.locals.get(index)
+      let x = run self.int(v, at)
+      if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+      let one = run self.constant(1, at)
+      let mut operation = Op.Add
+      let mut mode: u8 = 0
+      if opcode == op.OP_step_loc8 { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { operation = Op.Sub } }
+      else if opcode == op.OP_dec_loc { operation = Op.Sub }
+      let r = run self.arith(operation, x, one, at)
+      run self.store(index, r, at)
+      // step_loc8 pushes the old value (mode bit 0 clear) or the new one.
+      if opcode == op.OP_step_loc8 { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
+      return true
+    }
+    if opcode == op.OP_add_loc {
+      let b = self.top(1) let v = self.locals.get(index)
+      let x = run self.int(v, at) let y = run self.int(b, at)
+      if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+      let r = run self.arith(Op.Add, x, y, at)
+      drop self.pop() run self.release(b, at)
+      run self.store(index, r, at)
+      return true
+    }
+    if (opcode >= op.OP_add_loc_loc8 && opcode <= op.OP_mul_top_loc8) || (opcode >= op.OP_add_top_arg8 && opcode <= op.OP_mul_top_arg8) {
+      let mut operation = Op.Add
+      if opcode == op.OP_sub_loc_loc8 || opcode == op.OP_sub_top_loc8 || opcode == op.OP_sub_top_arg8 { operation = Op.Sub }
+      if opcode == op.OP_mul_loc_loc8 || opcode == op.OP_mul_top_loc8 || opcode == op.OP_mul_top_arg8 { operation = Op.Mul }
+      let twoLocals = opcode <= op.OP_mul_loc_loc8
+      let mut left = NONE
+      let first = u8.toUsize(byteAt(input, pc + 1))
+      let mut rightIndex = first
+      if twoLocals {
+        rightIndex = u8.toUsize(byteAt(input, pc + 2))
+        if first >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
+        left = self.locals.get(first)
+      } else { left = self.top(1) }
+      let mut right = NONE
+      if opcode >= op.OP_add_top_arg8 {
+        if rightIndex >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") }
+        right = run self.argument(usize.toU32(rightIndex), at)
+      } else {
+        if rightIndex >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
+        right = self.locals.get(rightIndex)
+      }
+      let x = run self.int(left, at) let y = run self.int(right, at)
+      if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+      let r = run self.arith(operation, x, y, at)
+      if !twoLocals { drop self.pop() run self.release(left, at) }
+      run self.push(r)
+      return true
+    }
+
+    // Control.
+    if isBranch(opcode) {
+      let v = self.top(1)
+      let c = run self.condition(v, at)
+      drop self.pop() run self.release(v, at)
+      let target = i64.toUsize(targetOf(input, pc))
+      let fall = pc + size
+      let taken = run self.destination(target, at)
+      let next = run self.destination(fall, at)
+      let mut whenTrue = taken let mut whenFalse = next
+      if opcode == op.OP_if_false || opcode == op.OP_if_false8 { whenTrue = next whenFalse = taken }
+      let edge = run self.edgeTo(whenTrue, at)
+      drop run self.edgeTo(whenFalse, at)
+      run self.f.terminate(self.current, Op.Branch, c, edge, at)
+      return false
+    }
+    if isGoto(opcode) { run self.jumpTo(i64.toUsize(targetOf(input, pc)), at) return false }
+    if opcode == op.OP_return {
+      let v = self.pop()
+      run self.releaseAll(at)
+      let r = run self.boxed(v, at)
+      run self.f.terminate(self.current, Op.Return, r, NONE, at)
+      return false
+    }
+    if opcode == op.OP_return_undef {
+      run self.releaseAll(at)
+      let u = run self.imm(Imm.Undefined, at)
+      run self.f.terminate(self.current, Op.Return, u, NONE, at)
+      return false
+    }
+    fail refuse(at, opcode, b"opcode outside the subset")
+  }
+}
+
+/// Translates `input`, or refuses. The result is compacted but not yet simplified or
+/// ownership-optimized (see `ssa_ownership.optimize`).
+pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+  if !input.normal { fail refuse(NONE, 0, b"generator or async function") }
+  if input.closureVars != 0 { fail refuse(NONE, 0, b"closure variables") }
+  if input.scopeSlots != 0 { fail refuse(NONE, 0, b"a function scope") }
+  if input.code.length() == 0 { fail refuse(NONE, 0, b"no code") }
+  if op.opcodeInfo(op.OP_fuse_prefix, true).size != 5 { fail refuse(NONE, op.OP_fuse_prefix, b"fusion prefix size changed") }
+  let shapeOf = run shape(input)
+  let length = input.code.length()
+  let mut t = Translator { f: Function.make(input.argumentCount, input.localCount), blockAt: List<u32>.make(), current: 0,
+    locals: List<u32>.make(), stack: List<u32>.make() }
+  run t.blockAt.appendRepeated(NONE, length + 1)
+  let entry = run t.f.block()
+  // A block per leader, with one parameter per local and per operand at that point.
+  let mut pc: usize = 0
+  while pc < length {
+    if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
+      let b = run t.f.block()
+      t.blockAt.set(pc, b)
+      let count = input.localCount + i32.wrappingToU32(shapeOf.depth.get(pc))
+      let mut i: u32 = 0
+      while i < count { drop run t.f.addParam(b, Type.Value, Own.Owned) i = i + 1 }
+    }
+    pc = pc + 1
+  }
+  // The entry: locals start undefined, then the code's first block.
+  t.current = entry
+  let undefined = run t.imm(Imm.Undefined, 0)
+  let mut i: u32 = 0
+  while i < input.localCount { run t.locals.append(undefined) i = i + 1 }
+  // Not a back edge, though its target is offset 0.
+  let first = t.blockAt.get(0)
+  let edge = run t.edgeTo(first, 0)
+  run t.f.terminate(entry, Op.Jump, NONE, edge, 0)
+  // Each block in code order.
+  pc = 0
+  while pc < length {
+    if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
+      run t.enter(pc)
+      let mut at = pc
+      let mut previous = pc
+      let mut open = true
+      while open {
+        if at != pc && shapeOf.leader.get(at) {
+          // Falling through into the next block, from the instruction before it.
+          run t.jumpTo(at, usize.toU32(previous))
+          open = false
+        } else {
+          open = run t.instruction(input, at)
+          previous = at
+          at = at + sizeAt(input, at)
+        }
+      }
+    }
+    pc = pc + 1
+  }
+  run t.f.compact()
+  return move t.f
+}
