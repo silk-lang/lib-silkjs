@@ -1,0 +1,620 @@
+//! The ownership-aware SSA form (docs/jit/ssa.md): data structures, builder, compaction and
+//! the textual printer.
+//!
+//! A `Function` is built by appending: `block` makes a block, `param` gives it parameters,
+//! `emit` and the terminator methods append instructions to the block named in their call, in
+//! any order across blocks. `compact` then puts the blocks in reverse postorder from the entry,
+//! drops unreachable blocks and `Removed` instructions, and renumbers blocks, values and exits
+//! densely, so the form the backend and the printer see is canonical. Passes rewrite in place
+//! and compact again.
+//!
+//! Everything is an index: nothing here holds a pointer, so a function can be stored and read
+//! back unchanged.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+
+/// The index that names nothing.
+pub const NONE: u32 = 4294967295
+
+/// The type of a value.
+pub enum Type { I32, Bool, Value }
+
+/// The ownership of a value. `Unboxed` is the only one an `i32` or `bool` has; a `value` is
+/// `Owned` (one count, consumed exactly once on every path), `Borrowed` (no count, valid while
+/// its root is) or `Imm` (no heap reference, needs no count).
+pub enum Own { Unboxed, Owned, Borrowed, Imm }
+
+/// What a borrowed value borrows from: an argument cell (`root` is its index) or an owned value
+/// (`root` is its value index).
+pub enum RootKind { None, Argument, Value }
+
+/// The operation of an instruction. See docs/jit/ssa.md for each one's meaning.
+pub enum Op {
+  /// `arg k`: the bits of argument cell `k`, borrowed from it.
+  Arg,
+  /// `const.i32 k`.
+  ConstI32,
+  /// An immediate boxed constant; `k` is an `Imm` tag.
+  Imm,
+  /// `unbox.i32 a`: guard, exits unless `a` is an Int.
+  Unbox,
+  /// `box.i32 a`.
+  BoxI32,
+  /// `box.bool a`.
+  BoxBool,
+  /// `add.i32 a, b`: guard, exits on overflow.
+  Add,
+  /// `sub.i32 a, b`: guard, exits on overflow.
+  Sub,
+  /// `mul.i32 a, b`: guard, exits on overflow and on a -0 result.
+  Mul,
+  /// `cmp.i32 a, b` with the `Cmp` in `k`: a bool.
+  Cmp,
+  /// `retain a`: a new owner of `a`'s bits.
+  Retain,
+  /// `release a`: consumes the owned `a`.
+  Release,
+  /// An interrupt safepoint on a loop back edge, with an exit at the loop target.
+  Poll,
+  /// Terminator: `jump` along `edge`.
+  Jump,
+  /// Terminator: `branch a`, along `edge` when true and `edge + 1` when false.
+  Branch,
+  /// Terminator: `return a`, transferring `a` to the caller.
+  Return,
+  /// Deleted by a pass; `compact` drops it.
+  Removed,
+}
+
+/// Comparisons, signed; stored in `Inst.k`.
+pub enum Cmp { Lt, Le, Gt, Ge, Eq, Ne }
+
+/// Immediate boxed constants; stored in `Inst.k`.
+pub enum Imm { Undefined, Null, False, True, Uninitialized }
+
+/// How a deoptimization exit writes a slot. See docs/jit/ssa.md.
+pub enum SlotMode { Int, Bool, Imm, Move, Dup }
+
+pub struct ValueInfo {
+  pub ty: Type,
+  pub own: Own,
+  pub rootKind: RootKind,
+  pub root: u32,
+  /// The block that defines it.
+  pub block: u32,
+  /// The defining instruction, or NONE for a block parameter.
+  pub def: u32,
+}
+impl Copy for ValueInfo {}
+
+pub struct Inst {
+  pub op: Op,
+  /// The value it defines, or NONE.
+  pub result: u32,
+  pub a: u32,
+  pub b: u32,
+  /// Constant, argument index, `Cmp` or `Imm` tag.
+  pub k: i32,
+  /// A terminator's first edge, or NONE.
+  pub edge: u32,
+  /// The deoptimization exit of a guard or `poll`, or NONE.
+  pub exit: u32,
+  /// The bytecode offset of the instruction this came from.
+  pub pc: u32,
+  pub block: u32,
+  /// Position within the block; only `compact` reads it.
+  pub order: u32,
+}
+impl Copy for Inst {}
+
+pub struct Block {
+  pub firstParam: u32,
+  pub paramCount: u32,
+  pub firstInst: u32,
+  pub instCount: u32,
+}
+impl Copy for Block {}
+
+pub struct Edge { pub target: u32, pub firstArg: u32, pub argCount: u32 }
+impl Copy for Edge {}
+
+/// A deoptimization exit: resume the interpreter at `pc` with `localCount` local slots and
+/// `stackDepth` operand stack slots, in `Function.slots` from `firstSlot` (locals first, then
+/// the stack bottom first).
+pub struct Exit { pub pc: u32, pub stackDepth: u32, pub firstSlot: u32 }
+impl Copy for Exit {}
+
+/// One slot of an exit. `root` is the argument index a `Dup` slot's value borrows from, or NONE.
+pub struct Slot { pub value: u32, pub mode: SlotMode, pub root: u32 }
+impl Copy for Slot {}
+
+pub struct Function {
+  pub argumentCount: u32,
+  pub localCount: u32,
+  pub blocks: List<Block>,
+  /// Block parameters, grouped by block once compacted.
+  pub params: List<u32>,
+  pub insts: List<Inst>,
+  pub values: List<ValueInfo>,
+  pub edges: List<Edge>,
+  pub edgeArgs: List<u32>,
+  pub exits: List<Exit>,
+  pub slots: List<Slot>,
+  nextOrder: u32,
+}
+
+pub fn ownOf(ty: Type) -> Own { if ty == Type.Value { return Own.Owned } return Own.Unboxed }
+
+/// Whether an instruction may run JavaScript or reenter the engine. None in the first subset;
+/// the ownership pass ends argument borrows at any instruction for which this holds.
+pub fn mayReenter(op: Op) -> bool { return op == Op.Removed && op != Op.Removed }
+
+pub fn isTerminator(op: Op) -> bool { return op == Op.Jump || op == Op.Branch || op == Op.Return }
+
+/// The number of successor edges a terminator has.
+pub fn edgeCount(op: Op) -> u32 {
+  if op == Op.Jump { return 1 }
+  if op == Op.Branch { return 2 }
+  return 0
+}
+
+impl Function {
+  pub fn make(argumentCount: u32, localCount: u32) -> Function {
+    return Function { argumentCount: argumentCount, localCount: localCount, blocks: List<Block>.make(),
+      params: List<u32>.make(), insts: List<Inst>.make(), values: List<ValueInfo>.make(),
+      edges: List<Edge>.make(), edgeArgs: List<u32>.make(), exits: List<Exit>.make(),
+      slots: List<Slot>.make(), nextOrder: 0 }
+  }
+
+  pub fn valueCount(self: &Self) -> u32 { return usize.toU32(self.values.length()) }
+  pub fn blockCount(self: &Self) -> u32 { return usize.toU32(self.blocks.length()) }
+  pub fn value(self: &Self, v: u32) -> ValueInfo { return self.values.get(u32.toUsize(v)) }
+  pub fn inst(self: &Self, index: u32) -> Inst { return self.insts.get(u32.toUsize(index)) }
+  pub fn edge(self: &Self, index: u32) -> Edge { return self.edges.get(u32.toUsize(index)) }
+  pub fn edgeArg(self: &Self, edge: Edge, index: u32) -> u32 { return self.edgeArgs.get(u32.toUsize(edge.firstArg + index)) }
+  pub fn exit(self: &Self, index: u32) -> Exit { return self.exits.get(u32.toUsize(index)) }
+  pub fn slot(self: &Self, exit: Exit, index: u32) -> Slot { return self.slots.get(u32.toUsize(exit.firstSlot + index)) }
+  /// A compacted block's `index`th parameter.
+  pub fn paramAt(self: &Self, block: Block, index: u32) -> u32 { return self.params.get(u32.toUsize(block.firstParam + index)) }
+  /// A compacted block's terminator.
+  pub fn terminator(self: &Self, block: Block) -> Inst { return self.insts.get(u32.toUsize(block.firstInst + block.instCount - 1)) }
+
+  pub fn setOwnership(self: &mut Self, v: u32, own: Own, rootKind: RootKind, root: u32) -> () {
+    let mut info = self.values.get(u32.toUsize(v))
+    info.own = own info.rootKind = rootKind info.root = root
+    self.values.set(u32.toUsize(v), info)
+  }
+  pub fn setType(self: &mut Self, v: u32, ty: Type) -> () {
+    let mut info = self.values.get(u32.toUsize(v))
+    info.ty = ty
+    self.values.set(u32.toUsize(v), info)
+  }
+  pub fn setInst(self: &mut Self, index: u32, inst: Inst) -> () { self.insts.set(u32.toUsize(index), inst) }
+  pub fn setSlot(self: &mut Self, index: u32, slot: Slot) -> () { self.slots.set(u32.toUsize(index), slot) }
+  pub fn setEdgeArg(self: &mut Self, index: u32, v: u32) -> () { self.edgeArgs.set(u32.toUsize(index), v) }
+
+  // ---- building ----
+
+  /// A new block with no parameters and no instructions.
+  pub effect fn block(self: &mut Self) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.blocks.append(Block { firstParam: 0, paramCount: 0, firstInst: 0, instCount: 0 })
+    return usize.toU32(self.blocks.length() - 1)
+  }
+
+  effect fn newValue(self: &mut Self, ty: Type, own: Own, block: u32, def: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.values.append(ValueInfo { ty: ty, own: own, rootKind: RootKind.None, root: NONE, block: block, def: def })
+    return usize.toU32(self.values.length() - 1)
+  }
+
+  /// Adds a parameter to `block`, after the ones it has.
+  pub effect fn addParam(self: &mut Self, block: u32, ty: Type, own: Own) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let v = run self.newValue(ty, own, block, NONE)
+    run self.params.append(v)
+    return v
+  }
+
+  /// The parameters of `block` in order, for a function that is not compacted yet.
+  pub effect fn paramsOf(self: &Self, block: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let mut out = List<u32>.make()
+    let mut i: usize = 0
+    while i < self.params.length() {
+      let v = self.params.get(i)
+      if self.values.get(u32.toUsize(v)).block == block { run out.append(v) }
+      i = i + 1
+    }
+    return move out
+  }
+
+  /// Appends an instruction to `block`. When `ty` is not NONE-like (the `hasResult` flag), the
+  /// instruction defines a new value of that type and ownership, returned; else NONE.
+  pub effect fn emit(self: &mut Self, block: u32, op: Op, hasResult: bool, ty: Type, own: Own, a: u32, b: u32, k: i32, pc: u32) -> u32
+    ! OutOfMemoryError ? &mut Allocator {
+    let index = usize.toU32(self.insts.length())
+    let mut result = NONE
+    if hasResult { result = run self.newValue(ty, own, block, index) }
+    run self.insts.append(Inst { op: op, result: result, a: a, b: b, k: k, edge: NONE, exit: NONE, pc: pc, block: block, order: self.nextOrder })
+    self.nextOrder = self.nextOrder + 2
+    return result
+  }
+
+  /// Inserts an instruction just before instruction `before` (in the same block).
+  pub effect fn insertBefore(self: &mut Self, before: u32, op: Op, hasResult: bool, ty: Type, own: Own, a: u32, b: u32, k: i32) -> u32
+    ! OutOfMemoryError ? &mut Allocator {
+    let at = self.inst(before)
+    let index = usize.toU32(self.insts.length())
+    let mut result = NONE
+    if hasResult { result = run self.newValue(ty, own, at.block, index) }
+    run self.insts.append(Inst { op: op, result: result, a: a, b: b, k: k, edge: NONE, exit: NONE, pc: at.pc, block: at.block, order: at.order - 1 })
+    return result
+  }
+
+  /// Gives the last instruction appended an exit. Returns the exit's index; its slots are added
+  /// with `slotAt`.
+  pub effect fn exitFor(self: &mut Self, inst: u32, pc: u32, stackDepth: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let index = usize.toU32(self.exits.length())
+    run self.exits.append(Exit { pc: pc, stackDepth: stackDepth, firstSlot: usize.toU32(self.slots.length()) })
+    let mut at = self.inst(inst)
+    at.exit = index
+    self.setInst(inst, at)
+    return index
+  }
+  /// Appends a slot to the exit made last.
+  pub effect fn slotAt(self: &mut Self, value: u32, mode: SlotMode, root: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.slots.append(Slot { value: value, mode: mode, root: root })
+  }
+  /// The index of the instruction appended last.
+  pub fn lastInst(self: &Self) -> u32 { return usize.toU32(self.insts.length() - 1) }
+
+  /// Appends an edge to `target` with no arguments yet; arguments follow with `edgeArgument`.
+  pub effect fn newEdge(self: &mut Self, target: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.edges.append(Edge { target: target, firstArg: usize.toU32(self.edgeArgs.length()), argCount: 0 })
+    return usize.toU32(self.edges.length() - 1)
+  }
+  /// Adds an argument to the edge made last.
+  pub effect fn edgeArgument(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.edgeArgs.append(v)
+    let last = self.edges.length() - 1
+    let mut e = self.edges.get(last)
+    e.argCount = e.argCount + 1
+    self.edges.set(last, e)
+  }
+
+  /// Ends `block` with a terminator whose edges are `edge` and, for a branch, `edge + 1`.
+  pub effect fn terminate(self: &mut Self, block: u32, op: Op, a: u32, edge: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.emit(block, op, false, Type.I32, Own.Unboxed, a, NONE, 0, pc)
+    let last = self.lastInst()
+    let mut inst = self.inst(last)
+    inst.edge = edge
+    self.setInst(last, inst)
+  }
+
+  // ---- compaction ----
+
+  /// Puts the blocks in reverse postorder from block 0, drops unreachable blocks and removed
+  /// instructions, and renumbers blocks, values and exits densely in that order.
+  pub effect fn compact(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let blockCount = self.blocks.length()
+    // The terminator of each block, to walk its successors.
+    let mut term = List<u32>.make()
+    run term.appendRepeated(NONE, blockCount)
+    let mut i: usize = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      if isTerminator(inst.op) { term.set(u32.toUsize(inst.block), usize.toU32(i)) }
+      i = i + 1
+    }
+    // Iterative depth-first search for the postorder.
+    let mut state = List<u8>.make()
+    run state.appendRepeated(0, blockCount)
+    let mut post = List<u32>.make()
+    let mut stack = List<u32>.make()
+    let mut next = List<u32>.make()
+    if blockCount > 0 { run stack.append(0) run next.append(0) state.set(0, 1) }
+    while stack.length() > 0 {
+      let top = stack.length() - 1
+      let b = stack.get(top)
+      let n = next.get(top)
+      let t = term.get(u32.toUsize(b))
+      let mut count: u32 = 0
+      if t != NONE { count = edgeCount(self.insts.get(u32.toUsize(t)).op) }
+      if n < count {
+        next.set(top, n + 1)
+        let target = self.edges.get(u32.toUsize(self.insts.get(u32.toUsize(t)).edge + n)).target
+        if state.get(u32.toUsize(target)) == 0 {
+          state.set(u32.toUsize(target), 1)
+          run stack.append(target) run next.append(0)
+        }
+      } else {
+        run post.append(b)
+        drop stack.pop() drop next.pop()
+      }
+    }
+    // rank[old block] = new index, or NONE when unreachable.
+    let mut rank = List<u32>.make()
+    run rank.appendRepeated(NONE, blockCount)
+    let mut order = List<u32>.make()
+    let mut p = post.length()
+    while p > 0 { p = p - 1 rank.set(u32.toUsize(post.get(p)), usize.toU32(order.length())) run order.append(post.get(p)) }
+
+    // Instructions grouped by new block, then by order within it.
+    let mut buckets = List<List<u32>>.make()
+    let mut bi: usize = 0
+    while bi < order.length() { run buckets.append(List<u32>.make()) bi = bi + 1 }
+    i = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      let r = rank.get(u32.toUsize(inst.block))
+      if r != NONE && inst.op != Op.Removed { run buckets.asMutSlice()[u32.toUsize(r)].append(usize.toU32(i)) }
+      i = i + 1
+    }
+    bi = 0
+    while bi < buckets.length() {
+      let list = &mut buckets.asMutSlice()[bi]
+      // Insertion sort by order: blocks are short and nearly sorted.
+      let mut x: usize = 1
+      while x < list.length() {
+        let item = list.get(x)
+        let key = self.insts.get(u32.toUsize(item)).order
+        let mut y = x
+        while y > 0 && self.insts.get(u32.toUsize(list.get(y - 1))).order > key { let prev = list.get(y - 1) list.set(y, prev) y = y - 1 }
+        list.set(y, item)
+        x = x + 1
+      }
+      bi = bi + 1
+    }
+
+    // New value numbers: each block's parameters (in creation order), then its results.
+    let mut renumber = List<u32>.make()
+    run renumber.appendRepeated(NONE, self.values.length())
+    let mut newValues = List<ValueInfo>.make()
+    let mut newParams = List<u32>.make()
+    let mut newBlocks = List<Block>.make()
+    let mut newInsts = List<Inst>.make()
+    bi = 0
+    while bi < order.length() {
+      let old = order.get(bi)
+      let firstParam = usize.toU32(newParams.length())
+      let mut q: usize = 0
+      while q < self.params.length() {
+        let v = self.params.get(q)
+        let info = self.values.get(u32.toUsize(v))
+        if info.block == old {
+          renumber.set(u32.toUsize(v), usize.toU32(newValues.length()))
+          run newParams.append(usize.toU32(newValues.length()))
+          let mut moved = info moved.block = usize.toU32(bi)
+          run newValues.append(moved)
+        }
+        q = q + 1
+      }
+      let firstInst = usize.toU32(newInsts.length())
+      let list = &buckets.asSlice()[bi]
+      let mut x: usize = 0
+      while x < list.length() {
+        let mut inst = self.insts.get(u32.toUsize(list.get(x)))
+        inst.block = usize.toU32(bi)
+        inst.order = usize.toU32(x) * 2
+        if inst.result != NONE {
+          let mut info = self.values.get(u32.toUsize(inst.result))
+          info.block = usize.toU32(bi) info.def = usize.toU32(newInsts.length())
+          renumber.set(u32.toUsize(inst.result), usize.toU32(newValues.length()))
+          inst.result = usize.toU32(newValues.length())
+          run newValues.append(info)
+        }
+        run newInsts.append(inst)
+        x = x + 1
+      }
+      run newBlocks.append(Block { firstParam: firstParam, paramCount: usize.toU32(newParams.length()) - firstParam,
+        firstInst: firstInst, instCount: usize.toU32(newInsts.length()) - firstInst })
+      bi = bi + 1
+    }
+
+    // Edges and exits in the order the new instructions use them; operands renumbered.
+    let mut newEdges = List<Edge>.make()
+    let mut newArgs = List<u32>.make()
+    let mut newExits = List<Exit>.make()
+    let mut newSlots = List<Slot>.make()
+    i = 0
+    while i < newInsts.length() {
+      let mut inst = newInsts.get(i)
+      if inst.a != NONE && inst.op != Op.Arg && inst.op != Op.ConstI32 && inst.op != Op.Imm { inst.a = renumber.get(u32.toUsize(inst.a)) }
+      if inst.b != NONE { inst.b = renumber.get(u32.toUsize(inst.b)) }
+      if inst.edge != NONE {
+        let first = usize.toU32(newEdges.length())
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let edge = self.edges.get(u32.toUsize(inst.edge + e))
+          let firstArg = usize.toU32(newArgs.length())
+          let mut g: u32 = 0
+          while g < edge.argCount { run newArgs.append(renumber.get(u32.toUsize(self.edgeArgs.get(u32.toUsize(edge.firstArg + g))))) g = g + 1 }
+          run newEdges.append(Edge { target: rank.get(u32.toUsize(edge.target)), firstArg: firstArg, argCount: edge.argCount })
+          e = e + 1
+        }
+        inst.edge = first
+      }
+      if inst.exit != NONE {
+        let exit = self.exits.get(u32.toUsize(inst.exit))
+        let count = self.localCount + exit.stackDepth
+        let firstSlot = usize.toU32(newSlots.length())
+        let mut s: u32 = 0
+        while s < count {
+          let mut slot = self.slots.get(u32.toUsize(exit.firstSlot + s))
+          slot.value = renumber.get(u32.toUsize(slot.value))
+          run newSlots.append(slot)
+          s = s + 1
+        }
+        inst.exit = usize.toU32(newExits.length())
+        run newExits.append(Exit { pc: exit.pc, stackDepth: exit.stackDepth, firstSlot: firstSlot })
+      }
+      newInsts.set(i, inst)
+      i = i + 1
+    }
+    // Value roots name values too.
+    let mut v: usize = 0
+    while v < newValues.length() {
+      let mut info = newValues.get(v)
+      if info.rootKind == RootKind.Value { info.root = renumber.get(u32.toUsize(info.root)) newValues.set(v, info) }
+      v = v + 1
+    }
+    self.blocks = move newBlocks
+    self.params = move newParams
+    self.insts = move newInsts
+    self.values = move newValues
+    self.edges = move newEdges
+    self.edgeArgs = move newArgs
+    self.exits = move newExits
+    self.slots = move newSlots
+    self.nextOrder = usize.toU32(self.insts.length()) * 2 + 2
+  }
+
+  // ---- printing ----
+
+  /// The textual form: one line per block header, instruction and exit.
+  pub effect fn print(self: &Self, out: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut b: u32 = 0
+    while b < self.blockCount() {
+      let block = self.blocks.get(u32.toUsize(b))
+      run text(&mut out, b"b") run number(&mut out, b)
+      if block.paramCount > 0 {
+        run text(&mut out, b"(")
+        let mut p: u32 = 0
+        while p < block.paramCount {
+          if p > 0 { run text(&mut out, b", ") }
+          let v = self.paramAt(block, p)
+          run self.typed(&mut out, v)
+          p = p + 1
+        }
+        run text(&mut out, b")")
+      }
+      run text(&mut out, b":\n")
+      let mut i: u32 = 0
+      while i < block.instCount {
+        run self.printInst(&mut out, self.inst(block.firstInst + i))
+        i = i + 1
+      }
+      b = b + 1
+    }
+    let mut e: u32 = 0
+    while e < usize.toU32(self.exits.length()) {
+      let exit = self.exit(e)
+      run text(&mut out, b"e") run number(&mut out, e) run text(&mut out, b": pc ") run number(&mut out, exit.pc)
+      run text(&mut out, b" locals [")
+      let mut s: u32 = 0
+      while s < self.localCount { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, s)) s = s + 1 }
+      run text(&mut out, b"] stack [")
+      s = 0
+      while s < exit.stackDepth { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, self.localCount + s)) s = s + 1 }
+      run text(&mut out, b"]\n")
+      e = e + 1
+    }
+  }
+
+  effect fn typed(self: &Self, out: &mut List<u8>, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run text(&mut out, b"v") run number(&mut out, v) run text(&mut out, b": ")
+    let info = self.value(v)
+    if info.ty == Type.I32 { run text(&mut out, b"i32") return () }
+    if info.ty == Type.Bool { run text(&mut out, b"bool") return () }
+    run text(&mut out, b"value ")
+    if info.own == Own.Owned { run text(&mut out, b"owned") }
+    else if info.own == Own.Imm { run text(&mut out, b"imm") }
+    else if info.own == Own.Borrowed {
+      run text(&mut out, b"borrowed(")
+      if info.rootKind == RootKind.Argument { run text(&mut out, b"arg ") run number(&mut out, info.root) }
+      else if info.rootKind == RootKind.Value { run text(&mut out, b"v") run number(&mut out, info.root) }
+      else { run text(&mut out, b"?") }
+      run text(&mut out, b")")
+    } else { run text(&mut out, b"unboxed?") }
+  }
+
+  effect fn printEdge(self: &Self, out: &mut List<u8>, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let edge = self.edge(index)
+    run text(&mut out, b"b") run number(&mut out, edge.target) run text(&mut out, b"(")
+    let mut g: u32 = 0
+    while g < edge.argCount { if g > 0 { run text(&mut out, b", ") } run text(&mut out, b"v") run number(&mut out, self.edgeArg(edge, g)) g = g + 1 }
+    run text(&mut out, b")")
+  }
+
+  effect fn printInst(self: &Self, out: &mut List<u8>, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    run text(&mut out, b"  ")
+    if inst.result != NONE { run self.typed(&mut out, inst.result) run text(&mut out, b" = ") }
+    let op = inst.op
+    if op == Op.Arg { run text(&mut out, b"arg ") run number(&mut out, i32.wrappingToU32(inst.k)) }
+    else if op == Op.ConstI32 { run text(&mut out, b"const.i32 ") run signed(&mut out, inst.k) }
+    else if op == Op.Imm { run text(&mut out, b"imm ") run text(&mut out, immName(inst.k)) }
+    else if op == Op.Unbox { run text(&mut out, b"unbox.i32 ") run operand(&mut out, inst.a) }
+    else if op == Op.BoxI32 { run text(&mut out, b"box.i32 ") run operand(&mut out, inst.a) }
+    else if op == Op.BoxBool { run text(&mut out, b"box.bool ") run operand(&mut out, inst.a) }
+    else if op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp {
+      if op == Op.Add { run text(&mut out, b"add.i32 ") }
+      else if op == Op.Sub { run text(&mut out, b"sub.i32 ") }
+      else if op == Op.Mul { run text(&mut out, b"mul.i32 ") }
+      else { run text(&mut out, cmpName(inst.k)) run text(&mut out, b".i32 ") }
+      run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b)
+    }
+    else if op == Op.Retain { run text(&mut out, b"retain ") run operand(&mut out, inst.a) }
+    else if op == Op.Release { run text(&mut out, b"release ") run operand(&mut out, inst.a) }
+    else if op == Op.Poll { run text(&mut out, b"poll") }
+    else if op == Op.Jump { run text(&mut out, b"jump ") run self.printEdge(&mut out, inst.edge) }
+    else if op == Op.Branch {
+      run text(&mut out, b"branch ") run operand(&mut out, inst.a) run text(&mut out, b", ")
+      run self.printEdge(&mut out, inst.edge) run text(&mut out, b", ") run self.printEdge(&mut out, inst.edge + 1)
+    }
+    else if op == Op.Return { run text(&mut out, b"return ") run operand(&mut out, inst.a) }
+    else { run text(&mut out, b"removed") }
+    if inst.exit != NONE { run text(&mut out, b" exit e") run number(&mut out, inst.exit) }
+    run text(&mut out, b"   @") run number(&mut out, inst.pc)
+    run text(&mut out, b"\n")
+  }
+
+  effect fn printSlot(self: &Self, out: &mut List<u8>, slot: Slot) -> () ! OutOfMemoryError ? &mut Allocator {
+    run text(&mut out, slotModeName(slot.mode)) run text(&mut out, b" ") run operand(&mut out, slot.value)
+    if slot.root != NONE { run text(&mut out, b" (arg ") run number(&mut out, slot.root) run text(&mut out, b")") }
+  }
+}
+
+pub fn immName(k: i32) -> &'static [u8] {
+  if k == 0 { return b"undefined" }
+  if k == 1 { return b"null" }
+  if k == 2 { return b"false" }
+  if k == 3 { return b"true" }
+  return b"uninitialized"
+}
+pub fn cmpName(k: i32) -> &'static [u8] {
+  if k == 0 { return b"lt" }
+  if k == 1 { return b"le" }
+  if k == 2 { return b"gt" }
+  if k == 3 { return b"ge" }
+  if k == 4 { return b"eq" }
+  return b"ne"
+}
+pub fn slotModeName(mode: SlotMode) -> &'static [u8] {
+  if mode == SlotMode.Int { return b"int" }
+  if mode == SlotMode.Bool { return b"bool" }
+  if mode == SlotMode.Imm { return b"imm" }
+  if mode == SlotMode.Move { return b"move" }
+  return b"dup"
+}
+
+pub effect fn text(out: &mut List<u8>, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator { run out.appendSlice(bytes) }
+effect fn operand(out: &mut List<u8>, v: u32) -> () ! OutOfMemoryError ? &mut Allocator { run text(&mut out, b"v") run number(&mut out, v) }
+/// Appends `value` in decimal.
+pub effect fn number(out: &mut List<u8>, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10]
+  let mut count: usize = 0
+  let mut rest = value
+  while count == 0 || rest > 0 { digits[count] = u32.wrappingToU8(rest % 10) + 48 rest = rest / 10 count = count + 1 }
+  while count > 0 { count = count - 1 run out.append(digits[count]) }
+}
+/// Appends `value` in decimal with a sign when negative.
+pub effect fn signed(out: &mut List<u8>, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value < 0 {
+    run out.append(45)
+    // -2^31 has no positive i32; its magnitude still fits a u32.
+    run number(&mut out, u32.wrappingSubtract(0, i32.wrappingToU32(value)))
+    return ()
+  }
+  run number(&mut out, i32.wrappingToU32(value))
+}
