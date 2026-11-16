@@ -96,6 +96,8 @@ The integrated runtime passed real synchronous and asynchronous `/bin/sh` scenar
 
 Web stream checks additionally matched Node for truncated input and strict rejection of trailing junk, padding, and concatenated members across gzip, deflate, raw deflate, and Brotli. Cancellation preserved the original reason in both directions; a 1 MiB incompressible input exercised writable pressure and decoded byte-for-byte. A negative-status serialization trap was fixed with the stdlib's existing wrapping integer conversions; that was an adapter bug, not a missing numeric primitive.
 
+**Update, November 2026 (Silk 0.1.0-dev.74):** the pinned `silk.compress.deflate` and `silk.compress.inflate` now have levels, strategies, flushes, dictionaries and incremental steps, and the zlib kinds no longer use the C library: see [`ZLIB_NOTES.md`](ZLIB_NOTES.md) for what the standard library had, what was changed in a local copy, and what goes upstream. Brotli and Zstandard still use their C libraries.
+
 **Potential stdlib contribution:** incremental encoder/decoder owners with bounded output, explicit progress/end status, dictionary handling, flush/reset semantics, and cancellation-safe asynchronous execution. A bulk seeded CRC32 operation may avoid per-byte adapter overhead; compare the existing checksum API before proposing it.
 
 **Preserve:** distinguish truncated input from a stream awaiting more bytes; preserve unconsumed input and partial output across calls; make memory/output limits explicit; do not silently accept unsupported dictionary or flush modes. Keep Node Transform wrappers, callbacks, and zlib constant aliases out of the generic API.

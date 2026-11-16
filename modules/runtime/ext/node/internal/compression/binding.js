@@ -38,13 +38,17 @@ function decode(value, kind) {
   return { consumed: view.getUint32(4, true), output: Buffer.from(value, 20, view.getUint32(8, true)), finished: !!view.getInt32(12, true), again: !!view.getInt32(16, true) };
 }
 function call(op, args) { return host.compression(op, args); }
-function asyncCall(op, args, callback) {
-  const resource = new AsyncResource('ZLIB');
+// `resource` is the caller's async resource, which every call of one handle shares, as a Node
+// zlib handle is one resource for its life; without one, each call is its own.
+function asyncCall(op, args, callback, resource) {
+  const own = resource === undefined;
+  if (own) resource = new AsyncResource('ZLIB');
   try {
     host.compressionAsync(op, args, (err, value) => {
-      host.invokeResource(resource, callback, undefined, [err, value]);
+      // A shared resource lives on after the call; invokeResource destroys only one of its own.
+      host.invokeResource(resource, callback, undefined, [err, value], own);
       host.checkpoint();
     });
-  } catch (err) { resource.emitDestroy(); throw err; }
+  } catch (err) { if (own) resource.emitDestroy(); throw err; }
 }
 module.exports = { codes, codecError, decode, call, asyncCall };

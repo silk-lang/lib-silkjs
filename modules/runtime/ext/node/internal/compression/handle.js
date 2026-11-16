@@ -9,6 +9,8 @@
 
 const { Buffer } = require('buffer');
 const { call, asyncCall } = require('internal/compression/binding');
+const { AsyncResource, _hooksActive: hooksActive } = require('async_hooks');
+const host = require('internal/host');
 const constants = require('internal/compression/constants');
 const { codes: { ERR_INVALID_ARG_TYPE, ERR_OUT_OF_RANGE } } = require('internal/streams/support');
 
@@ -24,7 +26,17 @@ for (const key of Object.keys(constants)) {
 
 // Native kinds of internal/compression/binding.
 const DEFLATE = 1, GZIP = 3, DEFLATERAW = 5;
+// The binding's write op, by number.
+const WRITE = 8;
 const BROTLI_ENCODER = 8, BROTLI_DECODER = 9, ZSTD_COMPRESS = 10;
+// An async zlib write this small runs on the main thread, and its callback comes on a later turn
+// of the loop through the handle's async resource: the thread pool's round trip costs more than
+// the work (a 1 KiB write deflates or inflates in a few microseconds). The bounds keep the time
+// on the main thread to a few hundred microseconds at worst (level 9 on incompressible data, or
+// 64 KiB of inflated output). Larger writes, Brotli and Zstandard go to the thread pool, as in
+// Node. With async hooks installed every write goes there too, so that hooks see the same
+// resources as in Node (an inline write's callback would come from an Immediate).
+const INLINE_INPUT = 4096, INLINE_OUTPUT = 65536;
 
 function initializationFailed(message = 'Initialization failed') {
   const error = new Error(message);
@@ -128,6 +140,10 @@ class CompressionHandle {
     this._id = id;
     this._writeState = writeState;
     this._callback = callback;
+    // A synchronous write's input consumed and output written.
+    this._words = new Uint32Array(2);
+    // One async resource for the handle's life, as Node's zlib handle is.
+    this._resource = new AsyncResource('ZLIB');
     closeHandles.register(this, id, this);
   }
 
@@ -149,40 +165,23 @@ class CompressionHandle {
     if (typeof this.onerror === 'function') this.onerror(text, errno, code);
   }
 
-  // One write() runs native steps until the output range is full, the input is
-  // consumed, or the codec reports that the stream ended. Every step resumes the
-  // codec's retained copy of the remaining input.
-  _step(sync, state, done) {
-    const args = [this._id, state.input, state.flush, state.outLength - state.written];
-    state.input = undefined;
-    const finish = (value) => {
-      const result = decode(value);
-      if (result.output.length) {
-        state.out.set(result.output, state.outOffset + state.written);
-        state.written += result.output.length;
-      }
-      state.consumed += result.consumed;
-      if (result.status !== 0) { done(result.status, result.message); return; }
-      const progressed = result.consumed !== 0 || result.output.length !== 0;
-      if (result.again && progressed && state.written < state.outLength && this._id) {
-        this._step(sync, state, done);
-        return;
-      }
-      done(0);
-    };
-    if (sync) finish(call('process', args));
-    else asyncCall('process', args, (err, value) => {
-      if (err) { done(constants.Z_STREAM_ERROR, err.message); return; }
-      if (!this._id) { done(0); return; }
-      finish(value);
-    });
-  }
-
+  // One write() is one native 'write': the codec reads the caller's input range and writes the
+  // caller's output range in place, calling itself again while it has more to do and the output
+  // has room, as node_zlib.cc's Write does. Nothing is copied on the way.
   _write(sync, flush, input, inOffset, inLength, out, outOffset, outLength) {
     this._check(sync ? 'writeSync' : 'write');
     if (!Number.isInteger(flush)) throw new ERR_INVALID_ARG_TYPE('flush', 'number', flush);
-    const source = input === undefined || input === null ? new ArrayBuffer(0) :
-      snapshot(byteView(input, 'in'), inOffset, inLength, 'in');
+    let source, start = 0, length = 0;
+    if (input !== undefined && input !== null) {
+      const bytes = range(byteView(input, 'in'));
+      if (!Number.isInteger(inOffset) || inOffset < 0 || inOffset > bytes.length) {
+        throw new ERR_OUT_OF_RANGE('in_off', `>= 0 && <= ${bytes.length}`, inOffset);
+      }
+      if (!Number.isInteger(inLength) || inLength < 0 || inLength > bytes.length - inOffset) {
+        throw new ERR_OUT_OF_RANGE('in_len', `>= 0 && <= ${bytes.length - inOffset}`, inLength);
+      }
+      source = bytes.buffer; start = bytes.offset + inOffset; length = inLength;
+    }
     out = byteView(out, 'out');
     const target = range(out);
     if (!Number.isInteger(outOffset) || outOffset < 0 || outOffset > target.length) {
@@ -191,20 +190,37 @@ class CompressionHandle {
     if (!Number.isInteger(outLength) || outLength < 1 || outLength > target.length - outOffset) {
       throw new ERR_OUT_OF_RANGE('out_len', `>= 1 && <= ${target.length - outOffset}`, outLength);
     }
-    const state = {
-      input: source, flush, consumed: 0, written: 0,
-      out: new Uint8Array(target.buffer, target.offset, target.length), outOffset, outLength,
-    };
-    const inBefore = source.byteLength;
+    const args = [this._id, flush, source, start, length, target.buffer, target.offset + outOffset, outLength];
     this._writeInProgress = true;
-    this._step(sync, state, (status, message) => {
+    const done = (value) => {
       this._writeInProgress = false;
-      this._writeState[0] = outLength - state.written;
-      this._writeState[1] = inBefore - state.consumed;
+      let status = 0, consumed, written;
+      if (value === 0) { consumed = this._words[0]; written = this._words[1]; }
+      else {
+        const view = new DataView(value);
+        status = view.getInt32(0, true); consumed = view.getUint32(4, true); written = view.getUint32(8, true);
+      }
+      this._writeState[0] = outLength - written;
+      this._writeState[1] = length - consumed;
       if (this._pendingClose) this.close();
-      if (status !== 0) { this._error(status, message); return; }
+      if (status !== 0) {
+        const message = value !== 0 && value.byteLength > 20 ? Buffer.from(value, 20).toString('latin1') : undefined;
+        this._error(status, message);
+        return;
+      }
       if (!sync) this._callback.call(this);
-    });
+    };
+    if (sync) { args.push(this._words.buffer); done(call(WRITE, args)); return; }
+    if (length <= INLINE_INPUT && outLength <= INLINE_OUTPUT && this._kind < BROTLI_ENCODER && !hooksActive()) {
+      args.push(this._words.buffer);
+      const value = call(WRITE, args);
+      setImmediate(() => host.invokeResource(this._resource, done, undefined, [value], false));
+      return;
+    }
+    asyncCall('write', args, (err, value) => {
+      if (err) { this._writeInProgress = false; this._error(constants.Z_STREAM_ERROR, err.message); return; }
+      done(value);
+    }, this._resource);
   }
 
   write(flush, input, inOffset, inLength, out, outOffset, outLength) {
@@ -230,6 +246,7 @@ class CompressionHandle {
     this._id = 0;
     closeHandles.unregister(this);
     call('close', [id]);
+    if (this._resource) { this._resource.emitDestroy(); this._resource = null; }
   }
 }
 
@@ -305,7 +322,9 @@ class ZstdDecompress extends ZstdHandle {
 
 function crc32(data, value) {
   if (typeof data === 'string') data = Buffer.from(data);
-  return call('crc32', [snapshot(data, 0, range(data).length, 'data'), value]);
+  const bytes = range(data);
+  // The CRC-32 reads the caller's bytes where they are.
+  return call('checksum', [undefined, value, bytes.buffer, bytes.offset, bytes.length]);
 }
 
 module.exports = { Zlib, BrotliEncoder, BrotliDecoder, ZstdCompress, ZstdDecompress, crc32 };
