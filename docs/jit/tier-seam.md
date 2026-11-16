@@ -1,7 +1,8 @@
 # The tier seam: where a JIT can attach to the SilkJS interpreter
 
 Read from the code of `modules/engine` at `42b98426` (branch `claude/sweet-ptolemy-f5t7na`,
-2026-11-16). Every `file:line` below is in `modules/engine/src` at that revision. Everything here
+2026-11-16). Every `file:line` below is in `modules/engine/src` at that revision, except in
+[Hotness counting](#hotness-counting), which cites `c56dd8d`, the revision that adds the hook. Everything here
 was read in the code unless it says "ran" or "measured". Points I could not settle are listed as
 open questions in the last section instead of guessed.
 
@@ -81,15 +82,17 @@ nothing for a compiler.
 
 | Path | Where | What runs |
 | --- | --- | --- |
-| Leaf runs | `leaves.attempt` (`js_vm_leaf.silk:75`), `attemptKnown` (`:101`); tried in `enterCallWith` (`js_vm.silk:3242-3249`), `enterKnownCall` (`:3274-3280`), `applyInline` (`:3180-3186`) | A small function (`FunctionBytecode.leaf`, decided by `js_bytecode.leafCode`) whose bytecode is evaluated on scratch cells with no frame. A one-line accessor (`LEAF_ACCESSOR`) runs without even that (`js_vm_leaf.silk:83-89`). A leaf may call one more leaf (`Outer.call`, `:824`). A declined run changes nothing and costs the leaf one credit (`miss`, `:64`). |
+| Leaf runs (not counted) | `leaves.attempt` (`js_vm_leaf.silk:75`), `attemptKnown` (`:101`); tried in `enterCallWith` (`js_vm.silk:3242-3249`), `enterKnownCall` (`:3274-3280`), `applyInline` (`:3180-3186`) | A small function (`FunctionBytecode.leaf`, decided by `js_bytecode.leafCode`) whose bytecode is evaluated on scratch cells with no frame. A one-line accessor (`LEAF_ACCESSOR`) runs without even that (`js_vm_leaf.silk:83-89`). A leaf may call one more leaf (`Outer.call`, `:824`). A declined run changes nothing and costs the leaf one credit (`miss`, `:64`). |
 | Planned constructors | `constructStores` (`js_vm.silk:3549`), `constructPlanned`/`constructRecipe` (`:3746`, `:3765`), `simpleConstruct` and `constructGrowing` in `constructInline` (`:3672-3684`) | `new F(...)` for a constructor whose body is a recognised list of stores: the object is built from a cached plan and the body never runs. |
 | Field initialisers | `fieldsPrefix` (`js_vm.silk:3582`) | A class's constant instance fields are defined without calling the initializer. |
 | Comparator patterns | `js_array_intrinsics_order.silk:208-218` | `(a, b) => a - b` and `b - a` comparators are recognised and computed without calling the function. |
 | Native answers | `quickInline` (`js_vm.silk:2904`), `pushInline` (`:2129`), `nativeInline` (`:2504`), `framelessCall` (`:2538`), `leanCall` (`:2649`), `literalCall` (`:2758`) | Calls of builtins answered in the loop. Not JavaScript bodies, listed because a call site's target can be one of these. |
 
-The hotness prototype counts completed leaf runs (both the accessor and the evaluated form,
-outer and nested) and does not count planned constructors, field initialisers or comparator
-patterns, whose bodies do not run.
+The hotness prototype counts none of these. Planned constructors, field initialisers and comparator
+patterns do not run their bodies. Leaf runs do, but counting them cost up to 0.9 percent of all
+instructions on call-heavy benchmarks (measured, see [Measurements](#measurements)), and a leaf is
+small, never loops and is the kind of callee a compiler would inline into its hot caller, which is
+counted. A leaf that only ever runs frameless from uncounted code is never reported.
 
 ### Tail calls
 
@@ -212,9 +215,14 @@ Prototype added on top of `42b98426`. Nothing compiles anything; the hook only r
 
 - **Counter.** `FunctionBytecode.hotness: u32` counts down from `HOT_ENTRY_BUDGET` (`js_hotness`)
   per entry. When it reaches zero, `exhausted` runs out of line.
-- **Where it counts.** `callInternal` and `callKnown` after the frame is described, `enterFrame`
-  after the region room check (inline frames, except iteration frames), `frames.allocate`
-  (generator, async and module calls), and completed leaf runs. Generator resumption is not counted.
+- **Where it counts.** In `activation.describe` and `describeKnown` (`js_vm_activation.silk:84`,
+  `:112`) when called with `counted`: `callInternal` and `callKnown` pass true (`js_vm.silk:266`,
+  `:343`), `vm.resume` passes false (`:460`). In `enterFrame` after the region room check
+  (`js_vm_activation.silk:577`; `enterDecoded` and `enterKnown` count, `enterIteration` does not).
+  In `frames.allocate` (`js_async_functions_frame.silk:47`: generator, async and module calls).
+  Leaf runs and generator resumption are not counted. Counting inside `describe`, where the
+  `FunctionBytecode` payload is already loaded, was cheaper than a separate call after it
+  (measured below).
 - **Back edges are not counted.** A per-function back-edge counter would cost on every loop
   iteration in both dispatch loops. A function entered a few times that loops for long (a
   benchmark's main loop) is therefore never reported; that is the OSR case, left open. A cheap
@@ -237,7 +245,39 @@ Prototype added on top of `42b98426`. Nothing compiles anything; the hook only r
 
 ## Measurements
 
-Filled in from the runs recorded in the workstream report; see the end of this file.
+All measured on the cloud container, release builds (`silk build --release`), with
+`python3 scripts/v8bench.py --instructions BASELINE NEW` (instructions under callgrind, ratio
+NEW / BASELINE). Baseline is `42b98426`. Target: under 0.5 percent on every benchmark.
+
+| Benchmark | First placement (`4b5e1da`) | No leaf counting | Count in `describe`, no leaf (`c56dd8d`) | Layout only, no counting (control) |
+| --- | --- | --- | --- | --- |
+| richards | 1.006x | 0.999x | 0.999x | 0.999x |
+| deltablue | 1.009x | 1.000x | 0.999x | 0.996x |
+| crypto | 1.000x | not run | 0.999x | 0.999x |
+| raytrace | 1.002x | 1.000x | 0.999x | 0.999x |
+| earley-boyer | 1.008x | 1.006x | **1.008x** | 1.006x |
+| regexp | 1.001x | not run | 1.002x | 1.001x |
+| splay | 1.001x | not run | 0.999x | 0.998x |
+| navier-stokes | 1.000x | not run | 0.998x | 0.998x |
+
+`c56dd8d` is the committed placement. It is under target on seven benchmarks and over on
+earley-boyer (+0.82 percent). Most of that is not the counting:
+
+- The control build has every field the change adds (`FunctionBytecode.hotness`,
+  `RuntimeState.hotFunctions` and `hotPending`) but an empty `js_hotness.enter`. It already shows
+  earley-boyer at +0.58 percent (measured).
+- Callgrind with `--dump-instr=yes` on earley-boyer (measured) puts the extra instructions in one
+  call-path function called 532,558 times, about 14 more per call. The hotness decrement is not in
+  that function. The difference is a 4-way set probe keyed by an object address
+  (`(address >> 4) * 0x9e3779b97f4a7c15 >> 58`): at baseline the first way hits, with the change
+  the first two miss. Object addresses moved because `FunctionBytecode` grew.
+- Moving the two `RuntimeState` fields to the end of the struct did not change any number
+  (measured), so the shift comes from the heap, not from `RuntimeState` offsets.
+- The counting alone (control to `c56dd8d`) costs at most +0.34 percent (deltablue), +0.23 percent
+  on earley-boyer and +0.13 percent on regexp, under 0.05 percent elsewhere.
+
+This address sensitivity will move with any change to the size of a heap cell, so it is a property
+of that cache rather than of this hook (open question 7).
 
 ## Open questions
 
@@ -256,3 +296,9 @@ Filled in from the runs recorded in the workstream report; see the end of this f
    back into the loop. Not decided here.
 6. Which getters on the generic path (`js_property_get.silk`) reach `callInternal` and which run
    natively without it was not traced exhaustively.
+7. The earley-boyer cost above is a probe-order effect in an address-keyed 4-way cache on the
+   call path. Probing the ways in parallel, or a hash that spreads cell addresses better, would
+   remove it, and would also make benchmark deltas of unrelated changes less noisy. Not tried.
+8. Leaf runs are not counted (see above). If a tier needs leaves reported on their own, counting
+   in `leaves.miss`-style credit bookkeeping or sampling at the interrupt poll would be cheaper
+   than one decrement per run. Not measured.
