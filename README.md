@@ -14,6 +14,7 @@ products, split the way Node and V8 are:
 | --- | --- | --- |
 | [`modules/engine`](modules/engine) | `silkjs-engine` | The SilkJS Engine: the JavaScript engine, its embedding API and the `silkjs-engine` shell |
 | [`modules/runtime`](modules/runtime) | `silkjs-runtime` | SilkJS, the Node-compatible runtime and its `silkjs` command; depends on the engine by path |
+| [`modules/jit`](modules/jit) | `silkjs-jit` | Optional JIT foundations: W^X executable memory for Linux x86-64; depends on the engine by path |
 | [`modules/benchkit`](modules/benchkit) | `benchkit` | The benchmark harness the `bench` tasks of the engine and the runtime are written with |
 | [`modules/pm`](modules/pm) | `pm` | The package manager, in Silk on the Silk standard library; it will run as the runtime's `install`, `add` and related commands |
 

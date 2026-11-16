@@ -1,0 +1,166 @@
+// Blocks own whole pages: publishing one must never make another writer executable.
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.usize
+import silk.num.i32
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+
+fn requireTarget() -> () {
+static if Intrinsic.targetObjectFormat() == "wasm" {
+  compileError("silkjsjit requires native executable memory; WebAssembly is unsupported")
+} else {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    compileError("silkjsjit executable memory is not implemented for Windows")
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetArchitecture() == "x86_64" {
+      // x86-64 has coherent instruction and data caches; mprotect publishes completed writes.
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetArchitecture() == "aarch64" {
+        // Future backend: clear the instruction cache before publication, using a native
+        // __builtin___clear_cache wrapper. No arm64 implementation has been tested.
+        compileError("silkjsjit Linux arm64 cache publication is not implemented")
+      } else {
+        static if Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" {
+          // Future backend: MAP_JIT, pthread_jit_write_protect_np and
+          // sys_icache_invalidate need a distinct per-thread publication protocol.
+          // That protocol has not been implemented or tested.
+          compileError("silkjsjit macOS arm64 MAP_JIT publication is not implemented")
+        } else { compileError("silkjsjit currently requires Linux x86-64") }
+      }
+    }
+  }
+}
+
+}
+
+unsafe extern "C" fn mmap(address: ?*mut u8, size: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> ?*mut u8
+unsafe extern "C" fn mprotect(address: *mut u8, size: usize, protection: i32) -> i32
+unsafe extern "C" fn munmap(address: *mut u8, size: usize) -> i32
+unsafe extern "C" fn getpagesize() -> i32
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(address: *mut u8) -> ()
+unsafe extern "C" fn errnoAddress() -> *const i32 as "__errno_location"
+
+pub struct MemoryError { pub code: i32 }
+impl Debug for MemoryError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut record = run Format.debugRecord("MemoryError", &mut formatter)
+    run Format.debugField(&mut record, "code", &self.code, &mut formatter)
+    return run Format.debugFinish(record, &mut formatter)
+  }
+}
+fn osError() -> MemoryError { return MemoryError { code: unsafe Pointer.read<i32>(unsafe errnoAddress()) } }
+struct State { base: *mut u8, bytes: usize, page: usize, pages: usize, references: usize, used: [*]mut u8 }
+// The control allocation lives until the region owner and every block have dropped.
+// These handles are owner-thread only; no Transferable/Concurrent implementation is supplied.
+pub struct CodeMemory { state: *mut State }
+struct Lease { state: *mut State, first: usize, pages: usize }
+pub struct CodeWriter { lease: Lease, count: usize, limit: usize }
+pub struct CodeBlock { lease: Lease, count: usize }
+
+unsafe fn release(state: *mut State) -> () {
+  let mut anchor = () let s = unsafe Pointer.borrowMut(&mut anchor, state)
+  s.references = s.references - 1
+  if s.references != 0 { return () }
+  drop unsafe munmap(s.base, s.bytes)
+  unsafe free(unsafe Intrinsic.pointerRequalify<[*]mut u8, *mut u8>(s.used))
+  drop s
+  unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(state))
+}
+impl Drop for CodeMemory { fn drop(self: &mut Self) -> () { unsafe release(self.state) } }
+impl Drop for Lease {
+  fn drop(self: &mut Self) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut(&mut anchor, self.state)
+    let address = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(s.base), self.first * s.page)
+    // Failed revocation quarantines the pages. Never reuse a still-executable page as writable.
+    if unsafe mprotect(address, self.pages * s.page, 0) == 0 {
+      let mut i: usize = 0
+      while i < self.pages { unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(s.used, self.first + i), 0) i = i + 1 }
+    }
+    drop s
+    unsafe release(self.state)
+  }
+}
+impl CodeMemory {
+  pub effect fn reserve(bytes: usize) -> CodeMemory ! MemoryError {
+    requireTarget()
+    let page = i32.toUsize(unsafe getpagesize())
+    if bytes == 0 || bytes > usize.MAX - (page - 1) { fail MemoryError { code: 22 } }
+    let pages = (bytes + page - 1) / page
+    let size = pages * page
+    let raw = unsafe mmap(Pointer.null<u8>(), size, 0, 34, -1, 0)
+    if Pointer.address<u8>(raw) == usize.MAX || Pointer.isNull<u8>(raw) { fail osError() }
+    let control = unsafe calloc(1, Layout.of<State>().bytes)
+    if Pointer.isNull<u8>(control) {
+      drop unsafe munmap(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw), size)
+      fail MemoryError { code: 12 }
+    }
+    let bitmap = unsafe calloc(pages, 1)
+    if Pointer.isNull<u8>(bitmap) {
+      unsafe free(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(control))
+      drop unsafe munmap(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw), size)
+      fail MemoryError { code: 12 }
+    }
+    let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(control))
+    unsafe Pointer.put<State>(state, State {
+      base: unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw), bytes: size,
+      page: page, pages: pages, references: 1,
+      used: unsafe Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(bitmap) })
+    return CodeMemory { state: state }
+  }
+  pub effect fn allocate(self: &mut Self, capacity: usize) -> CodeWriter ! MemoryError {
+    let mut anchor = () let s = unsafe Pointer.borrowMut(&mut anchor, self.state)
+    if capacity == 0 || capacity > s.bytes { fail MemoryError { code: 22 } }
+    let pages = (capacity + s.page - 1) / s.page
+    let mut start: usize = 0 let mut count: usize = 0 let mut i: usize = 0
+    while i < s.pages {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, i)) == 0 { count = count + 1 }
+      else { count = 0 start = i + 1 }
+      if count == pages { break }
+      i = i + 1
+    }
+    if count != pages { fail MemoryError { code: 12 } }
+    let address = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(s.base), start * s.page)
+    if unsafe mprotect(address, pages * s.page, 3) != 0 { fail osError() }
+    i = 0
+    while i < pages { unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(s.used, start + i), 1) i = i + 1 }
+    s.references = s.references + 1
+    return CodeWriter { lease: Lease { state: self.state, first: start, pages: pages }, count: 0, limit: capacity }
+  }
+}
+impl Lease {
+  fn address(self: &Self) -> *mut u8 {
+    let anchor = () let s = unsafe Pointer.borrow(&anchor, self.state)
+    return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(s.base), self.first * s.page)
+  }
+}
+impl CodeWriter {
+  pub fn length(self: &Self) -> usize { return self.count }
+  // An integer permits permission inspection without offering a callable pointer.
+  pub fn address(self: &Self) -> usize { return Pointer.address<u8>(self.lease.address()) }
+  pub effect fn append(self: &mut Self, bytes: &[u8]) -> () ! MemoryError {
+    if bytes.length > self.limit - self.count { fail MemoryError { code: 28 } }
+    let base = unsafe Pointer.assumeManyMut<u8>(self.lease.address())
+    let mut i: usize = 0
+    while i < bytes.length { unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(base, self.count + i), bytes[i]) i = i + 1 }
+    self.count = self.count + bytes.length
+  }
+  pub effect fn finish(self: Self) -> CodeBlock ! MemoryError {
+    return match move self {
+      CodeWriter { lease, count, limit: _limit } => {
+        let anchor = () let s = unsafe Pointer.borrow(&anchor, lease.state)
+        if count == 0 { fail MemoryError { code: 22 } }
+        if unsafe mprotect(lease.address(), lease.pages * s.page, 5) != 0 { fail osError() }
+        return CodeBlock { lease: move lease, count: count }
+      }
+    }
+  }
+}
+impl CodeBlock {
+  pub fn length(self: &Self) -> usize { return self.count }
+  /// The address is valid only while this block lives. Calls require the exact C ABI
+  /// signature, preserved callee-saved registers and stack alignment. No unwinding.
+  pub fn entry(self: &Self) -> *const u8 { return self.lease.address() }
+}
