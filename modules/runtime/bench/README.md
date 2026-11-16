@@ -92,7 +92,7 @@ printf '[native.override.silkjs-simde]\npath = "%s"\n[native.override.silkjs-bro
 If a pinned revision changes, take the new one from the `url` of `[native.archive.*]` in those
 manifests.
 
-Where sqlite.org and dist.libuv.org are blocked as well, prepared copies stand in:
+Where sqlite.org is blocked as well, prepared copies stand in:
 
 ```sh
 silk task offline-deps --from DIR     # or SILKJS_OFFLINE_DEPS=DIR
@@ -100,7 +100,7 @@ silk task offline-deps --from DIR     # or SILKJS_OFFLINE_DEPS=DIR
 
 It unpacks `runtime-native-prefix.tgz`, `runtime-sqlite-amalgamation.tgz`,
 `runtime-zstd-nghttp2-system.tgz` (into `/usr`, as root) and `runtime-build-deps.tgz` from `DIR`,
-fetches Brotli and libuv with git at the revisions `../native/*/silk.toml` pin, writes
+fetches Brotli with git at the revision `../native/brotli/silk.toml` pins, writes
 `~/.silk/native-overrides.toml` and prints the build command. The tasks themselves are built with
 the runtime's C libraries, so on such a network the first `silk task offline-deps` needs the
 overrides already: write `native-overrides.toml` by hand once, or run the task from a checkout
