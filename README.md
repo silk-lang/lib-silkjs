@@ -34,6 +34,7 @@ cd modules/engine
 silk task             # list the engine's tasks
 silk task check       # the correctness gate (needs `silk build --release`)
 silk task bench-octane   # Octane against other engines (modules/engine/bench/README.md)
+silk task differential --count 500   # generated programs, plain vs observed dispatch (scripts/differential.py --help)
 
 cd ../runtime
 silk task build       # the runtime executable, modules/runtime/build/silkjs

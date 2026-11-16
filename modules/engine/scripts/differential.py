@@ -3,10 +3,22 @@
 report every program on which they disagree.
 
 A program is generated from a seed alone, so a failure is reproduced by its seed. Each program
-calls a few functions in a hot loop with stable argument types, then changes the types, the
-object shapes and the call targets, printing a checksum after every phase. That is the pattern
-a tiering compiler has to get right: specialise on what the loop saw, then give the
-specialisation up.
+defines a few functions, calls each in a hot loop with stable argument types, then changes the
+types, the object shapes and the call targets, printing a checksum after every phase. That is
+the pattern a tiering compiler has to get right: specialise on what the loop saw, then give the
+specialisation up. The phases, in order: hot, types, target stable, target mixed, late throw (a
+hot function throws, through the frames between, into a caller's loop), late after, proto
+stable, proto changed, again, end.
+
+Function bodies cover arithmetic, comparisons, property and element reads, calls, closures
+(captured variables read and written, closures made in loops over let and var bindings, one
+closure whose state lives across the whole program), property writes (properties added in an
+order that depends on the arguments, element writes, writes into the arguments, deletes),
+exceptions (thrown and caught by callers, caught locally and rethrown, finally blocks that
+override the result), and typed arrays (nine element kinds, NaN, -0, out-of-range and non-index
+stores, arguments of other kinds and lengths, BigInt64Array, an aliasing view). Values a
+function stores pass through __clamp, so strings stay short and no object cycle forms. Nothing
+engine-defined is compared: no timing, no error message text, no stack traces.
 
     python3 scripts/differential.py                          # 200 programs, plain vs observed
     python3 scripts/differential.py --seed 7 --count 1 --show    # print one program
@@ -14,12 +26,19 @@ specialisation up.
     python3 scripts/differential.py --config jit='{engine} --jit {file}'
     python3 scripts/differential.py --self-test              # check the harness itself
 
-Configurations are command templates; `{engine}` is the engine executable and `{file}` the
-program. The first configuration named is the baseline the others are compared with.
+Configurations are command templates; `{engine}` is the engine executable, `{node}` the Node
+reference and `{file}` the program. The first configuration named is the baseline the others
+are compared with.
 
   plain      {engine} {file}                    the interpreter's ordinary dispatch loop
   observed   {engine} --debug-observed {file}   the instruction-observing loop of the debugger
-  node       node {file}                        a reference engine ($NODE_REFERENCE or `node`)
+  node       {node} {file}                      a reference engine ($NODE_REFERENCE or `node`)
+
+Adding a configuration: for a one-off run pass `--config NAME=TEMPLATE` (repeatable; the name is
+appended to --configs). To make it permanent, add NAME: TEMPLATE to BUILTIN in this script, and
+add NAME to REFERENCES when it is another engine rather than a SilkJS configuration. A JIT tier
+or a deoptimization-stress mode is a SilkJS configuration: any disagreement with plain is a
+mismatch.
 
 A reference engine that is not installed is reported as skipped, never as passing. A program on
 which two SilkJS configurations agree and only a reference engine differs is counted apart, as
@@ -34,6 +53,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shlex
 import shutil
 import signal
@@ -53,23 +73,57 @@ REFERENCES = {"node"}
 PRELUDE = """\
 var __out = typeof print === 'function' ? print : console.log;
 var __sum = 0;
+var __fin = 0;
+var __at = -1;
 function __show(v) {
   if (typeof v === 'number') return Object.is(v, -0) ? '-0' : String(v);
   if (typeof v === 'string') return JSON.stringify(v);
   if (typeof v === 'function') return 'function';
   if (v === null || typeof v !== 'object') return String(v);
-  if (Array.isArray(v)) return '[' + v.map(__show).join(',') + ']';
-  return '{' + Object.keys(v).map(function (k) { return k + ':' + __show(v[k]); }).join(',') + '}';
+  var keys = Object.keys(v).map(function (k) { return k + ':' + __show(v[k]); });
+  if (!Array.isArray(v)) return '{' + keys.join(',') + '}';
+  var named = keys.slice(Object.keys(v).filter(function (k) { return k === String(k >>> 0); }).length);
+  return '[' + v.map(__show).join(',') + ']' + (named.length ? '{' + named.join(',') + '}' : '');
 }
 function __mix(v) {
   var s = __show(v);
   for (var i = 0; i < s.length; i++) __sum = (Math.imul(__sum, 31) + s.charCodeAt(i)) | 0;
 }
+function __err(e) { return e instanceof Error ? e.constructor.name : 'value ' + __show(e); }
 function __try(f, a, b) {
-  try { __mix(f(a, b)); } catch (e) { __mix('throw ' + (e && e.constructor ? e.constructor.name : typeof e)); }
+  try { __mix(f(a, b)); } catch (e) { __mix('thrown ' + __err(e)); }
 }
-function __phase(name) { __out(name + ' ' + __sum); }
+function __clamp(v) {
+  if (typeof v === 'string') return v.slice(0, 6);
+  if (v !== null && typeof v === 'object') return 'o';
+  return v;
+}
+function __phase(name) { __out(name + ' ' + __sum + ' ' + __fin); }
 """
+# Why the prelude is shaped like this:
+# - __show defines the checksum from values alone; error messages and stack traces are left out.
+# - __clamp is applied to every value a generated function stores (captured variables, properties,
+#   elements, thrown values): strings stay short, so nothing grows without bound across a hot loop,
+#   and objects are never stored, so no cycle can reach __show.
+# - __fin counts finally blocks run, __at is the argument at which guarded functions throw.
+
+TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+         "Int32Array", "Uint32Array", "Float32Array", "Float64Array"]
+
+# How a generated function's body is built; repeated entries weight the pick.
+FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed"]
+
+# Each area of the generator: a pattern that marks a program exercising it, and a source
+# rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
+# configuration, so it shows that the checksums observe the area, not only that a planted
+# output change is caught.
+AREAS = {
+    "prototypes": (r"delete proto\.x", r"delete proto\.x;", ";"),  # the delete is lost
+    "closures": (r"\bc0 = __clamp\(", r"\bc0 = __clamp\(", "void __clamp("),  # captured writes are lost
+    "property writes": (r"\.\w+ = __clamp\(", r"\b[oab]\.\w+ = __clamp\(", "void __clamp("),  # named stores are lost
+    "exceptions": (r"\bthrow ", r"\bthrow ", "return "),  # a throw returns instead
+    "typed arrays": (r"\bvar ta = new ", r"\bvar ta = new \w+\(", "var ta = new Float64Array("),  # wrong element kind
+}
 
 
 class Generator:
@@ -80,6 +134,9 @@ class Generator:
         self.seed = seed
         self.hot = hot
         self.functions = 0
+        self.reads: list[str] = []  # variables in scope besides a and b
+        self.typed = self.pick(TYPED)  # the element kind of the stable typed-array arguments
+        self.guarded: list[str] = []  # functions that throw when a === __at
 
     def pick(self, values):
         return self.random.choice(values)
@@ -88,7 +145,7 @@ class Generator:
         return str(self.pick([0, 1, 2, 3, 7, -1, -8, 31, 32, 255, 65535, 1073741823, 2147483647, -2147483648]))
 
     def atom(self, depth: int) -> str:
-        choices = ["a", "b", "a", "b", self.integer(), "a.x", "b.y", "a[0]", "b.length", "a.x"]
+        choices = ["a", "b", "a", "b", self.integer(), "a.x", "b.y", "a[0]", "b.length", "a.x"] + self.reads * 2
         if self.functions and depth < 2:
             choices.append(f"f{self.random.randrange(self.functions)}(b, a)")
         return self.pick(choices)
@@ -105,27 +162,109 @@ class Generator:
             op = self.pick(["<", "<=", ">", ">=", "==", "===", "!=", "!=="])
             return f"({left} {op} {right} ? {self.expression(depth + 1)} : {self.expression(depth + 1)})"
         if kind < 0.85:
-            return f"({self.pick(['-', '~', '!', '+', 'typeof '])}{left})"
+            # A negative literal gets parentheses: `--1` would not parse.
+            operand = f"({left})" if left[0] in "-+" else left
+            return f"({self.pick(['-', '~', '!', '+', 'typeof '])}{operand})"
         if kind < 0.93:
             return f"Math.{self.pick(['abs', 'floor', 'sqrt', 'trunc', 'fround'])}({left})"
         return f"({left} {self.pick(['&&', '||', '??'])} {right})"
 
+    def using(self, names: list[str], depth: int = 1) -> str:
+        """An expression that may also read `names`."""
+        saved = self.reads
+        self.reads = saved + names
+        try:
+            return self.expression(depth)
+        finally:
+            self.reads = saved
+
+    def clamped(self, names: list[str] | None = None) -> str:
+        return f"__clamp({self.using(names or [])})"
+
+    def thrown(self) -> str:
+        return self.pick(["new RangeError('r')", "new TypeError('t')", "new Error('e')", self.integer(),
+                          "'s'", f"{{code: {self.integer()}}}", self.clamped(), "undefined", "null"])
+
+    def condition(self, names: list[str] | None = None) -> str:
+        return self.pick(["typeof a === 'string'", "b === undefined", "a === null",
+                          f"(({self.using(names or [])}) & 15) === 3", f"({self.using(names or [])})"])
+
+    def body(self, flavor: str) -> str:
+        if flavor == "plain":
+            return f"return {self.expression()};"
+        if flavor == "loop":
+            return (f"var t = {self.expression()}; for (var i = 0; i < {self.pick([1, 2, 3, 5])}; i++) "
+                    f"{{ t = {self.pick(['t + i', 't ^ i', '(t * 3) | 0', 't + a', 't - b'])}; }} return t;")
+        if flavor == "branch":
+            return f"if ({self.expression(1)}) {{ return {self.expression(1)}; }} return {self.expression(1)};"
+        if flavor == "closure":
+            # An inner function that writes a variable of its parent, which the parent then reads.
+            return (f"var c0 = {self.clamped()}; function g(x) {{ c0 = {self.clamped(['c0', 'x'])}; "
+                    f"return {self.using(['c0', 'x'])}; }} var t = __clamp(g(b)); return [t, __clamp(g(a)), c0];")
+        if flavor == "closures":
+            # Closures created in a loop, over a per-iteration (let) or shared (var) binding.
+            binding = self.pick(["let", "var"])
+            return (f"var fs = []; for ({binding} j = 0; j < {self.pick([1, 2, 3])}; j++) {{ let c0 = {self.clamped(['j'])}; "
+                    f"fs.push(function (x) {{ c0 = {self.clamped(['c0', 'j', 'x'])}; return {self.using(['c0', 'j', 'x'])}; }}); }} "
+                    f"var t = []; for (var k = 0; k < fs.length; k++) {{ t.push(__clamp(fs[k](a)), __clamp(fs[(k + 1) % fs.length](b))); }} "
+                    f"return t;")
+        if flavor == "writes":
+            # Writes that add properties in an order that depends on the arguments, element
+            # writes, writes into the arguments, and deletes.
+            literal = self.pick(["{}", "{x: 1}", "{y: 2, x: 3}", "[]", "[1, 2]", f"new {self.typed}(3)"])
+            first, second = self.pick(["x", "y", "z", "w0"]), self.pick(["x", "y", "z", "w1"])
+            key = self.pick([f"'k' + (({self.using(['o.x'])}) & 3)", f"({self.using(['o.x'])}) & 3"])
+            parts = [f"var o = {literal};", f"o.{first} = {self.clamped()};",
+                     f"if ({self.using(['o.x', 'o.y'])}) {{ o.{second} = {self.clamped(['o.x'])}; }} else {{ o[{key}] = {self.clamped()}; }}"]
+            parts += self.random.sample([
+                f"a.{self.pick(['x', 'y', 'w2'])} = {self.clamped(['o.x', 'o.y'])};",
+                f"b[({self.using(['o.x'])}) & 7] = {self.clamped(['o.y'])};",
+                f"a[0] = {self.clamped(['o[0]'])};",
+                f"a.length = ({self.expression(2)}) & 3;",
+                f"delete o.{self.pick(['x', 'y', 'z'])};",
+            ], self.random.randrange(1, 4))
+            # The arguments are part of the result, so that writes into them are observed.
+            parts.append(f"return [{self.pick(['o', self.using(['o.x', 'o.y', 'o[0]'])])}, a, b];")
+            return " ".join(parts)
+        if flavor == "throws":
+            return f"if ({self.condition()}) throw {self.thrown()}; return {self.expression()};"
+        if flavor == "catches":
+            if self.random.random() < 0.6:
+                # Caught inside the function, sometimes rethrown, always counted by finally.
+                rethrow = self.pick(["", "if (j === 2) throw e; "])
+                return (f"var t = {self.clamped()}; for (var j = 0; j < {self.pick([1, 3, 4])}; j++) {{ "
+                        f"try {{ if ({self.condition(['t', 'j'])}) throw {self.thrown()}; t = {self.clamped(['t', 'j'])}; }} "
+                        f"catch (e) {{ {rethrow}t = __clamp(__err(e) + j); }} finally {{ __fin = (__fin + 1) | 0; }} }} return t;")
+            # A finally that may override the return value or the exception in flight.
+            return (f"var t = {self.clamped()}; try {{ if ({self.condition(['t'])}) throw {self.thrown()}; return t; }} "
+                    f"finally {{ __fin = (__fin + 1) | 0; if ({self.condition(['t'])}) return [t]; }}")
+        if flavor == "typed":
+            # Stores that convert, wrap, clamp or round; out-of-range and non-index stores that
+            # do nothing; then a loop over whatever the argument's length is.
+            kind = self.pick(TYPED)
+            return (f"var ta = new {kind}(4); ta[0] = {self.expression(1)}; ta[1] = NaN; ta[2] = -0; "
+                    f"ta[{self.pick(['4', '-1', '1.5', 'ta.length'])}] = {self.expression(1)}; "
+                    f"ta[({self.expression(2)}) & 7] = {self.using(['ta[0]'])}; var t = 0; "
+                    f"for (var j = 0; j < a.length; j++) {{ t = {self.clamped(['t', 'a[j]', 'ta[j & 3]'])}; }} "
+                    f"return [t, ta];")
+        raise ValueError(flavor)
+
     def function(self) -> str:
         name = f"f{self.functions}"
-        shape = self.random.random()
-        if shape < 0.5:
-            body = f"return {self.expression()};"
-        elif shape < 0.8:
-            body = (f"var t = {self.expression()}; for (var i = 0; i < {self.pick([1, 2, 3, 5])}; i++) "
-                    f"{{ t = {self.pick(['t + i', 't ^ i', '(t * 3) | 0', 't + a', 't - b'])}; }} return t;")
-        else:
-            body = f"if ({self.expression(1)}) {{ return {self.expression(1)}; }} return {self.expression(1)};"
-        line = f"function {name}(a, b) {{ {body} }}"
+        flavor = self.pick(FLAVORS)
+        body = self.body(flavor)
+        if flavor == "throws" or self.random.random() < 0.25:
+            # Throws only in the "late throw" phase, after the function has run hot.
+            body = f"if (a === __at) throw {self.thrown()}; " + body
+            self.guarded.append(name)
         self.functions += 1
-        return line
+        if flavor == "closure" and self.random.random() < 0.5:
+            # A closure made once, whose captured state lives across every call of the program.
+            return (f"var {name} = (function () {{ var c0 = {self.integer()}, c1 = 0; return function (a, b) {{ "
+                    f"c1 = (c1 + 1) | 0; c0 = {self.clamped(['c0', 'c1'])}; {body} }}; }})();")
+        return f"function {name}(a, b) {{ {body} }}"
 
     def value(self, kind: str) -> str:
-        r = self.random
         if kind == "int":
             return self.pick(["i", "i + 1", "i * 3", "i & 7", "(i << 3) | 1", "100 - i"])
         if kind == "big":
@@ -140,6 +279,13 @@ class Generator:
             return self.pick(["{y: i, x: i * 2}", "{x: i + 0.5, y: 's', z: 1}", "{x: 'p' + i}"])
         if kind == "array":
             return self.pick(["[i, i + 1]", "[i + 0.5]", "[]", "[, i]", "['a', i]"])
+        if kind == "typed":
+            return f"new {self.typed}([i, -i, i * 3])"
+        if kind == "typedB":
+            other = self.pick(TYPED)
+            return self.pick([f"new {other}([i + 0.5, -0, NaN, 300, -129])", f"new {other}({self.pick([0, 1, 8])})",
+                              "new BigInt64Array([1n, -2n])", f"new {other}([i, i]).subarray(1)",
+                              "new Uint8Array(new Float64Array([i + 0.5]).buffer)"])
         if kind == "odd":
             return self.pick(["null", "undefined", "true", "{valueOf: function () { return i; }}", "Symbol.iterator"])
         raise ValueError(kind)
@@ -154,12 +300,13 @@ class Generator:
         for _ in range(count):
             lines.append(self.function())
         names = [f"f{n}" for n in range(count)]
-        stable = self.pick([("int", "int"), ("int", "int"), ("objectA", "objectA"), ("double", "double"), ("array", "int")])
+        stable = self.pick([("int", "int"), ("int", "int"), ("objectA", "objectA"), ("double", "double"),
+                            ("array", "int"), ("typed", "int"), ("int", "typed")])
         # Stable types, hot enough for a tiering engine to specialise each function.
         for name in names:
             lines += self.loop(f"hot {name}", self.hot, name, stable)
         # Changed types and shapes: what was specialised must be given up.
-        kinds = ["int", "big", "double", "string", "objectA", "objectB", "array", "odd"]
+        kinds = ["int", "big", "double", "string", "objectA", "objectB", "array", "typed", "typedB", "odd"]
         for name in names:
             changed = (self.pick(kinds), self.pick(kinds))
             lines += self.loop(f"types {name}", self.pick([3, 17, 64]), name, changed)
@@ -169,10 +316,23 @@ class Generator:
                   "__phase('target stable');"]
         lines += [f"for (var i = 0; i < 64; i++) {{ __try(table[i % table.length], {self.value(stable[0])}, {self.value(stable[1])}); }}",
                   "__phase('target mixed');"]
-        # Changed objects: prototype, accessor and deleted properties behind the same sites.
-        victim = self.pick(names)
+        # A throw from a hot function, through any frames between, into a caller's loop.
+        victim = self.pick(self.guarded or names)
+        lines.append(f"function catcher(n) {{ var t = 0, i = 0; try {{ for (i = 0; i < n; i++) {{ "
+                     f"t = __clamp({victim}(i, {self.value(stable[1])})); }} }} catch (e) {{ __mix('late ' + i + ' ' + __err(e)); }} "
+                     f"finally {{ __fin = (__fin + 1) | 0; }} return t; }}")
+        lines += [f"__at = {self.hot - self.pick([1, 7, 40])}; __mix(catcher({self.hot}));", "__phase('late throw');",
+                  f"__at = -1; __mix(catcher({self.hot}));", "__phase('late after');"]
+        # Changed objects: prototype, accessor and deleted properties behind the same sites,
+        # read by a function that reads x or y where there is one.
+        sources = dict(zip(names, lines[1:1 + count]))
+        victim = self.pick([name for name in names if re.search(r"\b[ab]\.[xy]\b", sources[name])] or names)
+        # `reads` keeps the same property reads hot, so a read that misses the change is seen
+        # even when the victim's arithmetic washes the value out.
         lines.append(f"var proto = {{x: 5, y: 6}}; var holder = Object.create(proto); holder.length = 2; holder[0] = 9;")
-        lines += [f"for (var i = 0; i < {self.hot}; i++) {{ __try({victim}, holder, holder); }}", "__phase('proto stable');"]
+        lines.append("function reads(a, b) { return [a.x, b.y, a[0], b.length]; }")
+        lines += [f"for (var i = 0; i < {self.hot}; i++) {{ __try({victim}, holder, holder); __try(reads, holder, holder); }}",
+                  "__phase('proto stable');"]
         lines.append(self.pick([
             "proto.x = 'changed';",
             "Object.defineProperty(proto, 'x', {get: function () { return __sum & 3; }, configurable: true});",
@@ -180,7 +340,8 @@ class Generator:
             "holder.x = 1.5;",
             "Object.setPrototypeOf(holder, {x: [1], y: null});",
         ]))
-        lines += [f"for (var i = 0; i < 32; i++) {{ __try({victim}, holder, holder); }}", "__phase('proto changed');"]
+        lines += [f"for (var i = 0; i < 32; i++) {{ __try({victim}, holder, holder); __try(reads, holder, holder); }}",
+                  "__phase('proto changed');"]
         # Back to the stable types: code that deoptimised must still be right, and may tier up again.
         for name in names[:2]:
             lines += self.loop(f"again {name}", self.hot, name, stable)
@@ -247,54 +408,65 @@ def default_engine() -> Path:
     return toolchain.release_binary()
 
 
-def self_test(engine: Path, timeout: float) -> int:
-    """The harness must find a planted disagreement and reduce it, and must not invent one."""
+def self_test(engine: Path, timeout: float, programs: int = 40) -> int:
+    """The harness must find a planted disagreement in each area and reduce it, and must not invent one."""
+    failed = False
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
-        # A stand-in "engine" that is wrong only for programs that delete a prototype property.
+        # A stand-in "engine" that runs the program with one area rewritten.
         broken = work / "broken.py"
         broken.write_text(
-            "import subprocess, sys\n"
-            "source = open(sys.argv[2]).read()\n"
-            "result = subprocess.run([sys.argv[1], sys.argv[2]], capture_output=True, text=True)\n"
-            "out = result.stdout.replace('end ', 'end 1') if 'delete proto.x' in source else result.stdout\n"
-            "sys.stdout.write(out); sys.stderr.write(result.stderr); sys.exit(result.returncode)\n")
-        configs = {"plain": [str(engine), "{file}"], "broken": [sys.executable, str(broken), str(engine), "{file}"]}
-        found = clean = 0
-        failing = None
-        for seed in range(40):
+            "import re, subprocess, sys\n"
+            "pattern, replacement, engine, path = sys.argv[1:5]\n"
+            "source = open(path).read()\n"
+            "open(path + '.broken.js', 'w').write(re.sub(pattern, replacement, source))\n"
+            "result = subprocess.run([engine, path + '.broken.js'], capture_output=True, text=True)\n"
+            "sys.stdout.write(result.stdout); sys.stderr.write(result.stderr); sys.exit(result.returncode)\n")
+        paths = []
+        for seed in range(programs):
             path = work / f"{seed}.js"
             path.write_text(Generator(seed, 50).program())
-            if disagreements(outcomes(configs, path, timeout)):
-                found += 1
-                failing = failing or path
-            else:
-                clean += 1
-        if not found or not clean:
-            print(f"self-test: FAIL planted bug seen in {found} of 40 programs, expected some and not all")
-            return 1
+            paths.append(path)
+        plain = {"plain": [str(engine), "{file}"]}
+        clean = sum(1 for path in paths if not disagreements(outcomes({**plain, "again": plain["plain"]}, path, timeout)))
+        if clean != programs:
+            print(f"self-test: FAIL the engine disagreed with itself on {programs - clean} of {programs} programs")
+            failed = True
+        for area, (pattern, mutation, replacement) in AREAS.items():
+            configs = {**plain, "broken": [sys.executable, str(broken), mutation, replacement, str(engine), "{file}"]}
+            found = [path for path in paths if disagreements(outcomes(configs, path, timeout))]
+            exercising = [path for path in paths if re.search(pattern, path.read_text())]
+            if not found or len(found) == programs or not set(found) <= set(exercising):
+                print(f"self-test: FAIL {area}: planted bug seen in {len(found)} of {programs} programs, "
+                      f"{len(exercising)} exercise the area; expected some, not all, and only those")
+                failed = True
+                continue
 
-        def differs(text: str) -> bool:
-            probe = work / "probe.js"
-            probe.write_text(text)
-            return bool(disagreements(outcomes(configs, probe, timeout)))
+            def differs(text: str) -> bool:
+                probe = work / "probe.js"
+                probe.write_text(text)
+                return bool(disagreements(outcomes(configs, probe, timeout)))
 
-        reduced = minimize(failing.read_text(), differs)
-        before, after = len(failing.read_text().splitlines()), len(reduced.splitlines())
-        if "delete proto.x" not in reduced or after >= before / 2:
-            print(f"self-test: FAIL minimizer kept {after} of {before} lines")
-            return 1
+            original = found[0].read_text()
+            reduced = minimize(original, differs)
+            before, after = len(original.splitlines()), len(reduced.splitlines())
+            if not re.search(pattern, reduced) or after >= before / 2:
+                print(f"self-test: FAIL {area}: minimizer kept {after} of {before} lines")
+                failed = True
+                continue
+            print(f"self-test: {area}: planted bug found in {len(found)} of {programs} programs "
+                  f"({len(exercising)} exercise the area), reduced {before} lines to {after}")
         same = Generator(3, 50).program() == Generator(3, 50).program()
         other = Generator(3, 50).program() != Generator(4, 50).program()
         if not same or not other:
             print("self-test: FAIL generation is not a function of the seed")
-            return 1
-        print(f"self-test: PASS planted bug found in {found} of 40 programs, reduced {before} lines to {after}")
-        return 0
+            failed = True
+    print("self-test: FAIL" if failed else "self-test: PASS")
+    return 1 if failed else 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--engine", help="the SilkJS engine executable (default: $SILKJS_ENGINE, else this host's release build)")
     parser.add_argument("--configs", default="plain,observed", help="comma-separated configurations; the first is the baseline")
     parser.add_argument("--config", action="append", default=[], metavar="NAME=TEMPLATE",
@@ -307,7 +479,8 @@ def main() -> int:
                         help="where failing programs are written (default build/differential)")
     parser.add_argument("--no-minimize", action="store_true", help="keep failing programs as generated")
     parser.add_argument("--show", action="store_true", help="print the generated programs instead of running them")
-    parser.add_argument("--self-test", action="store_true", help="check that the harness finds and reduces a planted bug")
+    parser.add_argument("--self-test", action="store_true", help="check that the harness finds and reduces a planted bug in each area")
+    parser.add_argument("--self-test-programs", type=int, default=40, help="programs per self-test area (default 40)")
     args = parser.parse_args()
 
     if args.show:
@@ -320,7 +493,7 @@ def main() -> int:
         print(f"differential.py: no engine at {engine}; build it with `silk build --release` or pass --engine", file=sys.stderr)
         return 2
     if args.self_test:
-        return self_test(engine, args.timeout)
+        return self_test(engine, args.timeout, args.self_test_programs)
 
     templates = dict(BUILTIN)
     for definition in args.config:
