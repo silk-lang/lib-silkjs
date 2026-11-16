@@ -6,6 +6,7 @@ runtime built on it.
 | Module | Package | What it is |
 | --- | --- | --- |
 | [`modules/engine`](modules/engine) | `silkjs` | The JavaScript engine, its embedding API and the `silkjs` command line |
+| [`modules/jit`](modules/jit) | `silkjsjit` | Optional executable memory and x86-64 assembler; depends on the engine by path |
 | [`modules/runtime`](modules/runtime) | `silkjsruntime` | The Node-compatible runtime; depends on the engine by path |
 
 The two are released together. The root [`silk.toml`](silk.toml) is a Silk workspace whose
