@@ -78,8 +78,21 @@ the SQLite queries by the ids of `results.csv` (`sqlite_order`, ...).
 
 ## A network that blocks the build's downloads
 
-`silk task build` downloads the C libraries it compiles. Where codeload.github.com, sqlite.org and
-dist.libuv.org are blocked, prepared copies stand in:
+`silk task build` downloads the C libraries it compiles. Where only codeload.github.com is
+blocked, two of them are missing, simde and Brotli, and git still fetches both. Fetch them at the
+revisions `silk.toml` and `../native/brotli/silk.toml` pin and point Silk at them:
+
+```sh
+D=$PWD/build/bench/deps/src; mkdir -p $D
+git init -q $D/simde && git -C $D/simde fetch -q --depth 1 https://github.com/simd-everywhere/simde 71fd833d9666141edcd1d3c109a80e228303d8d7 && git -C $D/simde checkout -q FETCH_HEAD
+git init -q $D/brotli && git -C $D/brotli fetch -q --depth 1 https://github.com/google/brotli 028fb5a23661f123017c060daa546b55cf4bde29 && git -C $D/brotli checkout -q FETCH_HEAD
+printf '[native.override.silkjs-simde]\npath = "%s"\n[native.override.silkjs-brotli]\npath = "%s"\n' $D/simde $D/brotli > ~/.silk/native-overrides.toml
+```
+
+If a pinned revision changes, take the new one from the `url` of `[native.archive.*]` in those
+manifests.
+
+Where sqlite.org and dist.libuv.org are blocked as well, prepared copies stand in:
 
 ```sh
 silk task offline-deps --from DIR     # or SILKJS_OFFLINE_DEPS=DIR
