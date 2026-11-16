@@ -1,102 +1,162 @@
 # SilkJS JIT handoff
 
-Verified 2026-11-16. Recovery branch: `t3/jit-compiler-plan` at `86c3e4db`.
-Workspace: `/home/user/.t3/worktrees/silkjs/t3-d319cd44`.
+Updated 2026-11-16. Working branch: `claude/sweet-ptolemy-f5t7na`, based on `main` at `d1973537`.
+It replaces `t3/jit-compiler-plan` (based on the older `86c3e4db`) as the coordination branch.
 
-## Objective and standing user constraints
+## Objective and standing constraints
 
-Build an optional JIT that competes with V8 and JavaScriptCore on measured throughput, startup, warmup, latency, and memory. No current result establishes JIT parity or a performance win.
+Build an optional JIT that competes with V8 and JavaScriptCore on measured throughput, startup,
+warmup, latency and memory. No result yet establishes JIT parity or a performance win: no
+JavaScript is compiled to machine code anywhere in this repository.
 
-- Interpreter-only SilkJS must remain a first-class, easily embeddable product. Keep the engine independent of the optional `modules/jit` package and measure interpreter regressions.
-- The goal is better measured outcomes, not simplicity for its own sake. Tier count and memory model remain evidence-driven decisions.
-- Keep ahead-of-time compilation possible, even though it is outside the first milestones. Design relocatable code, serializable compiler inputs, and runtime references through data-side tables. These are proposed implementation rules supporting the user's AOT requirement, not implemented capabilities.
-- Earlier authorization was for local commits in isolated worktrees, without pushes or PRs. This recovery did not merge or cherry-pick implementation branches.
+- Interpreter-only SilkJS stays a first-class, easily embedded product. The engine does not import
+  `modules/jit`; interpreter regressions are measured, not assumed away.
+- The goal is better measured outcomes, not simplicity for its own sake. Tier count and memory
+  model are decided by evidence.
+- Ahead-of-time compilation must stay possible: relocatable code, serializable compiler inputs,
+  runtime references through data-side tables.
 
-## VM recovery and execution policy
+## State of each milestone
 
-The host has 8 CPUs and approximately 15 GiB usable RAM (a 16 GB VM). The user supplied a process listing showing five old Silk/Clang compiler processes using approximately 9.2 GiB combined RSS, three in uninterruptible kernel waits. Their ages were approximately 46 minutes. Their precise blocking cause was not diagnosed.
+| Milestone | State |
+| --- | --- |
+| 1. Foundational validation | Done, with one open item: two native tests fail (see below) |
+| 2. Scorecard | Not started. `modules/benchkit` on `main` already compares engines; see next steps |
+| 3. Differential harness | Runner, generator, minimizer and self-test done; not wired into `silk task` |
+| 4. Engine seam | Not started; design leads only |
+| 5. Machine-code foundations | x86-64 encoder and executable memory done for Linux x86-64 |
+| 6. Feedback and ownership-aware SSA | Not started |
+| 7. Optimizations | Not started |
 
-After the user terminated the old compiler jobs, command access recovered. A new release-build retry was observed in the memory-research worktree. Recovery called `task_cancel` for all seven historical task roots, including superseded differential-testing attempts, to stop running/queued continuations. Six returned completed and the rejected replacement returned failed. A subsequent process scan found no Silk/Clang jobs. No infrastructure services were killed.
+## What is on this branch
 
-The recovered VM snapshot showed approximately 3.4 GiB used and 12 GiB available RAM. This is a point-in-time observation, not a claim about steady state. The earlier gRPC failures stopped even no-op tool calls; their causal relation to VM load remains unproven.
+| Commit | Content |
+| --- | --- |
+| `2f2e2495` | The recovered handoff and research report (cherry-picked from `95a03c95`) |
+| `f9825d88` | The `modules/jit` package with W^X executable memory (cherry-picked from `82349ee1`, adapted to `main`: package `silkjs-jit`, Silk dev.74) |
+| `1827a101` | The hidden `--debug-observed` switch (cherry-picked from `c1c68890`) |
+| `e801def7` | Code memory hardened and tested |
+| `cc1ed33a` | The x86-64 encoder, its llvm-mc fixtures and executable tests |
+| `b6ee60e6` | `modules/engine/scripts/differential.py` |
 
-For continuation, run one memory-heavy build/check at a time, preserve logs in the worktree, and use bounded commands. Do not automatically restart the old agent wave. Worktree presence does not mean a worker is active. Do not remove worktrees to clear process load.
+### Executable memory (`modules/jit/src/code_memory.silk`)
 
-## Verified branches and saved implementation
+Reserve an inaccessible range, write into whole read-write pages, publish them read-execute, free
+them. Publishing returns the pages the code did not reach and fills the rest of the last page
+with `int3`; freeing gives the physical memory back with `MADV_DONTNEED`. Nine tests read
+`/proc/self/maps` and `mincore`: no page is writable and executable at once, drops revoke
+access, a block outlives its region owner, and exhaustion, fragmentation, overflow and empty
+publication fail with documented codes. Each property was also checked by breaking the
+implementation and seeing the test fail.
 
-All six worktrees below were clean at initial recovery inspection. Paths are relative to `/home/user/.t3/worktrees/silkjs/`.
+Known limit: a block takes at least one 4 KiB page. A compiler emitting many small functions must
+batch them per writer and then frees them together. Whether that or a dual mapping is better for
+memory and publish cost is not measured.
 
-| Workstream | Branch | Worktree | Head / implementation |
-| --- | --- | --- | --- |
-| Coordination | `t3/jit-compiler-plan` | `t3-d319cd44` | `86c3e4db`; recovery documentation added here |
-| Scorecard | `jit/p0-scorecard` | `t3-db1fac48` | `86c3e4db`; no task-specific commit or source changes |
-| Tier seam | `jit/p1-tier-seam` | `t3-4bc12667` | `86c3e4db`; no hook implementation or source changes |
-| Code memory | `jit/p1-code-memory-asm` | `t3-756f8a37` | `82349ee1a04dd5456e7cedfbfb958192e2c4eee8` |
-| Differential testing | `jit/p1-differential` | `t3-336fba2c` | `c1c688908f5f2caa0876cb0815a8d8bf5aef07eb` |
-| Memory research | `t3/jit-refcount-memory-research` | `t3-b15e66d7` | `86c3e4db`; report only, recovered separately |
+### x86-64 encoder (`modules/jit/src/asm_x64.silk`)
 
-Both implementation branches contain exactly one commit beyond the common base. Neither commit has been integrated into the coordination branch.
+Typed registers and memory operands; integer moves, loads and stores of 1 to 8 bytes, the eight
+two-operand arithmetic operations, `imul`, unary group, shifts, `setcc`, `cmovcc`, SSE2 scalar
+doubles and conversions, jumps, calls, labels. External references are relocation records
+(`Absolute64`, `Relative32`) applied by `Code.link(base, addresses)`, so assembled bytes contain no
+process-local pointer.
 
-### Code memory: implemented subset
+`scripts/encodings.py` generates `src/asm_x64_fixtures.silk`: 1,717 encoder calls, each compared
+with the bytes llvm-mc 22.1.8 assembles. All match. `src/asm_x64_tests.silk` runs assembled code,
+including a call back into Silk through a relocation.
 
-Commit `82349ee1` adds an optional workspace package, Linux x86-64 executable memory, and a direct-call test. The engine/runtime do not import the JIT package. `CodeMemory` reserves PROT_NONE memory; writers own whole RW pages; consuming `finish()` publishes RX pages; dropping leases revokes access before recycling pages. Blocks retain the region beyond the owner's lifetime. Review of the source establishes the intended mechanism, not comprehensive correctness.
+Not there: short (8-bit) jumps, AVX, 8/16-bit arithmetic, atomics, a frame layout, a register
+allocator, arm64, macOS, Windows, unwind metadata, stack maps.
 
-The generated constant-return function is invoked directly through an unsafe C-ABI function pointer read from an address slot. No C trampoline is required for this proof.
+### Differential harness (`modules/engine/scripts/differential.py`)
 
-Recovery validation, executed in `t3-756f8a37`:
+One program per seed: functions called hot with stable types, then with changed types, shapes,
+call targets and prototypes; a checksum is printed per phase. Configurations are command
+templates (`plain`, `observed`, `node`, or `--config NAME=TEMPLATE`), so a JIT or deopt-stress
+flag joins later through the same interface. Failing programs are written with seed and results
+and reduced by deleting lines. A missing reference engine is reported as skipped.
 
-```sh
-timeout --signal=TERM --kill-after=5s 60s silk test --manifest-path modules/jit/silk.toml --no-cache
-```
+Result on this branch: seeds 1..3000 agree across plain, `--debug-observed` and Node 22.23.4.
+`--self-test` finds a planted disagreement in 3 of 40 programs and reduces 60 lines to 12.
 
-Result: **1 passed, 0 failed, 0 cached, 1 executed**; the function returned 42. This only validates the constant-call path. The earlier delegated workspace check exited 143 (SIGTERM), not a successful check or a compiler diagnostic.
+Limits: the generator covers arithmetic, comparisons, property and element reads, calls, and
+prototype changes. It does not generate closures, generators, async code, exceptions thrown from
+generated functions, typed arrays, or property writes inside the hot functions. It found no bug,
+which says the two interpreter loops agree on this slice, not that the slice is wide.
+`--debug-observed` is confirmed to change the dispatch loop (the same script runs about 3x
+slower); that every path enters observed dispatch is still not established.
 
-Recovery also ran `timeout --signal=TERM --kill-after=5s 60s silk check --workspace` from the same worktree. It produced no diagnostic output and reached the timeout (exit 124). Engine/runtime compatibility therefore remains unverified. The final process scan found no remaining `silkc` or `clang-22` processes; no heavy check was left running.
+## Validation record
 
-Still missing: x86-64 encoder, instruction fixtures, permission/reuse/exhaustion/many-block tests, callback ABI tests, arm64 support, macOS MAP_JIT support, unwind metadata, and effects/exceptions across generated frames. `src/asm_x64.silk` is a one-line placeholder. The package README incorrectly describes a typed encoder and references nonexistent `scripts/check.py` and `scripts/encodings.py`; correct those claims before integration.
+All on a 4-CPU, 15 GiB Linux x86-64 cloud container, Silk 0.1.0-dev.74+205aea3f5b2e, Clang 22.1.8.
 
-### Differential branch: implemented subset
+| Command | Result |
+| --- | --- |
+| `silk test --manifest-path modules/jit/silk.toml --no-cache` | 28 passed, 0 failed |
+| `python3 modules/jit/scripts/encodings.py --check` | fixtures current |
+| `silk check --workspace` on `jit/p1-code-memory-asm` (dev.69), after `python3 modules/runtime/tools/embed.py` | 3 packages pass, 15 s warm, 43 s cold |
+| `silk build --release` in `modules/engine` | 4 m 48 s, peak 7.2 GiB |
+| `silk task check` in `modules/engine` | 271 script steps pass; native suite 562 passed, 2 failed |
+| `python3 scripts/differential.py --count 3000 --configs plain,observed,node` | 3000 agree |
+| `python3 scripts/differential.py --self-test` | pass |
 
-Commit `c1c68890` adds hidden `--debug-observed` parsing and configures the existing debugger API at interpreter startup. Only `cli_options.silk` and `qjs_launch.silk` changed. Review did not establish that all execution paths enter observed dispatch.
+The 60 s workspace-check timeout in the previous handoff was a slow host, not a hang. Without
+`embed.py` the runtime member fails with `Unknown module runtime.embedded`; that file is generated
+and ignored by git.
 
-Runner, generator, minimization, task integration, and documentation are unfinished. The worker reported **zero programs tested**. Its build log path is `t3-336fba2c/build/differential/release-build.log`; log existence and build completion must be checked before relying on it.
+### Open: two failing native tests
 
-### Tier seam
+`silk test src/tests.silk` (step 1 of `silk task check`) fails two tests, both in `js_for_in_tests`:
 
-No code landed. The worker identified the existing interrupt-poll path as a possible back-edge counting hook. Frameless leaf calls and constructor shortcuts require explicit treatment so native entry gets a valid frame. These are design leads, not tested changes.
+- `forInAllocationFailuresReleaseInputSnapshotsAndVisitedState`: fatal trap "QuickJS invariant
+  violated" at `js_array_storage_test_support:32`.
+- `forInFailSafeAndFastCompletionAreNotPermanentlyLatched`: assertion "iteration yields the
+  independently expected property name" at `js_for_in_tests:141`.
 
-### Scorecard
+This branch changes two engine files, `cli_options.silk` and `qjs_launch.silk`, neither of which
+is for-in code, so the failures most likely exist on `main` too. That is not yet confirmed: the
+same suite was being built on untouched `main` (`d1973537`) when this was written. Run it there
+before treating the failures as either pre-existing or caused here.
 
-No scorecard implementation, competitor installation, measurements, or larger-suite feasibility runs completed in that task. Earlier numbers in conversation came from a stale November 6 binary and single runs; do not publish them as current-head results.
+## Operating notes for this kind of host
 
-### Research
+- One memory-heavy command at a time. The native test suite build peaks near 13.9 GiB, the release
+  build at 7.2 GiB.
+- `silk check` can leave a `silkc check` process alive after its parent exits, reparented to init
+  and holding about 4.8 GiB. Look for it with `ps` and kill it before the next heavy step. Several
+  of these across worktrees would explain the memory pressure that stalled the previous VM; that
+  link is a hypothesis.
+- A second `silk check` on changed source once replayed a stale diagnostic in 0.00 s. `silk test
+  --no-cache` did not. Treat a suspiciously instant check result as stale.
+- Do not benchmark while a compiler runs.
 
-See [the recovered memory and feedback report](memory-feedback-research.md). It contains code inspection and historical evidence, but no completed instrumentation measurements. Key findings:
+## Next steps
 
-- RC elision must preserve independent ownership/rooting across reentrant calls. Keeping an object alive does not keep a property value alive after replacement.
-- The existing young collector is a cycle collector that relies on counts, not an uncounted allocation nursery. Nursery/tracing alternatives require root and barrier work, including native temporaries and embedding handles.
-- Own-field caches already include inline bytecode keys as well as runtime side tables. Do not blindly migrate them all to feedback vectors; measure the existing fast paths.
-- The previous packed-property-slot revert was attributed to conversion overhead. This does not settle the performance of a globally packed value representation.
-- Start with ownership-aware SSA and existing RC as an implementation hypothesis. Collector replacement and global packing remain experiments, not settled decisions.
+1. Scorecard. `modules/engine/bench/README.md` documents `silk task bench-setup`, `bench-octane
+   --jit`, `bench-micro --jit` and `bench-report`. Run them on an idle machine and add what the
+   harness lacks: startup of an empty script, peak RSS per process, binary size, warmup. Record
+   host, revision and every engine version. A worst-iteration time is not a GC pause or a p99.
+   Tier seam. Document every way a function body starts executing and every back-edge, then
+   prototype per-function hotness counting with an embedder-set callback slot and measure its
+   interpreter-only cost with `scripts/v8bench.py --instructions` (target under 0.5 percent).
+   Two cloud sessions were created for these (branches `claude/jit-scorecard` and
+   `claude/jit-tier-seam`, both still equal to `cc1ed33a`) and did nothing: they could not
+   install the Silk toolchain because the installer needs the GitHub release API of
+   `silk-lang/silk`, which a session attached only to `lib-silkjs` cannot reach. A session doing
+   this work needs both repositories attached.
+2. Wire `differential.py` into `silk task`, and widen the generator (closures, property writes,
+   exceptions, typed arrays).
+3. Decide the hook design from the tier-seam document and its instruction-count measurements.
+4. Then milestone 6: call and type feedback, an ownership-aware SSA form, and one narrow function
+   compiled end to end (integer arithmetic and a loop) with deoptimization to the interpreter,
+   run through the differential harness as a new configuration.
 
-## Recovered design and next milestones
+## Research
 
-The initial four-tier plan and immediate tracing-GC replacement were superseded in discussion. The subsequent direction was interpreter plus one SSA compiler with quick and full optimization modes, subject to measured warmup needs. Deopt to interpreter frames at bytecode boundaries; make ownership reconstruction part of the deopt design. The user did not mandate a permanent tier count or memory model.
+See [the memory and feedback report](memory-feedback-research.md). It is code inspection and
+history, with no instrumentation measurements; its source links refer to `86c3e4db`. Its
+recommendation stands as a hypothesis: start with ownership-aware SSA on the existing reference
+counting; treat a nursery, a tracing collector and globally packed values as separate experiments.
 
-1. **Finish foundational validation.** Correct overstated package docs; review the two saved commits; test memory permissions/lifetimes and the observed-dispatch option. Complete a bounded workspace check and relevant engine/runtime checks, recording commands and results. Integrate only validated changes.
-2. **Establish a scorecard.** Extend existing benchmark tooling for configurable SilkJS, Node, d8, and JSC commands. Record versions, host, source revision, binary provenance, repetitions, throughput, warmup, startup, per-process peak RSS, binary size, and an explicitly labeled pause proxy. Missing engines are explicit omissions. Keep benchmark runs isolated from builds. A worst-iteration ratio is not a measured GC pause or p99 latency.
-3. **Finish the differential harness.** Deterministic seeded programs; plain versus observed interpreter configurations; optional external reference engines; normalized output and exit classification; timeouts, reproducible failures, minimization, and explicit unsupported-case reporting. Generate stable hot calls followed by changed types/shapes/call targets. Add future JIT/deopt configurations through the same interface.
-4. **Implement the engine seam.** Define hotness and native-entry hooks with zero/verified-minimal interpreter-only cost. Cover normal calls, leaf paths, constructors, loops, exceptions, and invalidation; do not serialize process-local pointers. Prove frame and ownership contracts before compiled JavaScript entry.
-5. **Finish machine-code foundations.** Typed x64 operands and labels, relocation records, ABI handling, encoding comparisons against a real assembler, executable tests, and platform-gated extension points. One constant byte string is not an assembler.
-6. **Add feedback and ownership-aware SSA.** Begin with call/type feedback; specify safepoints, guards, deoptimization state, native helper effects, and roots. Keep compiler inputs serializable for background compilation/AOT. Build a narrow end-to-end compiled function before broad optimization passes.
-7. **Broaden optimizations from measurements.** Inlining, unboxed arithmetic, load/check elimination, register allocation, OSR, and allocation/RC optimizations. Evaluate background compilation, persisted profiles/code, cross-module optimization, and regexp compilation with correctness and performance gates.
-
-The historical phase durations were estimates, not delivery commitments. Define progress through tests and measured gates.
-
-## AOT context and historical artifacts
-
-The original HTML plan at `/tmp/silkjs-jit-plan/silkjs-jit-plan.html` no longer exists on this VM. The design above was recovered from conversation and the saved notes at `/home/user/.claude/projects/-home-user-silkjs/memory/`.
-
-Earlier Bun research cited [Bun PR 45631](https://github.com/oven-sh/bun/pull/45631), [WebKit PR 757](https://github.com/oven-sh/WebKit/pull/757), and [Bun AOT documentation](https://bun.com/docs/compiler/aot). Those sources and historical numerical claims were **not revalidated during this recovery**. The useful design hypotheses are immutable file-backed code, runtime data-side references, generic entry fallback, and opt-in closed-world assumptions. Preserve ordinary JS semantics by default. Do not assume static TypeScript annotations are sound runtime facts.
-
-No JavaScript JIT compiler, validated x64 assembler, current benchmark scorecard, or engine-wide JIT integration is complete at this handoff.
+The Bun AOT material cited in the earlier handoff ([Bun PR 45631](https://github.com/oven-sh/bun/pull/45631),
+[WebKit PR 757](https://github.com/oven-sh/WebKit/pull/757)) has not been revalidated.
