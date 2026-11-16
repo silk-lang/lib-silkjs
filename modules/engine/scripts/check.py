@@ -10,6 +10,8 @@ Runs, in order:
   3. SilkJS's own regression scripts, tests/silkjs/*.js (behavior QuickJS gets wrong)
   4. the benchmark workloads once each, checking output against C QuickJS
      (scripts/bench.py --skip-micro --runs 1)
+  5. 200 generated programs under the plain and observed dispatch loops, which must agree
+     (scripts/differential.py, about 15 seconds)
 
   python3 scripts/check.py                 # everything
   python3 scripts/check.py --skip-native   # only the JS-level checks (needs a release build)
@@ -98,6 +100,7 @@ def main():
     if not args.skip_bench:
         ok &= step('benchmark outputs', [sys.executable, 'scripts/bench.py', '--binary', str(binary),
                                          '--skip-micro', '--runs', '1'])
+    ok &= step('differential plain vs observed', [sys.executable, 'scripts/differential.py', '--engine', str(binary)])
     print('\nall checks passed' if ok else '\nCHECKS FAILED')
     sys.exit(0 if ok else 1)
 
