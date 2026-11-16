@@ -72,88 +72,85 @@ the C library, is removed, and the runtime links no `ZSTD_*` symbol.
 | Decoder | `../zstd/tests/decode_diff.py`: the bytes, the status and every `ZSTD_decompressStream` call's positions and return value, against libzstd 1.5.7 in the same call pattern; frames of every level, skippable and concatenated frames, window limits, dictionaries, 3000 mutated and truncated frames | 5351 comparisons, 0 differences |
 | Compressor, no dictionary | `../zstd/tests/compress_diff.py`: the bytes and every `ZSTD_compressStream2` call's result and positions; levels -131072 to 22, every strategy, parameter overrides and bounds, one-shot and streamed with flushes, windows smaller than the input, checksum, pledged sizes, several frames per context | 2489 cases, 0 failures |
 | Compressor, dictionaries | the same with raw, trained and corrupt dictionaries of 1 B to 3 MB, input sizes on both sides of every attach/copy/reload cut-off | 5668 cases, 0 failures (and 2739 one-shot cases identical to Node) |
-| Long-distance matching, `nbWorkers` | the ports' own harnesses against a multithreaded build of 1.5.7 | 268 and 371 cases, bytes identical (call traces differ with workers: Differences 1) |
-| Runtime against Node 24 | `silk task compat` (`tests/compat.mjs` with `tests/compat-zstd.mjs`: every level on 14 inputs, 120 fuzzed round trips, every parameter's bounds and errors, streams, async, decoding of corrupt input, dictionaries, workers, LDM) | 86 passed, 0 failed |
+| Long-distance matching, `nbWorkers` | the ports' own harnesses against a multithreaded build of 1.5.7 | 268 and 371 cases, bytes identical (call traces differ with workers: Differences 1); 371 again on the threaded version (`298ebbe`), 0 failures, and identical to the serial port in 3 runs of each case |
+| Runtime against Node 24 | `silk task compat` (`tests/compat.mjs` with `tests/compat-zstd.mjs`: every level on 14 inputs, 120 fuzzed round trips, every parameter's bounds and errors, streams, async, decoding of corrupt input, dictionaries, workers, LDM) | 87 passed, 0 failed (final build, Node 24.22.1; with Node 22 on `PATH` every build, `main` included, fails 12 cases) |
 | `node:zlib/iter` | `tests/iterable-streams-smoke.cjs` | ok |
 
 ### Measurements
 
-Release builds of `main` with the C library (`C`) and of this branch (`Silk`), interleaved in
-shuffled order, three rounds, `SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset, nothing compiling;
-`bench/scripts/zstd.cjs` (one case per process; MB/s of uncompressed data, the median of the runs
-of a case, then the median over the rounds; peak RSS of the process). Host noise is about 8%.
+Release builds of `main` with the C library (`C`) and of this branch at `298ebbe` (`Silk`),
+interleaved in shuffled order, `SILKJS_PREPARSE_THREADS=0`, `NODE_OPTIONS` unset, nothing
+compiling; `bench/scripts/zstd.cjs` (one case per process; MB/s of uncompressed data, the median
+of the runs of a case, then the median over the rounds; peak RSS of the process). Host noise is
+about 8%; it is much more while anything else runs (an earlier pass under a parallel test load
+moved single rows by 20 to 30%, and those numbers are not used). The compressed sizes are the
+same in every row (the bytes are compared by the tests above).
 
-One-shot `zstdCompressSync`/`zstdDecompressSync` with `chunkSize` 8 MiB (`ZSTD_CHUNK=8388608`),
-which shows the codec, on the final build (`cde7a51`; decompression rows from a second run of five
-rounds). The compressed sizes are the same in every row (the bytes are compared by the tests
-above):
-
-| case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
-| --- | --- | --- | --- | --- | --- | --- |
-| c:text:-5 | 190.8 | 192.9 | 1.01 | 131 | 124 | 5896760 / 5896760 |
-| c:text:1 | 189.1 | 186.5 | 0.99 | 121 | 115 | 3586493 / 3586493 |
-| c:text:3 | 166.7 | 163.0 | 0.98 | 124 | 118 | 3549252 / 3549252 |
-| c:text:9 | 47.7 | 38.4 | 0.81 | 116 | 110 | 2958542 / 2958542 |
-| c:text:19 | 2.7 | 2.6 | 0.96 | 116 | 110 | 447687 / 447687 |
-| c:json:1 | 477.4 | 438.3 | 0.92 | 79 | 72 | 309338 / 309338 |
-| c:json:3 | 433.8 | 409.8 | 0.94 | 83 | 77 | 272294 / 272294 |
-| c:json:9 | 113.1 | 86.3 | 0.76 | 91 | 85 | 277236 / 277236 |
-| c:binary:1 | 134.8 | 162.3 | 1.20 | 137 | 132 | 7954313 / 7954313 |
-| c:binary:3 | 123.9 | 114.5 | 0.92 | 135 | 130 | 6816591 / 6816591 |
-| c:binary:9 | 35.9 | 24.0 | 0.67 | 143 | 138 | 5996711 / 5996711 |
-| c:binary:19 | 2.7 | 2.8 | 1.04 | 142 | 136 | 1291911 / 1291911 |
-| d:text:1 | 513.1 | 380.5 | 0.74 | 133 | 122 | 3586493 / 3586493 |
-| d:text:3 | 476.5 | 366.0 | 0.77 | 133 | 124 | 3549252 / 3549252 |
-| d:text:19 | 413.4 | 381.1 | 0.92 | 180 | 174 | 2573302 / 2573302 |
-| d:json:3 | 1353.5 | 1334.4 | 0.99 | 129 | 124 | 272294 / 272294 |
-| d:binary:1 | 417.2 | 285.8 | 0.69 | 145 | 132 | 7954313 / 7954313 |
-| d:binary:3 | 332.8 | 290.5 | 0.87 | 142 | 129 | 6816591 / 6816591 |
-| d:binary:19 | 249.6 | 253.6 | 1.02 | 199 | 192 | 5409670 / 5409670 |
-
-- Compression: levels -5 to 3 and 19 are level with the C library (0.92 to 1.20). Level 9 is
-  0.67 to 0.81: the row match finder (levels 5 to 12) has no prefetch (Compiler walls 2).
-- Decompression: 0.69 to 1.02. **Not resolved:** frames of levels 1 and 3 decode at 0.69 to 0.87
-  of the C library inside the runtime, although the standalone decoder (`../zstd/tools/dcli`
-  against the same calls on libzstd) is within 2 to 15% on the same frames, and callgrind counts
-  3% more instructions for the whole runtime process (875 M against 851 M for two 16 MB frames;
-  the sequence decoder 204 M against 222 M, Huffman 114 M against 122 M). So the gap is not in
-  the instructions run; it looks like memory traffic. One known difference: the reference keeps
-  a block's literals at the end of the output buffer when they fit (`ZSTD_allocateLiteralsBuffer`
-  `ZSTD_in_dst`/`ZSTD_split`), and the port always decodes them into a separate 128 KiB buffer.
-  That is where to look next.
-- Peak RSS is 5 to 13 MiB lower than the C build's in every row, mostly from the start (below).
-
-The default `chunkSize` (16 KiB), the streams (`cs`, `ds`: 1 KiB writes) and the thread-pool
-calls (`ca`, `da`: four at a time). The one-shot rows here are dominated by the binding's cost per
-output chunk (Found in the runtime's binding, 1), for both builds alike. The 9 more bytes of the
-`cs` rows are Node's empty trailing frame, which the C build did not write:
+**One-shot with `chunkSize` 8 MiB** (`ZSTD_CHUNK=8388608`), which shows the codec; five rounds:
 
 | case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
 | --- | --- | --- | --- | --- | --- | --- |
-| c:text:3 | 10.3 | 10.9 | 1.06 | 115 | 118 | 3556322 / 3556322 |
-| d:text:3 | 9.7 | 9.5 | 0.98 | 108 | 111 | 3556322 / 3556322 |
-| c:binary:1 | 4.6 | 4.6 | 1.00 | 138 | 141 | 7954313 / 7954313 |
-| d:binary:1 | 4.7 | 4.6 | 0.98 | 136 | 138 | 7954313 / 7954313 |
-| cs:text:3 | 14.9 | 13.4 | 0.90 | 77 | 80 | 655020 / 655029 |
-| ds:text:3 | 56.5 | 51.9 | 0.92 | 76 | 79 | 655024 / 655024 |
-| cs:json:3 | 18.2 | 16.5 | 0.91 | 76 | 78 | 148683 / 148692 |
-| ds:json:3 | 141.0 | 124.7 | 0.88 | 72 | 76 | 148687 / 148687 |
-| cs:binary:3 | 15.3 | 13.9 | 0.91 | 95 | 94 | 1561230 / 1561239 |
-| ds:binary:3 | 33.5 | 34.0 | 1.01 | 92 | 94 | 1561234 / 1561234 |
-| ca:text:3 | 10.3 | 10.3 | 1.00 | 305 | 301 | 3556321 / 3556321 |
-| da:text:3 | 9.1 | 9.5 | 1.04 | 229 | 232 | 3556322 / 3556322 |
-| ca:binary:1 | 4.4 | 4.4 | 1.00 | 392 | 378 | 7954312 / 7954312 |
-| da:binary:1 | 4.4 | 4.2 | 0.95 | 296 | 324 | 7954313 / 7954313 |
+| c:binary:-5 | 277.8 | 374.2 | 1.35 | 166 | 144 | 10850964 / 10850964 |
+| c:binary:1 | 238.5 | 265.0 | 1.11 | 138 | 140 | 7954313 / 7954313 |
+| c:text:3 | 185.9 | 219.8 | 1.18 | 127 | 127 | 3549252 / 3549252 |
+| c:text:9 | 61.7 | 49.1 | 0.80 | 116 | 112 | 2958542 / 2958542 |
+| c:json:19 | 2.2 | 2.3 | 1.05 | 110 | 106 | 117074 / 117074 |
+| d:binary:1 | 551.5 | 473.2 | 0.86 | 145 | 141 | 7954313 / 7954313 |
+| d:binary:3 | 560.8 | 486.7 | 0.87 | 142 | 138 | 6816591 / 6816591 |
+| d:text:1 | 695.6 | 556.2 | 0.80 | 133 | 113 | 3586493 / 3586493 |
+| d:text:3 | 715.9 | 543.5 | 0.76 | 133 | 114 | 3549252 / 3549252 |
+| d:json:3 | 2042.9 | 2204.5 | 1.08 | 129 | 103 | 272294 / 272294 |
+| d:binary:19 | 331.6 | 401.6 | 1.21 | 207 | 195 | 5409670 / 5409670 |
 
-An HTTP server that compresses each response (1 MiB at the level shown) with
-`Content-Encoding: zstd`, and a client that decodes it (`http.get` piped into
-`createZstdDecompress`, five rounds):
+**The default `chunkSize`** (16 KiB), the streams (`cs`, `ds`: 1 KiB writes), the thread-pool
+calls (`ca`, `da`: four at a time) and HTTP (a server compressing each 1 MiB response with
+`Content-Encoding: zstd`, the client `http.get` into `createZstdDecompress`); three rounds. The
+one-shot and thread-pool rows are the binding fix (Found in the runtime's binding, 1), which helps
+zlib and Brotli the same way; the 9 more bytes of the `cs` rows are Node's empty trailing frame:
 
 | case | C MB/s | Silk MB/s | Silk/C | C RSS MiB | Silk RSS MiB | sizes C / Silk |
 | --- | --- | --- | --- | --- | --- | --- |
-| http:json:3 | 65.1 | 62.3 | 0.96 | 69 | 72 | 97337 / 97337 |
-| http:text:3 | 44.1 | 40.7 | 0.92 | 72 | 74 | 194578 / 194578 |
-| http:binary:1 | 41.3 | 40.6 | 0.98 | 86 | 89 | 404568 / 404568 |
+| c:text:3 | 13.0 | 195.9 | 15.07 | 115 | 96 | 3556322 / 3556322 |
+| d:text:3 | 11.5 | 707.9 | 61.56 | 108 | 106 | 3556322 / 3556322 |
+| c:binary:1 | 5.8 | 274.5 | 47.33 | 138 | 119 | 7954313 / 7954313 |
+| d:binary:1 | 5.7 | 591.7 | 103.81 | 136 | 121 | 7954313 / 7954313 |
+| c:binary:9 | 6.4 | 36.9 | 5.77 | 147 | 128 | 5997161 / 5997161 |
+| c:json:9 | 64.8 | 101.5 | 1.57 | 116 | 87 | 277239 / 277239 |
+| cs:text:3 | 21.2 | 20.4 | 0.96 | 77 | 71 | 655020 / 655029 |
+| ds:text:3 | 88.1 | 85.0 | 0.96 | 77 | 75 | 655024 / 655024 |
+| cs:binary:3 | 19.0 | 19.3 | 1.02 | 92 | 86 | 1561230 / 1561239 |
+| ds:binary:3 | 44.5 | 45.7 | 1.03 | 92 | 88 | 1561234 / 1561234 |
+| ca:text:3 | 12.8 | 382.8 | 29.91 | 295 | 207 | 3556321 / 3556321 |
+| da:text:3 | 11.2 | 320.3 | 28.60 | 229 | 254 | 3556322 / 3556322 |
+| ca:binary:1 | 5.5 | 419.2 | 76.22 | 368 | 284 | 7954312 / 7954312 |
+| da:binary:1 | 5.4 | 292.3 | 54.13 | 292 | 347 | 7954313 / 7954313 |
+| http:json:3 | 82.6 | 136.8 | 1.66 | 69 | 64 | 97337 / 97337 |
+| http:text:3 | 59.7 | 103.1 | 1.73 | 71 | 67 | 194578 / 194578 |
+| http:binary:1 | 52.8 | 91.8 | 1.74 | 86 | 81 | 404568 / 404568 |
+
+- Compression: levels -5 to 3 and 19 are at 1.05 to 1.35 of the C library. Level 9 (row match
+  finder, levels 5 to 12) is 0.80: prefetch, which dev.81 has and this workspace cannot use yet
+  (Compiler walls 2, measured there at 0.88 to 0.94 with it).
+- Decompression at the codec: levels 19 and json at 1.08 to 1.21. **Not resolved: levels 1 and
+  3 at 0.76 to 0.87 in this harness.** What is known:
+  - The standalone decoder is at 0.95 to 1.01 of libzstd on the same frames (`tools/dcli`), and
+    callgrind counts fewer instructions for the Silk runtime process (715 M against 820 M), fewer
+    cache misses and the same branch misses.
+  - A loop of 20 `zstdDecompressSync` calls on one frame alone (no compression first in the
+    process) gives the opposite: Silk 34.9 to 37.4 ms a frame against 41.4 to 42.2 (binary
+    level 1), 30.1 to 32.4 against 32.3 to 34.5 (text level 1), three interleaved rounds.
+  - In both, the Silk build spends less user time (431 to 463 ms against 609 to 645) and more
+    system time on minor page faults (240 k against 206 k for 20 frames). The fault count moves
+    with glibc's heap state: it was 53 k for both builds on an earlier, quieter run and changes
+    with forced `gc()` between frames. So the difference is in when memory is returned to the
+    system and touched again, not in the decoder. The C decoder allocates its 4 MiB window per
+    context; the port decodes without one, so the allocation pattern of a call differs.
+  - The binding now copies an input once with `memcpy` (it was a call per byte) and hands a
+    mostly full output buffer to the engine instead of copying it (`2b78cf1`). User time fell
+    by about a fifth; the harness rows did not move beyond noise.
+- Peak RSS is equal or lower than the C build's in every one-shot and stream row; `da` is 20 to
+  55 MiB higher (four decoders' outputs in flight are external buffers now, freed by the
+  collector rather than at once).
 
 ### Start-up memory: the function order was stale
 
@@ -213,7 +210,7 @@ Each is reduced to what the port needed. None was worked around with C.
      declaring them again. Those files belong to the engine and libuv work; the fix is one
      declaration per symbol (or the per-OS one under `static if`).
    With a local copy of lib-sqlite bumped, these four errors are the whole build failure.
-   Once both are done, bump every `silk-version` (15 manifests, CI reads the root one) and apply:
+   Once both are done, bump every `silk-version` (14 manifests; CI reads the root one) and apply:
 
    ```diff
    +import silk.mem.prefetch { Prefetch, PrefetchOptions, PrefetchAccess, PrefetchLocality, PrefetchCache }
@@ -276,11 +273,16 @@ Brotli share.
    | `zstdCompressSync`, level 3 | 2300 ms | 142 ms | 88 ms |
    | `gzipSync` level 1 + `gunzipSync` | 5193 ms | | 254 ms |
 
-   The time grows with input size times the number of output chunks. The likely cause, not yet
-   verified: `_write()` in `handle.js` takes a snapshot of the remaining input on every write, and
-   `zlib.js` writes again each time the 16 KiB output buffer fills. Not fixed here: it is shared
-   with the zlib and Brotli work. Until it is, a codec's speed shows through the runtime only at
-   slow levels or with a large `chunkSize`; the benchmark table gives both.
+   The time grows with input size times the number of output chunks: `_write()` in `handle.js`
+   took a snapshot of the remaining input on every write, and `zlib.js` writes again each time
+   the 16 KiB output buffer fills. **Fixed (`fce17c9`):** the native side keeps the unconsumed
+   input, and a write of the same remaining range continues from it. 16 MiB, default chunk:
+   `zstdDecompressSync` 1411 ms to 36 ms (Node 28 ms), gzip + gunzip 3239 ms to 158 ms (Node
+   112 ms), Brotli quality 5 227 ms to 45 ms.
+5. **Inputs were copied a byte at a time** (`buffers.loadScalar` per byte) into the job, and every
+   output chunk was copied into a new ArrayBuffer. Fixed (`2b78cf1`): one `copyBytes` (a `memcpy`
+   for unshared memory), and a mostly full output becomes the result's memory, freed by the host
+   finalizer `compression_native.OUTPUT_FREE` (one line in `libs/core/host.silk`).
 2. **Node appends an empty frame** (9 bytes; 13 with a dictionary identifier) when a
    `ZstdCompress` stream's last chunk is written after `end()` was called: the chunk goes out with
    `ZSTD_e_end`, then `_flush` asks for `ZSTD_e_end` again and libzstd starts and ends a new
@@ -294,20 +296,20 @@ Brotli share.
 
 ## Differences from the C library
 
-1. **`ZSTD_c_nbWorkers` >= 1 runs the jobs on the calling thread.** The C build is
-   multithreaded; its output depends only on the parameters, the input and where the caller's
-   flushes fall, not on thread timing (checked: six runs each at levels 1 to 19 with 2 and 4
-   workers gave the same bytes, also between 2 and 4 workers). The port cuts the same jobs,
-   with the same overlap, round buffer, serial XXH64 and serial long-distance matching, and
-   compresses each job in the call that creates it, so the frame is the same bytes. What each
-   call consumes, writes and returns is not: the threaded library returns 1 ("a job is
-   running") where the port can already return what is left to flush. The async API still runs
-   on the runtime's thread pool, so a worker setting never blocks the loop; it only does not
-   make one call faster. Measured with 4 workers on 41 MB: level 3 242 ms (zstd -T4: 88 ms),
-   level 19 21.8 s (14.9 s). Using real threads needs a thread pool inside the package; the job
-   code is already separate (`../zstd/src/zmt.silk`), so that is a contained change.
-2. **Row match finder levels (5 to 12) are 18 to 30% slower** than the C library, for want of a
-   prefetch (Compiler walls).
+1. **`ZSTD_c_nbWorkers` >= 1 runs on native threads** (`../zstd/src/zmt.silk`, `298ebbe`): up
+   to `nbWorkers` `NativeThread`s, each with its own context, take jobs in order and publish
+   finished output every 512 KB so the oldest job flushes while it runs; the calling thread cuts
+   jobs, runs long-distance matching and XXH64, as the reference does. The frame bytes are the C
+   library's (371 cases), and the same run to run. What each call consumes and returns depends
+   on thread timing, as it does in the C library (its own output also varies: one case gave
+   5208285 or 5208288 bytes over 15 runs, with or without a final empty block; the port always
+   writes 5208288). One wait the reference does not have: a job's input section is not reused
+   while a queued or running job still reads it. Without threads, jobs run inline. 48 MB, 4
+   workers, wall time: level 3 133 ms (C 127, serial port 267), level 9 497 ms (C 380), level 19
+   13.4 s (C 14.1 s); peak RSS equal to C. No ThreadSanitizer exists for Silk; race freedom rests
+   on the protocol and the stress and determinism runs.
+2. **Row match finder levels (5 to 12) are about 20% slower** than the C library, for want of a
+   prefetch (Compiler walls 2: available in Silk dev.81, which the workspace cannot pin yet).
 
 
 ## Upstreaming
