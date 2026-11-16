@@ -1,0 +1,235 @@
+//! The JIT as an engine embedder sees it: the state a JIT executable keeps per
+//! runtime, the C-ABI callbacks it hands the engine (runtime setup, hot function
+//! report), and the compiled code table the engine runs from
+//! (docs/jit/compiled-entry.md). Compilation happens in the hot function report,
+//! at an interrupt poll; it reads bytecode and never runs JavaScript.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_core_types { FunctionBytecode, CompiledEntry, HostHook, NativeFunctionId }
+import silkjs.js_runtime as runtime
+import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
+import silkjs.cli_io as io
+import code_memory { CodeMemory, CodeBlock, MemoryError }
+import asm_x64 { Code, LinkError }
+import x64_lower { Lowered, Refusal }
+import x64_lower as lower
+
+/// Functions one runtime can have compiled; the table never moves.
+pub const CAPACITY: usize = 4096
+/// Address space reserved for machine code.
+const CODE_BYTES: usize = 67108864
+
+pub struct Options {
+  /// --jit: compile hot functions.
+  pub enabled: bool,
+  /// --jit-threshold=N: entries before a function is reported hot (engine default 1000).
+  pub threshold: u32,
+  /// --jit-stress=N: every compiled guard also fails on its Nth evaluation, and so on.
+  pub stress: u32,
+  /// --jit-deopt-limit=N: deopts after which the engine unlinks a function (0: never).
+  pub deoptLimit: u32,
+  /// --jit-stats: print counters to stderr at exit.
+  pub stats: bool,
+  /// --jit-dump: print each hot function's bytecode and the compile outcome to stderr.
+  pub dump: bool
+}
+impl Options {
+  pub fn make() -> Self {
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false }
+  }
+}
+
+pub struct Jit {
+  pub options: Options,
+  memory: Option<CodeMemory>,
+  entries: List<CompiledEntry>,
+  blocks: List<CodeBlock>,
+  /// Countdown the stress configuration's guards share (CompiledEntry.data).
+  stressCounter: i32,
+  handler: HotHandler,
+  runtime: ?*mut HeapHeader,
+  pub reported: u64,
+  pub compiledFunctions: u64,
+  pub refused: u64,
+  pub failed: u64,
+  pub codeBytes: u64,
+  /// Sums of the table's counters (collect).
+  pub runs: u64,
+  pub deopts: u64,
+  pub polls: u64,
+  pub unlinked: u64
+}
+impl Jit {
+  pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let entries = run List<CompiledEntry>.makeWithCapacity(CAPACITY)
+    return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, blocks: List<CodeBlock>.make(),
+      stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
+      reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0 }
+  }
+  /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
+  pub fn setupAddress() -> *const u8 {
+    let function: extern "C" fn(*mut HeapHeader, ?*mut u8) -> () = jitRuntimeSetup
+    let slot = unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut HeapHeader, ?*mut u8) -> (), *const *const u8>(Pointer.fromRef(&function))
+    return unsafe Pointer.read<*const u8>(slot)
+  }
+  pub fn setupData(self: &mut Self) -> ?*mut u8 {
+    return unsafe Intrinsic.pointerReinterpret<*mut Jit, *mut u8>(Pointer.fromMutRef<Jit>(&mut self))
+  }
+  /// Prints the counters (--jit-stats) to stderr.
+  pub effect fn printStats(self: &Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut line = List<u8>.make()
+    run line.appendSlice(b"jit: reported ") run decimal(&mut line, self.reported)
+    run line.appendSlice(b" compiled ") run decimal(&mut line, self.compiledFunctions)
+    run line.appendSlice(b" refused ") run decimal(&mut line, self.refused)
+    run line.appendSlice(b" failed ") run decimal(&mut line, self.failed)
+    run line.appendSlice(b" runs ") run decimal(&mut line, self.runs)
+    run line.appendSlice(b" deopts ") run decimal(&mut line, self.deopts)
+    run line.appendSlice(b" polls ") run decimal(&mut line, self.polls)
+    run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
+    run line.appendSlice(b" code-bytes ") run decimal(&mut line, self.codeBytes)
+    run line.append(10)
+    io.stderr(line.asSlice())
+  }
+  /// Sums the compiled code table's counters into runs, deopts, polls and unlinked.
+  pub fn collect(self: &mut Self) -> () {
+    self.runs = 0 self.deopts = 0 self.polls = 0 self.unlinked = 0
+    let entries = self.entries.asSlice()
+    let mut index: usize = 0
+    while index < entries.length {
+      let entry = &entries[index]
+      self.runs = self.runs + entry.runs self.deopts = self.deopts + entry.deopts self.polls = self.polls + entry.polls
+      if entry.deoptLimit != 0 && entry.deopts >= u32.toU64(entry.deoptLimit) { self.unlinked = self.unlinked + 1 }
+      index = index + 1
+    }
+  }
+}
+
+pub effect fn decimal(line: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = u64.wrappingToU8(rest % 10) + 48
+    count = count + 1 rest = rest / 10
+    if rest == 0 { break }
+  }
+  while count > 0 { count = count - 1 run line.append(digits[count]) }
+}
+effect fn hex(line: &mut List<u8>, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let table = b"0123456789abcdef"
+  run line.append(table[u8.toUsize(u8.shiftRight(value, 4))]) run line.append(table[u8.toUsize(value & 15)])
+}
+
+fn hotAddress() -> *const u8 {
+  let function: extern "C" fn(*mut HeapHeader, *mut HeapHeader, ?*mut u8) -> () = jitHotFunction
+  let slot = unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut HeapHeader, *mut HeapHeader, ?*mut u8) -> (), *const *const u8>(Pointer.fromRef(&function))
+  return unsafe Pointer.read<*const u8>(slot)
+}
+unsafe fn jitOf<'a>(anchor: &'a mut (), data: ?*mut u8) -> &'a mut Jit {
+  return unsafe Pointer.borrowMut<(), Jit>(&mut anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Jit>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(data)))
+}
+
+/// QjsOptions.runtimeSetup: installs the hot handler and the compiled code table.
+export "C" fn jitRuntimeSetup(rt: *mut HeapHeader, data: ?*mut u8) -> () {
+  let mut anchor = ()
+  let jit = unsafe jitOf(&mut anchor, data)
+  jit.runtime = rt
+  if !jit.options.enabled { return () }
+  if jit.options.threshold != 0 { unsafe runtime.setHotEntryBudget(rt, jit.options.threshold) }
+  jit.handler.data = data
+  let handler = unsafe Intrinsic.pointerReinterpret<*mut HotHandler, *mut u8>(Pointer.fromMutRef<HotHandler>(&mut jit.handler))
+  let table = unsafe jit.entries.storage()
+  unsafe runtime.setCompiledTable(rt, unsafe Intrinsic.pointerRequalify<?[*]mut CompiledEntry, ?*mut CompiledEntry>(table), usize.toU32(CAPACITY))
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: LIBC_HOT_FUNCTION_C }), opaque: handler })
+}
+
+/// LibcServices.hotFunction through HotHandler: compile bytecode or refuse it.
+export "C" fn jitHotFunction(rt: *mut HeapHeader, bytecode: *mut HeapHeader, data: ?*mut u8) -> () {
+  let mut anchor = ()
+  let jit = unsafe jitOf(&mut anchor, data)
+  let mut system = Allocator.systemAllocatorProvider()
+  let outcome = run Effect.result(unsafe compileHot(&mut jit, bytecode)) |> Effect.provideMut<Allocator>(&mut system)
+  match move outcome {
+    Result<(), OutOfMemoryError | MemoryError | LinkError>.Success { .. } => ()
+    Result<(), OutOfMemoryError | MemoryError | LinkError>.Failure { .. } => { jit.failed = jit.failed + 1 }
+  }
+}
+
+unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  jit.reported = jit.reported + 1
+  if jit.entries.length() >= CAPACITY { jit.refused = jit.refused + 1 return () }
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if jit.options.dump { run unsafe dumpBytecode(&function) }
+  let lowered = run lower.lowerFunction(&function, jit.options.stress != 0)
+  drop function
+  let mut code = match move lowered {
+    Lowered.Code { value } => move value
+    Lowered.Refused { reason } => {
+      jit.refused = jit.refused + 1
+      if jit.options.dump { run say(b"jit: refused: ", reason.text()) }
+      return ()
+    }
+  }
+  if jit.memory.isNone() { jit.memory = Option<CodeMemory>.some(run CodeMemory.reserve(CODE_BYTES)) }
+  let block = match &mut jit.memory {
+    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code)
+    Option<CodeMemory>.None => { return () }
+  }
+  let entry = block.entry()
+  jit.codeBytes = jit.codeBytes + usize.toU64(code.bytes.length())
+  run jit.blocks.append(move block)
+  let mut stress: ?*mut u8 = Pointer.null<u8>()
+  if jit.options.stress != 0 {
+    jit.stressCounter = u32.wrappingToI32(jit.options.stress)
+    stress = unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(Pointer.fromMutRef<i32>(&mut jit.stressCounter))
+  }
+  let index = jit.entries.length()
+  let added = jit.entries.appendWithinCapacity(CompiledEntry { code: entry, data: stress, deoptLimit: jit.options.deoptLimit, runs: 0, deopts: 0, polls: 0 })
+  if !added { jit.refused = jit.refused + 1 return () }
+  unsafe runtime.linkCompiled(bytecode, usize.toU32(index))
+  jit.compiledFunctions = jit.compiledFunctions + 1
+  if jit.options.dump { run say(b"jit: compiled", b"") }
+}
+
+/// Links code for the address it will run at and publishes it.
+effect fn publish(memory: &mut CodeMemory, code: &mut Code) -> CodeBlock ! MemoryError | LinkError {
+  let mut writer = run memory.allocate(code.bytes.length())
+  let none: [usize; 1] = [0]
+  run code.link(writer.address(), Slice.view<usize>(&none, 0, 0))
+  run writer.append(code.bytes.asSlice())
+  return run writer.finish()
+}
+effect fn say(prefix: &[u8], text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(prefix) run line.appendSlice(text) run line.append(10)
+  io.stderr(line.asSlice())
+}
+
+unsafe effect fn dumpBytecode(function: &FunctionBytecode) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(b"jit: hot args ") run decimal(&mut line, u16.toU64(function.argumentCount))
+  run line.appendSlice(b" locals ") run decimal(&mut line, u16.toU64(function.variableCount))
+  run line.appendSlice(b" stack ") run decimal(&mut line, u16.toU64(function.stackSize))
+  run line.appendSlice(b" refs ") run decimal(&mut line, u16.toU64(function.varRefCount))
+  run line.appendSlice(b" scope ") run decimal(&mut line, u16.toU64(function.scopeSlots))
+  run line.appendSlice(b" mode ") run decimal(&mut line, u8.toU64(function.mode))
+  run line.appendSlice(b" constants ") run decimal(&mut line, usize.toU64(function.constants.length()))
+  run line.appendSlice(b" code")
+  let bytes = unsafe function.code.asSlice()
+  let mut index: usize = 0
+  while index < bytes.length { run line.append(32) run hex(&mut line, bytes[index]) index = index + 1 }
+  run line.append(10)
+  io.stderr(line.asSlice())
+}

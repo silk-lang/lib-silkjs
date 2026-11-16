@@ -1,0 +1,141 @@
+//! Entry into machine code an embedder compiled for a function, and the
+//! deoptimization back into its interpreter frame (docs/jit/compiled-entry.md).
+//! The engine knows only the C ABI and the exit format below; what compiles the
+//! code (modules/jit) is linked by a separate executable, never imported here.
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { FunctionBytecode, ContextState, RuntimeState, CompiledEntry }
+import js_vm_state { Machine }
+
+/// What compiled code returned (its u32 result).
+pub const EXIT_RETURNED: u32 = 0
+pub const EXIT_DEOPT: u32 = 1
+/// An interrupt poll fell due on a back edge: resume in the interpreter, which polls.
+pub const EXIT_POLL: u32 = 2
+
+/// Kinds of a frame-state word (bits 32..39); the payload is bits 0..31.
+pub const SLOT_LEAVE: u64 = 0
+pub const SLOT_INT: u64 = 1
+pub const SLOT_UNDEFINED: u64 = 2
+pub const SLOT_UNINITIALIZED: u64 = 3
+pub const SLOT_BOOL: u64 = 4
+pub const SLOT_NULL: u64 = 5
+/// A retained copy of the frame's parameter cell number payload.
+pub const SLOT_ARGUMENT: u64 = 6
+
+/// Argument words use the same encoding: an Int argument is (SLOT_INT << 32 | bits),
+/// any other argument n is (SLOT_ARGUMENT << 32 | n), which names it, uncounted.
+const KIND_SHIFT: u64 = 32
+
+fn trap() -> never { return Intrinsic.trap("compiled code table invariant violated") }
+
+/// Runs the compiled code linked as index (FunctionBytecode.compiled, nonzero)
+/// for machine, a freshly entered base frame that has not executed anything.
+/// Returns true with the result in value when the code returned; false when it
+/// left at a bytecode boundary, after which machine holds the interpreter state
+/// there (or is untouched when compiled code is skipped) and execute continues.
+@inlineNever
+pub unsafe fn enter(machine: &mut Machine, index: u32, value: &mut ValueBits) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  // The debugger, coverage and profiler see every instruction: interpret.
+  if state.observeInstructions { return false }
+  if index > state.compiled.count { trap() }
+  let table = unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(state.compiled.entries)
+  drop state
+  let entrySlot = unsafe Pointer.atMut<CompiledEntry>(unsafe Pointer.assumeManyMut<CompiledEntry>(table), u32.toUsize(index - 1))
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
+  let code = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(entry.code)
+  let data = entry.data
+  drop entry
+  let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
+  let parameters = u16.toUsize(bytecode.argumentCount)
+  let locals = u16.toUsize(bytecode.variableCount)
+  let stackSize = u16.toUsize(bytecode.stackSize)
+  drop bytecode
+  let arguments = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(parameters))
+  let words = 2 + locals + stackSize
+  let exitState = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(words))
+  let argumentWords = unsafe Pointer.assumeManyMut<u64>(arguments)
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(machine.arguments)
+  let mut position: usize = 0
+  while position < parameters {
+    let word = match unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, position)) {
+      ValueBits.Int { value: bits } => u64.bitOr(u64.shiftLeft(SLOT_INT, KIND_SHIFT), u32.toU64(i32.wrappingToU32(bits)))
+      _ => u64.bitOr(u64.shiftLeft(SLOT_ARGUMENT, KIND_SHIFT), usize.toU64(position))
+    }
+    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(argumentWords, position), word)
+    position = position + 1
+  }
+  let mut contextAnchor = () let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, machine.context)
+  let counter = Pointer.fromMutRef<i32>(&mut context.interruptCounter)
+  drop context
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(Pointer.fromRef<*const u8>(&code))
+  let function = unsafe Pointer.read<extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(slot)
+  let exit = unsafe function(unsafe Intrinsic.pointerRequalify<*mut u64, *const u64>(arguments), exitState, counter, data)
+  let stateWords = unsafe Pointer.assumeManyMut<u64>(exitState)
+  let mut tallyAnchor = () let tally = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut tallyAnchor, entrySlot)
+  tally.runs = tally.runs + 1
+  drop tally
+  if exit == EXIT_RETURNED {
+    // The result word names an owned value, as a frame-state word does.
+    value.* = unsafe materialize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 0)), cells, parameters)
+    return true
+  }
+  if exit != EXIT_DEOPT && exit != EXIT_POLL { trap() }
+  let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 0)))
+  let depth = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 1)))
+  if depth > stackSize { trap() }
+  let localCells = unsafe Pointer.assumeManyMut<ValueBits>(machine.locals)
+  position = 0
+  while position < locals {
+    let word = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 2 + position))
+    if u64.shiftRight(word, KIND_SHIFT) != SLOT_LEAVE {
+      unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(localCells, position), unsafe materialize(word, cells, parameters))
+    }
+    position = position + 1
+  }
+  position = 0
+  while position < depth {
+    let word = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 2 + locals + position))
+    unsafe machine.push(unsafe materialize(word, cells, parameters))
+    position = position + 1
+  }
+  unsafe machine.setPc(pc)
+  let mut unlink = false
+  let mut afterAnchor = () let after = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut afterAnchor, entrySlot)
+  if exit == EXIT_POLL { after.polls = after.polls + 1 }
+  else {
+    after.deopts = after.deopts + 1
+    unlink = after.deoptLimit != 0 && after.deopts >= u32.toU64(after.deoptLimit)
+  }
+  drop after
+  if unlink {
+    let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, machine.bytecode)
+    owner.compiled = 0
+  }
+  return false
+}
+/// The value a frame-state word names; an owned value (SLOT_ARGUMENT retains).
+unsafe fn materialize(word: u64, parameters: [*]mut ValueBits, count: usize) -> ValueBits {
+  let kind = u64.shiftRight(word, KIND_SHIFT)
+  let payload = u64.wrappingToU32(word)
+  if kind == SLOT_INT { return ValueBits.Int { value: u32.wrappingToI32(payload) } }
+  if kind == SLOT_UNDEFINED { return ValueBits.Undefined }
+  if kind == SLOT_UNINITIALIZED { return ValueBits.Uninitialized }
+  if kind == SLOT_BOOL { return ValueBits.Bool { value: (payload & 1) != 0 } }
+  if kind == SLOT_NULL { return ValueBits.Null }
+  if kind == SLOT_ARGUMENT {
+    let index = u32.toUsize(payload)
+    if index >= count { trap() }
+    let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(parameters, index))
+    return unsafe value.retained()
+  }
+  return trap()
+}
