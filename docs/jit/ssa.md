@@ -88,6 +88,7 @@ consumes an owned `v` (drops one count, with the interpreter's deferred release,
 | `const.i32 k` | `i32` | |
 | `imm undefined` / `null` / `true` / `false` / `uninitialized` | `value`, `imm` | |
 | `unbox.i32 v` | `i32` | Guard: exits when `v` is not an `Int` |
+| `unbox.bool v` | `bool` | Guard: exits when `v` is not a `Bool` |
 | `box.i32 x`, `box.bool c` | `value`, `imm` | |
 | `add.i32`, `sub.i32`, `mul.i32 x, y` | `i32` | Guard: exits on overflow; `mul` also exits when the result is `-0` (zero with a negative operand), where the interpreter makes a Float64 |
 | `lt`, `le`, `gt`, `ge`, `eq`, `ne` `.i32 x, y` | `bool` | Signed |
@@ -131,7 +132,7 @@ what the caller passed. Each slot is a value and a mode:
 | `bool` | `bool` | `ValueBits.Bool` |
 | `imm` | `value`, `imm` | its bits; no count changes |
 | `move` | `value`, `owned` | its bits; the slot takes the count |
-| `dup` | `value`, `borrowed(root)` | its bits, retained; the root (an argument index) is recorded in the slot |
+| `dup` | `value`, `borrowed(root)` | its bits, retained; `Slot.root` names the argument index for a borrow of an argument (informational: the bits are what is written) |
 
 The ownership rule at an exit: on the path that leaves, every owned value outstanding at that
 point appears in exactly one `move` slot. The interpreter frame then owns exactly what the
@@ -168,7 +169,7 @@ It refuses a function whose kind is not normal, that has closure variables or a 
   `push_true`, `push_false`, `drop`, `dup`, `nip`, `swap`;
 - slots: `get_loc*`, `put_loc*`, `set_loc*`, `get_arg*` (all short forms),
   `set_loc_uninitialized`, `get_loc_check`/`put_loc_check`/`put_loc_check_init` when the slot's
-  state is known statically;
+  state is known statically (otherwise refused: a read before initialization throws);
 - arithmetic: `add`, `sub`, `mul`, `add_imm`, `inc`, `dec`, `inc_loc`, `dec_loc`, `add_loc`,
   `step_loc8`, and the local-operand forms `add_loc_loc8`, `sub_loc_loc8`, `mul_loc_loc8`,
   `add_top_loc8`, `sub_top_loc8`, `mul_top_loc8`, `add_top_arg8`, `sub_top_arg8`,
@@ -192,7 +193,8 @@ shortcut over ordinary `lt` and `if_*8` bytes and needs nothing.
 operand of an arithmetic or comparison instruction is unboxed with a guard unless it is already an
 `i32` or a boxed `i32`; results stay unboxed until something needs them boxed (a local holding an
 `i32` is an `i32` value; the exit's mode is `int`). A branch on a comparison result branches on
-the `bool`; a branch on anything else is refused for now. Loop headers get one parameter per
+the `bool`, a branch on an `i32` on `ne.i32 x, 0`, and a branch on a boxed value on
+`unbox.bool`, a guard. `post_inc`/`post_dec` and every other opcode not listed are refused. Loop headers get one parameter per
 local and live stack slot, typed after the whole function has been seen (see below).
 
 **Speculation.** Every guard records the bytecode offset of its instruction. The first subset
@@ -203,7 +205,8 @@ per offset, whether to guard for `int32`, refuse, or (later) choose another repr
 
 The translator emits the interpreter's counts literally: `get_arg` becomes `retain (arg n)`,
 `drop` becomes `release`, a local written over releases its old value, `return` releases every
-local and leftover operand. Two rules then remove what is provably redundant:
+local and leftover operand. `ssa_ownership.optimize` then runs, in order: simplify, the
+argument-web rule, simplify again.
 
 1. **Argument webs.** Values connected through block parameters form a web. A web whose sources
    are all `retain` of an argument-rooted value or immediates, and whose members are consumed
@@ -211,13 +214,27 @@ local and leftover operand. Two rules then remove what is provably redundant:
    `return`, is replaced by the borrows: the retains and releases go, the parameters become
    `borrowed(arg)`, and the `move` slots become `dup`. Sound because nothing in the subset
    invalidates an argument borrow (see above).
-2. **Local pairs.** `r = retain a` followed in the same block by `release r`, with every use of
-   `r` between them, no reentering instruction between them, and `a` not consumed between them:
-   uses of `r` become uses of `a`, both instructions go, and `move r` exit slots become `dup`.
 
-Before it, a simplification folds `unbox.i32 (box.i32 x)` to `x`, a retain or release of an
-`imm` value away, and unboxes block parameters whose every incoming argument is an `i32` or a
-boxed `i32` (iterated to a fixed point), so a counted loop carries its counters unboxed.
+**Simplify** repeats, compacting after each round, until nothing changes:
+
+- folds: one `arg n` per argument (in the entry block), `unbox.i32 (box.i32 x)` to `x`,
+  `unbox.bool (box.bool c)` to `c`, a retain or release of an `imm` value removed;
+- trivial parameters: a block parameter whose incoming arguments are all one value (or itself)
+  is replaced by that value;
+- exit slots: a slot holding `box.i32 x` or `box.bool c` becomes an `int`/`bool` slot of `x`/`c`,
+  so the box is no longer needed for the exit;
+- dead code: pure instructions (constants, `arg`, `imm`, boxes, comparisons) with no use go;
+- parameter unboxing: a `value` parameter whose every incoming argument is an `i32` (or bool) or
+  a box of one becomes an `i32` (`bool`) parameter, so a counted loop carries its counters
+  unboxed.
+
+Guards are never removed by dead code: an unused `unbox.i32` still checks a type, and an unused
+`add.i32` still exits on overflow where the interpreter would make a Float64.
+
+A rule for local retain/release pairs inside one block (retain, uses, release, nothing reentering
+between) was designed but is not implemented: in the first subset every such pair comes from an
+argument and the web rule removes it. It becomes necessary once values other than arguments
+(property loads, call results) are held in locals.
 
 For integer code nothing is left. A function that returns an argument keeps exactly one `retain`,
 the count the caller receives.
@@ -251,4 +268,43 @@ What workstream E consumes, all in `ssa.silk`:
 - `Exit`: `pc`, `stackDepth` and the range of `Function.slots` (locals first, then stack bottom
   first); `Slot`: value, mode, root argument for `dup`.
 
-The printer (`Function.print`) writes the textual form the tests compare against.
+Every value in a `move` slot is `owned`; a `dup` slot is `borrowed`, written as its bits and
+retained (an `imm` value uses an `imm` slot, never `dup`). An `i32`/`bool` value is boxed by the
+exit itself (`int`/`bool` slots). `Op.Removed` never appears in a compacted function.
+
+The printer (`Function.print`) writes the textual form the tests compare against. For
+`sum(n){var s=0;for(var i=0;i<n;i++)s+=i;return s}` (test `goldenSumLoop` in
+`modules/jit/src/ssa_tests.silk`):
+
+```
+b0:
+  v0: value borrowed(arg 0) = arg 0   @0
+  jump b1()   @0
+b1:
+  v1: i32 = const.i32 0   @0
+  v2: i32 = const.i32 0   @2
+  v3: i32 = unbox.i32 v0 exit e0   @11
+  v4: bool = lt.i32 v2, v3   @11
+  branch v4, b2(v1, v2), b3(v1, v2)   @12
+b2(v5: i32, v6: i32):
+  v7: i32 = add.i32 v5, v6 exit e1   @15
+  v8: i32 = const.i32 1   @22
+  v9: i32 = add.i32 v6, v8 exit e2   @22
+  v10: i32 = unbox.i32 v0 exit e3   @26
+  v11: bool = lt.i32 v9, v10   @26
+  branch v11, b4(), b3(v7, v9)   @27
+b3(v12: i32, v13: i32):
+  v14: value imm = box.i32 v12   @29
+  return v14   @30
+b4:
+  poll exit e4   @27
+  jump b2(v7, v9)   @27
+e0: pc 11 locals [int v1, int v2] stack [int v2, dup v0 (arg 0)]
+e1: pc 15 locals [int v5, int v6] stack [int v6]
+e2: pc 22 locals [int v7, int v6] stack []
+e3: pc 26 locals [int v7, int v9] stack [int v9, dup v0 (arg 0)]
+e4: pc 14 locals [int v7, int v9] stack []
+```
+
+Each instruction ends with `@pc`, the offset it came from. The back edge goes through a latch
+block (`b4`) holding the `poll`, whose exit resumes at the loop target (offset 14).
