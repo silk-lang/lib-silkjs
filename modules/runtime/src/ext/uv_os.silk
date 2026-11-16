@@ -4,7 +4,10 @@
 //! darwin.c, bsd-ifaddrs.c, thread.c and src/uv-common.c): it returns 0 or a negative errno, keeps
 //! the buffer conventions (`*size` is the capacity on entry and the length on return; UV_ENOBUFS
 //! stores the needed capacity), fills the same `extern "C"` structures, and gives results that the
-//! matching `uv_free_*` function releases. The supported targets are GNU/Linux and Darwin on LP64.
+//! matching `uv_free_*` function releases. That memory, and what libuv allocates with uv__malloc
+//! on the way, comes from the functions that uv_replace_allocator installs (`uvMalloc`, `uvCalloc`,
+//! `uvRealloc`, `uvFree` below, the C library's until then). The supported targets are GNU/Linux
+//! and Darwin on LP64.
 //! No function enters JavaScript or the event loop.
 //!
 //! The Linux functions follow libuv's code path by path, also where its result looks accidental
@@ -26,6 +29,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silk.num.f64
+import silk.concurrency.atomic { Atomic, MemoryOrder }
 
 // --- The structures of uv.h --------------------------------------------------------------------
 
@@ -44,6 +48,11 @@ pub extern "C" struct Uname { pub sysname:[u8;256], pub release:[u8;256], pub ve
 pub extern "C" struct Timeval { pub sec:isize, pub usec:isize }
 /// `uv_rusage_t`: the two times, then ru_maxrss (kilobytes) through ru_nivcsw.
 pub extern "C" struct Usage { pub user:Timeval, pub system:Timeval, pub counters:[u64;14] }
+/// `uv_group_t`. `members` is a null-terminated array in one allocation that also holds the member
+/// names and, after them, `groupname`.
+pub extern "C" struct Group { pub groupname:?*mut u8, pub gid:usize, pub members:?*mut ?*mut u8 }
+/// `uv_env_item_t`. `name` owns one allocation that also holds `value`.
+pub extern "C" struct EnvItem { pub name:?*mut u8, pub value:?*mut u8 }
 // --- Statuses and constants --------------------------------------------------------------------
 
 // errno values that Linux and Darwin share.
@@ -90,6 +99,8 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
 
 unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
 unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+unsafe extern "C" fn realloc(pointer: ?*mut u8, size: usize) -> ?*mut u8
 @foreign(noCapture: .("source"))
 unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, count: usize) -> *mut u8
 @foreign(noCapture: .("text"))
@@ -120,6 +131,8 @@ unsafe extern "C" fn freeifaddrs(list: ?*mut IfAddrs) -> ()
 // name, the password, the 32-bit uid and gid in one slot, then Linux has the gecos, home and
 // shell, and Darwin has the change time, the class, the gecos, the home, the shell and the expiry.
 unsafe extern "C" fn getpwuid_r(uid: u32, record: *mut [?*mut u8; 10], buffer: *mut u8, size: usize, result: *mut ?*mut u8) -> i32
+// `struct group` is four 8-byte slots on both: the name, the password, the 32-bit gid, the members.
+unsafe extern "C" fn getgrgid_r(gid: u32, record: *mut [?*mut u8; 4], buffer: *mut u8, size: usize, result: *mut ?*mut u8) -> i32
 
 // `struct ifaddrs`. Linux keeps a union of the broadcast and destination addresses in `destination`.
 extern "C" struct IfAddrs { next: ?*mut IfAddrs, name: ?*const u8, flags: u32, address: ?*const u8, netmask: ?*const u8, destination: ?*const u8, data: ?*mut u8 }
@@ -215,6 +228,85 @@ fn pageSize() -> u64 {
 // A block from calloc that is freed when the owner goes out of scope.
 struct Memory { pointer: ?*mut u8 }
 impl Drop for Memory { fn drop(self: &mut Self) -> () { unsafe free(self.pointer) } }
+// A block from uvMalloc that is freed with uvFree when the owner goes out of scope.
+struct UvMemory { pointer: ?*mut u8 }
+impl Drop for UvMemory { fn drop(self: &mut Self) -> () { unsafe uvFree(self.pointer) } }
+
+// --- The allocator of uv_replace_allocator ------------------------------------------------------
+// libuv allocates what it hands to the caller, and what it releases in its uv_free_* functions,
+// through four functions that uv_replace_allocator may replace (src/uv-common.c). Each one is kept
+// in a process word of its own, zero while the C library's is in use.
+
+/// `uv_malloc_func`.
+pub type MallocFunction = extern "C" fn(usize) -> ?*mut u8
+/// `uv_realloc_func`.
+pub type ReallocFunction = extern "C" fn(?*mut u8, usize) -> ?*mut u8
+/// `uv_calloc_func`.
+pub type CallocFunction = extern "C" fn(usize, usize) -> ?*mut u8
+/// `uv_free_func`.
+pub type FreeFunction = extern "C" fn(?*mut u8) -> ()
+
+fn mallocWord() -> *mut u64 { return Intrinsic.processWord() }
+fn timebaseWord() -> *mut u64 { return Intrinsic.processWord() }
+fn reallocWord() -> *mut u64 { return Intrinsic.processWord() }
+fn callocWord() -> *mut u64 { return Intrinsic.processWord() }
+fn freeWord() -> *mut u64 { return Intrinsic.processWord() }
+// The address of a C function, and back.
+unsafe fn functionWord<F: Copy>(function: F) -> u64 {
+  let mut slot: u64 = 0
+  unsafe Pointer.write<F>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut F>(Pointer.fromMutRef<u64>(&mut slot)), function)
+  return slot
+}
+unsafe fn functionAt<F: Copy>(word: u64) -> F {
+  return unsafe Pointer.read<F>(unsafe Intrinsic.pointerReinterpret<*const u64, *const F>(Pointer.fromRef<u64>(&word)))
+}
+
+/// Installs the four functions of `uv_replace_allocator`, as libuv does: without synchronization
+/// and without moving what was allocated before.
+pub unsafe fn replaceAllocator(mallocFunction: MallocFunction, reallocFunction: ReallocFunction, callocFunction: CallocFunction, freeFunction: FreeFunction) -> () {
+  unsafe Atomic.store<u64>(mallocWord(), unsafe functionWord<MallocFunction>(mallocFunction), MemoryOrder.Release)
+  unsafe Atomic.store<u64>(reallocWord(), unsafe functionWord<ReallocFunction>(reallocFunction), MemoryOrder.Release)
+  unsafe Atomic.store<u64>(callocWord(), unsafe functionWord<CallocFunction>(callocFunction), MemoryOrder.Release)
+  unsafe Atomic.store<u64>(freeWord(), unsafe functionWord<FreeFunction>(freeFunction), MemoryOrder.Release)
+}
+/// uv__malloc: null for a size of 0.
+pub unsafe fn uvMalloc(size: usize) -> ?*mut u8 {
+  if size == 0 { return Pointer.null<u8>() }
+  let word = unsafe Atomic.load<u64>(mallocWord(), MemoryOrder.Acquire)
+  if word == 0 { return unsafe malloc(size) }
+  let function = unsafe functionAt<MallocFunction>(word)
+  return unsafe function(size)
+}
+/// uv__calloc.
+pub unsafe fn uvCalloc(count: usize, size: usize) -> ?*mut u8 {
+  let word = unsafe Atomic.load<u64>(callocWord(), MemoryOrder.Acquire)
+  if word == 0 { return unsafe calloc(count, size) }
+  let function = unsafe functionAt<CallocFunction>(word)
+  return unsafe function(count, size)
+}
+/// uv__realloc: a size of 0 frees `pointer` and gives null.
+pub unsafe fn uvRealloc(pointer: ?*mut u8, size: usize) -> ?*mut u8 {
+  if size == 0 { unsafe uvFree(pointer) return Pointer.null<u8>() }
+  let word = unsafe Atomic.load<u64>(reallocWord(), MemoryOrder.Acquire)
+  if word == 0 { return unsafe realloc(pointer, size) }
+  let function = unsafe functionAt<ReallocFunction>(word)
+  return unsafe function(pointer, size)
+}
+/// uv__free: errno is kept.
+pub unsafe fn uvFree(pointer: ?*mut u8) -> () {
+  let saved = unsafe errno()
+  let word = unsafe Atomic.load<u64>(freeWord(), MemoryOrder.Acquire)
+  if word == 0 { unsafe free(pointer) } else { let function = unsafe functionAt<FreeFunction>(word) unsafe function(pointer) }
+  unsafe Pointer.write<i32>(unsafe errorSlot(), saved)
+}
+/// uv__strdup: a copy of the C string `text` from uvMalloc, or null.
+pub unsafe fn uvStrdup(text: *const u8) -> ?*mut u8 {
+  let size = unsafe strlen(text) + 1
+  let copy = unsafe uvMalloc(size)
+  if Pointer.isNull<u8>(copy) { return copy }
+  let _dest = unsafe memcpy(unsafe presentMut(copy), text, size)
+  return copy
+}
 
 // --- C strings in byte slices ------------------------------------------------------------------
 // The texts below live in zero-filled buffers or in whole-file reads. A text ends at its first
@@ -440,10 +532,17 @@ pub unsafe fn uv_translate_sys_error(code: i32) -> i32 {
 /// clock cannot be read. Darwin: mach_continuous_time() in the Mach timebase, as libuv.
 pub unsafe fn uv_hrtime() -> u64 {
   static if Intrinsic.targetOperatingSystem() == "darwin" {
-    let mut base: [u32; 2] = [0; 2]
-    // libuv reads the timebase once and aborts if it cannot; the call does not fail in practice.
-    if unsafe mach_timebase_info(Pointer.fromMutRef<[u32; 2]>(&mut base)) != 0 || base[1] == 0 { return 0 }
-    return u64.wrappingMultiply(unsafe mach_continuous_time(), u32.toU64(base[0])) / u32.toU64(base[1])
+    // libuv reads the timebase once (uv_once) and aborts if it cannot; it is kept here in a process
+    // word as numerator << 32 | denominator, 0 until the first call.
+    let word = timebaseWord()
+    let mut cached = unsafe Atomic.load<u64>(word, MemoryOrder.Relaxed)
+    if cached == 0 {
+      let mut base: [u32; 2] = [0; 2]
+      if unsafe mach_timebase_info(Pointer.fromMutRef<[u32; 2]>(&mut base)) != 0 || base[1] == 0 { return 0 }
+      cached = u64.shiftLeft(u32.toU64(base[0]), 32) | u32.toU64(base[1])
+      unsafe Atomic.store<u64>(word, cached, MemoryOrder.Relaxed)
+    }
+    return u64.wrappingMultiply(unsafe mach_continuous_time(), u64.shiftRight(cached, 32)) / (cached & 4294967295)
   } else {
     let mut now = Timespec { seconds: 0, nanoseconds: 0 }
     if unsafe clock_gettime(1, Pointer.fromMutRef<Timespec>(&mut now)) != 0 { return 0 }
@@ -660,7 +759,7 @@ pub unsafe fn uv_os_uname(info: *mut Uname) -> i32 {
 unsafe fn passwdOf(info: *mut Passwd, uid: u32) -> i32 {
   let mut capacity: usize = 2000
   while true {
-    let scratch = Memory { pointer: unsafe calloc(1, capacity) }
+    let scratch = UvMemory { pointer: unsafe uvMalloc(capacity) }
     if Pointer.isNull<u8>(scratch.pointer) { return UV_ENOMEM }
     let mut record: [?*mut u8; 10] = [Pointer.null<u8>(); 10]
     let mut result: ?*mut u8 = Pointer.null<u8>()
@@ -681,12 +780,15 @@ unsafe fn passwdOf(info: *mut Passwd, uid: u32) -> i32 {
     let nameSize = unsafe textLength(name) + 1
     let homeSize = unsafe textLength(home) + 1
     let shellSize = unsafe textLength(shell) + 1
-    let block = unsafe calloc(1, nameSize + homeSize + shellSize)
+    let block = unsafe uvMalloc(nameSize + homeSize + shellSize)
     if Pointer.isNull<u8>(block) { return UV_ENOMEM }
     let base = unsafe presentMut(block)
     unsafe copyBytes(base, name, nameSize - 1)
+    unsafe setByte(base, nameSize - 1, 0)
     unsafe copyBytes(unsafe offsetMut(base, nameSize), home, homeSize - 1)
+    unsafe setByte(base, nameSize + homeSize - 1, 0)
     unsafe copyBytes(unsafe offsetMut(base, nameSize + homeSize), shell, shellSize - 1)
+    unsafe setByte(base, nameSize + homeSize + shellSize - 1, 0)
     unsafe Pointer.put<Passwd>(info, Passwd { username: base, uid: ids & 4294967295, gid: usize.shiftRight(ids, 32), shell: unsafe offsetMut(base, nameSize + homeSize), homedir: unsafe offsetMut(base, nameSize) })
     return 0
   }
@@ -705,10 +807,152 @@ pub unsafe fn uv_os_get_passwd2(info: *mut Passwd, uid: u32) -> i32 { return uns
 pub unsafe fn uv_os_free_passwd(info: *mut Passwd) -> () {
   // The five fields are 8-byte slots; username (0) owns the allocation, shell is 3 and homedir 4.
   let slots = unsafe Pointer.assumeManyMut<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut Passwd, *mut ?*mut u8>(info))
-  unsafe free(unsafe Pointer.read<?*mut u8>(unsafe Pointer.at<?*mut u8>(slots, 0)))
+  unsafe uvFree(unsafe Pointer.read<?*mut u8>(unsafe Pointer.at<?*mut u8>(slots, 0)))
   unsafe Pointer.write<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(slots, 0), Pointer.null<u8>())
   unsafe Pointer.write<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(slots, 3), Pointer.null<u8>())
   unsafe Pointer.write<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(slots, 4), Pointer.null<u8>())
+}
+
+// --- The group database ------------------------------------------------------------------------
+
+unsafe fn pointerAt(table: *const ?*const u8, index: usize) -> ?*const u8 {
+  return unsafe Pointer.read<?*const u8>(unsafe Pointer.at<?*const u8>(unsafe Pointer.assumeMany<?*const u8>(table), index))
+}
+
+/// The group database entry of `gid`: its name, its id, and its members, in one allocation that
+/// starts at `members` (libuv src/unix/core.c). UV_ENOENT when there is none. Release the result
+/// with [`uv_os_free_group`].
+pub unsafe fn uv_os_get_group(info: *mut Group, gid: u32) -> i32 {
+  let mut capacity: usize = 2000
+  while true {
+    let scratch = UvMemory { pointer: unsafe uvMalloc(capacity) }
+    if Pointer.isNull<u8>(scratch.pointer) { return UV_ENOMEM }
+    let mut record: [?*mut u8; 4] = [Pointer.null<u8>(); 4]
+    let mut result: ?*mut u8 = Pointer.null<u8>()
+    let mut status = EINTR
+    while status == EINTR {
+      status = unsafe getgrgid_r(gid, Pointer.fromMutRef<[?*mut u8; 4]>(&mut record), unsafe presentMut(scratch.pointer), capacity, Pointer.fromMutRef<?*mut u8>(&mut result))
+    }
+    if status == ERANGE { capacity = capacity * 2 continue }
+    if status != 0 { return 0 - status }
+    if Pointer.isNull<u8>(result) { return UV_ENOENT }
+    // The texts and the member table point into `scratch`.
+    let name: ?*const u8 = record[0]
+    let id = Pointer.address<u8>(record[2]) & 4294967295
+    let table = unsafe Intrinsic.pointerRequalify<?*mut ?*const u8, ?*const ?*const u8>(unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut ?*const u8>(record[3]))
+    let nameSize = unsafe textLength(name) + 1
+    let mut members: usize = 0
+    let mut memberBytes: usize = 8
+    if !Pointer.isNull<?*const u8>(table) {
+      let present = unsafe Intrinsic.pointerRequalify<?*const ?*const u8, *const ?*const u8>(table)
+      while !Pointer.isNull<u8>(unsafe pointerAt(present, members)) {
+        memberBytes = memberBytes + unsafe textLength(unsafe pointerAt(present, members)) + 1 + 8
+        members = members + 1
+      }
+    }
+    let block = unsafe uvMalloc(nameSize + memberBytes)
+    if Pointer.isNull<u8>(block) { return UV_ENOMEM }
+    let base = unsafe presentMut(block)
+    let slots = unsafe Pointer.assumeManyMut<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(base))
+    unsafe Pointer.write<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(slots, members), Pointer.null<u8>())
+    let mut at = (members + 1) * 8
+    let mut index: usize = 0
+    while index < members {
+      let member = unsafe pointerAt(unsafe Intrinsic.pointerRequalify<?*const ?*const u8, *const ?*const u8>(table), index)
+      let size = unsafe textLength(member) + 1
+      let copy = unsafe offsetMut(base, at)
+      unsafe copyBytes(copy, member, size - 1)
+      unsafe setByte(copy, size - 1, 0)
+      unsafe Pointer.write<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(slots, index), copy)
+      at = at + size
+      index = index + 1
+    }
+    let groupname = unsafe offsetMut(base, at)
+    unsafe copyBytes(groupname, name, nameSize - 1)
+    unsafe setByte(groupname, nameSize - 1, 0)
+    unsafe Pointer.put<Group>(info, Group { groupname: groupname, gid: id, members: unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(base) })
+    return 0
+  }
+  return UV_ENOENT
+}
+
+/// Frees what [`uv_os_get_group`] stored and clears the two pointers. Null is allowed.
+pub unsafe fn uv_os_free_group(info: ?*mut Group) -> () {
+  if Pointer.isNull<Group>(info) { return () }
+  let mut anchor = ()
+  let out = unsafe Pointer.borrowMut<(), Group>(&mut anchor, unsafe Intrinsic.pointerRequalify<?*mut Group, *mut Group>(info))
+  unsafe uvFree(unsafe Intrinsic.pointerReinterpret<?*mut ?*mut u8, ?*mut u8>(out.members))
+  out.members = Pointer.null<?*mut u8>()
+  out.groupname = Pointer.null<u8>()
+}
+
+// --- The environment ---------------------------------------------------------------------------
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn _NSGetEnviron() -> *mut *const ?*const u8
+  unsafe fn environment() -> *const ?*const u8 { return unsafe Pointer.read<*const ?*const u8>(unsafe _NSGetEnviron()) }
+} else {
+  unsafe extern "C" static environ: *const ?*const u8
+  unsafe fn environment() -> *const ?*const u8 { unsafe { return environ } }
+}
+
+/// The variables of the environment as name and value pairs, in the order of `environ`; an
+/// entry without `=` is left out. Each name and its value are one allocation. Release the result
+/// with [`uv_os_free_environ`].
+pub unsafe fn uv_os_environ(items: *mut ?*mut EnvItem, count: *mut i32) -> i32 {
+  unsafe Pointer.write<?*mut EnvItem>(items, Pointer.null<EnvItem>())
+  unsafe Pointer.write<i32>(count, 0)
+  let table = unsafe environment()
+  let mut total: usize = 0
+  while !Pointer.isNull<u8>(unsafe pointerAt(table, total)) { total = total + 1 }
+  let block = unsafe uvCalloc(total, Layout.of<EnvItem>().bytes)
+  if Pointer.isNull<u8>(block) { return UV_ENOMEM }
+  let entries = unsafe Pointer.assumeManyMut<EnvItem>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut EnvItem>(unsafe presentMut(block)))
+  let mut used: usize = 0
+  let mut index: usize = 0
+  while index < total {
+    let entry = unsafe pointerAt(table, index)
+    index = index + 1
+    if Pointer.isNull<u8>(entry) { break }
+    let copy = unsafe uvStrdup(unsafe present(entry))
+    if Pointer.isNull<u8>(copy) {
+      // libuv's failure path frees the entry at `used`, which calloc left empty, `used` times.
+      let mut n: usize = 0
+      while n < used {
+        let mut anchor = ()
+        let item = unsafe Pointer.borrowMut<(), EnvItem>(&mut anchor, unsafe Pointer.atMut<EnvItem>(entries, used))
+        unsafe uvFree(item.name)
+        n = n + 1
+      }
+      unsafe uvFree(block)
+      unsafe Pointer.write<?*mut EnvItem>(items, Pointer.null<EnvItem>())
+      unsafe Pointer.write<i32>(count, 0)
+      return UV_ENOMEM
+    }
+    let text = unsafe presentMut(copy)
+    let mut n: usize = 0
+    while unsafe byteAt(text, n) != 0 && unsafe byteAt(text, n) != 61 { n = n + 1 }
+    if unsafe byteAt(text, n) == 0 { unsafe uvFree(copy) continue }
+    unsafe setByte(text, n, 0)
+    unsafe Pointer.put<EnvItem>(unsafe Pointer.atMut<EnvItem>(entries, used), EnvItem { name: text, value: unsafe offsetMut(text, n + 1) })
+    used = used + 1
+  }
+  unsafe Pointer.write<?*mut EnvItem>(items, unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut EnvItem>(block))
+  unsafe Pointer.write<i32>(count, usize.toI32(used))
+  return 0
+}
+
+/// Frees what [`uv_os_environ`] stored: the first `count` names, then the array.
+pub unsafe fn uv_os_free_environ(items: ?*mut EnvItem, count: i32) -> () {
+  let mut index: i32 = 0
+  while index < count {
+    let entries = unsafe Pointer.assumeManyMut<EnvItem>(unsafe Intrinsic.pointerRequalify<?*mut EnvItem, *mut EnvItem>(items))
+    let mut anchor = ()
+    let item = unsafe Pointer.borrowMut<(), EnvItem>(&mut anchor, unsafe Pointer.atMut<EnvItem>(entries, i32.toUsize(index)))
+    unsafe uvFree(item.name)
+    index = index + 1
+  }
+  unsafe uvFree(unsafe Intrinsic.pointerReinterpret<?*mut EnvItem, ?*mut u8>(items))
 }
 
 // --- Network interfaces ------------------------------------------------------------------------
@@ -772,7 +1016,7 @@ pub unsafe fn uv_interface_addresses(addresses: *mut ?*mut Interface, count: *mu
   if total == 0 { unsafe freeifaddrs(head) return 0 }
   // One zeroed block: the entries, then the names.
   let size = Layout.of<Interface>().bytes
-  let block = unsafe calloc(1, total * size + names)
+  let block = unsafe uvCalloc(1, total * size + names)
   if Pointer.isNull<u8>(block) { unsafe freeifaddrs(head) return UV_ENOMEM }
   let base = unsafe presentMut(block)
   let entries = unsafe Pointer.assumeManyMut<Interface>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Interface>(base))
@@ -835,7 +1079,7 @@ pub unsafe fn uv_interface_addresses(addresses: *mut ?*mut Interface, count: *mu
 
 /// Frees the array that [`uv_interface_addresses`] stored; null is allowed.
 pub unsafe fn uv_free_interface_addresses(addresses: ?*mut Interface, count: i32) -> () {
-  unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Interface, ?*mut u8>(addresses))
+  unsafe uvFree(unsafe Intrinsic.pointerReinterpret<?*mut Interface, ?*mut u8>(addresses))
 }
 
 // --- Processors, memory, load: Linux -----------------------------------------------------------
@@ -874,7 +1118,7 @@ static if Intrinsic.targetOperatingSystem() == "linux" {
   /// cpufreq in MHz (0 when the kernel does not report one), and the times of /proc/stat in
   /// milliseconds. Stores the array and its length; release it with [`uv_free_cpu_info`].
   pub unsafe fn uv_cpu_info(cpus: *mut ?*mut Cpu, count: *mut i32) -> i32 {
-    let working = Memory { pointer: unsafe calloc(MAX_CPUS * SLOTS, 8) }
+    let working = UvMemory { pointer: unsafe uvCalloc(MAX_CPUS * SLOTS, 8) }
     if Pointer.isNull<u8>(working.pointer) { return UV_ENOMEM }
     let table = unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(unsafe presentMut(working.pointer)))
     let mut bitmap: [u8; 1024] = [0; 1024]
@@ -986,7 +1230,7 @@ static if Intrinsic.targetOperatingSystem() == "linux" {
     // One block: the entries, then the eight names that their `model` fields point into.
     let size = Layout.of<Cpu>().bytes
     unsafe Pointer.write<i32>(count, 0)
-    let block = unsafe calloc(1, online * size + 512)
+    let block = unsafe uvCalloc(1, online * size + 512)
     unsafe Pointer.write<?*mut Cpu>(cpus, unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Cpu>(block))
     if Pointer.isNull<u8>(block) { return UV_ENOMEM }
     let base = unsafe presentMut(block)
@@ -1020,7 +1264,7 @@ static if Intrinsic.targetOperatingSystem() == "linux" {
 
   /// Frees the array that [`uv_cpu_info`] stored. The model names are part of the same block.
   pub unsafe fn uv_free_cpu_info(cpus: ?*mut Cpu, count: i32) -> () {
-    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Cpu, ?*mut u8>(cpus))
+    unsafe uvFree(unsafe Intrinsic.pointerReinterpret<?*mut Cpu, ?*mut u8>(cpus))
   }
 
   // The kilobytes after `what` in /proc/meminfo, in bytes; 0 when the file or the key is missing.
@@ -1342,9 +1586,9 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
     let size = Layout.of<Cpu>().bytes
     let modelSize = length(&model) + 1
     // The entries, zeroed so that a partly filled array can be freed.
-    let block = unsafe calloc(total + 1, size)
+    let block = unsafe uvCalloc(total + 1, size)
     if Pointer.isNull<u8>(block) || Pointer.isNull<i32>(info) || u32.toUsize(infoCount) < total * 4 {
-      unsafe free(block)
+      unsafe uvFree(block)
       let _freed = unsafe vm_deallocate(taskSelf(), region, regionSize)
       return UV_ENOMEM
     }
@@ -1354,7 +1598,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
     let mut status: i32 = 0
     while index < total {
       // Each entry owns a copy of the model text.
-      let copy = unsafe calloc(1, modelSize)
+      let copy = unsafe uvCalloc(1, modelSize)
       if Pointer.isNull<u8>(copy) { status = UV_ENOMEM break }
       unsafe copyBytes(unsafe presentMut(copy), Pointer.fromRef<u8>(&model[0]), modelSize - 1)
       let user = u32.toU64(i32.wrappingToU32(unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(load, index * 4))))
@@ -1386,10 +1630,10 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
     while index < count {
       let mut anchor = ()
       let entry = unsafe Pointer.borrowMut<(), Cpu>(&mut anchor, unsafe Pointer.atMut<Cpu>(entries, i32.toUsize(index)))
-      unsafe free(unsafe Intrinsic.pointerRequalify<*const u8, ?*mut u8>(entry.model))
+      unsafe uvFree(unsafe Intrinsic.pointerRequalify<*const u8, ?*mut u8>(entry.model))
       index = index + 1
     }
-    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Cpu, ?*mut u8>(cpus))
+    unsafe uvFree(unsafe Intrinsic.pointerReinterpret<?*mut Cpu, ?*mut u8>(cpus))
   }
 
   /// The free memory in bytes: the free pages of host_statistics(HOST_VM_INFO), or 0.

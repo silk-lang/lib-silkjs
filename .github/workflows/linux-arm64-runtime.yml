@@ -1,0 +1,141 @@
+name: Linux arm64 runtime
+# Builds the runtime on a Linux arm64 runner and runs it, as the macOS workflow does on Apple
+# Silicon: the differential cases against Node 24, the fixtures, and libuv's own suite against the
+# Silk exports, for this branch and for main before the libuv replacement. The development machine
+# is x86-64; this is the run of the GNU arm64 code paths (the epoll_pwait syscall number, the
+# 16-byte epoll_event, the arm64 signal and register conventions of the exports).
+on:
+  push:
+    branches: [feature/replace-libuv]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: linux-arm64-runtime-${{ github.ref }}
+  # A run takes longer than the gap between pushes: finish it, and keep only the newest waiting.
+  cancel-in-progress: false
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # This branch, and main from before the libuv replacement (C libuv linked) as the baseline
+        # its fixture results are compared with.
+        source: [branch, f3d5ea8affce5bc169df95191b55ab47e3db2740]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source == 'branch' && github.sha || matrix.source }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the pinned Silk and its Clang
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          export SILK_RELEASE="v$(sed -n 's/^silk-version = "\(.*\)"/\1/p' silk.toml)"
+          curl --fail --location https://raw.githubusercontent.com/silk-lang/silk/8214c402307b/install.sh --output "$RUNNER_TEMP/install-silk.sh"
+          sh "$RUNNER_TEMP/install-silk.sh"
+          echo "$HOME/.silk/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/sl"
+          curl --fail --location https://github.com/silk-lang/silk/releases/download/llvm-23.1.5-silk.1/silk-llvm-23.1.5-silk.1-aarch64-unknown-linux-gnu.tar.gz | tar xz -C "$RUNNER_TEMP/sl" --strip-components 1
+          ls "$RUNNER_TEMP/sl/bin" | head
+          cd "$RUNNER_TEMP/sl/bin" && for n in clang clang++ ld.lld lld ld64.lld llvm-ar llvm-nm; do test -e $n || ln -sf llvm $n; done
+          echo "SILK_CLANG=$RUNNER_TEMP/sl/bin/clang" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/sl/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/sl/bin/clang" --version
+          nproc; free -g; uname -m
+      - name: Build the runtime
+        working-directory: modules/runtime
+        run: |
+          (time python3 tools/build.py --release --output "$RUNNER_TEMP/silkjs") 2>&1 | tail -40
+          "$RUNNER_TEMP/silkjs" -p 'process.versions.uv + " " + process.platform + " " + process.arch'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silkjs-${{ matrix.source }}
+          path: ${{ runner.temp }}/silkjs
+          retention-days: 3
+      - name: Differential cases against Node 24
+        working-directory: modules/runtime
+        run: |
+          unset NODE_OPTIONS
+          SILKJS_RUNTIME="$RUNNER_TEMP/silkjs" NODE_REFERENCE="$(which node)" node tests/compat.mjs 2>&1 | tee "$RUNNER_TEMP/compat.log" | tail -40
+      - name: Fixtures
+        if: always()
+        working-directory: modules/runtime
+        run: |
+          unset NODE_OPTIONS
+          export SILKJS_RUNTIME="$RUNNER_TEMP/silkjs" NODE_REFERENCE="$(which node)" CC=clang
+          # A failing fixture is reported, not a reason to stop the loop.
+          set +e
+          : > "$RUNNER_TEMP/fixtures.txt"
+          mkdir -p "$RUNNER_TEMP/fx"
+          for t in tests/*-smoke.cjs tests/*-smoke.mjs tests/eventsource-dispatcher.cjs tests/wasm-fixtures.cjs tests/wasm-interruptions.cjs tests/wasm-memory-range.cjs tests/fixtures/wasi/smoke.cjs; do
+            [ -f "$t" ] || continue
+            timeout 300 "$RUNNER_TEMP/silkjs" "$t" > "$RUNNER_TEMP/fx.out" 2>&1; s=$?
+            cp "$RUNNER_TEMP/fx.out" "$RUNNER_TEMP/fx/$(basename "$t").out"
+            echo "$s $t $(tail -1 "$RUNNER_TEMP/fx.out" | cut -c1-160)" | tee -a "$RUNNER_TEMP/fixtures.txt"
+          done
+          for t in tests/*.py; do
+            # embed-smoke.py builds an executable of its own: give the Python fixtures more time.
+            timeout 2400 python3 "$t" "$RUNNER_TEMP/silkjs" > "$RUNNER_TEMP/fx.out" 2>&1; s=$?
+            cp "$RUNNER_TEMP/fx.out" "$RUNNER_TEMP/fx/$(basename "$t").out"
+            echo "$s $t $(tail -1 "$RUNNER_TEMP/fx.out" | cut -c1-160)" | tee -a "$RUNNER_TEMP/fixtures.txt"
+          done
+          echo "$(grep -c '^0 ' "$RUNNER_TEMP/fixtures.txt") of $(wc -l < "$RUNNER_TEMP/fixtures.txt") fixtures passed"
+      - name: Loop behavior against Node 24
+        if: always()
+        working-directory: modules/runtime
+        run: |
+          unset NODE_OPTIONS
+          if [ -f tests/loop-behavior.mjs ]; then
+            SILKJS_RUNTIME="$RUNNER_TEMP/silkjs" node tests/loop-behavior.mjs 2>&1 | tee "$RUNNER_TEMP/loop-behavior.log" | tail -60
+          fi
+      - name: The loop driven directly (tests/loop-harness)
+        if: always() && matrix.source == 'branch'
+        working-directory: modules/runtime
+        run: python3 tools/loop_harness.py --work "$RUNNER_TEMP/loop-harness"
+      - name: libuv's own test suite, real libuv against the Silk exports
+        if: always()
+        working-directory: modules/runtime
+        run: |
+          [ -f tools/libuv_suite.py ] || exit 0
+          curl --fail --location https://dist.libuv.org/dist/v1.51.0/libuv-v1.51.0.tar.gz | tar xz -C "$RUNNER_TEMP"
+          set +e
+          python3 tools/libuv_suite.py --libuv-src "$RUNNER_TEMP/libuv-v1.51.0" --work "$RUNNER_TEMP/uvsuite" > "$RUNNER_TEMP/libuv-suite.log" 2>&1; s=$?
+          if [ $s -eq 0 ]; then tail -8 "$RUNNER_TEMP/libuv-suite.log"; else tail -150 "$RUNNER_TEMP/libuv-suite.log"; fi
+          cp "$RUNNER_TEMP/uvsuite/real.tap" "$RUNNER_TEMP/uvsuite/silk.tap" "$RUNNER_TEMP/" 2>/dev/null || true
+          exit $s
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-arm64-runtime-logs-${{ matrix.source }}
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/*.txt
+            ${{ runner.temp }}/*.tap
+            ${{ runner.temp }}/fx/*.out
+  bench:
+    # main f3d5ea8 against this branch on one runner, rounds alternating which goes first
+    # (tools/ci_bench.py): HTTP servers under wrk, setImmediate, spawnSync, cat, SQLite, cold start.
+    needs: runtime
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: silkjs-*
+          path: ${{ runner.temp }}/bin
+      - name: Benchmarks, main against the branch
+        working-directory: modules/runtime
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq wrk
+          chmod +x "$RUNNER_TEMP"/bin/*/silkjs
+          ls -la "$RUNNER_TEMP"/bin/*/silkjs
+          python3 tools/ci_bench.py "$RUNNER_TEMP/bin/silkjs-f3d5ea8affce5bc169df95191b55ab47e3db2740/silkjs" "$RUNNER_TEMP/bin/silkjs-branch/silkjs" --rounds 12 | tee "$RUNNER_TEMP/bench.txt"

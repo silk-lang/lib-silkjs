@@ -137,12 +137,21 @@ def startup_order(arguments):
     many pages as they fill: each page is a fault, and the kernel maps file pages 64 KB
     at a time, so a server's resident text was 22 MB. tools/startup-order.txt lists a
     start's functions and tools/server-order.txt the rest a server runs (tools/startup_order.py
-    writes both); a name that no longer exists is skipped. Only lld takes the list.
+    writes both); a name that no longer exists is skipped. lld takes the list on Linux; on macOS
+    the Mach-O linker takes it as an order file.
     """
+    names = (ROOT / 'tools/startup-order.txt').read_text() + (ROOT / 'tools/server-order.txt').read_text()
+    if platform.system() == 'Darwin':
+        # The Mach-O linkers (ld64, ld64.lld) take the same list as an order file, each C-level name
+        # with Mach-O's leading underscore; objects are laid out by symbol (subsections via symbols),
+        # so no per-function sections are needed. A name the executable lacks is skipped.
+        order = ROOT / 'build/function-order-macho.txt'
+        order.write_text(''.join('_' + name + '\n' for name in names.split()))
+        return ['-Wl,-order_file,' + str(order)]
     if platform.system() != 'Linux' or not any(a.startswith('--ld-path=') and 'lld' in a for a in arguments):
         return []
     order = ROOT / 'build/function-order.txt'
-    order.write_text((ROOT / 'tools/startup-order.txt').read_text() + (ROOT / 'tools/server-order.txt').read_text())
+    order.write_text(names)
     return ['-Wl,--symbol-ordering-file=' + str(order), '-Wl,--no-warn-symbol-ordering']
 
 
