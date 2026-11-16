@@ -52,9 +52,9 @@ configuration.
 | Milestone | State |
 | --- | --- |
 | 1. Foundational validation | Done. Two native tests fail, on `main` too (see below) |
-| 2. Scorecard | Not started. `modules/benchkit` on `main` already compares engines; see next steps |
-| 3. Differential harness | Runner, generator, minimizer and self-test done; not wired into `silk task` |
-| 4. Engine seam | Not started; design leads only |
+| 2. Scorecard | In progress in a separate session (see "Work in progress") |
+| 3. Differential harness | Done for the interpreter: widened generator, per-area self-test, `silk task differential`, a step in `silk task check` |
+| 4. Engine seam | In progress in a separate session (see "Work in progress") |
 | 5. Machine-code foundations | x86-64 encoder and executable memory done for Linux x86-64 |
 | 6. Feedback and ownership-aware SSA | Not started |
 | 7. Optimizations | Not started |
@@ -110,31 +110,48 @@ and reduced by deleting lines. A missing reference engine is reported as skipped
 Result on this branch: seeds 1..3000 agree across plain, `--debug-observed` and Node 22.23.4.
 `--self-test` finds a planted disagreement in 3 of 40 programs and reduces 60 lines to 12.
 
-Limits: the generator covers arithmetic, comparisons, property and element reads, calls, and
-prototype changes. It does not generate closures, generators, async code, exceptions thrown from
-generated functions, typed arrays, or property writes inside the hot functions. It found no bug,
-which says the two interpreter loops agree on this slice, not that the slice is wide.
-`--debug-observed` is confirmed to change the dispatch loop (the same script runs about 3x
-slower); that every path enters observed dispatch is still not established.
+Since `dfcd50a` the generator also covers closures (captured variables read and written, closures
+made in loops), property and element writes inside the hot functions (shape-changing adds,
+deletes, `length` writes), exceptions (thrown late in a hot loop through intermediate frames,
+local catch and rethrow, `finally` overriding the result) and typed arrays (nine element kinds,
+NaN, -0, out-of-range stores, an aliasing view). `--self-test` plants one source-level miscompile
+per area and requires that it is found and minimized. `silk task differential` wraps the script,
+and `silk task check` runs 200 programs, plain against observed, as its fifth step.
+
+Limits: it does not generate generators, async code, getters or setters defined in hot functions,
+Proxy, named writes on typed arrays, or strict mode. It found no bug, which says the two
+interpreter loops agree on this slice, not that the slice is wide. `--debug-observed` is
+confirmed to change the dispatch loop (the same script runs about 3x slower); that every path
+enters observed dispatch is still not established. A JIT joins as
+`--config jit='{engine} --jit {file}'`; it is not a reference engine, so any disagreement with
+`plain` is a mismatch.
 
 ## Validation record
 
-These were run once, on a 4-CPU, 15 GiB Linux x86-64 cloud container that no longer exists, with
-Silk 0.1.0-dev.74+205aea3f5b2e and Clang 22.1.8. Their logs were not kept; rerun to check them.
+Rerun on 2026-11-16 by the lead session on a fresh 4-CPU, 15 GiB Linux x86-64 cloud container
+(Silk 0.1.0-dev.74+205aea3f5b2e, Clang 22.1.8, Node 22.23.4), at `b4fbe1b` unless noted. Every
+row was run there; the exit status is given. Logs were not kept beyond the session.
 
-| Command | Result |
-| --- | --- |
-| `silk test --manifest-path modules/jit/silk.toml --no-cache` | 28 passed, 0 failed |
-| `python3 modules/jit/scripts/encodings.py --check` | fixtures current |
-| `silk check --workspace` on `jit/p1-code-memory-asm` (dev.69), after `python3 modules/runtime/tools/embed.py` | 3 packages pass, 15 s warm, 43 s cold |
-| `silk build --release` in `modules/engine` | 4 m 48 s, peak 7.2 GiB |
-| `silk task check` in `modules/engine` | 271 script steps pass; native suite 562 passed, 2 failed |
-| `python3 scripts/differential.py --count 3000 --configs plain,observed,node` | 3000 agree |
-| `python3 scripts/differential.py --self-test` | pass |
+| Command | Exit | Result |
+| --- | --- | --- |
+| `silk test --manifest-path modules/jit/silk.toml` | 0 | 28 passed, 0 failed |
+| `python3 modules/jit/scripts/encodings.py --check` | 0 | `src/asm_x64_fixtures.silk is current` |
+| `silk build --release` in `modules/engine` | 0 | 5 m 33 s |
+| native suite (command below) at `42b98426` | 1 | 562 passed, 2 failed, 13 m 10 s |
+| native suite at `main` `d1973537` (separate worktree) | 1 | 562 passed, 2 failed, same two tests and messages |
+| `python3 scripts/differential.py --self-test` | 0 | PASS: prototypes 9 of 40, closures 21, property writes 12, exceptions 34, typed arrays 8 |
+| `python3 scripts/differential.py --count 3000 --configs plain,observed,node` | 0 | agree 3000, mismatch 0, reference-only 0 |
+| `silk task differential --count 20` | 0 | agree 20 |
 
-The 60 s workspace-check timeout in the previous handoff was a slow host, not a hang. Without
-`embed.py` the runtime member fails with `Unknown module runtime.embedded`; that file is generated
-and ignored by git.
+Not rerun by the lead: `silk check --workspace` and the full `silk task check` (the worker for
+the differential harness ran `python3 scripts/check.py --skip-native --skip-bench`: 271 PASS).
+The native suite needs `modules/engine/build/` to exist: without it `silk test ... -o
+build/core-tests` exits 1 with `silk: cannot create temporary directory: not found`
+(`mkdir -p build`, or run the release build first). `/usr/bin/time` is not installed on these
+containers. Peak memory of the largest single process was 5.3 GiB for the native suite build
+and 3.1 GiB for the release build (`getrusage`, one process, not the sum of the build's
+processes; the 13.9 GiB and 7.2 GiB figures elsewhere in this file came from the earlier
+machine and were not reproduced as totals).
 
 ### Two native tests fail on `main` as well
 
@@ -147,7 +164,9 @@ and ignored by git.
   independently expected property name" at `js_for_in_tests:141`.
 
 The same command on untouched `main` at `d1973537` gives the same two failures with the same
-messages, so they predate this branch and are not caused by it. They are not fixed here.
+messages (rerun by the lead session on 2026-11-16, both revisions on one machine), so they
+predate this branch and are not caused by it. They are not fixed here, by decision: the
+programme moves on without them.
 
 ## Operating notes for this kind of host
 
@@ -161,26 +180,34 @@ messages, so they predate this branch and are not caused by it. They are not fix
   --no-cache` did not. Treat a suspiciously instant check result as stale.
 - Do not benchmark while a compiler runs.
 
+## Work in progress
+
+Since 2026-11-16 the work is split across sessions. The lead session integrates into
+`claude/sweet-ptolemy-f5t7na`, reruns each worker's key commands before merging, and is the only
+one that edits this file. The worker briefs (setup, machine rules, scope) are kept in the Silk
+UI project's shared files under `jit/briefs/` and repeat what this file says.
+
+| Workstream | State |
+| --- | --- |
+| A. Scorecard (`docs/jit/scorecard.md`, harness additions for startup, peak RSS, binary size, warmup) | Running in its own session; nothing merged yet |
+| B. Tier seam (`docs/jit/tier-seam.md`) and the per-function hotness hook with its cost measurement | Running in its own session; nothing merged yet |
+| C. Differential harness widening | Merged (`dfcd50a`, `b4fbe1b`), validated above |
+
 ## Next steps
 
-1. Scorecard. `modules/engine/bench/README.md` documents `silk task bench-setup`, `bench-octane
-   --jit`, `bench-micro --jit` and `bench-report`. Run them on an idle machine and add what the
-   harness lacks: startup of an empty script, peak RSS per process, binary size, warmup. Record
-   host, revision and every engine version. A worst-iteration time is not a GC pause or a p99.
-   Tier seam. Document every way a function body starts executing and every back-edge, then
-   prototype per-function hotness counting with an embedder-set callback slot and measure its
-   interpreter-only cost with `scripts/v8bench.py --instructions` (target under 0.5 percent).
-   Two cloud sessions were created for these (branches `claude/jit-scorecard` and
-   `claude/jit-tier-seam`, both still equal to `cc1ed33a`) and did nothing: they could not
-   install the Silk toolchain because the installer needs the GitHub release API of
-   `silk-lang/silk`, which a session attached only to `lib-silkjs` cannot reach. A session doing
-   this work needs both repositories attached.
-2. Wire `differential.py` into `silk task`, and widen the generator (closures, property writes,
-   exceptions, typed arrays).
-3. Decide the hook design from the tier-seam document and its instruction-count measurements.
-4. Then milestone 6: call and type feedback, an ownership-aware SSA form, and one narrow function
-   compiled end to end (integer arithmetic and a loop) with deoptimization to the interpreter,
-   run through the differential harness as a new configuration.
+1. Merge A and B after rerunning their key commands. For B that means
+   `python3 scripts/v8bench.py --instructions old new` (target under 0.5 percent),
+   `python3 scripts/differential.py --count 500`, `silk task check`, and the test that fails
+   when the hook stops firing.
+2. Decide the hook design from the tier-seam document and its instruction-count measurements.
+3. Then milestone 6: call and type feedback, an ownership-aware SSA form on the existing
+   reference counting, and one narrow function compiled end to end (integer arithmetic and a
+   loop) using `modules/jit`'s encoder and code memory, with deoptimization to an interpreter
+   frame at a bytecode boundary, run through the differential harness as a new configuration.
+
+Every session doing this work needs `silk-lang/silk` attached with GitHub API access as well as
+`silk-lang/lib-silkjs`: the Silk installer reads the release API and gets HTTP 403 otherwise
+(two earlier sessions failed on exactly this).
 
 ## Research
 
