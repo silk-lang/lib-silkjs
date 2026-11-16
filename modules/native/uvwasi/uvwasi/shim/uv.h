@@ -33,6 +33,21 @@
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+/* The rest of what libuv's uv.h, uv/unix.h and uv/darwin.h include, which uvwasi's sources rely on
+ * (clocks.c uses Mach's thread_info through them on Darwin). */
+#include <math.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <termios.h>
+#include <pwd.h>
+#include <semaphore.h>
+#include <sys/param.h>
+#if defined(__APPLE__)
+# include <mach/mach.h>
+# include <mach/task.h>
+# include <mach/semaphore.h>
+# include <TargetConditionals.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

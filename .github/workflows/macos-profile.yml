@@ -1,0 +1,110 @@
+name: macOS setImmediate profile and focused benchmarks
+# Samples the runtime's setImmediate loop on macOS with `sample`, for this branch and for main
+# df9c30b (C libuv), and prints where each spends its time and how often each makes the kernel
+# calls of a loop turn. The macOS benchmarks read setImmediate about 10% slower against df9c30b.
+on:
+  push:
+    branches: [feature/replace-libuv]
+    paths: ['.github/workflows/macos-profile.yml', 'modules/runtime/tools/build.py', 'modules/runtime/tools/startup-order.txt', 'modules/runtime/tools/server-order.txt', 'modules/runtime/src/ext/uv_loop.silk', 'modules/runtime/src/ext/fs_async.silk', 'modules/runtime/src/ext/uv_os.silk']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: macos-profile-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    strategy:
+      matrix:
+        source: [branch, df9c30baf2b211c60153eea8807e1206cbedb409]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source == 'branch' && github.sha || matrix.source }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the pinned Silk and its Clang
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          export SILK_RELEASE="v$(sed -n 's/^silk-version = "\(.*\)"/\1/p' silk.toml)"
+          curl --fail --location https://raw.githubusercontent.com/silk-lang/silk/8214c402307b/install.sh --output "$RUNNER_TEMP/install-silk.sh"
+          sh "$RUNNER_TEMP/install-silk.sh"
+          echo "$HOME/.silk/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/sl"
+          curl --fail --location https://github.com/silk-lang/silk/releases/download/llvm-23.1.5-silk.1/silk-llvm-23.1.5-silk.1-aarch64-apple-darwin.tar.gz | tar xz -C "$RUNNER_TEMP/sl" --strip-components 1
+          cd "$RUNNER_TEMP/sl/bin" && for n in clang clang++ ld.lld lld ld64.lld llvm-ar llvm-nm; do test -e $n || ln -sf llvm $n; done
+          echo "SILK_CLANG=$RUNNER_TEMP/sl/bin/clang" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/sl/bin" >> "$GITHUB_PATH"
+      - name: Build the runtime
+        working-directory: modules/runtime
+        run: python3 tools/build.py --release --output "$RUNNER_TEMP/silkjs" 2>&1 | tail -5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: profile-silkjs-${{ matrix.source }}
+          path: ${{ runner.temp }}/silkjs
+          retention-days: 2
+  profile:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: profile-silkjs-*
+          path: ${{ runner.temp }}/bin
+      - name: Sample setImmediate
+        run: |
+          chmod +x "$RUNNER_TEMP"/bin/*/silkjs
+          cat > "$RUNNER_TEMP/imm4.js" <<'EOF'
+          let n = 0; const t0 = performance.now();
+          function f() { n++; if (performance.now() - t0 < 4000) setImmediate(f); else console.log(`setImmediate ${Math.round(n / 4)} turns/s`); }
+          setImmediate(f);
+          EOF
+          for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            names="df9c30baf2b211c60153eea8807e1206cbedb409 branch"
+            [ $((round % 2)) -eq 0 ] && names="branch df9c30baf2b211c60153eea8807e1206cbedb409"
+            for name in $names; do
+              bin="$RUNNER_TEMP/bin/profile-silkjs-$name/silkjs"
+              SILKJS_PREPARSE_THREADS=0 "$bin" "$RUNNER_TEMP/imm4.js" > "$RUNNER_TEMP/out-$name-$round.txt" &
+              pid=$!
+              sleep 0.5
+              [ $round -le 2 ] && { sample $pid 2 -file "$RUNNER_TEMP/sample-$name-$round.txt" > /dev/null 2>&1 || true; }
+              wait $pid
+              echo "== $name round $round: $(cat "$RUNNER_TEMP/out-$name-$round.txt")"
+            done
+          done
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import glob, re, statistics, sys
+          values = {}
+          for path in sorted(glob.glob(sys.argv[1] + '/out-*.txt')):
+              name, number = re.match(r'.*/out-(.+)-(\d+)\.txt', path).groups()
+              match = re.search(r'(\d+) turns', open(path).read())
+              values.setdefault(name, {})[int(number)] = int(match.group(1)) if match else 0
+          base, branch = values['df9c30baf2b211c60153eea8807e1206cbedb409'], values['branch']
+          rounds = sorted(base)
+          wins = sum(1 for r in rounds if branch[r] >= base[r])
+          print(f'setImmediate turns/s, median of {len(rounds)} rounds: main df9c30b {statistics.median(base.values()):.0f}, branch {statistics.median(branch.values()):.0f}; branch at least as fast in {wins} of {len(rounds)} rounds')
+          PY
+          for name in df9c30baf2b211c60153eea8807e1206cbedb409 branch; do
+            echo "=================== $name: top of stack (round 2)"
+            sed -n '/Sort by top of stack/,/Binary Images/p' "$RUNNER_TEMP/sample-$name-2.txt" | head -40
+            echo "=================== $name: kernel calls in the call graph (round 2)"
+            grep -E "kevent|__read_nocancel|__write_nocancel|  read  |  write  |pthread_sigmask|mach_continuous|mach_timebase|__select|poll " "$RUNNER_TEMP/sample-$name-2.txt" | sed 's/^[ +!:|]*//' | sort | uniq -c | sort -rn | head -20
+          done
+      - name: spawnSync, cat and setImmediate, 24 alternating rounds against df9c30b
+        working-directory: modules/runtime
+        run: |
+          python3 tools/ci_bench.py "$RUNNER_TEMP/bin/profile-silkjs-df9c30baf2b211c60153eea8807e1206cbedb409/silkjs" "$RUNNER_TEMP/bin/profile-silkjs-branch/silkjs" --rounds 24 --only setImmediate,spawnSync,cat
+          echo "== the noise floor: df9c30b against itself, the same 24 rounds"
+          cp "$RUNNER_TEMP/bin/profile-silkjs-df9c30baf2b211c60153eea8807e1206cbedb409/silkjs" "$RUNNER_TEMP/silkjs-main-copy"
+          python3 tools/ci_bench.py "$RUNNER_TEMP/bin/profile-silkjs-df9c30baf2b211c60153eea8807e1206cbedb409/silkjs" "$RUNNER_TEMP/silkjs-main-copy" --rounds 24 --only setImmediate,spawnSync,cat
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-profile-samples
+          path: ${{ runner.temp }}/sample-*.txt
