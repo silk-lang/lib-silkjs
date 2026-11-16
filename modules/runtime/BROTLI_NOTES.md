@@ -326,6 +326,26 @@ with them is pinned (`silk set <version>` at the repository root), the port shou
   entry, so it gains nothing there.
 - Re-run `bench/brotli/compare.py` and the instruction counts, and update this file.
 
+Checked again on the released v0.1.0-dev.82+26eee9dbea76 (Linux x86-64, minimal cases):
+`log2` now binds `GLIBC_2.29`; `silk check` works in a library package without `main.silk`;
+static evaluation of an `unsafe` call gives `SEM0176` instead of an internal error; loops over
+plain `&mut [T]`/`&[T]` parameters keep their pointers in registers. Still open, filed on
+silk-lang/silk:
+
+- [silk#3147](https://github.com/silk-lang/silk/issues/3147): readable symbol names for
+  profilers, and stable names for linker order files (the runtime's `tools/startup-order.txt`
+  matches 38 of its 896 names).
+- [silk#3148](https://github.com/silk-lang/silk/issues/3148): partial borrows across calls, or
+  alias information, for buffers held in struct fields (the decoder's `detach`/`detachMut`).
+- [silk#3149](https://github.com/silk-lang/silk/issues/3149): warnings in path dependencies are
+  not reported by `silk build`.
+- [silk#3150](https://github.com/silk-lang/silk/issues/3150): the `--clang <wrapper>` version
+  probe ignores `SILK_CLANG`.
+- Not filed yet: register-allocation instability in `processCommandsInternal` and the H6 bucket
+  loop. Re-measure it once the port is on dev.82 with `silk.core.hint` and `noalias`, and file
+  it if it still holds.
+- `Slice.copyInto` as one `memmove` is silk#3141, after dev.82.
+
 The individual walls, as found:
 
 
