@@ -1,7 +1,9 @@
 //! Incremental compression with owned worker inputs and exclusive codec jobs.
 //! Results are ArrayBuffers: five little-endian i32 words (status, consumed,
 //! written, finished, again), followed by exactly `written` output bytes and
-//! then, when the status is a failure, the codec's own message text.
+//! then, when the status is a failure, the codec's own message text. When a
+//! synchronous process() wrote into the caller's `out` instead, `again` has bit
+//! 2 set and the output bytes are not in the result.
 //! The loop thread owns handle links/busy/disposed; workers only touch codec state.
 import ext.blocking_pool as pool
 import ext.fs_async as fs_async
@@ -55,6 +57,9 @@ struct Job {
   next: ?*mut Job, work: pool.Job, callback: ValueBits, done: bool,
   handle: ?*mut Handle, stream: ?*mut CodecState, op: i32, numbers: [i32; 8], data: [?*mut u8; 8], lengths: [usize; 8],
   output: ?*mut u8, capacity: usize, written: usize, consumed: usize,
+  // A synchronous process() writes into the caller's output range here instead of `output`
+  // (Node's binding writes into the chunk the same way); `output` then carries the header only.
+  direct: ?*mut u8,
   status: i32, finished: bool, again: bool, pledgedSize: u64,
   // A static C string naming the codec failure (zlib msg or the Zstandard error name).
   message: ?*mut u8
@@ -163,7 +168,8 @@ unsafe fn initialize(h: &mut CodecState, numbers: &[i32; 8]) -> i32 {
 }
 unsafe fn process(j: &mut Job, h: &mut CodecState) -> () {
   let kind = h.kind let flush = j.numbers[2] let input = j.data[1] let length = j.lengths[1]
-  let output = unsafe at(j.output, 20) let capacity = j.capacity
+  let mut output = unsafe at(j.output, 20) if !Pointer.isNull<u8>(j.direct) { output = unsafe nonnull(j.direct) }
+  let capacity = j.capacity
   if h.ignoring { j.finished = true return () }
   if kind <= 7 {
     let compress = kind == 1 || kind == 3 || kind == 5
@@ -293,15 +299,26 @@ unsafe fn execute(j: &mut Job) -> () {
 }
 effect fn newJob() -> *mut Job ! OutOfMemoryError {
   let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(run allocate(Layout.of<Job>().bytes))
-  unsafe Pointer.put<Job>(j, Job { next: Pointer.null<Job>(), work: pool.job(silkCompressionWork, silkCompressionAfterWork, unsafe raw(j), pool.KIND_ZLIB), callback: ValueBits.Undefined, done: false, handle: Pointer.null<Handle>(), stream: Pointer.null<CodecState>(), op: 0, numbers: [0; 8], data: [nil(); 8], lengths: [0; 8], output: nil(), capacity: 0, written: 0, consumed: 0, status: 0, finished: false, again: false, pledgedSize: 0, message: nil() }) return j
+  unsafe Pointer.put<Job>(j, Job { next: Pointer.null<Job>(), work: pool.job(silkCompressionWork, silkCompressionAfterWork, unsafe raw(j), pool.KIND_ZLIB), callback: ValueBits.Undefined, done: false, handle: Pointer.null<Handle>(), stream: Pointer.null<CodecState>(), op: 0, numbers: [0; 8], data: [nil(); 8], lengths: [0; 8], output: nil(), capacity: 0, written: 0, consumed: 0, direct: nil(), status: 0, finished: false, again: false, pledgedSize: 0, message: nil() }) return j
 }
 unsafe fn destroyJob(p: *mut Job) -> () { let j = unsafe Pointer.take<Job>(p) let mut i: usize = 0 while i < 8 { unsafe c.free(j.data[i]) i = i + 1 } unsafe c.free(j.output) unsafe c.free(unsafe raw(p)) }
-unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, j: &mut Job, argv: &FrameSlots) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+/// `process` arguments: [id, input, flush, avail, inOffset, inLength, out, outOffset]. The input
+/// range is copied, not the whole buffer; `out` (an ArrayBuffer) is only written into when
+/// `synchronous` is true, i.e. when no JavaScript runs before the codec does.
+unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, j: &mut Job, argv: &FrameSlots, synchronous: bool) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let name = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 0)) let op = name.asSlice()
   if equal(op, b"create") { j.op = 1 } if equal(op, b"process") { j.op = 2 } if equal(op, b"reset") { j.op = 3 } if equal(op, b"params") { j.op = 4 } if equal(op, b"close") { j.op = 5 } if equal(op, b"crc32") { j.op = 6 }
   if equal(op, b"pledge") { j.op = 7 }
   if j.op == 0 { let _ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown compression operation") return () }
   let args = unsafe common.argument(argv, 1) let mut index: u32 = 0
+  let mut inStart: u64 = 0 let mut inCount: u64 = u64.MAX
+  if j.op == 2 {
+    let first = run unsafe owners.getIndex(&mut engine, context, args, 4)
+    let count = run unsafe owners.getIndex(&mut engine, context, args, 5)
+    if first.isNumber() && count.isNumber() { inStart = f64.toU64(first.numericValue()) inCount = f64.toU64(count.numericValue()) }
+    unsafe owners.release(&mut engine, context, first) unsafe owners.release(&mut engine, context, count)
+  }
+  let mut outBacking = Option<buffers.BufferState>.none()
   while index < 8 {
     let value = run unsafe owners.getIndex(&mut engine, context, args, index) let i = u32.toUsize(index)
     if value.isNumber() {
@@ -318,11 +335,19 @@ unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
         unsafe owners.release(&mut engine, context, value)
         let backing = match move converted { Result<buffers.BufferState, JsException>.Success { value: data } => data Result<buffers.BufferState, JsException>.Failure { error } => { fail move error } }
         if backing.byteLength > usize.toU64(usize.MAX - 1) { fail OutOfMemoryError {} }
-        if (j.op == 2 || j.op == 4) && i == 1 && backing.byteLength > 2147483647 { let _ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Compression input exceeds INT_MAX result count") return () }
-        j.lengths[i] = u64.toUsize(backing.byteLength) j.data[i] = run allocate(j.lengths[i] + 1)
-        // One copy of the range (a memcpy unless the source is shared memory), not a call per byte.
-        let target = buffers.BufferState { data: j.data[i], byteLength: backing.byteLength, maxByteLength: -1, detached: false, shared: false, external: false, physicalCapacity: 0 }
-        unsafe buffers.copyBytes(target, 0, backing, 0, backing.byteLength)
+        let mut start: u64 = 0 let mut count = backing.byteLength
+        if j.op == 2 && i == 1 && inCount != u64.MAX {
+          if inStart > backing.byteLength || inCount > backing.byteLength - inStart { let _ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Compression input range is out of bounds") return () }
+          start = inStart count = inCount
+        }
+        if (j.op == 2 || j.op == 4) && i == 1 && count > 2147483647 { let _ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Compression input exceeds INT_MAX result count") return () }
+        if j.op == 2 && i == 6 { if synchronous && !backing.detached && backing.physicalCapacity == 0 { outBacking = Option<buffers.BufferState>.some(backing) } }
+        else {
+          j.lengths[i] = u64.toUsize(count) j.data[i] = run allocate(j.lengths[i] + 1)
+          // One copy of the range (a memcpy unless the source is shared memory), not a call per byte.
+          let target = buffers.BufferState { data: j.data[i], byteLength: count, maxByteLength: -1, detached: false, shared: false, external: false, physicalCapacity: 0 }
+          unsafe buffers.copyBytes(target, 0, backing, start, count)
+        }
       } }
     }
     index = index + 1
@@ -337,14 +362,25 @@ unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   if j.op == 2 { if j.numbers[3] < 1 { let _ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Invalid compression output size") return () } capacity = i32.toUsize(j.numbers[3]) }
   if j.op == 4 { capacity = 65536 }
   // The result also carries up to 255 bytes of failure message after the output.
-  j.capacity = capacity j.output = run allocate(capacity + 20 + 256)
+  j.capacity = capacity
+  match move outBacking {
+    Option<buffers.BufferState>.Some { value: out } => {
+      let at = i32.toU64(j.numbers[7])
+      if j.numbers[7] < 0 || at > out.byteLength || usize.toU64(capacity) > out.byteLength - at { let _ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Compression output range is out of bounds") return () }
+      j.direct = unsafe buffers.dataAt(out.data, at) j.output = run allocate(20 + 256) return ()
+    }
+    _ => ()
+  }
+  j.output = run allocate(capacity + 20 + 256)
 }
+/// The output bytes the result buffer carries: none when they went to the caller's buffer.
+fn body(j: &Job) -> usize { if Pointer.isNull<u8>(j.direct) { return j.written } return 0 }
 unsafe fn appendMessage(j: &Job) -> usize {
   if Pointer.isNull<u8>(j.message) { return 0 }
   let mut n: usize = 0
   while n < 255 {
     let byte = unsafe Pointer.read<u8>(unsafe at(j.message, n)) if byte == 0 { break }
-    unsafe Pointer.put<u8>(unsafe at(j.output, 20 + j.written + n), byte) n = n + 1
+    unsafe Pointer.put<u8>(unsafe at(j.output, 20 + body(j) + n), byte) n = n + 1
   }
   return n
 }
@@ -355,13 +391,13 @@ pub unsafe fn freeOutput(data: ?*mut u8) -> () { unsafe c.free(data) }
 unsafe effect fn result<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, j: &mut Job) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let messageLength = unsafe appendMessage(&j.*)
   unsafe putWord(j.output, 0, j.status) unsafe putWord(j.output, 4, usize.toI32(j.consumed)) unsafe putWord(j.output, 8, usize.toI32(j.written))
-  let mut finished: i32 = 0 let mut again: i32 = 0 if j.finished { finished = 1 } if j.again { again = 1 }
+  let mut finished: i32 = 0 let mut again: i32 = 0 if j.finished { finished = 1 } if j.again { again = 1 } if !Pointer.isNull<u8>(j.direct) { again = again | 2 }
   unsafe putWord(j.output, 12, finished) unsafe putWord(j.output, 16, again)
   let memory = engine.memory
-  let length = usize.toU64(j.written + 20 + messageLength)
+  let length = usize.toU64(body(&j.*) + 20 + messageLength)
   // A mostly full output becomes the result's memory as it is, rather than a copy: a one-shot
   // call with a large chunkSize otherwise copies (and faults in) every output chunk twice.
-  if j.written >= 65536 && j.written >= j.capacity / 2 {
+  if Pointer.isNull<u8>(j.direct) && j.written >= 65536 && j.written >= j.capacity / 2 {
     let data = j.output j.output = nil()
     let outcome = run Effect.result(unsafe buffers.newArrayBuffer(&mut engine, memory, unsafe lendRealm(&context, context), data, length, Option<NativeFunctionId>.some(NativeFunctionId.Host { id: OUTPUT_FREE }), nil(), false))
     return match move outcome { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { unsafe c.free(data) fail move error } }
@@ -409,7 +445,7 @@ unsafe effect fn synchronous<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
 }
 pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let p = run newJob() let mut anchor = () let j = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p)
-  let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut j, argv)) drop j
+  let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut j, argv, true)) drop j
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(p) fail move error } }
   let j2 = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p) let converted = run Effect.result(unsafe synchronous(&mut engine, context, state, &mut j2)) drop j2 unsafe destroyJob(p)
   return match move converted { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
@@ -423,7 +459,7 @@ export "C" fn silkCompressionAfterWork(data: ?*mut u8) -> () {
 }
 pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, io: *mut fs_async.State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let p = run newJob() let mut anchor = () let j = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p)
-  let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut j, argv)) drop j
+  let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut j, argv, false)) drop j
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(p) fail move error } }
   let j2 = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p)
   if j2.op < 2 || j2.op > 4 { drop j2 unsafe destroyJob(p) return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid asynchronous compression operation") }

@@ -53,8 +53,8 @@ function range(view) {
   return { buffer: typedArrayBuffer.call(view), offset: typedArrayOffset.call(view), length: typedArrayLength.call(view) };
 }
 
-// The native codec takes ownership of a copy of each input range.
-function snapshot(view, offset, length, name) {
+// The range of a view that a call reads, checked as node_zlib.cc checks it.
+function checkedRange(view, offset, length, name) {
   const bytes = range(view);
   if (!Number.isInteger(offset) || offset < 0 || offset > bytes.length) {
     throw new ERR_OUT_OF_RANGE(`${name}_off`, `>= 0 && <= ${bytes.length}`, offset);
@@ -62,21 +62,31 @@ function snapshot(view, offset, length, name) {
   if (!Number.isInteger(length) || length < 0 || length > bytes.length - offset) {
     throw new ERR_OUT_OF_RANGE(`${name}_len`, `>= 0 && <= ${bytes.length - offset}`, length);
   }
-  const start = bytes.offset + offset;
-  return bytes.buffer.slice(start, start + length);
+  return { buffer: bytes.buffer, start: bytes.offset + offset, length };
+}
+
+// The native codec takes ownership of a copy of each input range.
+function snapshot(view, offset, length, name) {
+  const { buffer, start } = checkedRange(view, offset, length, name);
+  return buffer.slice(start, start + length);
 }
 
 function decode(value) {
   const view = new DataView(value);
   const written = view.getUint32(8, true);
+  const direct = (view.getInt32(16, true) & 2) !== 0;
+  const body = direct ? 0 : written;
   let message;
-  if (value.byteLength > 20 + written) message = Buffer.from(value, 20 + written).toString('latin1');
+  if (value.byteLength > 20 + body) message = Buffer.from(value, 20 + body).toString('latin1');
   return {
     status: view.getInt32(0, true),
     consumed: view.getUint32(4, true),
-    output: new Uint8Array(value, 20, written),
+    // Bit 2 of `again`: the bytes went straight into the caller's buffer (synchronous calls).
+    direct,
+    written,
+    output: direct ? undefined : new Uint8Array(value, 20, written),
     finished: view.getInt32(12, true) !== 0,
-    again: view.getInt32(16, true) !== 0,
+    again: (view.getInt32(16, true) & 1) !== 0,
     message,
   };
 }
@@ -155,11 +165,17 @@ class CompressionHandle {
   // consumed, or the codec reports that the stream ended. Every step resumes the
   // codec's retained copy of the remaining input.
   _step(sync, state, done) {
-    const args = [this._id, state.input, state.flush, state.outLength - state.written];
+    // The input range is copied natively; a synchronous step also decodes straight into `out`.
+    const input = state.input;
+    const args = [this._id, input && input.buffer, state.flush, state.outLength - state.written,
+      input ? input.start : 0, input ? input.length : 0];
+    if (sync) args.push(state.out.buffer, state.out.byteOffset + state.outOffset + state.written);
     state.input = undefined;
     const finish = (value) => {
       const result = decode(value);
-      if (result.output.length) {
+      if (result.direct) {
+        state.written += result.written;
+      } else if (result.output.length) {
         state.out.set(result.output, state.outOffset + state.written);
         state.written += result.output.length;
       }
@@ -167,7 +183,7 @@ class CompressionHandle {
       state.finished = result.finished;
       state.again = result.again;
       if (result.status !== 0) { done(result.status, result.message); return; }
-      const progressed = result.consumed !== 0 || result.output.length !== 0;
+      const progressed = result.consumed !== 0 || result.written !== 0;
       if (result.again && progressed && state.written < state.outLength && this._id) {
         this._step(sync, state, done);
         return;
@@ -200,7 +216,7 @@ class CompressionHandle {
         inLength === retained.length && inOffset + inLength <= bytes.length;
     }
     if (!continued) {
-      source = view === undefined ? new ArrayBuffer(0) : snapshot(view, inOffset, inLength, 'in');
+      source = view === undefined ? { buffer: new ArrayBuffer(0), start: 0, length: 0 } : checkedRange(view, inOffset, inLength, 'in');
     }
     out = byteView(out, 'out');
     const target = range(out);
@@ -214,7 +230,7 @@ class CompressionHandle {
       input: source, flush, consumed: 0, written: 0, finished: false, again: false,
       out: new Uint8Array(target.buffer, target.offset, target.length), outOffset, outLength,
     };
-    const inBefore = continued ? inLength : source.byteLength;
+    const inBefore = continued ? inLength : source.length;
     this._writeInProgress = true;
     this._step(sync, state, (status, message) => {
       this._writeInProgress = false;
