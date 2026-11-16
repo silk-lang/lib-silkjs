@@ -188,8 +188,48 @@ Each is reduced to what the port needed. None was worked around with C.
    and, in the decoder, far match sources. Measured cost: the row match finder (levels 5 to 12) is 1.18 to 1.30 times
    the C library's time; the reference itself built with `NO_PREFETCH` is 1.27 times slower at level
    9 (321 to 331 ms against 250 to 256 ms), which accounts for the gap. A dummy read of the row a few
-   positions ahead (`rowTouch` in `../zstd/src/zlazy.silk`) brought level 9 from 1.5 to 1.2 times. Proposed: `Intrinsic.prefetch(pointer: ?*const u8,
-   locality: u32) -> ()`, a no-op where the target has none.
+   positions ahead (`rowTouch` in `../zstd/src/zlazy.silk`) brought level 9 from 1.5 to 1.2 times.
+
+   **Fixed upstream, blocked here.** Silk 0.1.0-dev.81+e483585cc453 has `silk.mem.prefetch`
+   (`Prefetch.hintMany<T>(pointer, static PrefetchOptions)`, silk-lang/silk#3126). With
+   `rowTouch` rewritten as the four hints of `ZSTD_row_prefetch` (the patch is below), the
+   compressor's own CPU time on 16 MiB inputs, 5 runs each, interleaved, against the C library
+   (`agent-mt/cref`, gcc -O3), with output byte-identical to C in every run:
+
+   | input, level | C (ms) | dev.74, dummy read | dev.81, dummy read | dev.81, prefetch |
+   |---|---|---|---|---|
+   | binary, 6 | 199–221 | 248–335 (0.71×) | 247–308 | 218–241 (0.91×) |
+   | binary, 9 | 338–350 | 385–498 (0.71×) | 424–487 | 378–423 (0.90×) |
+   | text, 6 | 141–153 | 169–188 (0.82×) | 167–185 | 156–164 (0.94×) |
+   | text, 9 | 223–253 | 283–383 (0.72×) | 307–321 | 269–283 (0.88×) |
+
+   The compiler change alone is worth nothing (third column); the prefetch is the gain. The
+   workspace cannot move to dev.81 yet, for two reasons outside this work:
+   - `silk-lang/lib-sqlite` at the pinned rev `b633d16` declares `silk-version` dev.74, and a dev
+     release builds only packages written for it. lib-sqlite needs a dev.81 revision.
+   - dev.81 rejects two foreign declarations of one C symbol with different types (SEM0192):
+     `modules/engine/src/js_os_platform.silk:28,30` (`darwinMkdir`/`linuxMkdir`, both `mkdir`),
+     `modules/engine/src/js_os_events_platform.silk:21,23` (`poll`), and `uvwasi_host.silk:561,566`
+     declaring them again. Those files belong to the engine and libuv work; the fix is one
+     declaration per symbol (or the per-OS one under `static if`).
+   With a local copy of lib-sqlite bumped, these four errors are the whole build failure.
+   Once both are done, bump every `silk-version` (15 manifests, CI reads the root one) and apply:
+
+   ```diff
+   +import silk.mem.prefetch { Prefetch, PrefetchOptions, PrefetchAccess, PrefetchLocality, PrefetchCache }
+    unsafe fn rowTouch(ms: &MatchState, hash: u32, rowLog: u32) -> u32 {
+      let relRow = mem.z(mem.shl32(mem.shr32(hash, ROW_TAG_BITS), rowLog))
+   -  ...the dummy reads...
+   +  let static options = PrefetchOptions { access: PrefetchAccess.Read, locality: PrefetchLocality.High, cache: PrefetchCache.Data }
+   +  let hashRow = unsafe mem.addc(unsafe mem.ro(ms.hashTable), usize.wrappingMultiply(relRow, 4))
+   +  Prefetch.hintMany<u8>(hashRow, options)
+   +  if rowLog >= 5 { Prefetch.hintMany<u8>(unsafe mem.addc(hashRow, 64), options) }
+   +  let tagRow = unsafe mem.addc(unsafe mem.ro(unsafe mem.nn(ms.tagTable)), relRow)
+   +  Prefetch.hintMany<u8>(tagRow, options)
+   +  if rowLog == 6 { Prefetch.hintMany<u8>(unsafe mem.addc(tagRow, 32), options) }
+   +  return 0
+    }
+   ```
 3. **No branch hints.** `LIKELY`/`UNLIKELY` shape the reference's hot loops (sequence execution,
    the lazy parser). `@cold` on a function exists; a hint on a condition does not. Proposed:
    `Intrinsic.likely(condition: bool) -> bool` / `Intrinsic.unlikely`.
