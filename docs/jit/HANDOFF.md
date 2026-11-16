@@ -52,9 +52,9 @@ configuration.
 | Milestone | State |
 | --- | --- |
 | 1. Foundational validation | Done. Two native tests fail, on `main` too (see below) |
-| 2. Scorecard | In progress in a separate session (see "Work in progress") |
+| 2. Scorecard | Done: [scorecard.md](scorecard.md), measured 2026-11-16, with startup, peak RSS, binary size and warmup added to the harness |
 | 3. Differential harness | Done for the interpreter: widened generator, per-area self-test, `silk task differential`, a step in `silk task check` |
-| 4. Engine seam | In progress in a separate session (see "Work in progress") |
+| 4. Engine seam | Mapped in [tier-seam.md](tier-seam.md); per-function hotness counting with an embedder slot is in the engine. Hook design beyond that is open |
 | 5. Machine-code foundations | x86-64 encoder and executable memory done for Linux x86-64 |
 | 6. Feedback and ownership-aware SSA | Not started |
 | 7. Optimizations | Not started |
@@ -142,9 +142,14 @@ row was run there; the exit status is given. Logs were not kept beyond the sessi
 | `python3 scripts/differential.py --self-test` | 0 | PASS: prototypes 9 of 40, closures 21, property writes 12, exceptions 34, typed arrays 8 |
 | `python3 scripts/differential.py --count 3000 --configs plain,observed,node` | 0 | agree 3000, mismatch 0, reference-only 0 |
 | `silk task differential --count 20` | 0 | agree 20 |
+| `silk task bench-setup`, `bench-startup --jit`, `bench-octane --jit richards deltablue splay`, `bench-warmup --jit richards` (with the scorecard harness merged) | 0 | see the cross-check table in scorecard.md |
+| `silk build --release` with the hotness hook merged | 0 | 4 m 35 s |
+| `python3 scripts/v8bench.py --instructions BASE HOT` | 0 | ratios above; earley-boyer 1.008x |
+| `python3 scripts/differential.py --count 500 --configs plain,observed,node` on the hook binary | 0 | agree 500 |
+| `silk test --file src/js_hotness_tests.silk --optimization debug` | 0 | 1 passed (exit 1 with the hook broken) |
+| `silk task check` on the hook binary | 1 | native suite 563 passed, 2 failed (the count is the 562 plus the new hotness test; `check.py` does not print the failing names); all 314 other steps PASS |
 
-Not rerun by the lead: `silk check --workspace` and the full `silk task check` (the worker for
-the differential harness ran `python3 scripts/check.py --skip-native --skip-bench`: 271 PASS).
+Not rerun by the lead: `silk check --workspace`.
 The native suite needs `modules/engine/build/` to exist: without it `silk test ... -o
 build/core-tests` exits 1 with `silk: cannot create temporary directory: not found`
 (`mkdir -p build`, or run the release build first). `/usr/bin/time` is not installed on these
@@ -172,6 +177,9 @@ programme moves on without them.
 
 - One memory-heavy command at a time. The native test suite build peaks near 13.9 GiB, the release
   build at 7.2 GiB.
+- `silk task` leaves a `silkc task` process (about 2.6 GiB, parent 1) after compiling the task
+  program, and `silk test` and `silk build` leave a `silkc` too. The benchmark harness refuses
+  to measure while it sees one. Kill it by PID before benchmarking.
 - `silk check` can leave a `silkc check` process alive after its parent exits, reparented to init
   and holding about 4.8 GiB. Look for it with `ps` and kill it before the next heavy step. Several
   of these across worktrees would explain the memory pressure that stalled the previous VM; that
@@ -180,34 +188,82 @@ programme moves on without them.
   --no-cache` did not. Treat a suspiciously instant check result as stale.
 - Do not benchmark while a compiler runs.
 
-## Work in progress
+## Scorecard (measured 2026-11-16)
 
-Since 2026-11-16 the work is split across sessions. The lead session integrates into
-`claude/sweet-ptolemy-f5t7na`, reruns each worker's key commands before merging, and is the only
-one that edits this file. The worker briefs (setup, machine rules, scope) are kept in the Silk
-UI project's shared files under `jit/briefs/` and repeat what this file says.
+[scorecard.md](scorecard.md) has the host, every engine version, the commands, the tables, the
+spread between rounds and the raw results. The harness (`modules/benchkit`, `silk task`) gained
+`bench-startup`, `bench-warmup`, per-process peak RSS in `bench-octane`, and
+`bench-report --spread`. Headline, all measured on one host: Octane geometric mean of median
+rounds silkjs 6019, v8-jitless 4695, jsc-nojit 3626, qjs 3243, v8-jit 53956, jsc-jit 53180, so
+the JIT engines are about 9x ahead of the interpreter. Empty-script startup: silkjs 3.4 ms, qjs
+2.1 ms, jsc 8.6 ms, node 26.7 ms. Octane peak RSS geometric mean: silkjs 54 MB, qjs 18 MB.
+The JIT engines' first iteration is 20x to 50x slower than their steady state, yet they pass
+SilkJS in cumulative time after 2 or 3 iterations. The lead reran startup, three Octane
+benchmarks and the richards warmup on a second host: engine ratios agree, absolute scores were
+about 20 percent higher there (table at the end of the scorecard). No GC pause or p99 figure
+exists yet.
 
-| Workstream | State |
-| --- | --- |
-| A. Scorecard (`docs/jit/scorecard.md`, harness additions for startup, peak RSS, binary size, warmup) | Running in its own session; nothing merged yet |
-| B. Tier seam (`docs/jit/tier-seam.md`) and the per-function hotness hook with its cost measurement | Running in its own session; nothing merged yet |
-| C. Differential harness widening | Merged (`dfcd50a`, `b4fbe1b`), validated above |
+`silk task bench-setup` failed at its `wasm` step on dev.74 until `20600651` added
+`HostInput.variableNames` to `bench/wasm/src/main.silk`. The comparison harness wants Node 24
+(`NODE_REFERENCE`; v24.22.3 from nodejs.org was used), the differential harness used Node 22.
+
+## Tier seam and the hotness hook
+
+[tier-seam.md](tier-seam.md) lists, with file:line references at `42b98426`, every way a function
+body starts executing, every back edge and its interrupt poll in both dispatch loops, how
+exceptions unwind, and what invalidates shape assumptions, and ends with eight open questions.
+
+In the engine (`c56dd8d`): `FunctionBytecode.hotness` counts entries down from
+`HOT_ENTRY_BUDGET` (1000). At zero, if the embedder set `RuntimeState.hotFunctions` with
+`js_runtime.setHotFunctionHandler` (default none), the function is parked in
+`RuntimeState.hotPending` and reported at the next interrupt poll through
+`InterruptHooks.hotFunction`. The engine does not import `modules/jit`. Not counted: leaf runs,
+generator and async resumption, back edges. So a function entered rarely that loops for long is
+never reported; on-stack replacement is open.
+
+Interpreter-only cost, `python3 scripts/v8bench.py --instructions` against the binary without
+the hook, measured twice (by the worker and again by the lead on another host, same ratios):
+richards 0.999x, deltablue 1.000x, crypto 1.000x, raytrace 0.999x, earley-boyer 1.008x, regexp
+1.001x, splay 1.001x, navier-stokes 1.000x. The 0.5 percent target is met on seven of eight
+and MISSED on earley-boyer (+0.8 percent). The worker measured that +0.58 of it appears in a
+control build that has the new fields but counts nothing, and traced it with callgrind to an
+address-keyed 4-way cache on the call path that takes more probes once heap cells move
+(tier-seam.md, open question 7). The lead did not rerun the control build. Whether to accept
+this, shrink the field, or fix that cache is undecided.
+
+`src/js_hotness_tests.silk` fails when the hook stops firing: with `deliverHot` commented out in
+`js_interrupts.handle` it fails with "an inline frame's function is reported once" (the lead
+reran both the passing and the broken case).
+
+## How the work was split
+
+On 2026-11-16 three worker sessions ran in parallel, each on its own machine, and a lead session
+reran each one's key commands before merging into `claude/sweet-ptolemy-f5t7na`. The lead is the
+only one that edits this file. The briefs are in the Silk UI project's shared files under
+`jit/briefs/`, the workers' reports under `jit/reports/`; neither is needed to continue.
+
+| Workstream | Worker branch | Merged |
+| --- | --- | --- |
+| A. Scorecard | `claude/project-thread-0jp1hn` (`f9ca0ee`) | yes |
+| B. Tier seam and hotness hook | `claude/project-thread-br37a3` (`b9afce9`) | yes |
+| C. Differential harness widening | `claude/project-thread-sisu3y` (`b4fbe1b`) | yes |
 
 ## Next steps
 
-1. Merge A and B after rerunning their key commands. For B that means
-   `python3 scripts/v8bench.py --instructions old new` (target under 0.5 percent),
-   `python3 scripts/differential.py --count 500`, `silk task check`, and the test that fails
-   when the hook stops firing.
-2. Decide the hook design from the tier-seam document and its instruction-count measurements.
-3. Then milestone 6: call and type feedback, an ownership-aware SSA form on the existing
-   reference counting, and one narrow function compiled end to end (integer arithmetic and a
-   loop) using `modules/jit`'s encoder and code memory, with deoptimization to an interpreter
-   frame at a bytecode boundary, run through the differential harness as a new configuration.
+1. Decide what to do about the earley-boyer miss (accept, or fix the address-keyed cache), and
+   whether to count back edges or sample at the interrupt poll for loops (tier-seam.md).
+2. Milestone 6: call and type feedback, an ownership-aware SSA form on the existing reference
+   counting, and one narrow function compiled end to end (integer arithmetic and a loop) using
+   `modules/jit`'s encoder and code memory, with deoptimization to an interpreter frame at a
+   bytecode boundary. Add it to `scripts/differential.py` as a new configuration
+   (`--config jit=...` or a `BUILTIN` entry) before trusting it. Open design point from the seam
+   document: whether a compiled frame lives in the call-frame region like an inline frame or on
+   the native stack (open question 5), and how it presents itself to `unwind`.
 
 Every session doing this work needs `silk-lang/silk` attached with GitHub API access as well as
 `silk-lang/lib-silkjs`: the Silk installer reads the release API and gets HTTP 403 otherwise
-(two earlier sessions failed on exactly this).
+(two earlier sessions failed on exactly this). In a Claude cloud session, read-only access is
+not enough; attaching it with push access is what enables the API.
 
 ## Research
 
