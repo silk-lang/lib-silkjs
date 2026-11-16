@@ -59,6 +59,43 @@ configuration.
 | 6. Feedback and ownership-aware SSA | Not started |
 | 7. Optimizations | Not started |
 
+## The plan as recovered (milestone definitions)
+
+Copied unchanged on 2026-11-16 from the earlier handoff on `t3/jit-compiler-plan` (`95a03c95`),
+which the first version of this file had shortened to milestone names. This is the fullest
+surviving statement of the plan: the original HTML plan was lost with its machine. Where the
+work done so far falls short of these definitions it is listed after them.
+
+The initial four-tier plan and immediate tracing-GC replacement were superseded in discussion. The subsequent direction was interpreter plus one SSA compiler with quick and full optimization modes, subject to measured warmup needs. Deopt to interpreter frames at bytecode boundaries; make ownership reconstruction part of the deopt design. The user did not mandate a permanent tier count or memory model.
+
+1. **Finish foundational validation.** Correct overstated package docs; review the two saved commits; test memory permissions/lifetimes and the observed-dispatch option. Complete a bounded workspace check and relevant engine/runtime checks, recording commands and results. Integrate only validated changes.
+2. **Establish a scorecard.** Extend existing benchmark tooling for configurable SilkJS, Node, d8, and JSC commands. Record versions, host, source revision, binary provenance, repetitions, throughput, warmup, startup, per-process peak RSS, binary size, and an explicitly labeled pause proxy. Missing engines are explicit omissions. Keep benchmark runs isolated from builds. A worst-iteration ratio is not a measured GC pause or p99 latency.
+3. **Finish the differential harness.** Deterministic seeded programs; plain versus observed interpreter configurations; optional external reference engines; normalized output and exit classification; timeouts, reproducible failures, minimization, and explicit unsupported-case reporting. Generate stable hot calls followed by changed types/shapes/call targets. Add future JIT/deopt configurations through the same interface.
+4. **Implement the engine seam.** Define hotness and native-entry hooks with zero/verified-minimal interpreter-only cost. Cover normal calls, leaf paths, constructors, loops, exceptions, and invalidation; do not serialize process-local pointers. Prove frame and ownership contracts before compiled JavaScript entry.
+5. **Finish machine-code foundations.** Typed x64 operands and labels, relocation records, ABI handling, encoding comparisons against a real assembler, executable tests, and platform-gated extension points. One constant byte string is not an assembler.
+6. **Add feedback and ownership-aware SSA.** Begin with call/type feedback; specify safepoints, guards, deoptimization state, native helper effects, and roots. Keep compiler inputs serializable for background compilation/AOT. Build a narrow end-to-end compiled function before broad optimization passes.
+7. **Broaden optimizations from measurements.** Inlining, unboxed arithmetic, load/check elimination, register allocation, OSR, and allocation/RC optimizations. Evaluate background compilation, persisted profiles/code, cross-module optimization, and regexp compilation with correctness and performance gates.
+
+The historical phase durations were estimates, not delivery commitments. Define progress through tests and measured gates.
+
+### AOT context and historical artifacts
+
+The original HTML plan at `/tmp/silkjs-jit-plan/silkjs-jit-plan.html` no longer exists on this VM. The design above was recovered from conversation and the saved notes at `/home/user/.claude/projects/-home-user-silkjs/memory/`.
+
+Earlier Bun research cited [Bun PR 45631](https://github.com/oven-sh/bun/pull/45631), [WebKit PR 757](https://github.com/oven-sh/WebKit/pull/757), and [Bun AOT documentation](https://bun.com/docs/compiler/aot). Those sources and historical numerical claims were **not revalidated during this recovery**. The useful design hypotheses are immutable file-backed code, runtime data-side references, generic entry fallback, and opt-in closed-world assumptions. Preserve ordinary JS semantics by default. Do not assume static TypeScript annotations are sound runtime facts.
+
+### Where the work so far falls short of these definitions
+
+- Milestone 2: `d8` is not a column (V8 is measured through Node 24, with and without
+  `--jitless`), and there is no pause proxy of any kind in the scorecard.
+- Milestone 4: only hotness counting exists. It does not cover leaf paths, loops (back edges)
+  or generator resumption, and there is no native-entry hook, no frame or ownership contract
+  for compiled entry yet (in progress in milestone 6's sessions).
+- Ahead-of-time compilation: nothing is implemented. What exists is the rule and two places
+  that follow it: the encoder emits relocation records instead of addresses, and the hotness
+  counter is not serialized with bytecode. No persisted code or profile format, no
+  closed-world mode, and no plan for when AOT work starts has been written.
+
 ## What is on this branch
 
 | Commit | Content |
