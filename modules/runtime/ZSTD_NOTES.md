@@ -131,23 +131,36 @@ zlib and Brotli the same way; the 9 more bytes of the `cs` rows are Node's empty
 - Compression: levels -5 to 3 and 19 are at 1.05 to 1.35 of the C library. Level 9 (row match
   finder, levels 5 to 12) is 0.80: prefetch, which dev.81 has and this workspace cannot use yet
   (Compiler walls 2, measured there at 0.88 to 0.94 with it).
-- Decompression at the codec: levels 19 and json at 1.08 to 1.21. **Not resolved: levels 1 and
-  3 at 0.76 to 0.87 in this harness.** What is known:
-  - The standalone decoder is at 0.95 to 1.01 of libzstd on the same frames (`tools/dcli`), and
-    callgrind counts fewer instructions for the Silk runtime process (715 M against 820 M), fewer
-    cache misses and the same branch misses.
-  - A loop of 20 `zstdDecompressSync` calls on one frame alone (no compression first in the
-    process) gives the opposite: Silk 34.9 to 37.4 ms a frame against 41.4 to 42.2 (binary
-    level 1), 30.1 to 32.4 against 32.3 to 34.5 (text level 1), three interleaved rounds.
-  - In both, the Silk build spends less user time (431 to 463 ms against 609 to 645) and more
-    system time on minor page faults (240 k against 206 k for 20 frames). The fault count moves
-    with glibc's heap state: it was 53 k for both builds on an earlier, quieter run and changes
-    with forced `gc()` between frames. So the difference is in when memory is returned to the
-    system and touched again, not in the decoder. The C decoder allocates its 4 MiB window per
-    context; the port decodes without one, so the allocation pattern of a call differs.
-  - The binding now copies an input once with `memcpy` (it was a call per byte) and hands a
-    mostly full output buffer to the engine instead of copying it (`2b78cf1`). User time fell
-    by about a fifth; the harness rows did not move beyond noise.
+- Decompression: **the level 1/3 gap was the binding and glibc's heap, not the decoder; fixed
+  in `ec34732`.** Build of `ec34732` against C, seven interleaved rounds, default malloc
+  settings: d:binary:1 0.97, d:binary:3 1.01, d:text:1 1.01, d:text:3 0.96, d:binary:19 1.20
+  (and c:binary:1 1.56, c:text:3 1.40). How it was found:
+  - The standalone decoder is at 0.95 to 1.01 of libzstd (`tools/dcli`), and callgrind counts
+    fewer instructions for the Silk runtime process (715 M against 820 M) with fewer cache
+    misses. The difference was system time: minor page faults.
+  - With `MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824` (glibc never
+    mmaps a block and never returns the heap top), the build of `298ebbe` decoded at 1.25 to
+    1.39 of C on the same cases where it had been 0.76 to 0.87. So the codec was faster, and
+    the loss was memory handed back to the system and faulted in again.
+  - An allocation tracer (`LD_PRELOAD`, blocks of 256 KiB and more, with their frees) showed
+    why the two builds differ: per call, the C decoder holds a 2.4 MB window (`M 2382671`,
+    `C 2382545`) across the steps, which keeps the heap top in use; the port needs no window,
+    so when the step's large buffers are freed the free top passes glibc's (dynamic) trim
+    threshold and is returned. And per call the binding churned large buffers Node's does
+    not: the input twice (a JavaScript `slice` and the native copy) and each output chunk
+    twice (a native buffer, then JavaScript's `set` into zlib.js's chunk).
+  - Fix: the binding copies only the input range from the caller's buffer, and a synchronous
+    step decodes straight into the caller's output range, as `node_zlib.cc` does (asynchronous
+    steps keep their own buffer, since JavaScript runs meanwhile). Earlier, `2b78cf1`: one
+    `memcpy` per input instead of a call per byte.
+  - Left: zlib.js's output chunks and the final `Buffer.concat` are allocated the same way in
+    both builds, and glibc still returns some of that memory depending on what else the heap
+    holds. That makes the fastest cases noisy: d:json:3 decodes 10 to 15 ms of 16 MB per call
+    and measured 0.86, 1.01 and 0.82 (json:1) of C in three runs at default settings, while a
+    loop of 40 calls gives 6.1 to 8.2 ms a frame against 8.0 to 10.4 for C, and with the heap
+    pinned it is 1.75 to 3.0 of C and 1.74 of the build before the fix. A runtime-wide
+    `mallopt` (trim and mmap thresholds) would remove this for every module; it is a policy
+    for the runtime's owners, not part of this change.
 - Peak RSS is equal or lower than the C build's in every one-shot and stream row; `da` is 20 to
   55 MiB higher (four decoders' outputs in flight are external buffers now, freed by the
   collector rather than at once).
@@ -293,6 +306,12 @@ Brotli share.
 4. **Node loses output with `ZSTD_c_nbWorkers` on a stream**: `ZSTD_compressStream2` returns
    before the workers finish and Node's stream stops asking, so the result is cut short or empty,
    depending on timing. The runtime gives the whole frame, and keeps doing so.
+6. **Each call copied its input range twice and each output chunk twice** (a JavaScript slice
+   plus the native copy; a native buffer plus JavaScript's `set`). Fixed (`ec34732`): the
+   arguments of `process` are `[id, input, flush, avail, inOffset, inLength, out, outOffset]`;
+   the binding copies `[inOffset, inOffset + inLength)` only, and a synchronous step writes into
+   `out` at `outOffset` (bit 2 of the result's `again` word says it did). The iterable streams
+   (`streams/iter/compression.js`) pass four arguments and keep the old behaviour.
 
 ## Differences from the C library
 
