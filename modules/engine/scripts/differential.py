@@ -23,16 +23,21 @@ engine-defined is compared: no timing, no error message text, no stack traces.
     python3 scripts/differential.py                          # 200 programs, plain vs observed
     python3 scripts/differential.py --seed 7 --count 1 --show    # print one program
     python3 scripts/differential.py --configs plain,observed,node
-    python3 scripts/differential.py --config jit='{engine} --jit {file}'
+    python3 scripts/differential.py --configs plain,observed,jit,jit-stress,node
     python3 scripts/differential.py --self-test              # check the harness itself
 
-Configurations are command templates; `{engine}` is the engine executable, `{node}` the Node
-reference and `{file}` the program. The first configuration named is the baseline the others
+Configurations are command templates; `{engine}` is the engine executable, `{jit}` the JIT
+executable (modules/jit/shell: $SILKJS_JIT or this host's release build of silkjs-jit-shell),
+`{node}` the Node reference, `{file}` the program and `{stats}` a file the run may write one
+line of `name value` counters to; the counters are summed per configuration and printed. The first configuration named is the baseline the others
 are compared with.
 
   plain      {engine} {file}                    the interpreter's ordinary dispatch loop
   observed   {engine} --debug-observed {file}   the instruction-observing loop of the debugger
   node       {node} {file}                      a reference engine ($NODE_REFERENCE or `node`)
+  jit        {jit} --jit ... {file}             hot functions compiled to x86-64 (docs/jit/compiled-entry.md)
+  jit-stress {jit} --jit --jit-stress=3 ...     the same, every function hot at its first entry and
+                                                every third guard check deoptimizing, never unlinked
 
 Adding a configuration: for a one-off run pass `--config NAME=TEMPLATE` (repeatable; the name is
 appended to --configs). To make it permanent, add NAME: TEMPLATE to BUILTIN in this script, and
@@ -67,6 +72,8 @@ BUILTIN = {
     "plain": "{engine} {file}",
     "observed": "{engine} --debug-observed {file}",
     "node": "{node} {file}",
+    "jit": "{jit} --jit --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-stress": "{jit} --jit --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
 }
 REFERENCES = {"node"}
 
@@ -111,7 +118,8 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
          "Int32Array", "Uint32Array", "Float32Array", "Float64Array"]
 
 # How a generated function's body is built; repeated entries weight the pick.
-FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed"]
+FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
+           "intloop", "intloop", "intnest", "intbranch"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -247,6 +255,19 @@ class Generator:
                     f"ta[({self.expression(2)}) & 7] = {self.using(['ta[0]'])}; var t = 0; "
                     f"for (var j = 0; j < a.length; j++) {{ t = {self.clamped(['t', 'a[j]', 'ta[j & 3]'])}; }} "
                     f"return [t, ta];")
+        if flavor == "intloop":
+            # Integer arithmetic in a counted loop, the subset the first compiler takes: the
+            # bound comes from an argument, the update may overflow int32 (a deopt).
+            update = self.pick(["t + i", "t - a", "t * 3 + i", "t + a * i", "a - t + i", "t * t - b", "t + i * i - b"])
+            return (f"var t = {self.pick(['0', 'a', 'b', str(self.random.randrange(-9, 10))])}; var n = b; "
+                    f"if (n > {self.pick([5, 20, 70])}) n = {self.pick([3, 20, 70])}; "
+                    f"for (var i = 0; i < n; i++) {{ t = {update}; }} return t;")
+        if flavor == "intnest":
+            return (f"var t = a; for (var i = 0; i < {self.pick([2, 4])}; i++) {{ for (var j = i; j < {self.pick([3, 6])}; j++) "
+                    f"{{ t = {self.pick(['t + i * j - b', 't - j + a', 't * 2 - i'])}; }} }} return t;")
+        if flavor == "intbranch":
+            return (f"var t = a; for (var i = 0; i < {self.pick([4, 9])}; i++) {{ if (t {self.pick(['>', '<', '>=', '==='])} b) "
+                    f"t = t - {self.pick(['i', '1', 'a'])}; else t = t + {self.pick(['2 * i', 'b', '3'])}; }} return t;")
         raise ValueError(flavor)
 
     def function(self) -> str:
@@ -373,9 +394,26 @@ def run(command: list[str], timeout: float) -> tuple[str, str]:
         return "timeout", output.decode(errors="replace") if isinstance(output, bytes) else output
 
 
-def outcomes(configs: dict[str, list[str]], path: Path, timeout: float) -> dict[str, tuple[str, str]]:
-    return {name: run([part.replace("{file}", str(path)) for part in template], timeout)
-            for name, template in configs.items()}
+def outcomes(configs: dict[str, list[str]], path: Path, timeout: float,
+             counters: dict[str, dict[str, int]] | None = None) -> dict[str, tuple[str, str]]:
+    """Runs path under each configuration. With counters, each configuration's {stats} file is
+    read into counters[name], and counters[name]["programs-compiled"] counts runs with a compiled run."""
+    results = {}
+    for name, template in configs.items():
+        stats = path.with_suffix(f".{name}.stats")
+        stats.unlink(missing_ok=True)
+        results[name] = run([part.replace("{file}", str(path)).replace("{stats}", str(stats)) for part in template], timeout)
+        if counters is not None and any("{stats}" in part for part in template):
+            seen: dict[str, int] = {}
+            read_stats(stats, seen)
+            into = counters.setdefault(name, {})
+            for key, value in seen.items():
+                into[key] = into.get(key, 0) + value
+            if seen.get("runs", 0) > 0:
+                into["programs-compiled"] = into.get("programs-compiled", 0) + 1
+            if seen.get("deopts", 0) > 0:
+                into["programs-deopted"] = into.get("programs-deopted", 0) + 1
+    return results
 
 
 def disagreements(results: dict[str, tuple[str, str]]) -> list[str]:
@@ -400,6 +438,23 @@ def minimize(source: str, differs, budget: int = 400) -> str:
         if not changed:
             chunk //= 2
     return "\n".join(lines) + "\n"
+
+
+def default_jit() -> Path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import toolchain
+    return toolchain.release_binary().parent / "silkjs-jit-shell"
+
+
+def read_stats(path: Path, into: dict[str, int]) -> None:
+    """Adds the `name value` pairs a run wrote to path (one line) into into."""
+    try:
+        words = [word for word in path.read_text().split() if not word.endswith(":")]
+    except OSError:
+        return
+    for name, value in zip(words[::2], words[1::2]):
+        if value.isdigit():
+            into[name] = into.get(name, 0) + int(value)
 
 
 def default_engine() -> Path:
@@ -505,13 +560,14 @@ def main() -> int:
         if name not in args.configs.split(","):
             args.configs += "," + name
     node = os.environ.get("NODE_REFERENCE") or "node"
+    jit = os.environ.get("SILKJS_JIT") or str(default_jit())
     configs: dict[str, list[str]] = {}
     skipped: dict[str, str] = {}
     for name in args.configs.split(","):
         if name not in templates:
             print(f"differential.py: unknown configuration {name!r}; known: {', '.join(templates)}", file=sys.stderr)
             return 2
-        command = [part.replace("{engine}", str(engine)).replace("{node}", node) for part in shlex.split(templates[name])]
+        command = [part.replace("{engine}", str(engine)).replace("{node}", node).replace("{jit}", jit) for part in shlex.split(templates[name])]
         if shutil.which(command[0]) is None and not Path(command[0]).exists():
             skipped[name] = f"{command[0]} is not installed"
             continue
@@ -526,12 +582,13 @@ def main() -> int:
     tally = {"agree": 0, "mismatch": 0, "reference": 0}
     endings: dict[str, int] = {}
     failures = []
+    counters: dict[str, dict[str, int]] = {}
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         for seed in range(args.seed, args.seed + args.count):
             path = work / f"seed-{seed}.js"
             path.write_text(Generator(seed, args.hot).program())
-            results = outcomes(configs, path, args.timeout)
+            results = outcomes(configs, path, args.timeout, counters)
             endings[results[baseline][0]] = endings.get(results[baseline][0], 0) + 1
             wrong = disagreements(results)
             if not wrong:
@@ -563,6 +620,8 @@ def main() -> int:
     for name, reason in skipped.items():
         print(f"skipped {name}: {reason}")
     print(f"baseline endings: {', '.join(f'{count} {ending}' for ending, count in sorted(endings.items()))}")
+    for name, values in counters.items():
+        print(f"counters {name}: " + ", ".join(f"{key} {value}" for key, value in sorted(values.items())))
     print(f"agree {tally['agree']}, mismatch {tally['mismatch']}, reference-only {tally['reference']}")
     return 1 if tally["mismatch"] else 0
 

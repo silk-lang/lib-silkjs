@@ -1,8 +1,15 @@
-//! Lowering of a function to x86-64 for the compiled-entry ABI
-//! (docs/jit/compiled-entry.md). Placeholder: refuses everything.
+//! From a hot FunctionBytecode to machine code for the compiled-entry ABI
+//! (docs/jit/compiled-entry.md): bytecode -> SSA (docs/jit/ssa.md) -> x64_backend.
+//!
+//! Until the SSA translator lands, the SSA for one fixed function is built by hand here,
+//! recognised by its exact bytecode: sum(n) { let s = 0; for (let i = 0; i < n; i++) s = s + i;
+//! return s } (handSum). Every other function is refused.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silkjs.js_core_types { FunctionBytecode }
-import asm_x64 { Code }
+import silkjs.js_core_types { FunctionBytecode, FunctionKind }
+import asm_x64 { Code, UnboundLabelError }
+import ssa { Function, Op, Type, Own, RootKind, SlotMode, NONE }
+import x64_backend { Lowering, Settings }
+import x64_backend as backend
 
 pub struct Refusal { pub why: &'static [u8] }
 impl Refusal {
@@ -10,6 +17,77 @@ impl Refusal {
 }
 pub union Lowered { Code { pub value: Code }, Refused { pub reason: Refusal } }
 
-pub effect fn lowerFunction(function: &FunctionBytecode, stress: bool) -> Lowered ! OutOfMemoryError ? &mut Allocator {
-  return Lowered.Refused { reason: Refusal { why: b"not implemented" } }
+/// sum's bytecode as the engine compiles it at 6341d15 (offsets in the comments below).
+const SUM_CODE: &[u8] = b"\xb9\xcd\xb9\xce\xb8\x01\x00\x21\x83\xca\xd5\xa1\xee\x10\xca\x92\x00\xb8\x14\x01\x00\xfc\xd1\x01\x01\xd5\xa1\xef\xf2\xc9\x28"
+
+pub unsafe effect fn lowerFunction(function: &FunctionBytecode, stress: u32) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  if function.kind != FunctionKind.Normal { return refused(b"not a plain function") }
+  let code = unsafe function.code.asSlice()
+  if !(code == SUM_CODE) || function.argumentCount != 1 || function.variableCount != 2 || function.varRefCount != 0 {
+    return refused(b"no SSA translation for this bytecode yet")
+  }
+  let ssa = run handSum()
+  match move run backend.lower(&ssa, Settings { stress: stress }) {
+    Lowering.Code { value } => { return Lowered.Code { value: move value } }
+    Lowering.Unsupported { reason } => { return refused(reason.why) }
+  }
+}
+fn refused(why: &'static [u8]) -> Lowered { return Lowered.Refused { reason: Refusal { why: why } } }
+
+/// The SSA the translator is expected to make for SUM_CODE:
+///    0 push_0  1 put_loc0  2 push_0  3 put_loc1  4 fuse_prefix
+///    9 get_loc1  10 get_arg0  11 lt  12 if_false8 -> 29
+///   14 get_loc1  15 add_loc 0  17 fuse_prefix  22 step_loc8 1 (++i, pushed)
+///   25 get_arg0  26 lt  27 if_true8 -> 14  29 get_loc0  30 return
+pub effect fn handSum() -> Function ! OutOfMemoryError ? &mut Allocator {
+  let mut f = Function.make(1, 2)
+  let entry = run f.block()
+  let body = run f.block()
+  let back = run f.block()
+  let done = run f.block()
+  let n = run f.emit(entry, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, 0, 10)
+  f.setOwnership(n, Own.Borrowed, RootKind.Argument, 0)
+  let zero = run f.emit(entry, Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, 0, 0)
+  // 11 lt: i (0) < n, n not yet known to be an Int.
+  let m = run f.emit(entry, Op.Unbox, true, Type.I32, Own.Unboxed, n, NONE, 0, 11)
+  let last1 = f.lastInst() drop run f.exitFor(last1, 11, 2)
+  run f.slotAt(zero, SlotMode.Int, NONE) run f.slotAt(zero, SlotMode.Int, NONE)
+  run f.slotAt(zero, SlotMode.Int, NONE) run f.slotAt(n, SlotMode.Dup, 0)
+  let first = run f.emit(entry, Op.Cmp, true, Type.Bool, Own.Unboxed, zero, m, 0, 11)
+  let enter = run f.newEdge(body)
+  run f.edgeArgument(zero) run f.edgeArgument(zero)
+  drop run f.newEdge(done)
+  run f.edgeArgument(zero)
+  run f.terminate(entry, Op.Branch, first, enter, 12)
+  let s = run f.addParam(body, Type.I32, Own.Unboxed)
+  let i = run f.addParam(body, Type.I32, Own.Unboxed)
+  // 15 add_loc 0: s += i, with i on the stack.
+  let sum = run f.emit(body, Op.Add, true, Type.I32, Own.Unboxed, s, i, 0, 15)
+  let last2 = f.lastInst() drop run f.exitFor(last2, 15, 1)
+  run f.slotAt(s, SlotMode.Int, NONE) run f.slotAt(i, SlotMode.Int, NONE) run f.slotAt(i, SlotMode.Int, NONE)
+  // 22 step_loc8 1: ++i.
+  let one = run f.emit(body, Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, 1, 22)
+  let next = run f.emit(body, Op.Add, true, Type.I32, Own.Unboxed, i, one, 0, 22)
+  let last3 = f.lastInst() drop run f.exitFor(last3, 22, 0)
+  run f.slotAt(sum, SlotMode.Int, NONE) run f.slotAt(i, SlotMode.Int, NONE)
+  let again = run f.emit(body, Op.Cmp, true, Type.Bool, Own.Unboxed, next, m, 0, 26)
+  let loop = run f.newEdge(back)
+  run f.edgeArgument(sum) run f.edgeArgument(next)
+  drop run f.newEdge(done)
+  run f.edgeArgument(sum)
+  run f.terminate(body, Op.Branch, again, loop, 27)
+  let s2 = run f.addParam(back, Type.I32, Own.Unboxed)
+  let i2 = run f.addParam(back, Type.I32, Own.Unboxed)
+  // The back edge's poll exits at its target, 14, with the state after the jump.
+  drop run f.emit(back, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, 27)
+  let last4 = f.lastInst() drop run f.exitFor(last4, 14, 0)
+  run f.slotAt(s2, SlotMode.Int, NONE) run f.slotAt(i2, SlotMode.Int, NONE)
+  let toBody = run f.newEdge(body)
+  run f.edgeArgument(s2) run f.edgeArgument(i2)
+  run f.terminate(back, Op.Jump, NONE, toBody, 27)
+  let result = run f.addParam(done, Type.I32, Own.Unboxed)
+  let boxed = run f.emit(done, Op.BoxI32, true, Type.Value, Own.Imm, result, NONE, 0, 30)
+  run f.terminate(done, Op.Return, boxed, NONE, 30)
+  run f.compact()
+  return move f
 }

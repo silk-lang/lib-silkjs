@@ -44,19 +44,21 @@ Which entries check the slot:
 For this milestone the compiled function makes no calls and cannot fail, so a compiled frame is
 a native-stack frame nested inside an ordinary interpreter frame: `callInternal` builds the
 interpreter frame exactly as it always does (arguments, locals set to undefined, operand stack
-empty), then, out of line in `js_compiled.run`, calls
+empty), then, out of line in `js_compiled.enter`, calls
 
 ```
 extern "C" fn(arguments: *const u64, state: *mut u64, counter: *mut i32, data: ?*mut u8) -> u32
 ```
 
-- `arguments`: one word per declared parameter: `(1 << 32) | bits` for a `ValueBits.Int`,
-  0 for anything else. Unboxing is in the engine; the type guard is in the machine code.
-- `state`: `2 + parameters + locals + stackSize` words, written only on an exit.
+- `arguments`: one word per declared parameter, in the frame-state word encoding below: an
+  `Int` is kind 1 with its bits, any other value is kind 6 naming its own parameter cell.
+  Unboxing is in the engine; the type guard is in the machine code.
+- `state`: `2 + locals + stackSize` words, written on every exit.
 - `counter`: the context's interrupt counter (`ContextState.interruptCounter`); compiled loops
   decrement it on every back edge like the interpreter and leave through a poll exit at zero.
 - `data`: the entry's embedder word (the stress counter of the deopt-stress configuration).
-- Result 0: returned; `state[0]` holds the int32 result. Result 1: deoptimization. Result 2:
+- Result 0: returned; `state[0]` is the result as a frame-state word (an owned value: kind 6
+  hands the caller a retained copy of that argument). Result 1: deoptimization. Result 2:
   interrupt poll (an exit that is not counted as a deopt).
 
 What this choice costs later: a compiled function always pays the interpreter frame setup and a
@@ -73,13 +75,12 @@ immediates and returns 1 (or 2). The state is:
 - `state[0]`: the bytecode offset to resume at, from the start of `FunctionBytecode.code`, at
   the start of the instruction to re-execute (the state before it);
 - `state[1]`: operand stack depth;
-- then one word per parameter, per local and per stack slot. A word is a kind in bits 32..39
+- then one word per local and per stack slot (bottom first). A word is a kind in bits 32..39
   and a payload in bits 0..31: 0 leave the cell as it is, 1 `Int` (payload), 2 `Undefined`,
   3 `Uninitialized`, 4 `Bool` (bit 0), 5 `Null`, 6 a retained copy of parameter `payload`
-  (G's `Dup` of an argument whose guard failed).
+  (G's `dup` of an argument). Arguments are not written: the SSA subset never writes one.
 
-`js_compiled.run` writes those into the interpreter frame (releasing a parameter cell it
-replaces), pushes the stack slots, sets `ip`, and `callInternal` continues into its ordinary
+`js_compiled.enter` writes those into the interpreter frame's locals, pushes the stack slots, sets `ip`, and `callInternal` continues into its ordinary
 `execute` loop, so everything after a deopt (exceptions, calls, polls, the debugger) is the
 interpreter's own. The interpreter re-executes the instruction that failed its guard (an `add`
 that overflowed makes its `Float64` there).

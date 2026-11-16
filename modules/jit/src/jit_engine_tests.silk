@@ -1,0 +1,133 @@
+// The JIT inside the engine: scripts whose hot functions are compiled through
+// jit_runtime and x64_backend, run against the interpreter's answers, with the
+// deoptimization paths exercised and counted (docs/jit/compiled-entry.md).
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.testing.testing { Testing, AssertionError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_owned_value { Value, ValueRef }
+import silkjs.js_realm { Realm, lendRealm }
+import silkjs.js_core_types { HostHook, NativeFunctionId }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_eval as eval
+import silkjs.js_intrinsic_install as intrinsics
+import silkjs.native_stack as stack
+import code_memory { MemoryError }
+import asm_x64 { LinkError }
+import jit_runtime { Jit, Options }
+import jit_runtime as jitRuntime
+
+const HANDLER: u32 = 11
+
+pub struct Compiling { pub jit: Jit, pub failures: usize }
+impl EngineServices for Compiling {
+  effect fn initializeShadowRealm<'r, 's, 'm>(engine: &mut Engine<'m, Self>, caller: Realm<'r>, created: Realm<'s>) -> () ! JsException ? &mut Allocator {}
+  effect fn dynamicImportStarted<'r, 'v, 'w, 'x, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>, specifier: ValueRef<'v>, referrer: ValueRef<'w>, promise: ValueRef<'x>) -> ValueBits ! JsException ? &mut Allocator {
+    return promise.dup().intoBits()
+  }
+  unsafe effect fn hotFunction<'m>(engine: &mut Engine<'m, Self>, rt: *mut HeapHeader,
+    callback: NativeFunctionId, opaque: ?*mut u8, function: ValueBits) -> () ? &mut Allocator {
+    let bytecode = match function { ValueBits.FunctionBytecode { reference } => reference _ => { return () } }
+    let compiled = run Effect.result(unsafe jitRuntime.compileHot(&mut engine.services.jit, bytecode))
+    match move compiled {
+      Result<(), OutOfMemoryError | MemoryError | LinkError>.Success { .. } => ()
+      Result<(), OutOfMemoryError | MemoryError | LinkError>.Failure { .. } => { engine.services.failures = engine.services.failures + 1 }
+    }
+  }
+}
+/// Evaluates source; the completion value's bits (an Int or Float64 is all these scripts make).
+unsafe effect fn evaluate<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader, source: &[u8]) -> ValueBits ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  let result = run eval.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), source, b"jit.js", 0)
+  let bits = Value.intoBits(move result)
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), bits)
+  return bits
+}
+fn isInt(bits: ValueBits, expected: i32) -> bool { return match bits { ValueBits.Int { value } => value == expected _ => false } }
+fn isNumber(bits: ValueBits, expected: f64) -> bool {
+  return match bits { ValueBits.Float64 { value } => value == expected ValueBits.Int { value } => i32.toF64(value) == expected _ => false }
+}
+/// What sum(n) below returns, as the interpreter computes it (int32 while it fits, then a double).
+fn sumOf(n: i64) -> f64 {
+  if n <= 0 { return 0.0 }
+  return i64.toF64(n * (n - 1) / 2)
+}
+
+const SUM: &[u8] = b"function sum(n){let s=0;for(let i=0;i<n;i++)s=s+i;return s}"
+
+unsafe effect fn exercise<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
+  ! JsException | AssertionError<'static> ? &mut Allocator {
+  drop run unsafe evaluate(&mut engine, context, SUM)
+  // Before the function is hot nothing is compiled; after its 20th entry it is.
+  let early = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<10;k++)t=t+sum(k);t")
+  run Testing.expect(isInt(early, 120) && engine.services.jit.compiledFunctions == 0, "cold: interpreted, nothing compiled")
+  let hot = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<300;k++)t=t+sum(k);t")
+  let mut expected: i64 = 0 let mut k: i64 = 0
+  while k < 300 { expected = expected + k * (k - 1) / 2 k = k + 1 }
+  run Testing.expect(isNumber(hot, i64.toF64(expected)), "hot: compiled results equal the interpreter's over n = 0..299")
+  run Testing.expect(engine.services.jit.compiledFunctions == 1, "sum is compiled once it is hot")
+  engine.services.jit.collect()
+  let runs = engine.services.jit.runs
+  run Testing.expect(runs >= 250, "and its calls run the compiled code (fails if compilation silently stops)")
+  run Testing.expect(engine.services.jit.deopts == 0, "int32 arguments that do not overflow never deopt")
+  // Overflow: the add's guard leaves at that add with s and i on the stack; the interpreter
+  // re-executes it and makes the double.
+  let wide = run unsafe evaluate(&mut engine, context, b"sum(70000)")
+  run Testing.expect(isNumber(wide, sumOf(70000)), "an int32 overflow deopts and the interpreter finishes with a double")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts == 1, "the overflow is one deopt")
+  // Not an int: the entry guard deopts before anything ran.
+  let half = run unsafe evaluate(&mut engine, context, b"sum(3.5)")
+  run Testing.expect(isInt(half, 6), "a double argument deopts at entry")
+  let text = run unsafe evaluate(&mut engine, context, b"sum('5')")
+  run Testing.expect(isInt(text, 10), "a string argument deopts at entry")
+  let missing = run unsafe evaluate(&mut engine, context, b"sum()")
+  run Testing.expect(isInt(missing, 0), "a missing argument (undefined) deopts at entry")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts == 4, "each guard failure is one deopt")
+  // Still linked: int calls keep running compiled code.
+  let again = run unsafe evaluate(&mut engine, context, b"sum(100)")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(again, 4950) && engine.services.jit.runs == runs + 5, "after deopts below the limit the code stays in use")
+  // Past the deopt limit (8) the engine unlinks the function and interprets it.
+  let many = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<10;k++)t=t+sum(0.5+k);t")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(many, 165) && engine.services.jit.unlinked == 1 && engine.services.jit.deopts == 8,
+    "the 8th deopt unlinks the function; later calls are interpreted")
+  run Testing.expect(engine.services.failures == 0, "no compile failed")
+}
+test effect fn hotFunctionsRunCompiledCodeAndDeopt() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut options = Options.make()
+  options.enabled = true options.threshold = 20
+  let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
+  unsafe jitRuntime.attach(&mut engine.services.jit, rt)
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exercise(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
+    Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}

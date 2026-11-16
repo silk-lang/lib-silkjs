@@ -1,0 +1,338 @@
+//! A first x86-64 backend for the SSA form (docs/jit/ssa.md) under the compiled-entry ABI
+//! (docs/jit/compiled-entry.md):
+//!   extern "C" fn(arguments: *const u64, state: *mut u64, counter: *mut i32, data: ?*mut u8) -> u32
+//! Correctness and the deoptimization path come first, code quality later: every SSA value
+//! lives in its own 8-byte stack slot, every instruction loads its operands into scratch
+//! registers and stores its result, and an edge copies its arguments through a scratch area
+//! into the target's parameters (a parallel move). No register allocation.
+//!
+//! Words. An i32 value's slot holds it zero-extended, a bool 0 or 1. A boxed `value` is held
+//! as a frame-state word of js_compiled (kind << 32 | payload): an Int is SLOT_INT, an
+//! argument that is not an Int is SLOT_ARGUMENT naming its cell, constants their own kinds.
+//! Retaining is deferred to the engine: an owned value made by `retain` of an argument is the
+//! argument's word, `release` emits nothing, and each consumption that hands it to the engine
+//! (a `move` exit slot, `return`) makes the engine retain once. That is exact because the
+//! verifier proves every owned value is consumed once on every path.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.core.option { Option }
+import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Shift, UnboundLabelError, Width }
+import ssa { Function, Inst, Op, Type, Own, RootKind, SlotMode }
+
+/// Frame-state kinds (js_compiled.SLOT_*), shifted into the high word.
+const KIND_INT: u64 = 4294967296
+const KIND_UNDEFINED: u64 = 8589934592
+const KIND_UNINITIALIZED: u64 = 12884901888
+const KIND_BOOL: u64 = 17179869184
+const KIND_NULL: u64 = 21474836480
+const KIND_ARGUMENT: u64 = 25769803776
+/// js_compiled.EXIT_*.
+const EXIT_RETURNED: u32 = 0
+const EXIT_DEOPT: u32 = 1
+const EXIT_POLL: u32 = 2
+/// More values than this would make the frame larger than is sensible for a first tier.
+const MAX_VALUES: u32 = 65536
+
+/// Why a function was not lowered.
+pub struct Unsupported { pub why: &'static [u8] }
+pub union Lowering { Code { pub value: Code }, Unsupported { pub reason: Unsupported } }
+
+/// Options of one lowering.
+pub struct Settings {
+  /// Every guard first counts down the i32 at `data` and fails when it reaches zero,
+  /// resetting it to stress (the deopt-stress configuration). 0: off.
+  pub stress: u32
+}
+
+struct Emitter {
+  a: Assembler,
+  blockLabels: List<Label>,
+  exitLabels: List<Label>,
+  /// Bytes of the frame below the return address: values, then the edge scratch area.
+  frame: i32,
+  scratch: i32,
+  settings: Settings
+}
+
+fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * 8)) }
+
+/// Lowers function, which must be compacted and verified.
+pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  match supported(&function) {
+    Option<&'static [u8]>.Some { value } => { return Lowering.Unsupported { reason: Unsupported { why: value } } }
+    Option<&'static [u8]>.None => ()
+  }
+  let values = function.valueCount()
+  let mut widest: u32 = 0
+  let mut e: usize = 0
+  while e < function.edges.length() {
+    let edge = function.edges.get(e)
+    if edge.argCount > widest { widest = edge.argCount }
+    e = e + 1
+  }
+  // 16-byte aligned frame: the code makes no calls, but keep the ABI shape.
+  let raw = (values + widest) * 8 + 8
+  let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8)
+  let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
+    frame: frame, scratch: u32.wrappingToI32(values * 8), settings: move settings }
+  let mut b: u32 = 0
+  while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
+  let mut x: usize = 0
+  while x < function.exits.length() { run emitter.exitLabels.append(run emitter.a.label()) x = x + 1 }
+  if frame != 0 { run emitter.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, frame) }
+  b = 0
+  while b < function.blockCount() {
+    let block = function.blocks.get(u32.toUsize(b))
+    emitter.a.bind(emitter.blockLabels.get(u32.toUsize(b)))
+    let mut i: u32 = 0
+    while i < block.instCount {
+      run emitter.instruction(&function, function.inst(block.firstInst + i))
+      i = i + 1
+    }
+    b = b + 1
+  }
+  // Exit stubs: the interpreter state at each exit's bytecode boundary.
+  x = 0
+  while x < function.exits.length() {
+    run emitter.exitStub(&function, usize.toU32(x))
+    x = x + 1
+  }
+  return Lowering.Code { value: run emitter.a.finish() }
+}
+
+/// The first reason function is outside what this backend lowers, or None.
+fn supported(function: &Function) -> Option<&'static [u8]> {
+  if function.valueCount() > MAX_VALUES { return Option<&'static [u8]>.some(b"too many values") }
+  let mut i: usize = 0
+  while i < function.insts.length() {
+    let inst = function.insts.get(i)
+    if inst.op == Op.Retain {
+      // Only a retain of an argument (its word, see the module comment).
+      let source = function.value(inst.a)
+      if !(source.own == Own.Borrowed && source.rootKind == RootKind.Argument) && source.own != Own.Imm {
+        return Option<&'static [u8]>.some(b"retain of a value that is not an argument")
+      }
+    }
+    if inst.op == Op.Removed { return Option<&'static [u8]>.some(b"uncompacted function") }
+    i = i + 1
+  }
+  return Option<&'static [u8]>.none()
+}
+
+impl Emitter {
+  effect fn instruction(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    let op = inst.op
+    if op == Op.Arg {
+      // The argument word as the engine wrote it.
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rdi, inst.k * 8))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.ConstI32 {
+      run self.a.storeImm(Width.W64, slotOf(inst.result), 0)
+      run self.a.storeImm(Width.W32, slotOf(inst.result), inst.k)
+      return ()
+    }
+    if op == Op.Imm {
+      run self.a.movImm64(Reg.Rax, immWord(inst.k))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.Unbox {
+      run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
+      run self.stressGuard(inst.exit)
+      run self.a.mov(Width.W64, Reg.R8, Reg.Rax)
+      run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R8, 32)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, 1)
+      run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+      // A 32-bit move zero-extends: the slot holds the i32.
+      run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.BoxI32 {
+      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      run self.a.movImm64(Reg.R8, KIND_INT)
+      run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R8)
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.BoxBool {
+      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      run self.a.movImm64(Reg.R8, KIND_BOOL)
+      run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R8)
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.Add || op == Op.Sub {
+      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      run self.a.load(Width.W32, Reg.R8, slotOf(inst.b))
+      run self.stressGuard(inst.exit)
+      if op == Op.Add { run self.a.alu(Alu.Add, Width.W32, Reg.Rax, Reg.R8) } else { run self.a.alu(Alu.Sub, Width.W32, Reg.Rax, Reg.R8) }
+      run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.Mul {
+      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      run self.a.load(Width.W32, Reg.R8, slotOf(inst.b))
+      run self.stressGuard(inst.exit)
+      // -0: a zero product with a negative operand, which (a | b) < 0 detects.
+      run self.a.mov(Width.W32, Reg.R9, Reg.Rax)
+      run self.a.alu(Alu.Or, Width.W32, Reg.R9, Reg.R8)
+      run self.a.imul(Width.W32, Reg.Rax, Reg.R8)
+      run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
+      let fine = run self.a.label()
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.NotEqual, fine)
+      run self.a.test(Width.W32, Reg.R9, Reg.R9)
+      run self.a.jcc(Cond.Sign, self.exitLabels.get(u32.toUsize(inst.exit)))
+      self.a.bind(fine)
+      run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.Cmp {
+      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      run self.a.load(Width.W32, Reg.R8, slotOf(inst.b))
+      run self.a.movImm32(Reg.R9, 0)
+      run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.R8)
+      run self.a.setcc(condition(inst.k), Reg.R9)
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.R9)
+      return ()
+    }
+    if op == Op.Retain {
+      run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      return ()
+    }
+    if op == Op.Release { return () }
+    if op == Op.Poll {
+      run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+      run self.a.jcc(Cond.LessOrEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
+    if op == Op.Jump {
+      run self.edge(&function, inst.edge)
+      return ()
+    }
+    if op == Op.Branch {
+      let otherwise = run self.a.label()
+      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, otherwise)
+      run self.edge(&function, inst.edge)
+      self.a.bind(otherwise)
+      run self.edge(&function, inst.edge + 1)
+      return ()
+    }
+    if op == Op.Return {
+      let v = function.value(inst.a)
+      run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
+      if v.ty == Type.I32 {
+        run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.movImm64(Reg.R8, KIND_INT)
+        run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R8)
+      } else if v.ty == Type.Bool {
+        run self.a.movImm64(Reg.R8, KIND_BOOL)
+        run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R8)
+      }
+      run self.a.store(Width.W64, Mem.at(Reg.Rsi, 0), Reg.Rax)
+      run self.leave(EXIT_RETURNED)
+      return ()
+    }
+    Intrinsic.trap("x64_backend: unlowered SSA operation")
+  }
+  /// Moves an edge's arguments into its target's parameters, then jumps there.
+  effect fn edge(self: &mut Self, function: &Function, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let edge = function.edge(index)
+    let target = function.blocks.get(u32.toUsize(edge.target))
+    let mut i: u32 = 0
+    while i < edge.argCount {
+      run self.a.load(Width.W64, Reg.Rax, slotOf(function.edgeArg(edge, i)))
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch + u32.wrappingToI32(i * 8)), Reg.Rax)
+      i = i + 1
+    }
+    i = 0
+    while i < edge.argCount {
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, self.scratch + u32.wrappingToI32(i * 8)))
+      run self.a.store(Width.W64, slotOf(function.paramAt(target, i)), Reg.Rax)
+      i = i + 1
+    }
+    run self.a.jmp(self.blockLabels.get(u32.toUsize(edge.target)))
+  }
+  /// The stress configuration: every guard also fails on every Nth check.
+  effect fn stressGuard(self: &mut Self, exit: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.settings.stress == 0 { return () }
+    let pass = run self.a.label()
+    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rcx, 0), 1)
+    run self.a.jcc(Cond.Greater, pass)
+    run self.a.storeImm(Width.W32, Mem.at(Reg.Rcx, 0), u32.wrappingToI32(self.settings.stress))
+    run self.a.jmp(self.exitLabels.get(u32.toUsize(exit)))
+    self.a.bind(pass)
+  }
+  /// Restores the stack and returns code.
+  effect fn leave(self: &mut Self, code: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.frame != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, self.frame) }
+    run self.a.movImm32(Reg.Rax, code)
+    run self.a.ret()
+  }
+  effect fn exitStub(self: &mut Self, function: &Function, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let exit = function.exit(index)
+    self.a.bind(self.exitLabels.get(u32.toUsize(index)))
+    run self.a.movImm32(Reg.Rax, exit.pc)
+    run self.a.store(Width.W64, Mem.at(Reg.Rsi, 0), Reg.Rax)
+    run self.a.movImm32(Reg.Rax, exit.stackDepth)
+    run self.a.store(Width.W64, Mem.at(Reg.Rsi, 8), Reg.Rax)
+    let count = function.localCount + exit.stackDepth
+    let mut i: u32 = 0
+    while i < count {
+      let slot = function.slot(exit, i)
+      run self.a.load(Width.W64, Reg.Rax, slotOf(slot.value))
+      if slot.mode == SlotMode.Int {
+        run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.movImm64(Reg.R8, KIND_INT)
+        run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R8)
+      } else if slot.mode == SlotMode.Bool {
+        run self.a.movImm64(Reg.R8, KIND_BOOL)
+        run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R8)
+      }
+      // Imm, Move and Dup: the value's word already names it; the engine retains an argument.
+      run self.a.store(Width.W64, Mem.at(Reg.Rsi, u32.wrappingToI32(16 + i * 8)), Reg.Rax)
+      i = i + 1
+    }
+    // A poll's exit is the loop target after a back edge: interrupt, not deopt.
+    let mut code = EXIT_DEOPT
+    if isPollExit(&function, index) { code = EXIT_POLL }
+    run self.leave(code)
+  }
+}
+
+fn isPollExit(function: &Function, exit: u32) -> bool {
+  let mut i: usize = 0
+  while i < function.insts.length() {
+    let inst = function.insts.get(i)
+    if inst.exit == exit { return inst.op == Op.Poll }
+    i = i + 1
+  }
+  return false
+}
+fn immWord(k: i32) -> u64 {
+  if k == 0 { return KIND_UNDEFINED }
+  if k == 1 { return KIND_NULL }
+  if k == 2 { return KIND_BOOL }
+  if k == 3 { return u64.bitOr(KIND_BOOL, 1) }
+  return KIND_UNINITIALIZED
+}
+fn condition(k: i32) -> Cond {
+  if k == 0 { return Cond.Less }
+  if k == 1 { return Cond.LessOrEqual }
+  if k == 2 { return Cond.Greater }
+  if k == 3 { return Cond.GreaterOrEqual }
+  if k == 4 { return Cond.Equal }
+  return Cond.NotEqual
+}

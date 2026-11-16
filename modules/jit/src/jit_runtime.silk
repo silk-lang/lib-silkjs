@@ -21,8 +21,8 @@ import silkjs.js_runtime as runtime
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
 import silkjs.cli_io as io
 import code_memory { CodeMemory, CodeBlock, MemoryError }
-import asm_x64 { Code, LinkError }
-import x64_lower { Lowered, Refusal }
+import asm_x64 { Code, LinkError, UnboundLabelError }
+import x64_lower { Lowered }
 import x64_lower as lower
 
 /// Functions one runtime can have compiled; the table never moves.
@@ -86,8 +86,8 @@ impl Jit {
   pub fn setupData(self: &mut Self) -> ?*mut u8 {
     return unsafe Intrinsic.pointerReinterpret<*mut Jit, *mut u8>(Pointer.fromMutRef<Jit>(&mut self))
   }
-  /// Prints the counters (--jit-stats) to stderr.
-  pub effect fn printStats(self: &Self) -> () ! OutOfMemoryError ? &mut Allocator {
+  /// The counters (--jit-stats) as one line.
+  pub effect fn statsLine(self: &Self) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
     let mut line = List<u8>.make()
     run line.appendSlice(b"jit: reported ") run decimal(&mut line, self.reported)
     run line.appendSlice(b" compiled ") run decimal(&mut line, self.compiledFunctions)
@@ -99,7 +99,7 @@ impl Jit {
     run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
     run line.appendSlice(b" code-bytes ") run decimal(&mut line, self.codeBytes)
     run line.append(10)
-    io.stderr(line.asSlice())
+    return move line
   }
   /// Sums the compiled code table's counters into runs, deopts, polls and unlinked.
   pub fn collect(self: &mut Self) -> () {
@@ -144,14 +144,19 @@ unsafe fn jitOf<'a>(anchor: &'a mut (), data: ?*mut u8) -> &'a mut Jit {
 export "C" fn jitRuntimeSetup(rt: *mut HeapHeader, data: ?*mut u8) -> () {
   let mut anchor = ()
   let jit = unsafe jitOf(&mut anchor, data)
-  jit.runtime = rt
   if !jit.options.enabled { return () }
-  if jit.options.threshold != 0 { unsafe runtime.setHotEntryBudget(rt, jit.options.threshold) }
+  unsafe attach(&mut jit, rt)
   jit.handler.data = data
   let handler = unsafe Intrinsic.pointerReinterpret<*mut HotHandler, *mut u8>(Pointer.fromMutRef<HotHandler>(&mut jit.handler))
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: LIBC_HOT_FUNCTION_C }), opaque: handler })
+}
+/// Gives rt jit's compiled code table and hot budget. An embedder that is not the libc
+/// session sets its own hot function handler and calls compileHot from it.
+pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
+  jit.runtime = rt
+  if jit.options.threshold != 0 { unsafe runtime.setHotEntryBudget(rt, jit.options.threshold) }
   let table = unsafe jit.entries.storage()
   unsafe runtime.setCompiledTable(rt, unsafe Intrinsic.pointerRequalify<?[*]mut CompiledEntry, ?*mut CompiledEntry>(table), usize.toU32(CAPACITY))
-  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: LIBC_HOT_FUNCTION_C }), opaque: handler })
 }
 
 /// LibcServices.hotFunction through HotHandler: compile bytecode or refuse it.
@@ -166,15 +171,20 @@ export "C" fn jitHotFunction(rt: *mut HeapHeader, bytecode: *mut HeapHeader, dat
   }
 }
 
-unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+/// Compiles bytecode, a FunctionBytecode cell reported hot, and links it, or refuses it.
+pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
   jit.reported = jit.reported + 1
   if jit.entries.length() >= CAPACITY { jit.refused = jit.refused + 1 return () }
   let anchor = ()
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   if jit.options.dump { run unsafe dumpBytecode(&function) }
-  let lowered = run lower.lowerFunction(&function, jit.options.stress != 0)
+  let lowered = run Effect.result(unsafe lower.lowerFunction(&function, jit.options.stress))
   drop function
-  let mut code = match move lowered {
+  let result = match move lowered {
+    Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
+    Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
+  }
+  let mut code = match move result {
     Lowered.Code { value } => move value
     Lowered.Refused { reason } => {
       jit.refused = jit.refused + 1
