@@ -16,6 +16,37 @@ JavaScript is compiled to machine code anywhere in this repository.
 - Ahead-of-time compilation must stay possible: relocatable code, serializable compiler inputs,
   runtime references through data-side tables.
 
+## Starting from nothing
+
+Nothing from the machine this was written on is needed or assumed: everything is in this branch
+of `silk-lang/lib-silkjs`. No build output, log or toolchain carries over. On a fresh Linux x86-64
+machine with at least 16 GB of RAM:
+
+```sh
+git clone --branch claude/sweet-ptolemy-f5t7na https://github.com/silk-lang/lib-silkjs
+cd lib-silkjs
+
+# Silk, at the version the workspace pins (silk.toml).
+curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh -o install-silk.sh
+SILK_RELEASE='v0.1.0-dev.74+205aea3f5b2e' sh install-silk.sh
+export PATH="$HOME/.silk/bin:$PATH"
+
+# Clang 22.1.8 with llvm-mc. Silk rejects older Clang.
+curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/scripts/setup-linux-llvm.sh -o setup-llvm.sh
+bash setup-llvm.sh "$HOME/llvm-22.1.8"
+export SILK_CLANG="$HOME/llvm-22.1.8/bin/clang"
+
+silk test --manifest-path modules/jit/silk.toml          # 28 tests, about 1 second
+(cd modules/engine && silk build --release)              # about 5 minutes, 7.2 GiB peak
+python3 modules/engine/scripts/differential.py --count 200
+```
+
+The Silk installer reads the GitHub release API of `silk-lang/silk`. An agent session therefore
+needs `silk-lang/silk` reachable as well as `silk-lang/lib-silkjs`, and needs its user's
+permission to attach it; a session with only `lib-silkjs` gets HTTP 403 from the installer.
+`valgrind` is needed for the instruction-count benchmarks, Node for the `node` reference
+configuration.
+
 ## State of each milestone
 
 | Milestone | State |
@@ -88,7 +119,8 @@ slower); that every path enters observed dispatch is still not established.
 
 ## Validation record
 
-All on a 4-CPU, 15 GiB Linux x86-64 cloud container, Silk 0.1.0-dev.74+205aea3f5b2e, Clang 22.1.8.
+These were run once, on a 4-CPU, 15 GiB Linux x86-64 cloud container that no longer exists, with
+Silk 0.1.0-dev.74+205aea3f5b2e and Clang 22.1.8. Their logs were not kept; rerun to check them.
 
 | Command | Result |
 | --- | --- |
@@ -114,9 +146,10 @@ and ignored by git.
   independently expected property name" at `js_for_in_tests:141`.
 
 This branch changes two engine files, `cli_options.silk` and `qjs_launch.silk`, neither of which
-is for-in code, so the failures most likely exist on `main` too. That is not yet confirmed: the
-same suite was being built on untouched `main` (`d1973537`) when this was written. Run it there
-before treating the failures as either pre-existing or caused here.
+is for-in code, so the failures most likely exist on `main` too. That is not confirmed. To
+settle it, check out `main` at `d1973537`, run `silk test src/tests.silk -o build/core-tests
+--optimization speed --debug false` in `modules/engine` (about 12 minutes, 13.9 GiB peak), and
+compare.
 
 ## Operating notes for this kind of host
 
