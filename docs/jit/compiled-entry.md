@@ -226,59 +226,72 @@ clears `leaf`); from then on interpreted callers reach it through 7.1 and compil
 through 7.4. A leaf called only from interpreted code stays an interpreter leaf, which is the
 cheap case the leaf runner exists for; the interpreter-only cost of this choice is zero.
 
-### 7.3 Calls from compiled code: the generic runtime call
+### 7.3 Calls from compiled code: call exits
 
-SSA: `call v_function, v_this, (v_args...)` produces an owned `value`, is `mayReenter`, and has
-two exits: none for the ordinary path, and a **throw exit** naming the frame state *before* the
-call (the call's operands still on the operand stack, as the interpreter holds them while a call
-runs). The translator emits it for `call0..3`, `call` and `call_method` (the callee and receiver
-come from the operand stack like any other value); every value live across it is either owned,
-an immediate, an unboxed `i32`/`bool`, or a borrow of an argument cell.
+As built, and off by default: the shell compiles functions that make calls only with
+`--jit-calls` (`Options.calls`), because a generic call from compiled code still costs more than
+the interpreter's inline call (measured below). Without the flag, `lowerFunction` refuses a
+function that makes a call, so `--jit` behaves as before.
 
-Backend: the operands are written as `ValueBits` into a stack area (function, this, arguments),
-and the code calls the helper `jit_helpers.CALL` (H's index range) through the environment's
-table with `(env, frame, area, count, result)`. The helper is ordinary Silk in modules/jit; it
-makes the call through the engine's own catching entry (`vm.call`-like, which runs bytecode in
-`callInternal`, natives through their class, linked callees through `js_compiled.runCode`
-directly) and returns 0 with the owned result written, or 1 when the call threw (the exception
-is pending in `RuntimeState.currentException`, exactly where the interpreter leaves it).
-Compiled code tests the status and on 1 jumps to the throw exit.
+SSA: `call.arg v, k` (one per argument, contiguous) then `v = call v_function, v_this, n exit e`,
+which produces an owned `value` and is `mayReenter`. The exit names the frame state before the
+call, with the call's operands still on the operand stack as the interpreter holds them. The
+translator emits it for `call0..3`, `call` and `call_method`, refuses more than 8 arguments,
+and refuses a callee that is not a boxed value.
 
-What the rest of the engine sees, case by case:
+**A call is an exit, not a native call.** The first design called a helper from machine code;
+that needs the engine's hooks and allocator from inside generated code, which the engine cannot
+give without making them process-local. Instead the code leaves and the engine makes the call:
 
-- **The callee throws.** No unwinding through generated code ever happens: the helper returns.
-  The throw exit is a deopt stub returning `EXIT_THROW` (3) with the state before the call. The
-  engine restores that state into a frame and, instead of executing, takes the branch the
-  `callInternal` loop takes when `execute` fails at the call instruction (`exceptionBoundary`,
-  then `unwindFrames`), so handlers in the compiled function (`catch`, `finally`) and the
-  release of the call's operands are the interpreter's own. The first version translates no
-  `catch`/`gosub`, so every throw leaves the function; the restore is still the general
-  mechanism. From a frameless entry (7.1) the engine builds the frame first (base frame through
-  `callResuming`, which can fail), so functions that make calls are entered through
-  `callCompiled`, never `enterCompiled`.
-- **The callee polls, collects garbage, or reenters the engine.** The engine reference-counts
-  and never moves objects. Values the compiled frame holds across the call are owned (one count
-  each, invisible to the cycle collector's internal-reference subtraction, so they are treated as
-  external roots), immediates, or borrows of the frame's argument cells. Argument cells are the
-  caller's operands or the frame's own copies; nothing else writes them while the function runs
-  (the translator refuses `arguments` and argument writes, `Function.prototype.arguments` is a
-  poison pill, and observation runs interpreted code only), so an argument borrow survives a
-  call. Any other borrow ends at a `mayReenter` instruction (the ownership pass retains it before
-  the call if it is used after). No stack map is needed.
-- **The callee reads the stack** (an `Error` captures its stack, a backtrace is built at unwind,
-  `Error.prepareStackTrace`). Backtraces walk `RuntimeState.currentStackFrame`. A function entered
-  through `callInternal` already has its published `StackFrame`; one entered frameless publishes
-  a minimal `StackFrame` record on the native stack for the duration of the run
-  (`previous`, `currentFunction`, `mode`, `debuggerId` 0, empty locals, the argument cells), and
-  the compiled code writes the call's bytecode offset to its `currentPc` before each call
-  (`CompiledFrame` gains a `stackFrame` pointer at its end). The backtrace then shows the
-  compiled function at the right line, exactly as the interpreter would.
-- **The debugger.** Compiled code never runs while instructions are observed. When a callee
-  turns observation on, the compiled caller continues until its next poll or exit; the debugger
-  sees it as a frame without locals (the record above) until it deoptimizes.
+- `CompiledFrame.calls` (offset 48) points to the frame's *call block*, `u64` words:
+  word 0 the resume word, word 1 the site (pc low, argument count high), words 2-3 the result,
+  from word 4 the area (callee, receiver, up to 8 arguments, 2 words each), from word 24 the
+  saved values (value `v` at `24 + 2v`). `CompiledEntry.callWords` is its size, 0 when the code
+  makes no calls.
+- At a call the code writes the area and the site, writes `(point + 1) << 2` to word 0, copies
+  the values live after the call (`ssa_liveness.savedAcross`, plus the call exit's values) from
+  their frame slots to the saved area, and returns `EXIT_CALL` (4).
+- `enterBase` (js_vm) loops while the exit is `EXIT_CALL`: `compiledCall` sets the frame's pc to
+  the instruction after the call (backtraces show the right line), makes the call through the
+  engine's catching entry (`callForCompiled`: natives as the interpreter calls them, bytecode
+  through `callInternal`, a linked callee without calls frameless through `runCode`), writes
+  the result and ORs how it went into word 0 (0 returned, 1 threw, 2 deopt), then runs the code
+  again with the same arguments.
+- The prologue reads word 0: 0 is a fresh run; otherwise it jumps to that call's resume label,
+  which copies the saved values back to their slots and continues, or on a throw or deopt
+  returns `EXIT_THROW` (3) or `EXIT_DEOPT` from the call's exit stub with the state before the
+  call.
+- **Throws.** No unwinding through generated code happens. After `EXIT_THROW` the engine
+  restores the state into the base frame and takes the branch the `callInternal` loop takes when
+  `execute` fails at the call (`exceptionBoundary`, then `unwindFrames`), so handlers and the
+  release of the call's operands are the interpreter's own.
+- **Deopt at the call.** A callee the engine wants to run inline (a known local function,
+  `FunctionBytecode` value) gives `CALL_DEOPT`: the frame is restored at the call and the
+  interpreter makes it.
+- **Reentry, GC, the debugger.** The engine reference-counts and never moves objects. Saved
+  values are owned (external roots for the cycle collector), immediates, unboxed `i32`/`bool`,
+  or borrows of argument cells, which nothing writes while the function runs; other borrows end
+  at a `mayReenter` instruction. No stack map is needed. Compiled code never runs while
+  instructions are observed.
 
-AOT: the helper is named by its table index; the area, the status and the record offsets are
-fixed by the ABI. No per-runtime value enters the code bytes.
+Functions that make calls run only from a base frame (`enterBase`); `enterCompiled` and
+`callCompiled` refuse them, because the frameless entry has no frame to restore a throw into.
+No value is held in a register across a call: everything a later exit needs is in its slot.
+
+AOT: the block offsets and exit codes are fixed by the ABI; the block lives on the native stack
+of `enterBase`. No per-runtime value enters the code bytes.
+
+Cost (measured, callgrind): the generic call micro `callsx.js` runs 105.3M instructions with
+`--jit-calls` against 68.7M interpreted; Box2D (Octane, 3 runs) with `--jit-calls` compiles 2
+functions with calls and runs 1.3 percent more instructions than plain. Direct calls (7.4) are
+what would make calls pay off.
+
+Box2D under `--jit` (measured): the inline `apply`/`call`/`Reflect.apply` and lazy-`arguments`
+paths in `callInline` refused linked targets and built an arguments object instead, which made
+Box2D 4.3 percent slower than plain once its two empty functions were compiled. `callLinked`
+now runs a linked target from those paths frameless, and `lowerFunction` refuses bodies shorter
+than 3 bytes (nothing to gain, ~180 instructions of entry per call). Box2D with `--jit` is now
+0.12 percent below plain (2,506.5M against 2,509.5M).
 
 ### 7.4 Direct calls to a known compiled callee
 

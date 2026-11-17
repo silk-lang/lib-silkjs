@@ -30,6 +30,7 @@ import ssa { Function, Inst, Op, Type, Own, SlotMode }
 import value_layout { ValueLayout }
 import jit_helpers as helpers
 import silkjs.js_compiled as compiled
+import ssa_liveness as liveness
 
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
@@ -63,8 +64,10 @@ pub struct Emitter {
   pub exitLabels: List<Label>,
   /// Where each call resumes, in instruction order (resume point k + 1 is call k).
   pub resumeLabels: List<Label>,
-  /// Values in the frame, which a call saves in its call block.
-  pub values: u32,
+  /// What each call saves in its call block (ssa_liveness.savedAcross): call k's values are
+  /// savedValues[savedStart[k] .. savedStart[k + 1]].
+  pub savedValues: List<u32>,
+  pub savedStart: List<u32>,
   /// Bytes of the frame below the return address: values, then the edge scratch area.
   pub frame: i32,
   pub scratch: i32,
@@ -97,7 +100,7 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let raw = inputs + INPUT_COUNT * 8 + 8
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8)
   let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
-    resumeLabels: List<Label>.make(), values: values, frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings }
+    resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings }
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
   let mut x: usize = 0
@@ -110,7 +113,17 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
     if function.insts.get(c).op == Op.Call { run emitter.resumeLabels.append(run emitter.a.label()) }
     c = c + 1
   }
-  if emitter.resumeLabels.length() != 0 { run emitter.resume() }
+  if emitter.resumeLabels.length() != 0 {
+    let saved = run liveness.savedAcross(&function)
+    let mut k: usize = 0
+    while k < saved.length() {
+      run emitter.savedStart.append(usize.toU32(emitter.savedValues.length()))
+      run emitter.savedValues.appendSlice(saved.asSlice()[k].asSlice())
+      k = k + 1
+    }
+    run emitter.savedStart.append(usize.toU32(emitter.savedValues.length()))
+    run emitter.resume()
+  }
   b = 0
   while b < function.blockCount() {
     let block = function.blocks.get(u32.toUsize(b))
@@ -336,13 +349,11 @@ impl Emitter {
       run self.a.store(Width.W64, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SITE), 8)), Reg.Rax)
       run self.a.movImm32(Reg.Rax, u32.shiftLeft(point + 1, 2))
       run self.a.store(Width.W64, word(Reg.R11, 0), Reg.Rax)
-      run self.a.lea(Width.W64, Reg.R10, Mem.at(Reg.Rsp, 0))
-      run self.a.lea(Width.W64, Reg.R11, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SAVED), 8)))
-      let words = self.values * 2
-      run self.copyWords(words)
+      run self.keep(point, true)
       run self.leave(EXIT_CALL)
       // Resumed (see resume) with the block's word 0 in RAX and the block in R11.
       self.a.bind(self.resumeLabels.get(u32.toUsize(point)))
+      run self.keep(point, false)
       let returned = run self.a.label()
       run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 3)
       run self.a.jcc(Cond.Equal, returned)
@@ -477,21 +488,27 @@ impl Emitter {
     }
     return Intrinsic.trap("x64_backend: a call without a resume point")
   }
-  /// Copies count words from R10 to R11 (count nonzero). Clobbers RAX, R9, R10, R11.
-  effect fn copyWords(self: &mut Self, count: u32) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.a.movImm32(Reg.Rax, count)
-    let again = run self.a.label()
-    self.a.bind(again)
-    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R10, 0))
-    run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.R9)
-    run self.a.aluImm(Alu.Add, Width.W64, Reg.R10, 8)
-    run self.a.aluImm(Alu.Add, Width.W64, Reg.R11, 8)
-    run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rax, 1)
-    run self.a.jcc(Cond.NotEqual, again)
+  /// Saves (out) or restores the values call point keeps, between the frame and the call block
+  /// in R11, at block word CALL_SAVED + 2 * value. Clobbers R9.
+  effect fn keep(self: &mut Self, point: u32, out: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let base = u32.wrappingMultiply(usize.toU32(compiled.CALL_SAVED), 8)
+    let mut i = u32.toUsize(self.savedStart.get(u32.toUsize(point)))
+    let end = u32.toUsize(self.savedStart.get(u32.toUsize(point) + 1))
+    while i < end {
+      let v = self.savedValues.get(i)
+      let mut w: u32 = 0
+      while w < 2 {
+        let frame = Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES + w * 8))
+        let block = word(Reg.R11, base + v * SLOT_BYTES + w * 8)
+        if out { run self.a.load(Width.W64, Reg.R9, frame) run self.a.store(Width.W64, block, Reg.R9) }
+        else { run self.a.load(Width.W64, Reg.R9, block) run self.a.store(Width.W64, frame, Reg.R9) }
+        w = w + 1
+      }
+      i = i + 1
+    }
   }
   /// The entry of code that makes calls: a run after EXIT_CALL (the call block's word 0 is
-  /// nonzero) restores the saved values and jumps to its resume point with word 0 in RAX and
-  /// the block in R11.
+  /// nonzero) jumps to its resume point with word 0 in RAX and the block in R11.
   effect fn resume(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let fresh = run self.a.label()
     run self.callBlock(Reg.R11)
@@ -500,12 +517,6 @@ impl Emitter {
     run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
     run self.a.test(Width.W64, Reg.Rax, Reg.Rax)
     run self.a.jcc(Cond.Equal, fresh)
-    run self.a.lea(Width.W64, Reg.R10, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SAVED), 8)))
-    run self.a.lea(Width.W64, Reg.R11, Mem.at(Reg.Rsp, 0))
-    let words = self.values * 2
-    run self.copyWords(words)
-    run self.callBlock(Reg.R11)
-    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
     run self.a.mov(Width.W64, Reg.R8, Reg.Rax)
     run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R8, 2)
     let mut point: u32 = 0
