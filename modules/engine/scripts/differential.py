@@ -285,12 +285,14 @@ class Generator:
         if flavor == "numloop":
             # A double accumulator in a counted loop (docs/jit/doubles.md): it starts as an Int or
             # a double, so an int add may overflow or meet a double and deoptimize, after which
-            # the recompiled function carries it as f64. Comparisons meet NaN and -0.
+            # the recompiled function carries it as f64. Starts, steps and tests meet NaN, -0 and the infinities.
             # A numeric start: a string a would double in length each time round.
-            start = self.pick(["0", "0.5", "+a", "-0", "b / 2", "2147483600"])
+            start = self.pick(["0", "0.5", "+a", "-0", "b / 2", "2147483600", "NaN", "Infinity", "-Infinity", "a / 0"])
             step = self.pick(["d + i * 0.5", "d + 1073741824", "d / 3 + i", "d * 1.5 - b", "d + Math.sqrt(i)",
-                              "Math.floor(d / 2) + i", "Math.abs(d - a) + 0.25", "-d + i", "d + (i | 0) / 7"])
-            test = self.pick(["d < b", "d >= 0", "d !== d", "d === 0", "d > 1e9", "!(d <= a)"])
+                              "Math.floor(d / 2) + i", "Math.abs(d - a) + 0.25", "-d + i", "d + (i | 0) / 7", "d * 0 + i", "d - Infinity"])
+            # Every branch form meets NaN: the negations (!(d < b) is not d >= b) and ToBoolean.
+            test = self.pick(["d < b", "d >= 0", "d !== d", "d === 0", "d > 1e9", "!(d <= a)", "!(d < b)",
+                              "!(d > -0)", "d != b", "d == -0", "d", "!d", "d <= Infinity"])
             return (f"var d = {start}; var n = b; if (n > {self.pick([5, 20, 70])}) n = {self.pick([3, 20, 70])}; "
                     f"var c = 0; for (var i = 0; i < n; i++) {{ d = d + {step}; if ({test}) c++; }} "
                     f"return [d, c, d | 0, d >>> 0];")
