@@ -63,9 +63,10 @@ cell address only separates a re-report of the same function from another functi
 code, which starts from the sites the first one learned. Both are hints: every guard stays in the
 compiled code, so a wrong match costs speed, never correctness.
 
-## Limits today
+## Boxing
 
-Boxing a double, unboxing one from a value, and writing one to an exit or a return need the
-16-byte ValueBits layout of the compiled-entry ABI. Until that lands, functions that do any of
-these are refused with "boxing a double needs the ValueBits ABI" or "a double in an exit needs the
-ValueBits ABI", so the f64 path runs only in the backend tests.
+Under the compiled-entry ABI a boxed value is a 16-byte ValueBits in the engine's layout
+(`value_layout.ValueLayout`). `unbox.f64` reads the tag: Int converts its signed payload with
+`cvtsi2sd`, Float64 takes its payload bits, anything else exits. `box.f64`, an `f64` exit slot and
+a returned double write the Float64 tag and the bits. An integral double stays a Float64 (see
+"Representation" above).
