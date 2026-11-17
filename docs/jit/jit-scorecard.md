@@ -352,3 +352,100 @@ call (needs `--jit-calls`) 74, `get_array_el2` 41, `get_array_el` 38, `get_var_r
 `get_array_el` 40, `get_var_ref` 35, `get_length` 26. `push_this` no longer appears
 (INFERRED from the counts, not read in code: the translator now takes `this`), so methods now stop at their first property write (`put_field`) or
 global read (`get_var`).
+
+## 2026-11-17 10:37 UTC: integration 4e5e3dba (K round 2, I OSR, J objects, H native nested calls)
+
+Same host and versions. Branch merges integration `4e5e3dba` (`20785a3b`, keeping J's versions
+of `jit_coverage.py`, with `--calls` and deopt-site sums, and `jit_kernels.py`). The deopt-site
+lines (`jit: deoptimized at:`) are not printed by the 4e5e3dba shell, so this section has deopt
+counts but no deopt opcodes. Raw files:
+[`jit-scorecard-results/2026-11-17-4e5e3dba/`](jit-scorecard-results/2026-11-17-4e5e3dba/).
+This host ran about 15% faster this time (silkjs Octane 6832 against 5763), so compare columns
+within this section, not absolute values across sections.
+
+### Kernels
+
+Median ns per inner iteration over 7 processes (ratio to v8-jit / jsc-jit).
+
+| Kernel | silkjs | silkjs-jit | silkjs-jit-calls | v8-jit | jsc-jit | outcome (--jit) |
+|---|---:|---:|---:|---:|---:|---|
+| sum-calls | 5.42 | **1.03 (2.1/1.7)** | 1.05 | 0.49 | 0.62 | compiled + OSR, 67.6% compiled |
+| sum-long | 9.86 | **2.24 (2.5/4.1)** | 2.52 | 0.90 | 0.54 | OSR now enters the long loop: 99.3% compiled |
+| nested | 9.21 | **1.59 (2.8/1.2)** | 1.52 | 0.57 | 1.37 | 95.7% compiled |
+| calls | 20.73 | 19.95 (33.4/20.8) | 18.66 (31.3/19.4) | 0.60 | 0.96 | needs --jit-calls; with it 10.1M runs, 9,988,091 direct calls, 48.7% compiled, still interpreter speed |
+| method | 27.06 | 25.63 | 26.98 (32.1/19.3) | 0.84 | 1.40 | --jit-calls: compiled, 36.7% compiled, no longer 2.4x slower |
+| doubles | 13.98 | **2.10 (1.2/1.2)** | 2.32 | 1.70 | 1.71 | 68.2% compiled; level with JSC, 1.2x V8 |
+| array-sum | 9.31 | **5.39 (9.1/8.5)** | 4.67 | 0.59 | 0.63 | now compiled (J's element reads), 53.1% |
+| typed-array | 33.48 | 36.86 (38.2/39.3) | 35.06 | 0.96 | 0.94 | compiles, then 24 deopts unlink 3 functions |
+
+### Octane 2
+
+| Engine | best round | median round | worst round |
+|---|---:|---:|---:|
+| silkjs | 7069 | 6832 | 6524 |
+| silkjs-jit | 6595 | 6324 | 6012 |
+| silkjs-jit-calls | 5893 | 5702 | 5295 |
+| v8-jitless | 5394 | 5242 | 5017 |
+| jsc-nojit | 4199 | 4032 | 3740 |
+| qjs | 3733 | 3614 | 3458 |
+| v8-jit | 63056 | 60125 | 55543 |
+| jsc-jit | 61911 | 57486 | 54141 |
+
+Geometric mean of per-benchmark medians against silkjs: silkjs-jit **0.926**, silkjs-jit-calls
+0.835. The default JIT is now slower than the interpreter on Octane. Lines with non-overlapping
+ranges: MandreelLatency 0.565, Mandreel 0.748, Gameboy 0.828, zlib 0.828, Box2D 0.864 (with
+`--jit-calls`: DeltaBlue 0.406, Box2D 0.679, MandreelLatency 0.504).
+
+The cause is compile time, MEASURED with callgrind on one fixed iteration
+([`compile-cost.txt`](jit-scorecard-results/2026-11-17-4e5e3dba/compile-cost.txt)):
+
+- zlib: 56.10G instructions without `--jit`, 83.66G with it (+49%). Engine instructions are the
+  same (55.96G); the extra 27.6G are the compiler: `ssa_ownership` 14.64G, `ssa_translate` 8.58G,
+  `ssa` 2.02G, `x64_backend` 0.70G. 85 OSR compilations produced 23.9 MB of code; 123 of the 125
+  OSR runs deoptimized.
+- mandreel: 23.21G to 35.93G (+55%), `ssa_ownership` 9.56G of the extra 12.7G; 121 OSR
+  compilations, 22.5 MB of code, 158 of 160 OSR runs deoptimized.
+
+So the ownership pass is superlinear on zlib's and mandreel's large functions, and OSR compiles
+them repeatedly only to deopt almost every entry. Compiled code itself is under 0.04% of the
+instructions on both.
+
+### Coverage
+
+`--jit` columns from `jit_coverage.py --instructions --kernels`; `--jit-calls` from the same with
+`--calls`.
+
+| Benchmark | hot / compiled | deopts / unlinked | OSR compiled / runs / deopts | compiled instr | --jit-calls: compiled, deopts / unlinked, compiled instr | top refusals (--jit) |
+|---|---:|---:|---:|---:|---:|---|
+| octane/richards | 26 / 0 | 0 / 0 | 4 / 32 / 32 | 0.0008% | 7, 24 / 3, 3.0308% | `if_not_nullish8` 9; `call_constructor` 8; a call (calls from compiled code need --jit-calls) 4 |
+| octane/deltablue | 69 / 12 | 96 / 12 | 32 / 133 / 133 | 0.0013% | 159, 1088 / 136, 15.7770% | a call (calls from compiled code need --jit-calls) 28; `call_constructor` 15; deoptimized again where it was already widened 9 |
+| octane/crypto | 57 / 11 | 64 / 8 | 65 / 166 / 165 | 0.1479% | 31, 216 / 27, 0.5996% | a call (calls from compiled code need --jit-calls) 16; deoptimized again where it was already widened 7; `call_constructor` 6 |
+| octane/raytrace | 39 / 5 | 40 / 5 | 12 / 66 / 66 | 0.0009% | 19, 152 / 19, 0.0026% | `call_constructor` 24; a call (calls from compiled code need --jit-calls) 5; deoptimized again where it was already widened 2 |
+| octane/earley-boyer | 69 / 2 | 16 / 2 | 30 / 96 / 96 | 0.0003% | 18, 144 / 18, 0.0005% | `instanceof` 24; a call (calls from compiled code need --jit-calls) 7; `if_not_null8` 6 |
+| octane/regexp | 19 / 3 | 16 / 2 | 87 / 69 / 69 | 0.9620% | 5, 32 / 4, 0.9757% | `regexp` 12; a call (calls from compiled code need --jit-calls) 2; deoptimized again where it was already widened 1 |
+| octane/splay | 65 / 5 | 24 / 3 | 52 / 389 / 389 | 0.1713% | 22, 144 / 18, 0.3227% | `call_constructor` 49; a call (calls from compiled code need --jit-calls) 6; `if_not_nullish8` 3 |
+| octane/navier-stokes | 27 / 0 | 0 / 0 | 60 / 152 / 139 | 0.6791% | 3, 24 / 3, 0.6824% | `insert3` 7; `get_array_el3` 5; deoptimized again where it was already widened 4 |
+| octane/pdfjs | 115 / 10 | 48 / 6 | 121 / 292 / 291 | 0.0051% | 63, 395 / 49, 0.1562% | a call (calls from compiled code need --jit-calls) 31; `array_from` 16; deoptimized again where it was already widened 12 |
+| octane/mandreel | 113 / 27 | 192 / 24 | 148 / 262 / 257 | 0.0363% | 86, 607 / 75, 0.2007% | a call (calls from compiled code need --jit-calls) 33; `get_array_el2` 28; deoptimized again where it was already widened 14 |
+| octane/gbemu | 207 / 62 | 295 / 24 | 152 / 577 / 449 | 1.2908% | 118, 683 / 68, 1.4290% | `get_array_el2` 60; a call (calls from compiled code need --jit-calls) 31; `insert2` 11 |
+| octane/code-load | 29 / 6 | 40 / 5 | 23 / 3 / 2 | 0.0003% | 11, 56 / 7, 0.0003% | `special_object` 6; `get_var_ref` 5; `call_constructor` 4 |
+| octane/box2d | 176 / 34 | 240 / 30 | 157 / 190 / 187 | 0.1577% | 76, 539 / 67, 0.1244% | a call (calls from compiled code need --jit-calls) 32; `is_undefined` 29; `call_constructor` 22 |
+| octane/zlib | 37 / 0 | 0 / 0 | 104 / 157 / 156 | 0.0008% | 0, 0 / 0, 0.0008% | `put_arg` 28; deoptimized again where it was already widened 8; recompiled too often 1 |
+| octane/typescript | 509 / 164 | 1256 / 156 | 131 / 258 / 242 | 0.5245% | 665, 5156 / 642, 0.6931% | a call (calls from compiled code need --jit-calls) 135; `get_var_ref` 67; `call_constructor` 47 |
+| kernel/sum-calls | 4 / 1 | 0 / 0 | 3 / 1958 / 16 | 67.6125% | 2, 0 / 0, 67.5511% | a call (calls from compiled code need --jit-calls) 2; deoptimized again where it was already widened 1 |
+| kernel/sum-long | 1 / 1 | 0 / 0 | 1 / 2000 / 0 | 99.3311% | 1, 0 / 0, 99.3310% | - |
+| kernel/nested | 2 / 1 | 0 / 0 | 3 / 1798 / 2 | 95.6915% | 2, 0 / 0, 95.5802% | a call (calls from compiled code need --jit-calls) 1 |
+| kernel/calls | 5 / 0 | 0 / 0 | 4 / 24 / 24 | 0.0001% | 2, 0 / 0, 48.6695% | a call (calls from compiled code need --jit-calls) 4; deoptimized again where it was already widened 1 |
+| kernel/method | 5 / 0 | 0 / 0 | 4 / 24 / 24 | 0.0001% | 2, 0 / 0, 36.7112% | a call (calls from compiled code need --jit-calls) 2; `call_constructor` 2; deoptimized again where it was already widened 1 |
+| kernel/doubles | 4 / 1 | 0 / 0 | 3 / 988 / 16 | 68.1536% | 2, 0 / 0, 67.9962% | a call (calls from compiled code need --jit-calls) 2; deoptimized again where it was already widened 1 |
+| kernel/array-sum | 2 / 1 | 0 / 0 | 2 / 1997 / 3 | 53.0618% | 2, 0 / 0, 53.0462% | a call (calls from compiled code need --jit-calls) 1 |
+| kernel/typed-array | 5 / 3 | 24 / 3 | 4 / 3 / 3 | 0.0002% | 4, 24 / 3, 0.0002% | recompiled too often 1; a call (calls from compiled code need --jit-calls) 1 |
+
+Refusals with `--jit` (all rows): a call (needs `--jit-calls`) 420, `call_constructor` 304,
+deoptimized again where it was already widened 125, `get_var_ref` 90, `get_array_el2` 88,
+`instanceof` 55, `if_not_nullish8` 50, `put_arg` 50. With `--jit-calls`: `call_constructor` 304,
+deoptimized again where it was already widened 265, `get_var_ref` 92, `get_array_el2` 77,
+`instanceof` 53, recompiled too often 41. `get_var`, `put_field` and `get_scope0` (the top three
+last time) are gone. Compiled share rose most on deltablue with `--jit-calls` (15.8%), richards
+(3.0%) and gbemu (1.3% default), but deopt churn is now large: typescript 1,256 deopts and 156
+unlinked by default, 5,156 and 642 with `--jit-calls`.
