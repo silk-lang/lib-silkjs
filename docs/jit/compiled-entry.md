@@ -181,3 +181,132 @@ All on the cloud container (x86-64 Linux), release builds.
 - Code size and compile time (measured, `--jit-stats`): `sum` is 989 bytes and took 162-283 µs
   to compile (first compile includes reserving code memory). Over the differential run, 1916
   bytes per compiled function on average and 13.7 µs per hot report, refusals included.
+
+## 7. Calls and frames (milestone 7, workstream H)
+
+Design written before the code of each step; "measured" and "ran" mark what was checked.
+
+### 7.1 Entering compiled code from a call site, before any frame
+
+A call made by the dispatch loop to a linked function no longer goes through `callInternal`.
+`enterCallWith` (and `enterKnownCall` for known local functions) still refuses a linked callee
+for free (its `frameCells` is the stub sentinel, section 1); the refusal branch, which runs only
+when `enterFrame` refused, re-decodes the call out of line (`linkedCall`) and, when the callee is
+linked, runs the machine code on the caller's operand cells (`enterCompiled`): no frame, no
+`activation.publish`, no debugger activation. The interrupt counter is charged as for an inline
+entry.
+
+- **Return**: the operands from the callee's cell up are released and replaced by the result;
+  the caller continues at the next instruction, as after a leaf run.
+- **Deopt or poll exit**: the exit already carries the whole interpreter state, so only now is a
+  frame built: an *inline* frame (`activation.enterResumed`: `enterFrame` with the frame size
+  the link saved in `CompiledEntry.frameCells`, not counted, without the `push_this` prologue),
+  into which `js_compiled.restore` writes the exit state. The dispatch loop then simply runs that
+  frame; its return goes through `finishInline` like any inline call.
+- **Skipped**: while instructions are observed, or when the region has no room for the frame a
+  deopt would need (checked before running the code, `activation.linkedRoom`), the call falls
+  back to `callInline`, which runs the code too (`callCompiled`) and on a deopt continues in a
+  base frame: `callInternal` is a wrapper of `callResuming`, whose extra `Resume` argument (a
+  constant "none" at every other call site, so the inlined copies fold it away) makes the new
+  frame restore an exit instead of starting at offset 0. `callKnown` takes the same argument.
+
+Why the refusal is decoded again instead of passing its values on (measured): passing the
+already decoded function, callee, arguments and receiver to the out-of-line path from the
+refusal branch kept them live across the inlined `enterFrame` in every call arm and cost the
+interpreter-only micro loop below 2.2 percent more instructions; re-decoding cost 0.1 percent.
+
+### 7.2 Leaf functions
+
+A leaf (`FunctionBytecode.leaf`) runs frameless and uncounted from interpreted callers, and
+counting leaf runs cost up to 0.9 percent of all instructions (tier-seam.md). The trigger chosen
+is "the caller is compiled": a call made by compiled code goes through the runtime call (7.3),
+which enters callees through `callInternal`'s `describe` and therefore counts them, leaves
+included. A hot leaf called from compiled code is reported, compiled and linked (linking already
+clears `leaf`); from then on interpreted callers reach it through 7.1 and compiled callers
+through 7.4. A leaf called only from interpreted code stays an interpreter leaf, which is the
+cheap case the leaf runner exists for; the interpreter-only cost of this choice is zero.
+
+### 7.3 Calls from compiled code: call exits
+
+As built, and off by default: the shell compiles functions that make calls only with
+`--jit-calls` (`Options.calls`), because a generic call from compiled code still costs more than
+the interpreter's inline call (measured below). Without the flag, `lowerFunction` refuses a
+function that makes a call, so `--jit` behaves as before.
+
+SSA: `call.arg v, k` (one per argument, contiguous) then `v = call v_function, v_this, n exit e`,
+which produces an owned `value` and is `mayReenter`. The exit names the frame state before the
+call, with the call's operands still on the operand stack as the interpreter holds them. The
+translator emits it for `call0..3`, `call` and `call_method`, refuses more than 8 arguments,
+and refuses a callee that is not a boxed value.
+
+**A call is an exit, not a native call.** The first design called a helper from machine code;
+that needs the engine's hooks and allocator from inside generated code, which the engine cannot
+give without making them process-local. Instead the code leaves and the engine makes the call:
+
+- `CompiledFrame.calls` (offset 48) points to the frame's *call block*, `u64` words:
+  word 0 the resume word, word 1 the site (pc low, argument count high), words 2-3 the result,
+  from word 4 the area (callee, receiver, up to 8 arguments, 2 words each), from word 24 the
+  saved values (value `v` at `24 + 2v`). `CompiledEntry.callWords` is its size, 0 when the code
+  makes no calls.
+- At a call the code writes the area and the site, writes `(point + 1) << 2` to word 0, copies
+  the values live after the call (`ssa_liveness.savedAcross`, plus the call exit's values) from
+  their frame slots to the saved area, and returns `EXIT_CALL` (4).
+- `enterBase` (js_vm) loops while the exit is `EXIT_CALL`: `compiledCall` sets the frame's pc to
+  the instruction after the call (backtraces show the right line), makes the call through the
+  engine's catching entry (`callForCompiled`: natives as the interpreter calls them, bytecode
+  through `callInternal`, a linked callee without calls frameless through `runCode`), writes
+  the result and ORs how it went into word 0 (0 returned, 1 threw, 2 deopt), then runs the code
+  again with the same arguments.
+- The prologue reads word 0: 0 is a fresh run; otherwise it jumps to that call's resume label,
+  which copies the saved values back to their slots and continues, or on a throw or deopt
+  returns `EXIT_THROW` (3) or `EXIT_DEOPT` from the call's exit stub with the state before the
+  call.
+- **Throws.** No unwinding through generated code happens. After `EXIT_THROW` the engine
+  restores the state into the base frame and takes the branch the `callInternal` loop takes when
+  `execute` fails at the call (`exceptionBoundary`, then `unwindFrames`), so handlers and the
+  release of the call's operands are the interpreter's own.
+- **Deopt at the call.** A callee the engine wants to run inline (a known local function,
+  `FunctionBytecode` value) gives `CALL_DEOPT`: the frame is restored at the call and the
+  interpreter makes it.
+- **Reentry, GC, the debugger.** The engine reference-counts and never moves objects. Saved
+  values are owned (external roots for the cycle collector), immediates, unboxed `i32`/`bool`,
+  or borrows of argument cells, which nothing writes while the function runs; other borrows end
+  at a `mayReenter` instruction. No stack map is needed. Compiled code never runs while
+  instructions are observed.
+
+Functions that make calls run only from a base frame (`enterBase`); `enterCompiled` and
+`callCompiled` refuse them, because the frameless entry has no frame to restore a throw into.
+No value is held in a register across a call: everything a later exit needs is in its slot.
+
+AOT: the block offsets and exit codes are fixed by the ABI; the block lives on the native stack
+of `enterBase`. No per-runtime value enters the code bytes.
+
+Cost (measured, callgrind): the generic call micro `callsx.js` runs 105.3M instructions with
+`--jit-calls` against 68.7M interpreted; Box2D (Octane, 3 runs) with `--jit-calls` compiles 2
+functions with calls and runs 1.3 percent more instructions than plain. Direct calls (7.4) are
+what would make calls pay off.
+
+Box2D under `--jit` (measured): the inline `apply`/`call`/`Reflect.apply` and lazy-`arguments`
+paths in `callInline` refused linked targets and built an arguments object instead, which made
+Box2D 4.3 percent slower than plain once its two empty functions were compiled. `callLinked`
+now runs a linked target from those paths frameless, and `lowerFunction` refuses bodies shorter
+than 3 bytes (nothing to gain, ~180 instructions of entry per call). Box2D with `--jit` is now
+0.12 percent below plain (2,506.5M against 2,509.5M).
+
+### 7.4 Direct calls to a known compiled callee
+
+`js_feedback` records call targets (94 percent of call sites are monomorphic). When a site's
+feedback names one closure, the call is lowered as: compare the callee's `FunctionBytecode`
+(loaded from the function object) with the bytecode the feedback named (passed through a
+per-compilation constant table, never as an address in the code), and when it is linked, call
+`js_compiled.runCode`'s machine code directly with the argument area as its `arguments` and a
+`CompiledFrame` built in the caller's frame; any other callee takes the generic helper. A
+callee deopt returns `EXIT_DEOPT` to the caller's call site, which then runs the helper's
+"resume" entry (build the callee's base frame from its exit state and finish it interpreted).
+
+### 7.5 Inlining (design only unless time allows)
+
+A small monomorphic callee is translated into the caller's SSA at the call (its `arg n` are the
+call's operands). Every exit inside the inlined body carries two frame states, the caller's
+(at the call, its operands on the stack) and the callee's; the engine rebuilds the caller's frame,
+then the callee's frame inline above it, so the interpreter returns into the caller normally.
