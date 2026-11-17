@@ -171,7 +171,7 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
     || opcode == op.OP_for_of_next
-    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode)
+    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode) || genericOpcode(opcode)
     || exceptionOpcode(opcode)
     || opcode == op.OP_instanceof
     || genericOpcode(opcode)
@@ -186,7 +186,10 @@ fn isThrow(opcode: u8) -> bool { return opcode == op.OP_throw || opcode == op.OP
 
 /// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
 /// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
-fn osrExit(opcode: u8, calls: bool) -> bool { return !supported(opcode) || (!calls && callOpcode(opcode)) || genericOpcode(opcode) }
+fn osrExit(opcode: u8, calls: bool) -> bool {
+  if opcode == op.OP_for_of_next { return false }
+  return !supported(opcode) || (!calls && callOpcode(opcode)) || genericOpcode(opcode)
+}
 /// Whether OSR code for input may make calls: asked for, no captured local, and no
 /// arguments object or direct eval that could alias the frame's cells.
 fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
@@ -212,7 +215,7 @@ pub fn genericOpcode(opcode: u8) -> bool {
     || opcode == op.OP_get_super || opcode == op.OP_get_private_field || opcode == op.OP_put_private_field
     || opcode == op.OP_define_private_field || opcode == op.OP_private_in || opcode == op.OP_add_brand
     || opcode == op.OP_push_bigint_i32 || opcode == op.OP_private_symbol
-    || frameGeneric(opcode)
+    || frameGeneric(opcode) || iterationOpcode(opcode)
 }
 
 /// Stream P's part of generic exits (group 3): instructions that read the frame (its
@@ -223,6 +226,12 @@ pub fn frameGeneric(opcode: u8) -> bool {
   return opcode == op.OP_special_object || opcode == op.OP_rest || opcode == op.OP_fclosure || opcode == op.OP_fclosure8
     || opcode == op.OP_get_scope0_el || opcode == op.OP_check_ctor || opcode == op.OP_check_ctor_return
     || opcode == op.OP_init_ctor || opcode == op.OP_apply || opcode == op.OP_define_array_el || opcode == op.OP_append
+}
+/// Stream Q's for-in and for-of instructions, generic exits outside OSR code (OSR code steps a
+/// stand-in record itself, and leaves at the others).
+pub fn iterationOpcode(opcode: u8) -> bool {
+  return opcode == op.OP_for_in_start || opcode == op.OP_for_in_next || opcode == op.OP_for_of_start
+    || opcode == op.OP_for_of_next || opcode == op.OP_iterator_close
 }
 /// Refuses the frame instructions (frameGeneric) compiled code cannot run on a copy of the
 /// frame: a mapped arguments object aliases the frame's argument cells; a lazy one is a
@@ -245,11 +254,23 @@ effect fn frameAllowed(input: &FunctionInput, pc: usize) -> () ! Refusal {
     if index >= input.closures.length() || input.closures.get(index) != CLOSURE_SAFE { fail refuse(at, opcode, b"a closure that captures the frame's slots") }
   }
 }
-/// The bottom operands of a generic instruction it leaves on the stack unchanged; the
-/// result, if it pushes more, is the value above them (js_vm.genericKept is the same table).
-pub fn genericKept(opcode: u8) -> usize {
-  if opcode == op.OP_define_array_el { return 2 }
+/// The values a generic instruction at pc leaves on the engine's stack when more than one
+/// (calls.RESULTS_SHIFT; js_vm.compiledOp checks it), or 0 for one at most.
+pub fn genericResults(input: &FunctionInput, pc: usize) -> usize {
+  let opcode = byteAt(input, pc)
+  if opcode == op.OP_for_of_start || opcode == op.OP_for_in_next { return 3 }
+  if opcode == op.OP_for_of_next { return 5 + u8.toUsize(byteAt(input, pc + 1)) }
+  if opcode == op.OP_define_array_el || opcode == op.OP_append || opcode == op.OP_check_ctor_return { return 2 }
+  return 0
+}
+/// The operand cells of such an instruction it leaves as they were (calls.KEPT_SHIFT, bit c:
+/// cell c): the code keeps its own values for them. for_of_next writes only its record's
+/// array and position (js_vm_control.forOfNext), not the marker or the values above it.
+pub fn genericKeptCells(input: &FunctionInput, pc: usize) -> i32 {
+  let opcode = byteAt(input, pc)
+  if opcode == op.OP_define_array_el { return 3 }
   if opcode == op.OP_append || opcode == op.OP_check_ctor_return { return 1 }
+  if opcode == op.OP_for_of_next { return i32.shiftLeft(i32.shiftLeft(1, u8.toI32(byteAt(input, pc + 1)) + 1) - 1, 2) }
   return 0
 }
 
@@ -744,6 +765,8 @@ struct Translator {
   /// Whether an equality site of the function deoptimized: then every equality of a boxed
   /// operand goes through Equals (sites of one function tend to meet the same values).
   wideEquality: bool,
+  /// Translating OSR code (translateOsrWith).
+  osr: bool,
 }
 
 /// Lexical locals that may be uninitialized (still in their TDZ) on entry to each leader, from a
@@ -1744,7 +1767,7 @@ impl Translator {
     if (opcode == op.OP_get_loc_length8 || opcode == op.OP_get_loc_el8) && self.lazyLocal(u8.toUsize(byteAt(input, pc + 1))) {
       fail refuse(at, opcode, b"a fused read of a lazy arguments object")
     }
-    if opcode == op.OP_for_of_next {
+    if opcode == op.OP_for_of_next && self.osr {
       // A stand-in record (js_iterators.forOfStart: the array, then its next index as an Int)
       // steps a fast Array's element here; anything else exits, and the interpreter steps.
       let offset = u8.toUsize(byteAt(input, pc + 1))
@@ -1847,7 +1870,12 @@ impl Translator {
     let mut count = u8.toUsize(info.pops)
     if opcode == op.OP_array_from { count = u16.toUsize(u16At(input, pc + 1)) }
     run frameAllowed(input, pc)
-    let kept = genericKept(opcode)
+    // for_of_next reads its record under `offset` values and leaves them all, with the step's
+    // value and done above.
+    if opcode == op.OP_for_of_next { count = 3 + u8.toUsize(byteAt(input, pc + 1)) }
+    let results = genericResults(input, pc)
+    let keptCells = genericKeptCells(input, pc)
+    if results > i32.toUsize(calls.MAX_RESULTS) || i32.shiftRight(keptCells, usize.toI32(count)) != 0 { fail refuse(at, opcode, b"too many results for a generic instruction") }
     if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many operands for a generic instruction") }
     if self.stack.length() < count { fail refuse(at, opcode, b"generic instruction operands missing") }
     // Boxes come before the call.arg run, which must stay contiguous.
@@ -1860,11 +1888,33 @@ impl Translator {
       drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, operands.get(i), NONE, usize.toI32(i), at)
       i = i + 1
     }
-    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, none, none, usize.toI32(count) | calls.GENERIC, at)
+    let k = usize.toI32(count) | calls.GENERIC | i32.shiftLeft(usize.toI32(results), calls.RESULTS_SHIFT) | i32.shiftLeft(keptCells, calls.KEPT_SHIFT)
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, none, none, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
+    if results != 0 {
+      // Every value it left, read before anything else runs: a kept cell is the operand as it
+      // was, the others the call's and call.result's. A for-of record's new marker (cell 2:
+      // CatchOffset 0, no count) is the immediate the translation pushes for it.
+      let mut values = List<u32>.make()
+      let mut c: usize = 0
+      while c < results {
+        if calls.kept(k, usize.toI32(c)) { run values.append(self.top(count - c)) }
+        else if c == 0 { run values.append(r) }
+        else if c == 2 && opcode == op.OP_for_of_start { let marker = run self.f.emit(self.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, ssa.IMM_CATCH, at) run values.append(marker) }
+        else { let v = run self.f.emit(self.current, Op.CallResult, true, Type.Value, Own.Owned, r, NONE, usize.toI32(c), at) run values.append(v) }
+        c = c + 1
+      }
+      if calls.kept(k, 0) { run self.release(r, at) }
+      // The operands it replaced go; the kept ones move to their cells.
+      i = 0
+      while i < count { let v = self.pop() if !calls.kept(k, usize.toI32(count - 1 - i)) { run self.release(v, at) } i = i + 1 }
+      i = 0
+      while i < values.length() { run self.push(values.get(i)) i = i + 1 }
+      return true
+    }
     i = 0
-    while i < count - kept { let v = self.pop() run self.release(v, at) i = i + 1 }
-    if u8.toUsize(info.pushes) <= kept { run self.release(r, at) } else { run self.push(r) }
+    while i < count { let v = self.pop() run self.release(v, at) i = i + 1 }
+    if info.pushes == 0 { run self.release(r, at) } else { run self.push(r) }
     let next = pc + u8.toUsize(info.size)
     if (opcode == op.OP_fclosure || opcode == op.OP_fclosure8) && next < input.code.length() && byteAt(input, next) == op.OP_set_name
       && self.blockAt.get(next) == NONE { self.namedClosure = next }
@@ -2392,7 +2442,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false }
   t.lazySlot = lazyArgumentsLocal(input)
   if t.lazySlot != usize.MAX { t.lazyAlias = lazyArgumentsCopy(input, t.lazySlot) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -2633,7 +2683,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
