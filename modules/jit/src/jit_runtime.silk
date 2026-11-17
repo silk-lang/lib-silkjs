@@ -25,6 +25,8 @@ import code_memory { CodeMemory, CodeBlock, MemoryError }
 import asm_x64 { Code, LinkError, UnboundLabelError }
 import x64_lower { Lowered }
 import x64_lower as lower
+import jit_recompile { History }
+import jit_recompile as recompile
 
 /// Functions one runtime can have compiled; the table never moves.
 pub const CAPACITY: usize = 4096
@@ -73,14 +75,19 @@ pub struct Jit {
   pub runs: u64,
   pub deopts: u64,
   pub polls: u64,
-  pub unlinked: u64
+  pub unlinked: u64,
+  /// Earlier compilations per function and their deopt sites (jit_recompile).
+  history: History,
+  /// Reports of functions compiled or refused before (recompilations attempted).
+  pub recompiled: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
     let entries = run List<CompiledEntry>.makeWithCapacity(CAPACITY)
     return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, blocks: List<CodeBlock>.make(),
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
-      reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0 }
+      reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
+      history: History.make(), recompiled: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -102,6 +109,7 @@ impl Jit {
     run line.appendSlice(b" deopts ") run decimal(&mut line, self.deopts)
     run line.appendSlice(b" polls ") run decimal(&mut line, self.polls)
     run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
+    run line.appendSlice(b" recompiled ") run decimal(&mut line, self.recompiled)
     run line.appendSlice(b" code-bytes ") run decimal(&mut line, self.codeBytes)
     run line.appendSlice(b" compile-ns ") run decimal(&mut line, self.compileNanoseconds)
     run line.append(10)
@@ -193,7 +201,14 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let anchor = ()
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   if jit.options.dump { run unsafe dumpBytecode(&function) }
-  let lowered = run Effect.result(unsafe lower.lowerFunction(&function, jit.options.stress))
+  let plan = run unsafe jit.history.plan(&function, Pointer.address<HeapHeader>(bytecode), &jit.entries)
+  if plan.recompile { jit.recompiled = jit.recompiled + 1 }
+  if plan.refuse {
+    jit.refused = jit.refused + 1
+    if jit.options.dump { run say(b"jit: refused: ", plan.why) }
+    return ()
+  }
+  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, &plan.sites))
   drop function
   let result = match move lowered {
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
@@ -202,6 +217,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let mut code = match move result {
     Lowered.Code { value } => move value
     Lowered.Refused { reason } => {
+      run jit.history.remember(&plan, recompile.noEntry())
       jit.refused = jit.refused + 1
       if jit.options.dump { run say(b"jit: refused: ", reason.text()) }
       return ()
@@ -209,6 +225,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   }
   let installed = run unsafe install(&mut jit, bytecode, &mut code)
   if !installed { jit.refused = jit.refused + 1 return () }
+  run jit.history.remember(&plan, usize.toU32(jit.entries.length() - 1))
   jit.compiledFunctions = jit.compiledFunctions + 1
   if jit.options.dump { run say(b"jit: compiled", b"") }
 }
@@ -232,7 +249,7 @@ pub unsafe effect fn install(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mu
     stress = unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(Pointer.fromMutRef<i32>(&mut jit.stressCounter))
   }
   let index = jit.entries.length()
-  let added = jit.entries.appendWithinCapacity(CompiledEntry { code: entry, data: stress, deoptLimit: jit.options.deoptLimit, frameCells: 0, leaf: 0, runs: 0, deopts: 0, polls: 0 })
+  let added = jit.entries.appendWithinCapacity(CompiledEntry { code: entry, data: stress, deoptLimit: jit.options.deoptLimit, frameCells: 0, leaf: 0, runs: 0, deopts: 0, polls: 0, deoptPcs: [0; 4], deoptPcCount: 0 })
   if !added { return false }
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
   unsafe runtime.linkCompiled(attached, bytecode, usize.toU32(index))
