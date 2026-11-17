@@ -38,6 +38,8 @@ are compared with.
   jit        {jit} --jit ... {file}             hot functions compiled to x86-64 (docs/jit/compiled-entry.md)
   jit-stress {jit} --jit --jit-stress=3 ...     the same, every function hot at its first entry and
                                                 every third guard check deoptimizing, never unlinked
+  jit-calls  {jit} --jit --jit-calls ...        jit, also compiling functions that make calls
+  jit-calls-stress                              jit-stress with --jit-calls
 
 Adding a configuration: for a one-off run pass `--config NAME=TEMPLATE` (repeatable; the name is
 appended to --configs). To make it permanent, add NAME: TEMPLATE to BUILTIN in this script, and
@@ -74,6 +76,8 @@ BUILTIN = {
     "node": "{node} {file}",
     "jit": "{jit} --jit --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-stress": "{jit} --jit --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
+    "jit-calls": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-calls-stress": "{jit} --jit --jit-calls --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
 }
 REFERENCES = {"node"}
 
@@ -119,7 +123,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
-           "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters"]
+            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters", "calls", "calls"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -267,6 +271,14 @@ class Generator:
         if flavor == "intnest":
             return (f"var t = a; for (var i = 0; i < {self.pick([2, 4])}; i++) {{ for (var j = i; j < {self.pick([3, 6])}; j++) "
                     f"{{ t = {self.pick(['t + i * j - b', 't - j + a', 't * 2 - i'])}; }} }} return t;")
+        if flavor == "calls":
+            # Calls from a loop: a method of the argument (bytecode or native), the same function
+            # taken out and called without a receiver, through call and apply, and an argument
+            # that is not callable at all (a TypeError) once the types change.
+            call = self.pick(["a.f(i, b)", "a.g(i, b)", "h(i)", "a.f.call(a, b, i)", "a.f.apply(a, [i, b])", "a.f(a.f(i), i)",
+                              "b(i)", "a.k(i)"])
+            return (f"var t = {self.pick(['0', 'b', '1'])}; var h = a.f; for (var i = 0; i < {self.pick([2, 3, 6])}; i++) "
+                    f"{{ t = {self.pick(['t + ' + call, '(t ^ ' + call + ')', '__clamp(t * 2 + ' + call + ')'])}; }} return t;")
         if flavor == "intbranch":
             return (f"var t = a; for (var i = 0; i < {self.pick([4, 9])}; i++) {{ if (t {self.pick(['>', '<', '>=', '==='])} b) "
                     f"t = t - {self.pick(['i', '1', 'a'])}; else t = t + {self.pick(['2 * i', 'b', '3'])}; }} return t;")
@@ -340,6 +352,12 @@ class Generator:
             return self.pick([f"new {other}([i + 0.5, -0, NaN, 300, -129])", f"new {other}({self.pick([0, 1, 8])})",
                               "new BigInt64Array([1n, -2n])", f"new {other}([i, i]).subarray(1)",
                               "new Uint8Array(new Float64Array([i + 0.5]).buffer)"])
+        if kind == "withf":
+            # Methods: a closure reading its receiver (sloppy, so a missing receiver is the global
+            # object), a native, and one that throws for some inputs.
+            return self.pick(["{x: i, f: function (v, w) { return (v * 3 + (this.x | 0)) | 0; }, g: Math.max, "
+                              "k: function (v) { if (v > 4) throw new RangeError('k' + v); return v; }}",
+                              "{x: i, f: Math.min, g: function (v) { return typeof v; }, k: Math.abs}"])
         if kind == "odd":
             return self.pick(["null", "undefined", "true", "{valueOf: function () { return i; }}", "Symbol.iterator"])
         raise ValueError(kind)
@@ -355,12 +373,12 @@ class Generator:
             lines.append(self.function())
         names = [f"f{n}" for n in range(count)]
         stable = self.pick([("int", "int"), ("int", "int"), ("objectA", "objectA"), ("double", "double"),
-                            ("array", "int"), ("typed", "int"), ("int", "typed")])
+                            ("array", "int"), ("typed", "int"), ("int", "typed"), ("withf", "int")])
         # Stable types, hot enough for a tiering engine to specialise each function.
         for name in names:
             lines += self.loop(f"hot {name}", self.hot, name, stable)
         # Changed types and shapes: what was specialised must be given up.
-        kinds = ["int", "big", "double", "string", "objectA", "objectB", "array", "typed", "typedB", "odd"]
+        kinds = ["int", "big", "double", "string", "objectA", "objectB", "array", "typed", "typedB", "odd", "withf"]
         for name in names:
             changed = (self.pick(kinds), self.pick(kinds))
             lines += self.loop(f"types {name}", self.pick([3, 17, 64]), name, changed)
