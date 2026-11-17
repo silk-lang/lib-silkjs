@@ -6,8 +6,9 @@ It replaces `t3/jit-compiler-plan` (based on the older `86c3e4db`) as the coordi
 ## Objective and standing constraints
 
 Build an optional JIT that competes with V8 and JavaScriptCore on measured throughput, startup,
-warmup, latency and memory. No result yet establishes JIT parity or a performance win: no
-JavaScript is compiled to machine code anywhere in this repository.
+warmup, latency and memory. No result yet establishes JIT parity. Since 2026-11-17 one narrow
+kind of function (integer arithmetic and loops, no calls) is compiled to x86-64 by the separate
+`silkjs-jit-shell` executable; it does not move any benchmark yet.
 
 - Interpreter-only SilkJS stays a first-class, easily embedded product. The engine does not import
   `modules/jit`; interpreter regressions are measured, not assumed away.
@@ -56,8 +57,8 @@ configuration.
 | 3. Differential harness | Done for the interpreter: widened generator, per-area self-test, `silk task differential`, a step in `silk task check` |
 | 4. Engine seam | Mapped in [tier-seam.md](tier-seam.md); per-function hotness counting with an embedder slot is in the engine. Hook design beyond that is open |
 | 5. Machine-code foundations | x86-64 encoder and executable memory done for Linux x86-64 |
-| 6. Feedback and ownership-aware SSA | Feedback recorder ([feedback.md](feedback.md)) and SSA form with a bytecode translator ([ssa.md](ssa.md)) merged; the first compiled function with deoptimization is in progress in a separate session |
-| 7. Optimizations | Not started |
+| 6. Feedback and ownership-aware SSA | Done: feedback recorder ([feedback.md](feedback.md)), SSA form and translator ([ssa.md](ssa.md)), first compiled function with deoptimization ([compiled-entry.md](compiled-entry.md)) |
+| 7. Optimizations | Started 2026-11-17 in five sessions (see "Milestone 7") |
 
 ## The plan as recovered (milestone definitions)
 
@@ -258,15 +259,23 @@ In the engine (`c56dd8d`): `FunctionBytecode.hotness` counts entries down from
 generator and async resumption, back edges. So a function entered rarely that loops for long is
 never reported; on-stack replacement is open.
 
-Interpreter-only cost, `python3 scripts/v8bench.py --instructions` against the binary without
-the hook, measured twice (by the worker and again by the lead on another host, same ratios):
-richards 0.999x, deltablue 1.000x, crypto 1.000x, raytrace 0.999x, earley-boyer 1.008x, regexp
-1.001x, splay 1.001x, navier-stokes 1.000x. The 0.5 percent target is met on seven of eight
-and MISSED on earley-boyer (+0.8 percent). The worker measured that +0.58 of it appears in a
-control build that has the new fields but counts nothing, and traced it with callgrind to an
-address-keyed 4-way cache on the call path that takes more probes once heap cells move
-(tier-seam.md, open question 7). The lead did not rerun the control build. Whether to accept
-this, shrink the field, or fix that cache is undecided.
+Interpreter-only cost. As first merged, `python3 scripts/v8bench.py --instructions` against the
+binary without the hook (`42b98426`) gave earley-boyer 1.008x and everything else within 0.1
+percent (measured by the worker and again by the lead). The cause was not the counter:
+`js_gc.receiverWay`, the constructor receiver cache (16 sets of 4 ways keyed by cell address,
+probed in order), took more probes once `FunctionBytecode` grew and earley-boyer's pair
+constructor moved from way 0 to way 2 (worker's callgrind measurement; tier-seam.md, "The
+receiver cache fix"). Fixed in `633aede` and following: keys moved into
+`RuntimeState.receiverFunctions`, a per-set last-hit hint probed first.
+
+Current state, measured by the lead at `e889c65e`: the no-hook binary `42b98426` against the
+integration head with the hook, the feedback recorder, the compiled-entry slot and the cache fix,
+no JIT attached: richards 0.999x, deltablue 1.000x, crypto 1.000x, raytrace 1.001x,
+earley-boyer 1.001x, regexp 1.001x, splay 1.001x, navier-stokes 1.000x. The 0.5 percent target
+is met on all eight. On that binary: `differential.py --count 500 --configs
+plain,observed,jit,jit-stress,node` exit 0, agree 500; the hotness test exit 0; the JIT suite
+exit 0, 50 passed; `tests/silkjs/receiver_cache_sets.js` exit 0. `silk task check` was not
+rerun by the lead after this last merge (the worker ran it: only the two known failures).
 
 `src/js_hotness_tests.silk` fails when the hook stops firing: with `deliverHot` commented out in
 `js_interrupts.handle` it fails with "an inline frame's function is reported once" (the lead
@@ -312,6 +321,42 @@ functions after one run of each v8 benchmark the translator accepts 28, the veri
 none. First refusals, largest first (worker's count): `push_this` 190, `get_var` 80, function
 scopes and scope reads 52.
 
+## First compiled function (milestone 6, part 3)
+
+[compiled-entry.md](compiled-entry.md) is the design as built. `modules/jit/shell` builds
+`silkjs-jit-shell`, the engine CLI plus `modules/jit` (flags `--jit`, `--jit-threshold=N`,
+`--jit-stress=N`, `--jit-deopt-limit=N`, `--jit-stats`, `--jit-dump`); the engine's own
+executable never links the JIT. The shell sets the hot-function handler, which runs bytecode
+through `ssa_translate`, `ssa_ownership.optimize`, `ssa_verify` and `x64_backend`, and links the
+code through an embedder-owned table (`js_runtime.setCompiledTable`, `linkCompiled`);
+`FunctionBytecode.compiled` is an index into it. `callInternal` and `callKnown` enter compiled
+code through `js_compiled.enter` after building the interpreter frame. Inline call sites
+refuse a linked function for free (linking sets `frameCells` to the stub sentinel). A guard
+failure (non-int32 argument, overflow) or an interrupt poll returns a frame state; the engine
+writes it into the interpreter frame and the interpreter continues at that bytecode offset. A
+function is unlinked after 8 deoptimizations.
+
+Rerun by the lead at `0e940d3a` (each exit status as shown):
+
+| Command | Exit | Result |
+| --- | --- | --- |
+| `silk test --manifest-path modules/jit/silk.toml --no-cache` | 0 | 50 passed |
+| `silk build --release` in `modules/engine`, then in `modules/jit/shell` | 0 | about 6 minutes each |
+| `python3 scripts/v8bench.py --instructions` (feedback-merge binary against this one, no JIT attached) | 0 | 1.000x on seven; regexp 0.984x, which is run-to-run noise of that benchmark (the same baseline binary gave 1,357,6xx,xxx and 1,380,2xx,xxx on two runs) |
+| `python3 scripts/differential.py --count 3000 --configs plain,observed,jit,jit-stress,node` | 0 | agree 3000; jit: 994 programs ran compiled code, 978 deoptimized, 1166 functions compiled, 32468 refused; jit-stress: 1035 and 995 |
+| `silk task check` | 1 | native suite 564 passed, 2 failed (the known two); 272 other steps PASS |
+
+Measured by the lead, one host, whole process, median of 7 runs, 2,000,000 calls of
+`function sum(n){let s=0;for(let i=0;i<n;i++)s=s+i;return s}` with n = 100: jsc with JIT 127 ms,
+Node 24 with JIT 123 ms, silkjs-jit-shell `--jit` 662 ms, jsc `--useJIT=false` 1277 ms, silkjs
+interpreter 1299 ms, Node `--jitless` 2583 ms, qjs 3336 ms. This is one function, not a
+benchmark. Empty-script start is about 28 ms of Node's time and 10 ms of jsc's.
+
+Limits as built: compiled code makes no calls, holds no heap reference, has no doubles; leaf
+functions never get hot; a poll exit ends compiled execution for the rest of that call (in the
+timing above 19,889 of 1,999,000 runs left that way); the interpreter frame is built before
+every compiled entry; register assignment is naive.
+
 ## Ahead-of-time compilation: what is known
 
 Julia's direction (2026-11-16): start AOT only if it is cheap, meaning the same compiler run at
@@ -320,9 +365,12 @@ translated in two runtime instances gives byte-identical translator input and IR
 (`independentOfTheRuntimeInstance`). That holds because the subset has no atom, constant,
 closure or realm operand. As it grows these need re-resolving at load time: atom numbers in
 the code bytes are per runtime, constants and function constants need table indices, shape
-versions are runtime ids. The machine-code side (link compiled code at another address in a
-second runtime and run it, deoptimization included) is being checked with the first compiled
-function. No file format or cache exists.
+versions are runtime ids. The machine-code side passes too (`jit_engine_tests.compiledCodeLoadsIntoAnotherRuntime`):
+code lowered in one runtime is carried as bytes plus relocation records, linked at another
+address in a fresh runtime, run and deoptimized. The artefact has zero relocations and depends
+only on the bytecode it came from. So for the call-free subset, compiling ahead is the same
+compiler run at another time; it stops being free at calls, shapes and atoms. No file format
+or cache exists, and none was started.
 
 ## Engine restructuring is allowed
 
@@ -338,7 +386,10 @@ integration is better for it. Restructures the workers proposed and did not do:
 - atom operands as indices into a per-function atom list, so code bytes do not depend on the
   runtime;
 - fixed-layout captured-variable slots (about 12 percent of translator refusals);
-- redesigning the address-keyed call cache (tier-seam.md, open question 7).
+- entering compiled code before building the interpreter frame, and building it only on
+  deoptimization; dispatching to compiled code from inline call sites;
+- letting leaf functions get hot or run compiled frameless;
+- polling without leaving compiled code.
 
 ## How the work was split
 
@@ -354,20 +405,80 @@ only one that edits this file. The briefs are in the Silk UI project's shared fi
 | C. Differential harness widening | `claude/project-thread-sisu3y` (`b4fbe1b`) | yes |
 | F. Call and type feedback | `claude/project-thread-kuzo60` (`5569a15`) | yes |
 | G. SSA form and translator | `claude/project-thread-38jcx9` (`1fe07af`) | yes |
-| D. Call cache behind the earley-boyer cost | running | no |
-| E. Compiled entry, deoptimization, first compiled function | `claude/project-thread-do7odg`, running | no |
+| D. Receiver cache behind the earley-boyer cost | `claude/project-thread-rdl3vl` (`7a62053`) | yes |
+| E. Compiled entry, deoptimization, first compiled function | `claude/project-thread-do7odg` (`0e940d3a`) | yes |
+
+## Milestone 7 (started 2026-11-17)
+
+Five sessions, briefs in the project's shared files (`jit/briefs/M7-common.md` and one file
+each). Every one must pass `differential.py --count 3000 --configs
+plain,observed,jit,jit-stress,node` with counters proving its feature ran compiled, keep
+interpreter-only instruction counts within 0.5 percent, and show before/after on the
+benchmarks it targets.
+
+| Workstream | Scope |
+| --- | --- |
+| H. Calls and frames | compiled entry before frame setup, inline call sites dispatching to compiled code, leaf functions, calls from compiled code, exceptions through compiled frames, then inlining |
+| I. Loops | polls without leaving compiled code, loop hotness, on-stack replacement (navier-stokes compiles nothing today) |
+| J. Objects | owned values in compiled code, `this`, property reads and writes with shape guards from feedback, globals, scope variables, fast array elements |
+| K. Doubles and code quality | unboxed doubles, recompilation from feedback, remaining operators, typed arrays and Math intrinsics, register allocation |
+| L. Measurement | a `silkjs-jit` column in the comparison harness, per-benchmark compile coverage, feature kernels against V8 and JSC, `docs/jit/jit-scorecard.md` as a dated series |
+
+### Milestone 7 progress
+
+Merged so far, with the lead's own reruns (2026-11-17, all RAN on this host unless marked):
+
+| Merge | Head | What it adds | Lead's checks |
+| --- | --- | --- | --- |
+| K. Doubles and code quality | `f87c61d3` | f64 values in SSA, remaining arithmetic and comparison operators, short jumps, guard removal, recompilation after deopt (`deoptPcs` in `CompiledEntry`, hotness rearmed on unlink, at most 2 recompiles), linear-scan register allocation, J's ABI | JIT tests 65 passed; `encodings.py --check` current; engine and shell release builds exit 0; `v8bench.py --instructions` against the 14e41811 engine 1.000x on all eight; `differential.py --count 3000 --configs plain,observed,jit,jit-stress,node` agree 3000, mismatch 0 (jit: compiled 1850, deopts 13214, recompiled 1607); `--self-test` PASS; native suite 564 passed, 2 failed (the two known `js_for_in_tests`) |
+| L. Measurement | `e47ae731` (merge of `d473e12`) | `silkjs-jit` harness column, `bench/kernels/`, `scripts/jit_kernels.py`, `scripts/jit_coverage.py`, `docs/jit/jit-scorecard.md` | JIT tests 65 passed; builds exit 0; differential 600 agree; `jit_kernels.py --rounds 7` exit 0 (table below) |
+
+A first gate run on K's earlier head `ea2ca9d` timed out in the differential (exit 124): three
+seeds ended `timeout` in every configuration because a new generator flavour (numloop) produced
+programs that ran too long. `f87c61d3` fixes the generator; it was not an engine fault.
+
+The shared compiled-code ABI is frozen (J, `a6c063b`, already inside K's merge):
+`CompiledCode = extern "C" fn(args, state, counter, data, env, frame) -> u32`, `stateWords = 3 +
+2*(locals+stack)`, a return writes an owned ValueBits to words 0-1 and the return pc to word 2,
+an exit writes pc, depth and one ValueBits per slot. `CompiledEnv.helpers[128]` is split J 0-31,
+H 32-63, I 64-95, K 96-127.
+
+Kernels at `e47ae731`, MEASURED by the lead (`python3 scripts/jit_kernels.py --rounds 7`, ms per
+`kernel()` call, median of 7 processes; compile and warmup included, startup excluded):
+
+| Kernel | silkjs | silkjs-jit | v8-jit | jsc-jit | silkjs-jit vs v8 / jsc | Compiled? |
+| --- | --- | --- | --- | --- | --- | --- |
+| sum-calls | 128.3 | 37.9 | 10.7 | 11.7 | 3.5x / 3.2x | yes |
+| sum-long | 191.9 | 163.9 | 21.4 | 11.8 | 7.7x / 13.9x | never reported hot (needs I's OSR) |
+| nested | 152.4 | 49.2 | 10.6 | 25.4 | 4.7x / 1.9x | yes |
+| calls | 189.5 | 204.3 | 6.4 | 8.3 | 31.8x / 24.5x | refused (needs H) |
+| method | 264.0 | 291.2 | 9.4 | 12.6 | 31.1x / 23.1x | refused (needs H, J) |
+| doubles | 118.2 | 39.1 | 15.8 | 17.7 | 2.5x / 2.2x | yes |
+| array-sum | 197.5 | 213.7 | 13.3 | 12.6 | 16.1x / 17.0x | refused (needs J) |
+| typed-array | 377.9 | 373.8 | 13.2 | 10.0 | 28.3x / 37.5x | refused (needs J, K) |
+
+Where code compiles it is 2.2x to 4.7x behind V8 and JSC; where it is refused it runs at
+interpreter speed, 16x to 38x behind. Octane as a whole does not move yet (L, worker-measured at
+14e41811: geomean silkjs 5959, silkjs-jit 5858, v8-jit 54836, jsc-jit 52714), because at most
+0.014 percent of any benchmark's instructions run compiled. The most-blocking refusal is
+`push_this` (602 hot functions), then `get_arg_field8` (107) and `get_var` (94).
+
+Open finding (L, worker-measured, sent to H): Box2D executes 4.3 percent more instructions with
+`--jit`, with only 2 functions compiled. Hypothesis, read not proved: linking sets
+`STUB_FRAME_CELLS`, the inline call path refuses, and callers build a real arguments object.
+
+Not merged yet (heads as reported by the workers; each conflicts with K's merge in the SSA and
+backend files and must merge the integration branch first): I `c84db2e` on
+`claude/project-thread-xytm2y` (OSR, poll re-entry, loop hotness), H `fd3a8307` on
+`claude/project-thread-g1zedu` (direct compiled entry from inline call sites), J `b7b8c7f` on
+`claude/project-thread-k45qjk` (real retain/release, property reads through a helper).
 
 ## Next steps
 
-1. Decide what to do about the earley-boyer miss (accept, or fix the address-keyed cache), and
-   whether to count back edges or sample at the interrupt poll for loops (tier-seam.md).
-2. Milestone 6: call and type feedback, an ownership-aware SSA form on the existing reference
-   counting, and one narrow function compiled end to end (integer arithmetic and a loop) using
-   `modules/jit`'s encoder and code memory, with deoptimization to an interpreter frame at a
-   bytecode boundary. Add it to `scripts/differential.py` as a new configuration
-   (`--config jit=...` or a `BUILTIN` entry) before trusting it. Open design point from the seam
-   document: whether a compiled frame lives in the call-frame region like an inline frame or on
-   the native stack (open question 5), and how it presents itself to `unwind`.
+1. Merge milestone 7 sub-steps as they pass their checks, rerunning each one's key commands.
+2. Decide from L's coverage numbers which refusal reasons to remove next.
+3. Open from earlier milestones: no pause or p99 measurement, no `d8` column, feedback has no
+   consumer yet (K's recompilation is the first), and AOT has no file format.
 
 Every session doing this work needs `silk-lang/silk` attached with GitHub API access as well as
 `silk-lang/lib-silkjs`: the Silk installer reads the release API and gets HTTP 403 otherwise

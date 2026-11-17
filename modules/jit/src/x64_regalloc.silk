@@ -1,0 +1,368 @@
+//! Register allocation for x64_backend (docs/jit/ssa.md, "Register allocation"): linear scan
+//! over one live interval per value, on the compacted, verified function.
+//!
+//! Order. Blocks are in reverse postorder; instruction i sits at position 2i + 2, its operands
+//! and exit slots are read there and its result is written at 2i + 3. A block's parameters are
+//! written at its start, 2 * firstInst + 1. Because lowering reads every operand into scratch
+//! registers and writes the result last, after any exit, an operand whose interval ends where a
+//! result's begins may share its register.
+//!
+//! Liveness is the usual backward pass over blocks in reverse order (Wimmer and Franz, "Linear
+//! Scan Register Allocation on SSA Form"): a block's live-out is its successors' live-in plus
+//! its edge arguments, and a value live into a loop header is live through the whole loop. Each
+//! value then gets the hull of its live ranges, from its definition to its last live position:
+//! coarse but safe, since a definition comes first in reverse postorder.
+//!
+//! Pools. Integers and bools take rbx, r12, r13, r14, r15: callee-saved, so they survive the
+//! helper calls compiled code makes, and the prologue saves those it uses. Doubles take xmm2 to
+//! xmm15. rax, rcx, rdx, rsi, rdi, r8 to r11 and xmm0, xmm1 stay with the lowering (scratch, and
+//! the ABI's state, counter and stress words). A `value` (16 bytes) always lives in its slot.
+//! When a pool runs out, the interval that ends furthest away is spilled to its slot.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import asm_x64 { Alu, Assembler, Mem, PackedOp, Reg, ScalarOp, Width, Xmm }
+import ssa { Function, Op, Type, NONE, edgeCount, readsK }
+import silk.num.i32
+import ssa_verify { readsA, readsB }
+
+pub const SPILL: u8 = 0
+pub const GPR: u8 = 1
+pub const XMM: u8 = 2
+
+/// Where a value lives for its whole life: its slot (`mem`) when `kind` is SPILL, else `gpr`
+/// or `xmm`.
+pub struct Place { pub kind: u8, pub gpr: Reg, pub xmm: Xmm, pub mem: Mem }
+impl Copy for Place {}
+
+/// A spilled place at mem.
+pub fn spilled(mem: Mem) -> Place { return Place { kind: SPILL, gpr: Reg.Rax, xmm: Xmm.Xmm0, mem: mem } }
+
+/// The outcome of `allocate`: one kind and register per value, and which callee-saved
+/// integer registers the code uses.
+pub struct Allocation {
+  pub kinds: List<u8>,
+  pub registers: List<u8>,
+  /// Bit n: GPRS[n] is used.
+  pub savedMask: u32,
+  /// Interval bounds, for the tests' checker.
+  pub starts: List<u32>,
+  pub ends: List<u32>,
+}
+
+const GPR_COUNT: usize = 5
+const XMM_COUNT: usize = 14
+
+/// The integer pool, in the order the scan hands it out.
+pub fn gprAt(index: usize) -> Reg {
+  if index == 0 { return Reg.Rbx }
+  if index == 1 { return Reg.R12 }
+  if index == 2 { return Reg.R13 }
+  if index == 3 { return Reg.R14 }
+  return Reg.R15
+}
+pub fn gprCount() -> usize { return GPR_COUNT }
+fn xmmAt(index: usize) -> Xmm {
+  if index == 0 { return Xmm.Xmm2 }
+  if index == 1 { return Xmm.Xmm3 }
+  if index == 2 { return Xmm.Xmm4 }
+  if index == 3 { return Xmm.Xmm5 }
+  if index == 4 { return Xmm.Xmm6 }
+  if index == 5 { return Xmm.Xmm7 }
+  if index == 6 { return Xmm.Xmm8 }
+  if index == 7 { return Xmm.Xmm9 }
+  if index == 8 { return Xmm.Xmm10 }
+  if index == 9 { return Xmm.Xmm11 }
+  if index == 10 { return Xmm.Xmm12 }
+  if index == 11 { return Xmm.Xmm13 }
+  if index == 12 { return Xmm.Xmm14 }
+  return Xmm.Xmm15
+}
+
+impl Allocation {
+  /// The place of value v, whose slot is mem.
+  pub fn place(self: &Self, v: u32, mem: Mem) -> Place {
+    let kind = self.kinds.get(u32.toUsize(v))
+    let index = u8.toUsize(self.registers.get(u32.toUsize(v)))
+    if kind == GPR { return Place { kind: GPR, gpr: gprAt(index), xmm: Xmm.Xmm0, mem: mem } }
+    if kind == XMM { return Place { kind: XMM, gpr: Reg.Rax, xmm: xmmAt(index), mem: mem } }
+    return spilled(mem)
+  }
+  /// The register index of v within its pool (meaningful when kind is not SPILL).
+  pub fn register(self: &Self, v: u32) -> u8 { return self.registers.get(u32.toUsize(v)) }
+  pub fn kind(self: &Self, v: u32) -> u8 { return self.kinds.get(u32.toUsize(v)) }
+}
+
+fn position(inst: u32) -> u32 { return inst * 2 + 2 }
+fn blockStart(f: &Function, b: u32) -> u32 { return f.blocks.get(u32.toUsize(b)).firstInst * 2 + 1 }
+fn blockEnd(f: &Function, b: u32) -> u32 {
+  let block = f.blocks.get(u32.toUsize(b))
+  return position(block.firstInst + block.instCount - 1)
+}
+
+struct Live { words: usize, bits: List<u64> }
+impl Live {
+  fn has(self: &Self, set: usize, v: u32) -> bool {
+    let word = self.bits.get(set * self.words + u32.toUsize(v / 64))
+    return u64.bitAnd(u64.shiftRight(word, u32.toU64(v % 64)), 1) != 0
+  }
+  fn put(self: &mut Self, set: usize, v: u32, on: bool) -> () {
+    let index = set * self.words + u32.toUsize(v / 64)
+    let bit = u64.shiftLeft(1, u32.toU64(v % 64))
+    let word = self.bits.get(index)
+    if on { self.bits.set(index, u64.bitOr(word, bit)) } else { self.bits.set(index, u64.bitAnd(word, u64.bitXor(bit, 18446744073709551615))) }
+  }
+  /// set |= other
+  fn join(self: &mut Self, set: usize, other: usize) -> () {
+    let mut w: usize = 0
+    while w < self.words {
+      let a = self.bits.get(set * self.words + w)
+      let b = self.bits.get(other * self.words + w)
+      self.bits.set(set * self.words + w, u64.bitOr(a, b))
+      w = w + 1
+    }
+  }
+}
+
+fn extend(ends: &mut List<u32>, v: u32, end: u32) -> () {
+  let index = u32.toUsize(v)
+  if ends.get(index) == NONE || ends.get(index) < end { ends.set(index, end) }
+}
+
+/// Allocates registers for f, which must be compacted and verified.
+pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+  let values = f.valueCount()
+  let count = f.blockCount()
+  let mut starts = List<u32>.make()
+  run starts.appendRepeated(NONE, u32.toUsize(values))
+  let mut ends = List<u32>.make()
+  run ends.appendRepeated(NONE, u32.toUsize(values))
+  // Definitions.
+  let mut b: u32 = 0
+  while b < count {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut p: u32 = 0
+    while p < block.paramCount { starts.set(u32.toUsize(f.paramAt(block, p)), blockStart(&f, b)) p = p + 1 }
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if inst.result != NONE { starts.set(u32.toUsize(inst.result), position(i) + 1) }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  // Live sets: one per block (live-in) plus a working set at index count.
+  let words = u32.toUsize(values / 64 + 1)
+  let mut live = Live { words: words, bits: List<u64>.make() }
+  run live.bits.appendRepeated(0, words * (u32.toUsize(count) + 1))
+  let work = u32.toUsize(count)
+  b = count
+  while b > 0 {
+    b = b - 1
+    let block = f.blocks.get(u32.toUsize(b))
+    let start = blockStart(&f, b)
+    let end = blockEnd(&f, b)
+    let mut w: usize = 0
+    while w < words { live.bits.set(work * words + w, 0) w = w + 1 }
+    let term = f.terminator(block)
+    if term.edge != NONE {
+      let mut e: u32 = 0
+      while e < edgeCount(term.op) {
+        let edge = f.edge(term.edge + e)
+        if edge.target > b { live.join(work, u32.toUsize(edge.target)) }
+        let mut g: u32 = 0
+        while g < edge.argCount { live.put(work, f.edgeArg(edge, g), true) g = g + 1 }
+        e = e + 1
+      }
+    }
+    // Everything live out is live through the block, as far as its definition.
+    let mut v: u32 = 0
+    while v < values { if live.has(work, v) { extend(&mut ends, v, end) } v = v + 1 }
+    let mut i = block.firstInst + block.instCount
+    while i > block.firstInst {
+      i = i - 1
+      let inst = f.inst(i)
+      if inst.result != NONE { live.put(work, inst.result, false) }
+      let at = position(i)
+      if readsA(inst.op) && inst.a != NONE { live.put(work, inst.a, true) extend(&mut ends, inst.a, at) }
+      if readsB(inst.op) && inst.b != NONE { live.put(work, inst.b, true) extend(&mut ends, inst.b, at) }
+      if readsK(inst.op) { let third = i32.wrappingToU32(inst.k) live.put(work, third, true) extend(&mut ends, third, at) }
+      if inst.exit != NONE {
+        let exit = f.exit(inst.exit)
+        let mut s: u32 = 0
+        while s < f.localCount + exit.stackDepth {
+          let slotValue = f.slot(exit, s).value
+          live.put(work, slotValue, true) extend(&mut ends, slotValue, at)
+          s = s + 1
+        }
+      }
+    }
+    let mut p: u32 = 0
+    while p < block.paramCount { live.put(work, f.paramAt(block, p), false) p = p + 1 }
+    // A loop header: what is live into it is live to the end of its last back edge.
+    let mut loopEnd: u32 = 0
+    let mut s: u32 = b
+    while s < count {
+      let source = f.blocks.get(u32.toUsize(s))
+      let st = f.terminator(source)
+      if st.edge != NONE {
+        let mut e: u32 = 0
+        while e < edgeCount(st.op) { if f.edge(st.edge + e).target == b { loopEnd = blockEnd(&f, s) } e = e + 1 }
+      }
+      s = s + 1
+    }
+    v = 0
+    while v < values {
+      if live.has(work, v) {
+        if loopEnd != 0 { extend(&mut ends, v, loopEnd) }
+        extend(&mut ends, v, start)
+      }
+      v = v + 1
+    }
+    w = 0
+    while w < words { let word = live.bits.get(work * words + w) live.bits.set(u32.toUsize(b) * words + w, word) w = w + 1 }
+  }
+  // A value nothing reads still needs somewhere to be written.
+  let mut v: u32 = 0
+  while v < values {
+    let index = u32.toUsize(v)
+    if ends.get(index) == NONE || ends.get(index) < starts.get(index) { ends.set(index, starts.get(index)) }
+    v = v + 1
+  }
+  return run scan(&f, move starts, move ends)
+}
+
+effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+  let values = f.valueCount()
+  let mut kinds = List<u8>.make()
+  run kinds.appendRepeated(SPILL, u32.toUsize(values))
+  let mut registers = List<u8>.make()
+  run registers.appendRepeated(0, u32.toUsize(values))
+  // Candidates by start, then value.
+  let mut order = List<u64>.make()
+  let mut v: u32 = 0
+  while v < values {
+    let ty = f.value(v).ty
+    // xmm registers are caller-saved: a double live across a helper call stays in its slot.
+    let crosses = ty == Type.F64 && crossesCall(&f, starts.get(u32.toUsize(v)), ends.get(u32.toUsize(v)))
+    if (ty == Type.I32 || ty == Type.Bool || ty == Type.F64) && starts.get(u32.toUsize(v)) != NONE && !crosses {
+      run order.append(u64.bitOr(u64.shiftLeft(u32.toU64(starts.get(u32.toUsize(v))), 32), u32.toU64(v)))
+    }
+    v = v + 1
+  }
+  run order.sort()
+  // The value holding each register (integers first, then doubles), or NONE.
+  let mut owners = List<u32>.make()
+  run owners.appendRepeated(NONE, GPR_COUNT + XMM_COUNT)
+  let mut saved: u32 = 0
+  let mut k: usize = 0
+  while k < order.length() {
+    let v = u64.wrappingToU32(order.get(k))
+    let start = starts.get(u32.toUsize(v))
+    let double = f.value(v).ty == Type.F64
+    let mut first: usize = 0
+    let mut last = GPR_COUNT
+    if double { first = GPR_COUNT last = GPR_COUNT + XMM_COUNT }
+    // Expire what ended before this start; take a free register.
+    let mut free = usize.MAX
+    let mut r = first
+    while r < last {
+      let owner = owners.get(r)
+      if owner != NONE && ends.get(u32.toUsize(owner)) < start { owners.set(r, NONE) }
+      if owners.get(r) == NONE && free == usize.MAX { free = r }
+      r = r + 1
+    }
+    if free == usize.MAX {
+      // Spill whichever of v and the holders ends last.
+      let mut furthest = usize.MAX
+      let mut furthestEnd = ends.get(u32.toUsize(v))
+      r = first
+      while r < last {
+        let end = ends.get(u32.toUsize(owners.get(r)))
+        if end > furthestEnd { furthest = r furthestEnd = end }
+        r = r + 1
+      }
+      if furthest != usize.MAX {
+        kinds.set(u32.toUsize(owners.get(furthest)), SPILL)
+        free = furthest
+      }
+    }
+    if free != usize.MAX {
+      owners.set(free, v)
+      let index = free - first
+      if double { kinds.set(u32.toUsize(v), XMM) } else { kinds.set(u32.toUsize(v), GPR) saved = u32.bitOr(saved, u32.shiftLeft(1, usize.toU32(index))) }
+      registers.set(u32.toUsize(v), usize.wrappingToU8(index))
+    }
+    k = k + 1
+  }
+  return Allocation { kinds: move kinds, registers: move registers, savedMask: saved, starts: move starts, ends: move ends }
+}
+
+// ---- reading and writing places ----
+
+/// dst = the i32 or bool at p (zero-extended).
+pub effect fn getI32(a: &mut Assembler, dst: Reg, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == GPR { if p.gpr != dst { run a.mov(Width.W32, dst, p.gpr) } return () }
+  run a.load(Width.W32, dst, p.mem)
+}
+/// p = the i32 or bool in src, which holds it zero-extended.
+pub effect fn putI32(a: &mut Assembler, p: Place, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == GPR { if p.gpr != src { run a.mov(Width.W32, p.gpr, src) } return () }
+  run a.store(Width.W64, p.mem, src)
+}
+/// dst op= the i32 at p.
+pub effect fn aluWith(a: &mut Assembler, op: Alu, dst: Reg, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == GPR { run a.alu(op, Width.W32, dst, p.gpr) return () }
+  run a.aluLoad(op, Width.W32, dst, p.mem)
+}
+/// dst = the double at p.
+pub effect fn getF64(a: &mut Assembler, dst: Xmm, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { if p.xmm != dst { run a.packed(PackedOp.Movapd, dst, p.xmm) } return () }
+  run a.loadDouble(dst, p.mem)
+}
+/// p = the double in src.
+pub effect fn putF64(a: &mut Assembler, p: Place, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { if p.xmm != src { run a.packed(PackedOp.Movapd, p.xmm, src) } return () }
+  run a.storeDouble(p.mem, src)
+}
+/// dst = the bits of the double at p.
+pub effect fn getBits(a: &mut Assembler, dst: Reg, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { run a.doubleToBits(dst, p.xmm) return () }
+  run a.load(Width.W64, dst, p.mem)
+}
+/// p = the double whose bits are in src.
+pub effect fn putBits(a: &mut Assembler, p: Place, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { run a.bitsToDouble(p.xmm, src) return () }
+  run a.store(Width.W64, p.mem, src)
+}
+/// dst = dst op the double at p (or op of it, for sqrt).
+pub effect fn scalarWith(a: &mut Assembler, op: ScalarOp, dst: Xmm, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { run a.scalar(op, dst, p.xmm) return () }
+  run a.scalarLoad(op, dst, p.mem)
+}
+
+/// Whether lowering `op` calls a helper (x64_backend callHelper), which may change rax, rcx,
+/// rdx, rsi, rdi, r8 to r11 and every xmm register.
+pub fn callsOut(op: Op) -> bool {
+  return op == Op.Release || op == Op.GetField || op == Op.PutField || op == Op.AtomValue || op == Op.GetVar
+    || op == Op.PutVar || op == Op.GetScope || op == Op.PutScope || op == Op.GetElem || op == Op.PutElem
+    || op == Op.GetLength
+}
+/// Whether an instruction that calls out reads its operands strictly inside [start, end]:
+/// a value defined before it and read after it.
+fn crossesCall(f: &Function, start: u32, end: u32) -> bool {
+  if start == NONE { return false }
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    if callsOut(f.insts.get(i).op) {
+      let at = position(usize.toU32(i))
+      if start < at && end > at { return true }
+    }
+    i = i + 1
+  }
+  return false
+}

@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "src/asm_x64_fixtures.silk"
@@ -241,6 +242,99 @@ def assemble(lines: list[str]) -> list[bytes]:
     return encodings
 
 
+# Whole programs with labels, checked after `finish`: they cover branch relaxation, which a
+# single instruction cannot show. Each step is ("bind", n), ("jmp", n), ("jcc", cond, n),
+# ("call", n), ("lea", reg, n), ("nops", count) or ("ret",); labels count from 0.
+def programs() -> dict[str, list[tuple]]:
+    return {
+        # Forward and backward, every kind of reference, all within reach.
+        "nearRefs": [("bind", 0), ("jcc", "Equal", 1), ("jmp", 0), ("call", 1), ("lea", 9, 0), ("bind", 1), ("ret",)],
+        # 127 bytes forward fits in 8 bits; 128 does not.
+        "forwardEdge": [("jmp", 0), ("nops", 127), ("bind", 0), ("jcc", "Below", 1), ("nops", 128), ("bind", 1), ("ret",)],
+        # -128 fits, -129 does not (measured from the end of the 2-byte jump).
+        "backwardEdge": [("bind", 0), ("nops", 126), ("jmp", 0), ("bind", 1), ("nops", 127), ("jcc", "Greater", 1), ("ret",)],
+        # The second jump reaches only once the first has shrunk; the first only once the second has.
+        "chain": [("jmp", 1), ("nops", 60), ("jcc", "Sign", 2), ("nops", 63), ("bind", 1), ("nops", 2), ("bind", 2), ("ret",)],
+        # A long jump over short ones: its distance shrinks with theirs.
+        "longOverShort": [("jmp", 2)] + [x for i in range(40) for x in (("jcc", "Parity", 1), ("nops", 3))]
+                         + [("bind", 1), ("nops", 100), ("bind", 2), ("ret",)],
+        # Many branches to one exit at the end, the backend's shape.
+        "exits": [x for i in range(30) for x in (("nops", 4), ("jcc", "Overflow", 0))] + [("ret",), ("bind", 0), ("ud2",)],
+    }
+
+
+def program_text(steps: list[tuple]) -> tuple[list[str], list[str]]:
+    cond = dict(CONDS)
+    silk, asm = [], []
+    for step in steps:
+        kind = step[0]
+        if kind == "bind":
+            silk.append(f"a.bind(labels[{step[1]}])")
+            asm.append(f".L{step[1]}:")
+        elif kind == "jmp":
+            silk.append(f"run a.jmp(labels[{step[1]}])")
+            asm.append(f"jmp .L{step[1]}")
+        elif kind == "jcc":
+            silk.append(f"run a.jcc(Cond.{step[1]}, labels[{step[2]}])")
+            asm.append(f"j{cond[step[1]]} .L{step[2]}")
+        elif kind == "call":
+            silk.append(f"run a.call(labels[{step[1]}])")
+            asm.append(f"call .L{step[1]}")
+        elif kind == "lea":
+            silk.append(f"run a.leaLabel({reg(step[1])}, labels[{step[2]}])")
+            asm.append(f"lea {NAME64[step[1]]}, [rip + .L{step[2]}]")
+        elif kind == "nops":
+            silk.append(f"run nops(&mut a, {step[1]})")
+            asm += ["nop"] * step[1]
+        elif kind == "ret":
+            silk.append("run a.ret()")
+            asm.append("ret")
+        elif kind == "ud2":
+            silk.append("run a.ud2()")
+            asm.append("ud2")
+    return silk, asm
+
+
+def assemble_program(lines: list[str]) -> bytes:
+    with tempfile.TemporaryDirectory() as work:
+        source, obj, text = Path(work, "p.s"), Path(work, "p.o"), Path(work, "p.bin")
+        source.write_text(".intel_syntax noprefix\n.text\n" + "\n".join(lines) + "\n")
+        result = subprocess.run([llvm_mc(), "--triple=x86_64-unknown-linux-gnu", "-filetype=obj", "-o", str(obj), str(source)],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit("encodings.py: llvm-mc rejected a program:\n" + result.stderr)
+        objcopy = Path(llvm_mc()).resolve().parent / "llvm-objcopy"
+        result = subprocess.run([str(objcopy), "-O", "binary", "--only-section=.text", str(obj), str(text)],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit("encodings.py: llvm-objcopy failed:\n" + result.stderr)
+        return text.read_bytes()
+
+
+def render_programs() -> list[str]:
+    out = ["", "effect fn nops(a: &mut Assembler, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {",
+           "  let mut index: usize = 0",
+           "  while index < count { run a.nop() index = index + 1 }",
+           "}"]
+    for name, steps in programs().items():
+        silk, asm = program_text(steps)
+        expected = "".join(f"\\x{b:02x}" for b in assemble_program(asm))
+        count = 1 + max([s[1] for s in steps if s[0] in ("bind", "jmp", "call")]
+                        + [s[2] for s in steps if s[0] in ("jcc", "lea")])
+        out += ["", f"effect fn {name}Program() -> Code ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {{",
+                "  let mut a = Assembler.make()",
+                "  let mut labels = List<Label>.make()",
+                f"  while labels.length() < {count} {{ let label = run a.label() run labels.append(label) }}"]
+        out += [f"  {line}".replace("labels[", "labels.get(").replace("])", "))").replace("], ", "), ") for line in silk]
+        out += ["  return run a.finish()", "}", "",
+                f"test effect fn {name}MatchesLlvm() -> () ! OutOfMemoryError | UnboundLabelError | AssertionError<'static> {{",
+                "  let mut allocator = Allocator.systemAllocatorProvider()",
+                f"  let code = run {name}Program() |> Effect.provideMut<Allocator>(&mut allocator)",
+                f'  run Testing.expect(sameBytes(code.bytes.asSlice(), b"{expected}"), "{name}: the bytes llvm-mc assembles")',
+                "}"]
+    return out
+
+
 def render() -> str:
     groups = cases()
     flat = [text for group in groups.values() for _, text in group]
@@ -250,7 +344,8 @@ def render() -> str:
     out = [
         "// Generated by scripts/encodings.py; do not edit. Each `Assembler` call is followed by the",
         f"// bytes llvm-mc {release.group(1) if release else 'unknown'} assembles for the Intel-syntax instruction in the message.",
-        "import asm_x64 { Alu, Assembler, Cond, Mem, PackedOp, Reg, Scale, ScalarOp, Shift, Unary, Width, Xmm }",
+        "import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, Scale, ScalarOp, Shift, Unary, UnboundLabelError, Width, Xmm }",
+        "import silk.collections.list { List }",
         "import silk.core.effect { Effect }",
         "import silk.mem.allocator { Allocator, OutOfMemoryError }",
         "import silk.testing.testing { AssertionError, Testing }",
@@ -264,6 +359,16 @@ def render() -> str:
         "  let mut index: usize = 0",
         "  while index < expected.length {",
         "    if bytes[start + index] != expected[index] { return false }",
+        "    index = index + 1",
+        "  }",
+        "  return true",
+        "}",
+        "",
+        "fn sameBytes(actual: &[u8], expected: &[u8]) -> bool {",
+        "  if actual.length != expected.length { return false }",
+        "  let mut index: usize = 0",
+        "  while index < expected.length {",
+        "    if actual[index] != expected[index] { return false }",
         "    index = index + 1",
         "  }",
         "  return true",
@@ -284,7 +389,8 @@ def render() -> str:
                 "  let mut a = Assembler.make()",
                 f"  run {name}Cases(&mut a) |> Effect.provideMut<Allocator>(&mut allocator)",
                 "}"]
-    out.insert(2, f"// {total} cases.")
+    out += render_programs()
+    out.insert(2, f"// {total} cases and {len(programs())} programs.")
     return "\n".join(out) + "\n"
 
 

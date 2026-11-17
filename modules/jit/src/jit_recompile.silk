@@ -1,0 +1,120 @@
+//! What the JIT remembers between compilations of a function (docs/jit/doubles.md,
+//! "Recompilation"). A function the engine unlinked for deoptimizing too often is reported hot
+//! again (js_compiled.rearmHotness); its next compilation widens the sites that deoptimized
+//! (CompiledEntry.deoptPcs) to numbers, at most MAX_RECOMPILES times, and refuses it for good
+//! when that runs out or when it deoptimized only where it was already widened.
+//!
+//! Functions are recognised by their code: a hash of the bytecode bytes with the argument and
+//! local counts. The cell address only tells a re-report of the same function from another
+//! function with the same code (which starts from what the first one learned). Both are hints:
+//! every guard stays in the compiled code, so a wrong match costs speed, never correctness.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_core_types { FunctionBytecode, CompiledEntry }
+
+/// Compilations after the first a function may have.
+pub const MAX_RECOMPILES: u32 = 2
+const NONE: u32 = 4294967295
+
+struct Record {
+  address: usize,
+  hash: u64,
+  /// Compilations so far, refusals included.
+  compiles: u32,
+  /// The table entry of the code compiled last, or NONE.
+  entry: u32,
+  sites: List<u32>
+}
+
+pub struct History { records: List<Record> }
+
+/// What to do with a reported function: refuse it (with why), or compile it with `sites` as
+/// double sites. `record` names the History record to update afterwards; `recompile` says
+/// whether this is a function's second or later compilation.
+pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub recompile: bool, record: usize }
+
+/// FNV-1a over the code and the counts the translator reads.
+unsafe fn hashOf(function: &FunctionBytecode) -> u64 {
+  let mut hash: u64 = 14695981039346656037
+  let bytes = unsafe function.code.asSlice()
+  let mut index: usize = 0
+  while index < bytes.length { hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(bytes[index])), 1099511628211) index = index + 1 }
+  hash = u64.wrappingMultiply(u64.bitXor(hash, u16.toU64(function.argumentCount)), 1099511628211)
+  hash = u64.wrappingMultiply(u64.bitXor(hash, u16.toU64(function.variableCount)), 1099511628211)
+  return u64.wrappingMultiply(u64.bitXor(hash, usize.toU64(bytes.length)), 1099511628211)
+}
+
+effect fn copy(from: &List<u32>) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u32>.make()
+  run out.appendSlice(from.asSlice())
+  return move out
+}
+fn has(list: &List<u32>, value: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == value { return true } i = i + 1 }
+  return false
+}
+
+impl History {
+  pub fn make() -> History { return History { records: List<Record>.make() } }
+
+  /// The plan for `function`, reported hot, at `address`; `entries` is the compiled code table.
+  pub unsafe effect fn plan(self: &mut Self, function: &FunctionBytecode, address: usize, entries: &List<CompiledEntry>) -> Plan
+    ! OutOfMemoryError ? &mut Allocator {
+    let hash = unsafe hashOf(&function)
+    let mut same = self.records.length()
+    let mut alike = self.records.length()
+    let mut i: usize = 0
+    while i < self.records.length() {
+      let record = &self.records.asSlice()[i]
+      if record.hash == hash {
+        if record.address == address { same = i } else if alike == self.records.length() { alike = i }
+      }
+      i = i + 1
+    }
+    if same < self.records.length() {
+      // Reported again: its code was unlinked (or it was refused and the engine re-armed it).
+      let record = &mut self.records.asMutSlice()[same]
+      if record.compiles > MAX_RECOMPILES {
+        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), recompile: true, record: same }
+      }
+      let mut sites = run copy(&record.sites)
+      let mut widened = false
+      if record.entry != NONE {
+        let entry = &entries.asSlice()[u32.toUsize(record.entry)]
+        let mut k: usize = 0
+        while k < u8.toUsize(entry.deoptPcCount) {
+          let pc = entry.deoptPcs[k]
+          if !has(&sites, pc) { run sites.append(pc) widened = true }
+          k = k + 1
+        }
+      }
+      if !widened {
+        record.compiles = MAX_RECOMPILES + 1
+        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, recompile: true, record: same }
+      }
+      return Plan { refuse: false, why: b"", sites: move sites, recompile: true, record: same }
+    }
+    let mut sites = List<u32>.make()
+    if alike < self.records.length() { sites = run copy(&self.records.asSlice()[alike].sites) }
+    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make() })
+    return Plan { refuse: false, why: b"", sites: move sites, recompile: false, record: self.records.length() - 1 }
+  }
+
+  /// Records the outcome of `plan`: compiled into table entry `entry`, or NONE when refused.
+  pub effect fn remember(self: &mut Self, plan: &Plan, entry: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let record = &mut self.records.asMutSlice()[plan.record]
+    record.compiles = record.compiles + 1
+    record.entry = entry
+    record.sites.clear()
+    run record.sites.appendSlice(plan.sites.asSlice())
+  }
+}
+
+/// The NONE entry for `remember`.
+pub fn noEntry() -> u32 { return NONE }

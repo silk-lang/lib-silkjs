@@ -121,7 +121,8 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
-           "intloop", "intloop", "intnest", "intbranch", "fields", "elements", "globals", "method"]
+           "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
+           "fields", "elements", "globals", "method"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -133,6 +134,8 @@ AREAS = {
     "property writes": (r"\.\w+ = __clamp\(", r"\b[oab]\.\w+ = __clamp\(", "void __clamp("),  # named stores are lost
     "exceptions": (r"\bthrow ", r"\bthrow ", "return "),  # a throw returns instead
     "typed arrays": (r"\bvar ta = new ", r"\bvar ta = new \w+\(", "var ta = new Float64Array("),  # wrong element kind
+    "number loops": (r"\bvar d = ", r"\bd = d \+ ", "d = d - "),  # a double add becomes a subtract
+    "int operators": (r"\bvar u = ", r"\bvar u = a \| 0;", "var u = (a | 0) ^ 1;"),  # the first operand is off by one bit
 }
 
 
@@ -295,6 +298,37 @@ class Generator:
             # `this` reads in a hot prelude function, on objects of several shapes.
             return (f"var o = {self.pick(['{x: a, y: b}', '{y: b, x: a}', '{x: a, y: b, m: 1}'])}; "
                     f"return __sumthis.call(o, {self.pick([2, 5])}) + __sumthis.call(a, 1);")
+        if flavor == "numloop":
+            # A double accumulator in a counted loop (docs/jit/doubles.md): it starts as an Int or
+            # a double, so an int add may overflow or meet a double and deoptimize, after which
+            # the recompiled function carries it as f64. Comparisons meet NaN and -0.
+            # A numeric start: a string a would double in length each time round.
+            start = self.pick(["0", "0.5", "+a", "-0", "b / 2", "2147483600"])
+            step = self.pick(["d + i * 0.5", "d + 1073741824", "d / 3 + i", "d * 1.5 - b", "d + Math.sqrt(i)",
+                              "Math.floor(d / 2) + i", "Math.abs(d - a) + 0.25", "-d + i", "d + (i | 0) / 7"])
+            test = self.pick(["d < b", "d >= 0", "d !== d", "d === 0", "d > 1e9", "!(d <= a)"])
+            return (f"var d = {start}; var n = b; if (n > {self.pick([5, 20, 70])}) n = {self.pick([3, 20, 70])}; "
+                    f"var c = 0; for (var i = 0; i < n; i++) {{ d = d + {step}; if ({test}) c++; }} "
+                    f"return [d, c, d | 0, d >>> 0];")
+        if flavor == "intops":
+            # The int32 operators beyond add, sub and mul, with the cases where the interpreter
+            # makes a double: >>> past the int32 maximum, % with a -0 result or a non-positive
+            # divisor, - of 0 or the minimum.
+            update = self.pick(["(u ^ (i << 3)) | a", "u >>> 1", "(u % 7) - i", "~u + (i & 3)", "-u + b",
+                                "(u >> (i & 31)) & 0xffff", "(u << 5) - u", "u % (b | 0)", "Math.imul(u, 31) + i",
+                                "(u & a) | (u ^ b)", "-(u % 3)"])
+            check = self.pick(["u === 3", "u !== -1", "u === undefined", "typeof u === 'number'", "!u", "u === null"])
+            return (f"var u = a | 0; var n = b; if (n > {self.pick([6, 30])}) n = {self.pick([4, 30])}; var c = 0; "
+                    f"for (var i = 0; i < n; i++) {{ u = {update}; if ({check}) c = c + 1; else c = c - (u & 1); }} "
+                    f"return [u, c];")
+        if flavor == "counters":
+            # Increments in every form, on locals and on values kept on the stack (x++ in an
+            # expression), and logical operators that keep their operand.
+            form = self.pick(["k++", "++k", "k--", "--k", "k += 2", "k -= a", "k = k + 1"])
+            keep = self.pick(["(k && b) || 1", "k || a", "(a && k) || 0", "k ?? b"])
+            return (f"var k = {self.pick(['a', '0', 'b', '2147483646'])}; var s = 0; "
+                    f"for (var i = 0; i < {self.pick([3, 8, 40])}; i++) {{ {form}; s = s + (k++ & 7) + ({keep}); }} "
+                    f"return [k, s];")
         raise ValueError(flavor)
 
     def function(self) -> str:
