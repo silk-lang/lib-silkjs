@@ -173,7 +173,10 @@ fn isThrow(opcode: u8) -> bool { return opcode == op.OP_throw || opcode == op.OP
 
 /// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
 /// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
-fn osrExit(opcode: u8, calls: bool) -> bool { return !supported(opcode) || (!calls && callOpcode(opcode)) || genericOpcode(opcode) }
+fn osrExit(opcode: u8, calls: bool) -> bool {
+  if opcode == op.OP_for_of_next { return false }
+  return !supported(opcode) || (!calls && callOpcode(opcode)) || genericOpcode(opcode)
+}
 /// Whether OSR code for input may make calls: asked for, no captured local, and no
 /// arguments object or direct eval that could alias the frame's cells.
 fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
@@ -198,7 +201,21 @@ pub fn genericOpcode(opcode: u8) -> bool {
     || opcode == op.OP_set_proto || opcode == op.OP_define_method || opcode == op.OP_define_method_computed
     || opcode == op.OP_get_super || opcode == op.OP_get_private_field || opcode == op.OP_put_private_field
     || opcode == op.OP_define_private_field || opcode == op.OP_private_in || opcode == op.OP_add_brand
-    || opcode == op.OP_push_bigint_i32 || opcode == op.OP_private_symbol
+    || opcode == op.OP_push_bigint_i32 || opcode == op.OP_private_symbol || iterationOpcode(opcode)
+}
+/// Stream Q's for-in and for-of instructions, generic exits outside OSR code (OSR code steps a
+/// stand-in record itself, and leaves at the others).
+pub fn iterationOpcode(opcode: u8) -> bool {
+  return opcode == op.OP_for_in_start || opcode == op.OP_for_in_next || opcode == op.OP_for_of_start
+    || opcode == op.OP_for_of_next || opcode == op.OP_iterator_close
+}
+/// The values an iteration instruction at pc leaves on the engine's stack from its operands
+/// (calls.resultCount; js_vm.compiledOp checks it), or 0 for one at most.
+pub fn iterationResults(input: &FunctionInput, pc: usize) -> usize {
+  let opcode = byteAt(input, pc)
+  if opcode == op.OP_for_of_start || opcode == op.OP_for_in_next { return 3 }
+  if opcode == op.OP_for_of_next { return 5 + u8.toUsize(byteAt(input, pc + 1)) }
+  return 0
 }
 
 /// Workstream H's calls: `call0`..`call3`, `call`, `call_method` and `call_constructor`.
@@ -601,6 +618,8 @@ struct Translator {
   missed: &'static [u8],
   /// On-stack replacement: argument n's number, guarded once at entry, or NONE (or empty).
   argNumbers: List<u32>,
+  /// Translating OSR code (translateOsrWith).
+  osr: bool,
 }
 
 /// Lexical locals that may be uninitialized (still in their TDZ) on entry to each leader, from a
@@ -1517,7 +1536,7 @@ impl Translator {
       run self.push(r)
       return true
     }
-    if opcode == op.OP_for_of_next {
+    if opcode == op.OP_for_of_next && self.osr {
       // A stand-in record (js_iterators.forOfStart: the array, then its next index as an Int)
       // steps a fast Array's element here; anything else exits, and the interpreter steps.
       let offset = u8.toUsize(byteAt(input, pc + 1))
@@ -1618,6 +1637,11 @@ impl Translator {
     let info = op.opcodeInfo(opcode, true)
     let mut count = u8.toUsize(info.pops)
     if opcode == op.OP_array_from { count = u16.toUsize(u16At(input, pc + 1)) }
+    // for_of_next reads its record under `offset` values and leaves them all, with the step's
+    // value and done above.
+    if opcode == op.OP_for_of_next { count = 3 + u8.toUsize(byteAt(input, pc + 1)) }
+    let results = iterationResults(input, pc)
+    if results > i32.toUsize(calls.MAX_RESULTS) { fail refuse(at, opcode, b"too many results for a generic instruction") }
     if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many operands for a generic instruction") }
     if self.stack.length() < count { fail refuse(at, opcode, b"generic instruction operands missing") }
     // Boxes come before the call.arg run, which must stay contiguous.
@@ -1630,8 +1654,28 @@ impl Translator {
       drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, operands.get(i), NONE, usize.toI32(i), at)
       i = i + 1
     }
-    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, none, none, usize.toI32(count) | calls.GENERIC, at)
+    let k = usize.toI32(count) | calls.GENERIC | i32.shiftLeft(usize.toI32(results), calls.RESULTS_SHIFT)
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, none, none, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
+    if results != 0 {
+      // Every value it left, read before anything else runs. A for-of record's marker (cell 2:
+      // CatchOffset 0, no count) stays the immediate the translation pushes for it.
+      let record = opcode == op.OP_for_of_start || opcode == op.OP_for_of_next
+      let mut values = List<u32>.make()
+      run values.append(r)
+      let mut c: usize = 1
+      while c < results {
+        if c == 2 && record { run values.append(NONE) }
+        else { let v = run self.f.emit(self.current, Op.CallResult, true, Type.Value, Own.Owned, r, NONE, usize.toI32(c), at) run values.append(v) }
+        c = c + 1
+      }
+      if record { let marker = run self.f.emit(self.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, ssa.IMM_CATCH, at) values.set(2, marker) }
+      i = 0
+      while i < count { let v = self.pop() run self.release(v, at) i = i + 1 }
+      i = 0
+      while i < values.length() { run self.push(values.get(i)) i = i + 1 }
+      return true
+    }
     i = 0
     while i < count { let v = self.pop() run self.release(v, at) i = i + 1 }
     if info.pushes == 0 { run self.release(r, at) } else { run self.push(r) }
@@ -2083,7 +2127,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
-    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"" }
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", osr: false }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -2320,7 +2364,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
-    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"" }
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", osr: true }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
