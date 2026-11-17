@@ -194,7 +194,7 @@ AREAS = {
     "exceptions": (r"\bthrow ", r"\bthrow ", "return "),  # a throw returns instead
     "typed arrays": (r"\bvar ta = new ", r"\bvar ta = new \w+\(", "var ta = new Float64Array("),  # wrong element kind
     "number loops": (r"\bvar d = ", r"\bd = d \+ ", "d = d - "),  # a double add becomes a subtract
-    "loop invariants": (r"[{;] __poke\(", r"(?<=[{;] )__poke\(", "__clamp("),  # the change inside the loop is lost
+    "loop invariants": (r"\)\) \| 0; [^}]", r"(?<=\)\) \| 0; )(?=[^}])", "if (0) "),  # the change inside the loop is lost
     "int operators": (r"\bvar u = ", r"\bvar u = a \| 0;", "var u = (a | 0) ^ 1;"),  # the first operand is off by one bit
 }
 
