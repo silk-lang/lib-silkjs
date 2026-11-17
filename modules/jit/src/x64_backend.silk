@@ -21,6 +21,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.num.i32
 import silk.num.u32
+import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.core.option { Option }
@@ -28,6 +29,7 @@ import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Shift, UnboundLabe
 import ssa { Function, Inst, Op, Type, Own, SlotMode }
 import value_layout { ValueLayout }
 import jit_helpers as helpers
+import silkjs.js_compiled as compiled
 
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
@@ -35,6 +37,10 @@ pub const SLOT_BYTES: u32 = 16
 const EXIT_RETURNED: u32 = 0
 const EXIT_DEOPT: u32 = 1
 const EXIT_POLL: u32 = 2
+const EXIT_THROW: u32 = 3
+const EXIT_CALL: u32 = 4
+/// js_compiled.CompiledFrame.calls's offset (its seventh pointer).
+const FRAME_CALLS: i32 = 48
 /// More values than this would make the frame larger than is sensible for a first tier.
 const MAX_VALUES: u32 = 65536
 
@@ -55,6 +61,10 @@ pub struct Emitter {
   pub a: Assembler,
   pub blockLabels: List<Label>,
   pub exitLabels: List<Label>,
+  /// Where each call resumes, in instruction order (resume point k + 1 is call k).
+  pub resumeLabels: List<Label>,
+  /// Values in the frame, which a call saves in its call block.
+  pub values: u32,
   /// Bytes of the frame below the return address: values, then the edge scratch area.
   pub frame: i32,
   pub scratch: i32,
@@ -87,7 +97,7 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let raw = inputs + INPUT_COUNT * 8 + 8
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8)
   let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
-    frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings }
+    resumeLabels: List<Label>.make(), values: values, frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings }
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
   let mut x: usize = 0
@@ -95,6 +105,12 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   if frame != 0 { run emitter.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, frame) }
   let mut k: u32 = 0
   while k < INPUT_COUNT { let at = emitter.input(k) run emitter.a.store(Width.W64, at, inputRegister(k)) k = k + 1 }
+  let mut c: usize = 0
+  while c < function.insts.length() {
+    if function.insts.get(c).op == Op.Call { run emitter.resumeLabels.append(run emitter.a.label()) }
+    c = c + 1
+  }
+  if emitter.resumeLabels.length() != 0 { run emitter.resume() }
   b = 0
   while b < function.blockCount() {
     let block = function.blocks.get(u32.toUsize(b))
@@ -299,6 +315,51 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
       return ()
     }
+    if op == Op.CallArg {
+      // Borrowed into the call area; an i32 or bool is boxed there.
+      run self.callBlock(Reg.R11)
+      let at = u32.wrappingMultiply(usize.toU32(compiled.CALL_AREA), 8) + (2 + i32.wrappingToU32(inst.k)) * SLOT_BYTES
+      run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.R11, at)
+      return ()
+    }
+    if op == Op.Call {
+      // The result slot holds the exit status until the call answers (stress exits deopt).
+      run self.a.storeImm(Width.W64, slotOf(inst.result), u32.wrappingToI32(EXIT_DEOPT))
+      run self.stressGuard(inst.exit)
+      let area = u32.wrappingMultiply(usize.toU32(compiled.CALL_AREA), 8)
+      run self.callBlock(Reg.R11)
+      run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.R11, area)
+      run self.valueInto(&function, inst.b, SlotMode.Imm, Reg.R11, area + SLOT_BYTES)
+      // Leave with EXIT_CALL: the site, the resume point and every value go to the block.
+      let point = self.resumeIndex(&function, inst)
+      run self.a.movImm64(Reg.Rax, u64.bitOr(u32.toU64(inst.pc), u64.shiftLeft(u32.toU64(i32.wrappingToU32(inst.k)), 32)))
+      run self.a.store(Width.W64, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SITE), 8)), Reg.Rax)
+      run self.a.movImm32(Reg.Rax, u32.shiftLeft(point + 1, 2))
+      run self.a.store(Width.W64, word(Reg.R11, 0), Reg.Rax)
+      run self.a.lea(Width.W64, Reg.R10, Mem.at(Reg.Rsp, 0))
+      run self.a.lea(Width.W64, Reg.R11, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SAVED), 8)))
+      let words = self.values * 2
+      run self.copyWords(words)
+      run self.leave(EXIT_CALL)
+      // Resumed (see resume) with the block's word 0 in RAX and the block in R11.
+      self.a.bind(self.resumeLabels.get(u32.toUsize(point)))
+      let returned = run self.a.label()
+      run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 3)
+      run self.a.jcc(Cond.Equal, returned)
+      // Threw (1) or not called (2): the throw exit with that status, the state before the call.
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+      run self.a.storeImm(Width.W64, slotOf(inst.result), u32.wrappingToI32(EXIT_DEOPT))
+      run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+      run self.a.storeImm(Width.W64, slotOf(inst.result), u32.wrappingToI32(EXIT_THROW))
+      run self.a.jmp(self.exitLabels.get(u32.toUsize(inst.exit)))
+      self.a.bind(returned)
+      let result = u32.wrappingMultiply(usize.toU32(compiled.CALL_RESULT), 8)
+      run self.a.load(Width.W64, Reg.Rax, word(Reg.R11, result))
+      run self.a.load(Width.W64, Reg.R9, word(Reg.R11, result + 8))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+      return ()
+    }
     Intrinsic.trap("x64_backend: unlowered SSA operation")
   }
   /// Moves an edge's arguments into its target's parameters, then jumps there.
@@ -396,11 +457,75 @@ impl Emitter {
   }
   /// The frame slot of ABI input k.
   pub fn input(self: &Self, k: u32) -> Mem { return Mem.at(Reg.Rsp, self.inputs + u32.wrappingToI32(k * 8)) }
+  /// dst = the call block (CompiledFrame.calls).
+  effect fn callBlock(self: &mut Self, dst: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    let frame = self.input(INPUT_FRAME)
+    run self.a.load(Width.W64, dst, frame)
+    run self.a.load(Width.W64, dst, Mem.at(dst, FRAME_CALLS))
+  }
+  /// Which resume point call is (its index among the function's calls).
+  fn resumeIndex(self: &Self, function: &Function, call: Inst) -> u32 {
+    let mut point: u32 = 0
+    let mut i: usize = 0
+    while i < function.insts.length() {
+      let inst = function.insts.get(i)
+      if inst.op == Op.Call {
+        if inst.pc == call.pc && inst.result == call.result { return point }
+        point = point + 1
+      }
+      i = i + 1
+    }
+    return Intrinsic.trap("x64_backend: a call without a resume point")
+  }
+  /// Copies count words from R10 to R11 (count nonzero). Clobbers RAX, R9, R10, R11.
+  effect fn copyWords(self: &mut Self, count: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.a.movImm32(Reg.Rax, count)
+    let again = run self.a.label()
+    self.a.bind(again)
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R10, 0))
+    run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.R9)
+    run self.a.aluImm(Alu.Add, Width.W64, Reg.R10, 8)
+    run self.a.aluImm(Alu.Add, Width.W64, Reg.R11, 8)
+    run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rax, 1)
+    run self.a.jcc(Cond.NotEqual, again)
+  }
+  /// The entry of code that makes calls: a run after EXIT_CALL (the call block's word 0 is
+  /// nonzero) restores the saved values and jumps to its resume point with word 0 in RAX and
+  /// the block in R11.
+  effect fn resume(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let fresh = run self.a.label()
+    run self.callBlock(Reg.R11)
+    run self.a.test(Width.W64, Reg.R11, Reg.R11)
+    run self.a.jcc(Cond.Equal, fresh)
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+    run self.a.test(Width.W64, Reg.Rax, Reg.Rax)
+    run self.a.jcc(Cond.Equal, fresh)
+    run self.a.lea(Width.W64, Reg.R10, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SAVED), 8)))
+    run self.a.lea(Width.W64, Reg.R11, Mem.at(Reg.Rsp, 0))
+    let words = self.values * 2
+    run self.copyWords(words)
+    run self.callBlock(Reg.R11)
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+    run self.a.mov(Width.W64, Reg.R8, Reg.Rax)
+    run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R8, 2)
+    let mut point: u32 = 0
+    while point < usize.toU32(self.resumeLabels.length()) {
+      run self.a.aluImm(Alu.Cmp, Width.W64, Reg.R8, u32.wrappingToI32(point + 1))
+      run self.a.jcc(Cond.Equal, self.resumeLabels.get(u32.toUsize(point)))
+      point = point + 1
+    }
+    run self.a.ud2()
+    self.a.bind(fresh)
+  }
   /// Calls helper index with env as its first argument (the caller has set the others from
   /// RSI on), then reloads the inputs the code keeps in registers. The result is in RAX.
   pub effect fn callHelper(self: &mut Self, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let atE = self.input(INPUT_ENV) run self.a.load(Width.W64, Reg.Rdi, atE)
     run self.a.callMem(Mem.at(Reg.Rdi, helpers.helperOffset(index)))
+    run self.reloadInputs()
+  }
+  /// Reloads the ABI inputs the code keeps in registers (RDI to RCX) after a C call.
+  effect fn reloadInputs(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let at0 = self.input(0) run self.a.load(Width.W64, Reg.Rdi, at0)
     let at1 = self.input(1) run self.a.load(Width.W64, Reg.Rsi, at1)
     let at2 = self.input(2) run self.a.load(Width.W64, Reg.Rdx, at2)
@@ -437,21 +562,30 @@ impl Emitter {
       run self.valueInto(&function, slot.value, slot.mode, Reg.Rsi, 16 + i * SLOT_BYTES)
       i = i + 1
     }
-    // A poll's exit is the loop target after a back edge: interrupt, not deopt.
+    // A poll's exit is the loop target after a back edge: interrupt, not deopt. A call's
+    // returns the status its result slot holds.
+    let owner = exitOwner(&function, index)
+    if owner.op == Op.Call {
+      run self.a.load(Width.W32, Reg.Rax, slotOf(owner.result))
+      if self.frame != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, self.frame) }
+      run self.a.ret()
+      return ()
+    }
     let mut code = EXIT_DEOPT
-    if isPollExit(&function, index) { code = EXIT_POLL }
+    if owner.op == Op.Poll { code = EXIT_POLL }
     run self.leave(code)
   }
 }
 
-fn isPollExit(function: &Function, exit: u32) -> bool {
+/// The instruction exit belongs to (an Unbox's, when none claims it: never for a verified function).
+fn exitOwner(function: &Function, exit: u32) -> Inst {
   let mut i: usize = 0
   while i < function.insts.length() {
     let inst = function.insts.get(i)
-    if inst.exit == exit { return inst.op == Op.Poll }
+    if inst.exit == exit { return inst }
     i = i + 1
   }
-  return false
+  return function.insts.get(0)
 }
 /// The tag field and payload of an `Imm` constant.
 fn immTag(layout: &ValueLayout, k: i32) -> u32 {

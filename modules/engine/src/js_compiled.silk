@@ -19,6 +19,37 @@ pub const EXIT_RETURNED: u32 = 0
 pub const EXIT_DEOPT: u32 = 1
 /// An interrupt poll fell due on a back edge: resume in the interpreter, which polls.
 pub const EXIT_POLL: u32 = 2
+/// A call the code made threw: the state is the frame before the call (its operands still on
+/// the stack), and the exception is pending, as when the interpreter's call instruction fails.
+pub const EXIT_THROW: u32 = 3
+
+/// A call the code makes (section 7.3 of docs/jit/compiled-entry.md): the code saved its
+/// values and the call's operands in the call block (CompiledFrame.calls) and left; the engine
+/// makes the call, writes the answer into the block and runs the code again, which resumes there.
+pub const EXIT_CALL: u32 = 4
+
+/// What enterBase did: the code returned (value written), the interpreter continues from the
+/// frame it left (or the code was skipped), or a call in it threw from the restored frame.
+pub const ENTER_RETURNED: u32 = 0
+pub const ENTER_INTERPRET: u32 = 1
+pub const ENTER_THREW: u32 = 2
+
+/// The call block, in u64 words (offsets are part of the code ABI). Word 0: 0 for a fresh run;
+/// at EXIT_CALL the code writes its resume point there shifted left by 2, and the engine adds
+/// how the call went (CALL_*). Word 1: the call's bytecode offset (low 32 bits) and argument
+/// count (high 32). Words 2-3: the owned result on CALL_RETURNED. From word 4: the call area,
+/// CALL_AREA_SLOTS ValueBits (callee, receiver, arguments, borrowed by the call), then the
+/// code's saved values, which keep their counts while the call runs.
+pub const CALL_RESUME: usize = 0
+pub const CALL_SITE: usize = 1
+pub const CALL_RESULT: usize = 2
+pub const CALL_AREA: usize = 4
+pub const CALL_AREA_SLOTS: usize = 10
+pub const CALL_SAVED: usize = 24
+pub const CALL_RETURNED: u64 = 0
+pub const CALL_THREW: u64 = 1
+/// Nothing was called (a callee only the interpreter calls): deoptimize before the call.
+pub const CALL_DEOPT: u64 = 2
 
 /// What a compiled function runs for, passed as the code's sixth argument. Field offsets
 /// are part of the code ABI (each a pointer, in this order). Everything is borrowed for the
@@ -31,13 +62,16 @@ pub extern "C" struct CompiledFrame {
   /// The closure's captured variable cells (Machine.closureReferences).
   pub closureReferences: *const ?*mut HeapHeader,
   /// The running scope (Machine.scope), or null.
-  pub scope: ?*mut HeapHeader
+  pub scope: ?*mut HeapHeader,
+  /// The call block of code that makes calls (CompiledEntry.callWords words), or null.
+  pub calls: ?*mut u64
 }
 impl CompiledFrame {
   /// What machine, a freshly entered frame, runs.
   pub fn of(machine: &Machine) -> CompiledFrame {
     return CompiledFrame { thisValue: Pointer.fromRef<ValueBits>(&machine.thisValue), bytecode: machine.bytecode, context: machine.context,
-      runtime: machine.runtime, closureReferences: machine.closureReferences, scope: machine.scope }
+      runtime: machine.runtime, closureReferences: machine.closureReferences, scope: machine.scope,
+      calls: Pointer.null<u64>() }
   }
 }
 
@@ -61,35 +95,17 @@ impl Copy for Resume {}
 @inlineAlways
 pub fn fresh() -> Resume { return Resume { state: Pointer.null<u64>(), exit: 0, index: 0 } }
 
-/// Runs the compiled code linked as index (FunctionBytecode.compiled, nonzero)
-/// for machine, a freshly entered base frame that has not executed anything.
-/// Returns true with the result in value when the code returned; false when it
-/// left at a bytecode boundary, after which machine holds the interpreter state
-/// there (or is untouched when compiled code is skipped) and execute continues.
-@inlineNever
-pub unsafe fn enter(machine: &mut Machine, index: u32, value: &mut ValueBits) -> bool {
-  let anchor = ()
-  let observed = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).observeInstructions
-  // The debugger, coverage and profiler see every instruction: interpret.
-  if observed { return false }
-  let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
-  let words = stateWords(u16.toUsize(bytecode.variableCount), u16.toUsize(bytecode.stackSize))
-  let parameters = u16.toUsize(bytecode.argumentCount)
-  drop bytecode
-  let exitState = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(words))
-  let frame = CompiledFrame.of(&machine)
-  let exit = unsafe runCode(index, &frame, machine.arguments, parameters, exitState)
-  if exit == EXIT_RETURNED {
-    value.* = unsafe result(exitState)
-    return true
-  }
-  unsafe restore(&mut machine, index, exit, exitState)
-  return false
+/// The call block words of the code linked as index (CompiledEntry.callWords): 0 when it makes
+/// no calls. Code that makes calls runs only from a base frame (js_vm.enterBase), never frameless.
+pub unsafe fn callWords(runtime: *mut HeapHeader, index: u32) -> usize {
+  let entrySlot = unsafe entryAt(runtime, index)
+  let anchor = () return u32.toUsize((unsafe Pointer.borrow<(), CompiledEntry>(&anchor, unsafe Intrinsic.pointerRequalify<*mut CompiledEntry, *const CompiledEntry>(entrySlot))).callWords)
 }
 /// Runs the compiled code linked as index for frame.bytecode, whose arguments are the
 /// count cells at cells (parameters past count read as undefined), with no interpreter
 /// frame. state has room for stateWords. Returns the exit code:
-/// EXIT_RETURNED (see result) or EXIT_DEOPT / EXIT_POLL with the frame state for restore.
+/// EXIT_RETURNED (see result), EXIT_DEOPT / EXIT_POLL / EXIT_THROW with the frame state for
+/// restore, or EXIT_CALL (see the call block).
 pub unsafe fn runCode(index: u32, frame: &CompiledFrame, cells: *mut ValueBits, count: usize, state: *mut u64) -> u32 {
   let entrySlot = unsafe entryAt(frame.runtime, index)
   let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
@@ -124,14 +140,14 @@ pub unsafe fn runCode(index: u32, frame: &CompiledFrame, cells: *mut ValueBits, 
   let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const CompiledCode>(Pointer.fromRef<*const u8>(&code))
   let machineCode = unsafe Pointer.read<CompiledCode>(slot)
   let exit = unsafe machineCode(arguments, state, counter, data, env, Pointer.fromRef<CompiledFrame>(&frame))
-  if exit != EXIT_RETURNED && exit != EXIT_DEOPT && exit != EXIT_POLL { trap() }
+  if exit > EXIT_CALL { trap() }
   return exit
 }
 /// The owned value an EXIT_RETURNED state holds.
 pub unsafe fn result(state: *mut u64) -> ValueBits {
   return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(state))
 }
-/// Applies an EXIT_DEOPT or EXIT_POLL state of entry index to machine, a freshly
+/// Applies an EXIT_DEOPT, EXIT_POLL or EXIT_THROW state of entry index to machine, a freshly
 /// entered base frame of the same function that has not executed anything (its
 /// locals hold no counts), and counts the exit (unlinking after deoptLimit deopts).
 pub unsafe fn restore(machine: &mut Machine, index: u32, exit: u32, state: *mut u64) -> () {
@@ -162,7 +178,7 @@ pub unsafe fn restore(machine: &mut Machine, index: u32, exit: u32, state: *mut 
   let mut leaf: u8 = 0
   let mut afterAnchor = () let after = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut afterAnchor, entrySlot)
   if exit == EXIT_POLL { after.polls = after.polls + 1 }
-  else {
+  else if exit == EXIT_DEOPT {
     after.deopts = after.deopts + 1
     unlink = after.deoptLimit != 0 && after.deopts >= u32.toU64(after.deoptLimit)
     frameCells = after.frameCells

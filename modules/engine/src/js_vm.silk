@@ -46,6 +46,7 @@ import js_strings { Strings }
 import js_bigint { BigIntError }
 import js_vm_state { Machine, cellAt }
 import js_compiled as compiled
+import js_compiled { CompiledFrame }
 import js_vm_activation as activation
 import js_scopes as scopes
 import js_vm_activation { Entry }
@@ -310,14 +311,19 @@ unsafe effect fn callResuming<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   unsafe debugger.publish(rt, Pointer.fromMutRef<DebugActivation>(&mut observation))
   // dispatch, inlined: failures are caught once per run of execute and unwound here.
   let mut completed = false
+  let mut abandoned = false
   let mut value = ValueBits.Undefined
   match Pointer.nonNullMut<u64>(resume.state) {
     Option<*mut u64>.Some { value: state } => { unsafe compiled.restore(&mut machine, resume.index, resume.exit, state) }
     Option<*mut u64>.None => {
-      if description.compiled != 0 { completed = unsafe compiled.enter(&mut machine, description.compiled, &mut value) }
+      if description.compiled != 0 {
+        let how = run unsafe enterBase(&mut hooks, memory, &mut machine, description.compiled, &mut value)
+        completed = how == compiled.ENTER_RETURNED
+        if how == compiled.ENTER_THREW { abandoned = !run unsafe compiledThrew(&mut hooks, memory, &mut machine) }
+      }
     }
   }
-  while !completed {
+  while !completed && !abandoned {
     let executed = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(
       unsafe execute(&mut hooks, memory, &mut machine), failed)
     match move executed {
@@ -380,14 +386,19 @@ unsafe effect fn callKnown<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
   let mut observation = unsafe debugger.enter(&machine)
   unsafe debugger.publish(rt, Pointer.fromMutRef<DebugActivation>(&mut observation))
   let mut completed = false
+  let mut abandoned = false
   let mut value = ValueBits.Undefined
   match Pointer.nonNullMut<u64>(resume.state) {
     Option<*mut u64>.Some { value: state } => { unsafe compiled.restore(&mut machine, resume.index, resume.exit, state) }
     Option<*mut u64>.None => {
-      if description.compiled != 0 { completed = unsafe compiled.enter(&mut machine, description.compiled, &mut value) }
+      if description.compiled != 0 {
+        let how = run unsafe enterBase(&mut hooks, memory, &mut machine, description.compiled, &mut value)
+        completed = how == compiled.ENTER_RETURNED
+        if how == compiled.ENTER_THREW { abandoned = !run unsafe compiledThrew(&mut hooks, memory, &mut machine) }
+      }
     }
   }
-  while !completed {
+  while !completed && !abandoned {
     let executed = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(
       unsafe execute(&mut hooks, memory, &mut machine), failed)
     match move executed {
@@ -597,6 +608,86 @@ unsafe effect fn dispatchBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
       }
     }
   }
+}
+/// Runs the compiled code linked as index (FunctionBytecode.compiled, nonzero) for machine, a
+/// freshly entered base frame that has not executed anything, making the calls it asks for
+/// (compiled.EXIT_CALL). compiled.ENTER_RETURNED with the result in value; ENTER_INTERPRET
+/// when it left at a bytecode boundary, after which machine holds the interpreter state there
+/// (or is untouched when compiled code is skipped) and execute continues; ENTER_THREW when a
+/// call it made threw, with machine holding the state at that call.
+@inlineNever
+unsafe effect fn enterBase<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, index: u32, value: &mut ValueBits) -> u32 ? &mut Allocator {
+  let anchor = ()
+  // The debugger, coverage and profiler see every instruction: interpret.
+  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).observeInstructions { return compiled.ENTER_INTERPRET }
+  let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  let words = compiled.stateWords(u16.toUsize(bytecode.variableCount), u16.toUsize(bytecode.stackSize))
+  let parameters = u16.toUsize(bytecode.argumentCount)
+  drop bytecode
+  let state = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(words))
+  let callWords = unsafe compiled.callWords(machine.runtime, index)
+  let mut room: usize = 1
+  if callWords > room { room = callWords }
+  let block = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(room))
+  let mut frame = CompiledFrame.of(&machine)
+  if callWords != 0 {
+    unsafe Pointer.write<u64>(block, 0)
+    frame.calls = unsafe Intrinsic.pointerRequalify<*mut u64, ?*mut u64>(block)
+  }
+  let mut exit = unsafe compiled.runCode(index, &frame, machine.arguments, parameters, state)
+  while exit == compiled.EXIT_CALL {
+    let how = run unsafe compiledCall(&mut hooks, memory, &mut machine, block)
+    unsafe Pointer.write<u64>(block, unsafe Pointer.read<u64>(block) | how)
+    exit = unsafe compiled.runCode(index, &frame, machine.arguments, parameters, state)
+  }
+  if exit == compiled.EXIT_RETURNED {
+    value.* = unsafe compiled.result(state)
+    return compiled.ENTER_RETURNED
+  }
+  unsafe compiled.restore(&mut machine, index, exit, state)
+  if exit == compiled.EXIT_THROW { return compiled.ENTER_THREW }
+  return compiled.ENTER_INTERPRET
+}
+/// The call compiled code running for machine left to make (the call block at block): how it
+/// went, as compiled.CALL_RETURNED (the owned result in the block), CALL_THREW (the exception
+/// pending) or CALL_DEOPT (nothing called).
+@inlineNever
+unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, block: *mut u64) -> u64 ? &mut Allocator {
+  let words = unsafe Pointer.assumeManyMut<u64>(block)
+  let site = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_SITE))
+  let pc = u64.toUsize(site & 0xffffffff)
+  let count = u64.toUsize(u64.shiftRight(site, 32))
+  let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
+  let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
+  // A known local function's value needs the caller's frame: the interpreter makes that call.
+  if let ValueBits.FunctionBytecode { .. } = function { return compiled.CALL_DEOPT }
+  let receiver = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 1))
+  let argv = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(area, 2), count: count }
+  // Backtraces name the call as the interpreter's would: the offset just past it.
+  let size = u8.toUsize(op.opcodeInfo(unsafe machine.byteAt(pc), true).size)
+  unsafe machine.setPc(pc + size)
+  unsafe machine.publishPc()
+  let called = run Intrinsic.catchFailure<JsException>(unsafe callForCompiled(&mut hooks, memory, machine.context, function, receiver, &argv), failedJs)
+  match move called {
+    ValueBits result => {
+      unsafe Pointer.write<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_RESULT)), result)
+      return compiled.CALL_RETURNED
+    }
+    FailedJs { .. } => { return compiled.CALL_THREW }
+  }
+}
+/// A call made by compiled code threw (compiled.ENTER_THREW): machine holds the state at
+/// that call and the exception is pending, as when execute fails there. Unwinds as the
+/// callInternal loop does; false when nothing in this run catches it.
+@inlineNever
+unsafe effect fn compiledThrew<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + CallHooks + ErrorHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine) -> bool ? &mut Allocator {
+  if !unsafe restricted.rejected(machine.runtime) { run unsafe exceptionBoundary(&mut hooks, memory, &mut machine) }
+  return run unsafe unwindFrames(&mut hooks, memory, &mut machine)
 }
 unsafe effect fn exceptionBoundary<H: HeapHooks + CoercionHooks + ErrorHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, base: &mut Machine) -> () ? &mut Allocator {
@@ -2075,6 +2166,18 @@ unsafe effect fn callFromBytecode<H: HeapHooks + CoercionHooks + OwnPropertyHook
   }
   return run unsafe callBytecode(&mut hooks, memory, context, function, receiver, argv)
 }
+/// callFromBytecode for a call made by compiled code (js_compiled_calls): argv's cells are
+/// borrowed, so a bytecode callee copies them. A known local function's value (its
+/// FunctionBytecode) is not callable from here: the caller checks for it first.
+pub unsafe effect fn callForCompiled<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots) -> ValueBits
+  ! JsException ? &mut Allocator {
+  if function.isObject() && unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION {
+    return run unsafe callFromBytecode(&mut hooks, memory, context, function, receiver, argv)
+  }
+  return run unsafe callInternal(&mut hooks, memory, context, function, receiver, ValueBits.Undefined, argv, activation.COPY_ARGUMENTS)
+}
 /// callFromBytecode for a bound function with no bound arguments, called (not
 /// constructed): its target runs directly with the bound this. A target of
 /// Function.prototype.call, as primordials' uncurryThis (bind.bind(call)(fn))
@@ -3325,7 +3428,8 @@ unsafe fn enterCompiled<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, func
   let anchor = ()
   let runtime = machine.runtime
   let frameCells = unsafe compiled.linkedFrameCells(runtime, index)
-  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).observeInstructions || !unsafe activation.linkedRoom(runtime, callee.bytecode, argv.count, frameCells) {
+  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).observeInstructions || unsafe compiled.callWords(runtime, index) != 0
+    || !unsafe activation.linkedRoom(runtime, callee.bytecode, argv.count, frameCells) {
     unsafe machine.skip(usize.wrappingSubtract(0, width))
     unsafe refund(counter)
     return Pointer.null<Machine>()
@@ -3543,7 +3647,8 @@ unsafe fn compiledFrame(caller: &Machine, function: ValueBits, bytecode: *mut He
   known: bool) -> compiled.CompiledFrame {
   let captures = unsafe activation.capturesOf(function, bytecode, Pointer.fromRef<Machine>(&caller), known)
   return compiled.CompiledFrame { thisValue: Pointer.fromRef<ValueBits>(&receiver), bytecode: bytecode, context: realm,
-    runtime: caller.runtime, closureReferences: captures.references, scope: captures.scope }
+    runtime: caller.runtime, closureReferences: captures.references, scope: captures.scope,
+    calls: Pointer.null<u64>() }
 }
 /// FunctionBytecode.compiled of bytecode: nonzero when it is linked to machine code.
 @inlineAlways
@@ -3563,7 +3668,7 @@ unsafe effect fn callCompiled<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   memory: &AllocationObserver, machine: &mut Machine, function: ValueBits, bytecode: *mut HeapHeader, index: u32, receiver: ValueBits,
   argv: FrameSlots, first: usize, known: bool) -> bool ! JsException ? &mut Allocator {
   let anchor = ()
-  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).observeInstructions { return false }
+  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).observeInstructions || unsafe compiled.callWords(machine.runtime, index) != 0 { return false }
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let words = compiled.stateWords(u16.toUsize(code.variableCount), u16.toUsize(code.stackSize))
   let realm = code.realm

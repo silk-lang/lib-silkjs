@@ -184,7 +184,7 @@ unsafe effect fn aotExercise<'m>(engine: &mut Engine<'m, Compiling>, context: *m
       Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { return Intrinsic.trap("sum must lower") }
     }
     match move lowered {
-      Lowered.Code { value } => { carried.* = Option<Code>.some(move value) }
+      Lowered.Code { value, .. } => { carried.* = Option<Code>.some(move value) }
       Lowered.Refused { .. } => { return Intrinsic.trap("sum must lower") }
     }
   } else {
@@ -197,7 +197,7 @@ unsafe effect fn aotExercise<'m>(engine: &mut Engine<'m, Compiling>, context: *m
     Option<Code>.None => { return Intrinsic.trap("no code") }
   }
   run Testing.expect(code.relocations.length() == 0, "the compiled artefact refers to no external address")
-  let installed = run unsafe jitRuntime.install(&mut engine.services.jit, header, &mut code)
+  let installed = run unsafe jitRuntime.install(&mut engine.services.jit, header, &mut code, 0)
   run Testing.expect(installed, "installed")
   let ten = run unsafe evaluate(&mut engine, context, b"sum(10)")
   let hundred = run unsafe evaluate(&mut engine, context, b"sum(100)")
@@ -279,6 +279,58 @@ test effect fn propertyReadsRunCompiled() -> ()
   unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
   let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
   let checked = run Effect.result(unsafe exerciseObjects(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
+    Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+const CALLS: &[u8] = b"function inc(x){return x+1}function each(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i);return s}function apply(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i,i);return s}function twice(o,n){let s=0;for(let i=0;i<n;i++)s=s+o.dbl(i);return s}function risky(x){if(x>50)throw new RangeError('big '+x);return x}function guarded(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i);return s}"
+
+unsafe effect fn exerciseCalls<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
+  ! JsException | AssertionError<'static> ? &mut Allocator {
+  drop run unsafe evaluate(&mut engine, context, CALLS)
+  // Globals are outside the subset, so callees come in as arguments. inc is counted only by
+  // calls from compiled each and is reported at a later interrupt poll.
+  let hot = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<3000;k++)t=t+each(inc,10);t")
+  run Testing.expect(isInt(hot, 165000), "calls from a compiled loop return what the interpreter's do")
+  run Testing.expect(engine.services.jit.compiledFunctions == 2, "each compiles, and inc, hot only through compiled calls, too")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.runs >= 100 && engine.services.jit.deopts == 0, "and they run compiled without a deopt")
+  // Natives, bound functions and closures go through the same call.
+  let native = run unsafe evaluate(&mut engine, context, b"var u=0;for(var k=0;k<50;k++)u=u+apply(Math.max,4);u")
+  run Testing.expect(isInt(native, 300), "a native callee")
+  let bound = run unsafe evaluate(&mut engine, context, b"apply(function(a,b){return a*b}.bind(null,2),5)")
+  run Testing.expect(isInt(bound, 20), "a bound callee")
+  let method = run unsafe evaluate(&mut engine, context, b"var o={dbl(x){return 2*x}};var w=0;for(var k=0;k<50;k++)w=w+twice(o,4);w")
+  run Testing.expect(isInt(method, 600), "a method call passes its receiver")
+  // A throw inside a call made by compiled code unwinds through the compiled caller.
+  let caught = run unsafe evaluate(&mut engine, context, b"var c=0;for(var k=0;k<50;k++)c=c+guarded(risky,20);try{guarded(risky,60);c=-1}catch(e){c=e instanceof RangeError&&e.message==='big 51'?c:-2}c")
+  run Testing.expect(isInt(caught, 9500), "a callee's throw reaches the script's catch, with the right exception")
+  let stack = run unsafe evaluate(&mut engine, context, b"var d=0;try{guarded(risky,60)}catch(e){d=e.stack.indexOf('guarded')>0?1:0}d")
+  run Testing.expect(isInt(stack, 1), "the backtrace names the compiled caller")
+  let notFunction = run unsafe evaluate(&mut engine, context, b"var r=0;try{apply(5,3)}catch(e){r=e instanceof TypeError?1:2}r")
+  run Testing.expect(isInt(notFunction, 1), "calling a non-function throws the interpreter's TypeError")
+  run Testing.expect(engine.services.failures == 0, "no compile failed")
+}
+test effect fn callsFromCompiledCode() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut options = Options.make()
+  options.enabled = true options.threshold = 20
+  let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
+  unsafe jitRuntime.attach(&mut engine.services.jit, rt)
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exerciseCalls(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
   run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
   unsafe gc.releaseHeader(&mut engine, rt, context)
   run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
