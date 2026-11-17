@@ -178,3 +178,89 @@ function is the time; `push_this` (methods and constructors, J's area) blocks th
 on 8 of the 15 Octane benchmarks, then `get_var` (globals, which calls to other functions need:
 H) and `get_arg_field8`/`get_field2` (property reads: J). Integer bit operations (`sar_imm`,
 `or_imm`, `shr`) block all of mandreel's and zlib's hot functions.
+
+## 2026-11-17 04:27 UTC: integration 8e5a87b3 (K landed: f64, register allocation, recompile)
+
+Same host, tools and versions as the baseline section; branch `claude/project-thread-6ys4ab`
+fast-forwarded to integration `8e5a87b3` (which contains the tools). Engine and shell rebuilt
+from it. Raw files: [`jit-scorecard-results/2026-11-17-8e5a87b3/`](jit-scorecard-results/2026-11-17-8e5a87b3/).
+Startup, RSS, size, warmup and micros were not rerun (K changes no engine or shell startup path).
+
+### Kernels
+
+Median ns per inner iteration over 7 processes, then the ratio to v8-jit / jsc-jit. Baseline
+silkjs-jit value in brackets.
+
+| Kernel | silkjs | silkjs-jit | v8-jit | jsc-jit | silkjs-jit outcome |
+|---|---:|---:|---:|---:|---|
+| sum-calls | 6.98 (14.3/9.9) | **2.37 (4.9/3.4)** [3.47] | 0.49 | 0.71 | compiled; 683 code bytes (989 before); 62.1% of instructions in compiled code |
+| sum-long | 10.03 | 9.89 (9.6/13.3) [10.22] | 1.03 | 0.74 | never hot (needs OSR) |
+| nested | 9.38 | **2.89 (4.8/2.5)** [11.43] | 0.60 | 1.14 | now compiled; 19,000 runs, 1,708 polls; 64.4% compiled |
+| calls | 22.31 | 24.33 (37.5/27.0) [23.16] | 0.65 | 0.90 | refused: `get_var` |
+| method | 30.73 | 31.32 (34.3/19.7) [31.26] | 0.91 | 1.59 | refused: `get_field2` |
+| doubles | 16.41 | **5.43 (3.3/2.8)** [16.97] | 1.66 | 1.97 | now compiled (f64); 99,000 runs, 984 polls; 69.8% compiled |
+| array-sum | 11.09 | 11.21 (16.6/15.6) [10.30] | 0.68 | 0.72 | refused: `get_arg_length8` |
+| typed-array | 41.69 | 42.92 (42.0/44.7) [44.59] | 1.02 | 0.96 | refused: `get_var` |
+
+Three kernels now compile, each about 3x faster than the interpreter, and they are 2.5x to 4.9x
+behind the JITs. No deopts anywhere. The compiled share fell on sum-calls (76.7% to 62.1%)
+because the compiled loop now executes fewer instructions; the rest is the interpreter's outer
+loop and call entry. `calls` is 9% slower in the JIT column with nothing compiled (ranges
+[240.2, 250.7] against [221.3, 244.9]); with no compiled code involved this is most likely code
+layout, not yet checked with instruction counts.
+
+### Octane 2
+
+| Engine | best round | median round | worst round |
+|---|---:|---:|---:|
+| silkjs | 5955 | 5797 | 5605 |
+| silkjs-jit | 6048 | 5853 | 5381 |
+| v8-jitless | 4704 | 4555 | 4355 |
+| jsc-nojit | 3507 | 3412 | 3284 |
+| qjs | 3182 | 3114 | 3014 |
+| v8-jit | 56750 | 54900 | 52397 |
+| jsc-jit | 55311 | 52633 | 49425 |
+
+silkjs-jit/silkjs, geometric mean of per-benchmark medians: 1.010 (baseline 0.983). This round
+was noisier: per-benchmark ratios run from 0.920 to 1.177, and NavierStokes (1.177) and
+SplayLatency (0.927) move although nothing in them compiles, so differences under about 10% are
+noise here. Box2D is again slower with the JIT (0.920, ranges do not overlap), the cost found in
+the baseline (callers of linked functions take the arguments path); it is unchanged by K.
+
+### Coverage
+
+Octane rows and kernels (the v8bench rows match their Octane rows; see `coverage.log`).
+
+| Benchmark | hot | compiled | refused | runs | deopts | polls | compiled instr | top refusals |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| octane/richards | 16 | 0 | 16 | 0 | 0 | 0 | 0.0000% | `push_this` 16 |
+| octane/deltablue | 39 | 0 | 39 | 0 | 0 | 0 | 0.0000% | `push_this` 36; `get_arg_field8` 1; `get_var` 1 |
+| octane/crypto | 25 | 0 | 25 | 0 | 0 | 0 | 0.0000% | `push_this` 18; `get_var` 5; `get_arg_length8` 1 |
+| octane/raytrace | 25 | 0 | 25 | 0 | 0 | 0 | 0.0000% | `push_this` 14; `get_var` 8; `push_atom_value` 1 |
+| octane/earley-boyer | 49 | 0 | 49 | 0 | 0 | 0 | 0.0000% | `get_var` 20; a function scope: invalid 8; `if_not_null8` 5 |
+| octane/regexp | 2 | 0 | 2 | 0 | 0 | 0 | 0.0000% | `get_scope0` 1; `put_field` 1 |
+| octane/splay | 14 | 0 | 14 | 0 | 0 | 0 | 0.0000% | `push_this` 7; `get_var` 4; `get_scope0` 2 |
+| octane/navier-stokes | 3 | 0 | 3 | 0 | 0 | 0 | 0.0000% | `get_scope0` 3 |
+| octane/pdfjs | 55 | 0 | 55 | 0 | 0 | 0 | 0.0000% | `push_this` 30; `get_scope0` 12; `get_var` 3 |
+| octane/mandreel | 48 | 0 | 48 | 0 | 0 | 0 | 0.0000% | `get_var` 48 |
+| octane/gbemu | 120 | 0 | 120 | 0 | 0 | 0 | 0.0000% | `get_arg_field8` 74; `push_this` 25; `get_field2` 16 |
+| octane/code-load | 8 | 0 | 8 | 0 | 0 | 0 | 0.0003% | `get_var` 3; `fclosure8` 1; `push_atom_value` 1 |
+| octane/box2d | 122 | 4 | 118 | 208401 | 0 | 0 | 0.0213% | `push_this` 98; `get_scope0` 9; `is_undefined` 6 |
+| octane/zlib | 15 | 0 | 15 | 0 | 0 | 0 | 0.0000% | `put_arg` 15 |
+| octane/typescript | 332 | 1 | 331 | 68325 | 0 | 0 | 0.0016% | `push_this` 266; `get_arg_field8` 29; `get_scope0` 16 |
+| kernel/sum-calls | 1 | 1 | 0 | 199000 | 0 | 1979 | 62.1470% | - |
+| kernel/sum-long | 0 | 0 | 0 | 0 | 0 | 0 | 0.0000% | - |
+| kernel/nested | 1 | 1 | 0 | 19000 | 0 | 1708 | 64.4036% | - |
+| kernel/calls | 1 | 0 | 1 | 0 | 0 | 0 | 0.0000% | `get_var` 1 |
+| kernel/method | 1 | 0 | 1 | 0 | 0 | 0 | 0.0000% | `get_field2` 1 |
+| kernel/doubles | 1 | 1 | 0 | 99000 | 0 | 984 | 69.8342% | - |
+| kernel/array-sum | 1 | 0 | 1 | 0 | 0 | 0 | 0.0000% | `get_arg_length8` 1 |
+| kernel/typed-array | 1 | 0 | 1 | 0 | 0 | 0 | 0.0000% | `get_var` 1 |
+
+Refusals over all rows: `push_this` 602, `get_var` 134, `get_arg_field8` 107, `get_scope0` 50,
+a function scope: invalid 26, `get_field2` 25, `put_arg` 17, `put_field` 11, `get_arg_length8`
+11. K's integer bit operations removed the first refusal of every hot zlib and mandreel function,
+which now stop one opcode later: zlib at `put_arg` (all 15), mandreel at `get_var` (all 48,
+up from 10). Still at most 0.021% of any Octane benchmark's instructions run compiled (Box2D).
+`push_this` (J) remains the reason that blocks the most functions; `get_var` (H) is second and
+now blocks all of mandreel.
