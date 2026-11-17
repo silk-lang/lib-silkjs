@@ -13,27 +13,41 @@ engine's `js_compiled_inline.silk` (what the engine tells the compiler).
 
 ## 1. Which calls
 
-A `call_method` whose function operand is the value of a `get_field2` of the same code, when
-the embedder found a target for that `get_field2`:
+A call (`call0`..`call3`, `call`, `call_method`; not `new`) for which the embedder found a
+target, from one of two sources:
 
-- the interpreter's site cache entry for the `get_field2` is current (its site, a prototype
-  key, the runtime's shape epoch) and the slot it names holds a bytecode closure;
-- the closure's function is a plain function (`FunctionKind.Normal`) of the caller's realm,
-  with no closure variables and no scope of its own, at most 96 bytes of code;
-- its code is in the translator's subset and has no branch (it runs straight to one
-  `return`).
+- **the recording** (`js_feedback`, taken before the first compilation, `--jit-profile`): the
+  call site was recorded calling exactly one function, a bytecode function. This covers
+  plain calls (a global function, a local, an argument) as well as method calls;
+- **the site cache**, for a `call_method` whose function operand is the value of a
+  `get_field2` of the same code, when the recording has nothing for the call: the
+  interpreter's cache entry for the `get_field2` is current (its site, a prototype key, the
+  runtime's shape epoch) and the slot it names holds a bytecode closure.
 
-The target is a snapshot taken when the caller is compiled (`js_compiled_inline.methodTarget`):
-what the site called last. It is a hint. The code checks the callee's identity every time
-(section 3), so a wrong hint costs a deoptimization, never a wrong result.
+In both cases:
 
-Candidates nest: a target's own `get_field2` sites are looked up too, two levels down, and
-the translator inlines at most three bodies deep and sixteen sites per function.
+- the function is a plain function (`FunctionKind.Normal`) of the caller's realm, with no
+  closure variables and no scope of its own, at most 96 bytes of code;
+- its code is made of the opcodes `ssa_translate.inlinable` lists and runs straight to one
+  `return`. The list is its own, not "everything the translator supports": an opcode a later
+  change adds to the subset (one whose handler reads a table of the function by pc, say) is
+  not inlinable until it is put there;
+- the body of a plain call does not read `this` (what it is depends on the callee's mode).
+
+The target is a snapshot taken when the caller is compiled (`jit_runtime.candidates`,
+`js_compiled_inline.methodTarget` and `plainTarget`). It is a hint. The code checks the
+callee's identity every time (section 3), so a wrong hint costs a deoptimization, never a
+wrong result.
+
+Candidates nest: a target's own call sites are looked up too, two levels down, and the
+translator inlines at most three bodies deep and sixteen sites per function.
 
 A call site at whose pc compiled code deoptimized before (`jit_recompile`'s sites) is not
 inlined again: the next compilation makes an ordinary call there.
 
-`--jit-no-inline` turns all of it off.
+`--jit-no-inline` turns all of it off. `--jit-dump` prints, per compilation, `jit: not
+inlined: <why>` for each call that stayed a call and `jit: no inline target: <why>` for
+each `get_field2` whose site cache named none.
 
 ## 2. The SSA
 
@@ -109,6 +123,6 @@ another function.
   parameter).
 - A guard after an effect: an exit that names two frames, so the interpreter resumes inside
   the callee.
-- Targets of plain calls (`get_var` of a global function), natives, constructors.
+- Natives and constructors as targets.
 - A site with more than one target falls back to a deoptimization and an ordinary call on
   recompilation, instead of a second guarded body or a call on the miss path.
