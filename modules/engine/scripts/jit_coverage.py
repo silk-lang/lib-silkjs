@@ -85,8 +85,11 @@ def counters(shell, path, cwd, timeout):
                           timeout=timeout, env=env, cwd=cwd)
     refused = collections.Counter(line[len("jit: refused: "):] for line in done.stderr.splitlines()
                                   if line.startswith("jit: refused: "))
+    deopted = collections.Counter(line[len("jit: deoptimized at: "):] for line in done.stderr.splitlines()
+                                  if line.startswith("jit: deoptimized at: "))
     errors = [line for line in done.stdout.splitlines() if "ERROR" in line]
-    return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "errors": errors}
+    return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "deopted": dict(deopted),
+            "errors": errors}
 
 
 def compiled_fraction(shell, path, cwd, timeout):
@@ -207,6 +210,13 @@ def main():
     print("\nrefusal reasons over all benchmarks (hot functions refused):")
     for reason, count in total.most_common(12):
         print("  %5d  %s" % (count, reason))
+    sites = collections.Counter()
+    for entry in results.values():
+        sites.update(entry["counters"].get("deopted", {}))
+    if sites:
+        print("\ndeoptimization sites over all benchmarks (sites of recompiled functions, by opcode):")
+        for name, count in sites.most_common(12):
+            print("  %5d  %s" % (count, name))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"shell": shell, "results": results}, f, indent=1)
