@@ -126,7 +126,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tries", "tries"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -343,6 +343,39 @@ class Generator:
             return (f"var k = {self.pick(['a', '0', 'b', '2147483646'])}; var s = 0; "
                     f"for (var i = 0; i < {self.pick([3, 8, 40])}; i++) {{ {form}; s = s + (k++ & 7) + ({keep}); }} "
                     f"return [k, s];")
+        if flavor == "tries":
+            # Try regions in hot code (stream P): the region holds arithmetic, a property read,
+            # a call that may throw or a throwing getter; it throws a primitive, an object or an
+            # Error at an iteration that depends on the arguments; finally blocks see return,
+            # break and continue; handlers rethrow into an outer try.
+            n = self.pick([3, 6, 20])
+            thrown = self.thrown()
+            body = self.pick([
+                f"t = {self.clamped(['t', 'j'])};",
+                f"t = __clamp(t + a.x + j);",
+                f"t = __clamp(t + {self.pick(['a.f(j, b)', 'a.k(j)', 'b(j)', 'a.g(j, b)'])});",
+                f"t = __clamp(t + {self.pick(['{get x() { throw new TypeError(\'g\'); }}', '{get x() { return j; }}', '{x: j}'])}.x);",
+            ])
+            when = self.pick(["j === (b & 7)", "(t & 15) === 3", "j === 2 && a === b", f"({self.using(['t', 'j'])}) === 1"])
+            shape = self.pick(["catch", "catch", "finally", "nested", "return", "jumps", "rethrow"])
+            head = f"var t = {self.pick(['0', 'b', '1'])}; "
+            if shape == "catch":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                        f"catch (e) {{ t = __clamp(__err(e) + j); }} }} return t;")
+            if shape == "finally":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                        f"finally {{ __fin = (__fin + 1) | 0; t = __clamp(t + 1); }} }} return t;")
+            if shape == "nested":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                        f"catch (e) {{ if (j & 1) throw e; t = __clamp(t - j); }} }} catch (f) {{ t = __clamp(__err(f) + t); }} }} return t;")
+            if shape == "return":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) return [t, j]; }} "
+                        f"{self.pick(['catch (e) { return __err(e); }', 'finally { __fin = (__fin + 1) | 0; }'])} }} return t;")
+            if shape == "jumps":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ if (j === 1) continue; {body} if ({when}) break; }} "
+                        f"finally {{ __fin = (__fin + 1) | 0; t = __clamp(t + j); {self.pick(['', 'if (j === 4) return t;'])} }} }} return t;")
+            return (head + f"try {{ for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                    f"catch (e) {{ t = __clamp(t + 1); throw e; }} }} }} catch (e) {{ return [t, __err(e)]; }} return t;")
         raise ValueError(flavor)
 
     def function(self) -> str:
