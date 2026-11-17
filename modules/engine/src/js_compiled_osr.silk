@@ -2,7 +2,7 @@
 //! compiled code an embedder linked for one of its loop headers, at an interrupt poll on a
 //! backward jump, and comes back at a bytecode boundary. The code is a separate artefact per
 //! header (CompiledEntry.osr) on the compiled-entry ABI (js_compiled), taking the frame's
-//! arguments then its locals as arguments. A poll exit is handled here and the code entered
+//! arguments then its locals as its arguments. A poll exit is handled here and the code entered
 //! again, so a long loop stays compiled; a return exit lets the interpreter execute the
 //! return instruction, so inline frames need nothing of their own.
 import silk.mem.allocator { Allocator }
@@ -25,9 +25,7 @@ import js_exceptions { JsException }
 import js_realm { lendRealm }
 import js_hotness as hotness
 import js_opcode_data as op
-import js_compiled { EXIT_RETURNED, EXIT_DEOPT, EXIT_POLL, SLOT_LEAVE, SLOT_INT, SLOT_UNDEFINED, SLOT_UNINITIALIZED, SLOT_BOOL, SLOT_NULL, SLOT_ARGUMENT }
-
-const KIND_SHIFT: u64 = 32
+import js_compiled { EXIT_RETURNED, EXIT_DEOPT, EXIT_POLL, CompiledFrame, CompiledCode, stateWords, result }
 
 fn trap() -> never { return Intrinsic.trap("compiled code table invariant violated") }
 
@@ -81,46 +79,40 @@ unsafe fn codeAt(entrySlot: *mut CompiledEntry, pc: u32, depth: u32) -> ?*const 
   return Pointer.null<u8>()
 }
 
-/// The ABI word of a cell: an Int or Bool unboxed, anything else named by its position.
-unsafe fn wordOf(cell: *mut ValueBits, position: usize) -> u64 {
-  return match unsafe Pointer.read<ValueBits>(cell) {
-    ValueBits.Int { value: bits } => u64.bitOr(u64.shiftLeft(SLOT_INT, KIND_SHIFT), u32.toU64(i32.wrappingToU32(bits)))
-    ValueBits.Bool { value: truth } => u64.bitOr(u64.shiftLeft(SLOT_BOOL, KIND_SHIFT), if truth { 1 } else { 0 })
-    _ => u64.bitOr(u64.shiftLeft(SLOT_ARGUMENT, KIND_SHIFT), usize.toU64(position))
-  }
-}
-
 /// Runs code for machine and applies its exit. Returns the exit code.
 @inlineNever
 unsafe effect fn enterAt<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, entrySlot: *mut CompiledEntry, code: *const u8) -> u32 ? &mut Allocator {
   let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
   let data = entry.data
+  let env = entry.env
   drop entry
   let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
   let parameters = u16.toUsize(bytecode.argumentCount)
   let locals = u16.toUsize(bytecode.variableCount)
   let stackSize = u16.toUsize(bytecode.stackSize)
   drop bytecode
-  let inputs = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(parameters + locals))
-  let inputWords = unsafe Pointer.assumeManyMut<u64>(inputs)
+  // The code's arguments: the frame's arguments, then its locals, as borrowed bit copies.
+  let inputs = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(
+    unsafe Intrinsic.stackAllocate<ValueBits>(parameters + locals)))
   let mut position: usize = 0
   while position < parameters {
-    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(inputWords, position), unsafe wordOf(unsafe machine.argumentCell(position), position))
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(inputs, position), unsafe Pointer.read<ValueBits>(unsafe machine.argumentCell(position)))
     position = position + 1
   }
   position = 0
   while position < locals {
-    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(inputWords, parameters + position),
-      unsafe wordOf(unsafe machine.localCell(position), parameters + position))
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(inputs, parameters + position), unsafe Pointer.read<ValueBits>(unsafe machine.localCell(position)))
     position = position + 1
   }
-  let exitState = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(2 + locals + stackSize))
+  let exitState = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(stateWords(locals, stackSize)))
   let mut contextAnchor = () let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, machine.context)
   let counter = Pointer.fromMutRef<i32>(&mut context.interruptCounter)
   drop context
-  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(Pointer.fromRef<*const u8>(&code))
-  let function = unsafe Pointer.read<extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(slot)
-  let exit = unsafe function(unsafe Intrinsic.pointerRequalify<*mut u64, *const u64>(inputs), exitState, counter, data)
+  let frame = CompiledFrame.of(&machine)
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const CompiledCode>(Pointer.fromRef<*const u8>(&code))
+  let machineCode = unsafe Pointer.read<CompiledCode>(slot)
+  let arguments = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(unsafe Pointer.atMut<ValueBits>(inputs, 0))
+  let exit = unsafe machineCode(arguments, exitState, counter, data, env, Pointer.fromRef<CompiledFrame>(&frame))
   let words = unsafe Pointer.assumeManyMut<u64>(exitState)
   let mut tallyAnchor = () let tally = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut tallyAnchor, entrySlot)
   tally.osrRuns = tally.osrRuns + 1
@@ -132,8 +124,8 @@ unsafe effect fn enterAt<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, ent
   }
   drop tally
   if exit == EXIT_RETURNED {
-    let value = unsafe materialize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 0)), &mut machine, parameters)
-    let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 1)))
+    let value = unsafe result(exitState)
+    let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 2)))
     let opcode = unsafe machine.byteAt(pc)
     if opcode == op.OP_return { unsafe machine.push(value) }
     else if opcode == op.OP_return_undef { unsafe gc.release(&mut hooks, machine.runtime, value) }
@@ -142,73 +134,30 @@ unsafe effect fn enterAt<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, ent
     return exit
   }
   if exit != EXIT_DEOPT && exit != EXIT_POLL { trap() }
-  run unsafe restoreLive(&mut hooks, &mut machine, words, parameters, locals, stackSize)
+  unsafe restoreLive(&mut hooks, &mut machine, words, locals, stackSize)
   return exit
 }
 
-/// Applies exit state words to a live frame whose operand stack is empty: every value is
-/// read before any local is written, and a local written over loses its old value.
-unsafe effect fn restoreLive<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, words: [*]mut u64, parameters: usize,
-  locals: usize, stackSize: usize) -> () ? &mut Allocator {
+/// Applies an exit state to a live frame whose operand stack is empty: each slot's value owns
+/// its count (the exit stub retained what it copied), so a local takes it over and releases
+/// what it held.
+unsafe fn restoreLive<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, words: [*]mut u64, locals: usize, stackSize: usize) -> () {
   let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 0)))
   let depth = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 1)))
   if depth > stackSize || machine.sp() != 0 { trap() }
-  let fresh = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(
-    unsafe Intrinsic.stackAllocate<ValueBits>(locals + depth)))
+  let values = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, 2)))
   let mut position: usize = 0
-  while position < locals + depth {
-    let word = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 2 + position))
-    let mut value = ValueBits.Uninitialized
-    if !unsafe keeps(word, position, parameters, locals) { value = unsafe materialize(word, &mut machine, parameters) }
-    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(fresh, position), value)
-    position = position + 1
-  }
-  position = 0
   while position < locals {
-    let word = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 2 + position))
-    if !unsafe keeps(word, position, parameters, locals) {
-      let cell = unsafe machine.localCell(position)
-      let old = unsafe Pointer.read<ValueBits>(cell)
-      unsafe Pointer.write<ValueBits>(cell, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(fresh, position)))
-      unsafe gc.release(&mut hooks, machine.runtime, old)
-    }
+    let cell = unsafe machine.localCell(position)
+    let old = unsafe Pointer.read<ValueBits>(cell)
+    unsafe Pointer.write<ValueBits>(cell, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, position)))
+    unsafe gc.release(&mut hooks, machine.runtime, old)
     position = position + 1
   }
   position = 0
   while position < depth {
-    unsafe machine.push(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(fresh, locals + position)))
+    unsafe machine.push(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, locals + position)))
     position = position + 1
   }
   unsafe machine.setPc(pc)
-}
-/// Whether local slot position's word leaves the cell as it is: SLOT_LEAVE, or a copy of
-/// the value the cell itself held at entry.
-unsafe fn keeps(word: u64, position: usize, parameters: usize, locals: usize) -> bool {
-  if position >= locals { return false }
-  let kind = u64.shiftRight(word, KIND_SHIFT)
-  if kind == SLOT_LEAVE { return true }
-  return kind == SLOT_ARGUMENT && u64.toUsize(u64.bitAnd(word, 4294967295)) == parameters + position
-}
-/// The owned value word names; position payloads count the frame's arguments, then its locals.
-unsafe fn materialize(word: u64, machine: &mut Machine, parameters: usize) -> ValueBits {
-  let kind = u64.shiftRight(word, KIND_SHIFT)
-  let payload = u64.wrappingToU32(word)
-  if kind == SLOT_INT { return ValueBits.Int { value: u32.wrappingToI32(payload) } }
-  if kind == SLOT_UNDEFINED { return ValueBits.Undefined }
-  if kind == SLOT_UNINITIALIZED { return ValueBits.Uninitialized }
-  if kind == SLOT_BOOL { return ValueBits.Bool { value: (payload & 1) != 0 } }
-  if kind == SLOT_NULL { return ValueBits.Null }
-  if kind == SLOT_ARGUMENT {
-    let index = u32.toUsize(payload)
-    let mut cell = unsafe machine.localCell(0)
-    if index < parameters { cell = unsafe machine.argumentCell(index) }
-    else {
-      let bytecodeAnchor = ()
-      let locals = u16.toUsize((unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)).variableCount)
-      if index - parameters >= locals { trap() }
-      cell = unsafe machine.localCell(index - parameters)
-    }
-    return unsafe (unsafe Pointer.read<ValueBits>(cell)).retained()
-  }
-  return trap()
 }
