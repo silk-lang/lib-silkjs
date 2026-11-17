@@ -69,8 +69,24 @@ unchanged compiled-entry ABI:
   with an exit there that is always taken (`sideExit`: an `unbox.i32` of `undefined`). Cold
   paths in or after a loop (a property write on the last iteration, the code after the loop)
   then cost nothing; a hot one costs one entry and one exit per poll until the deopt limit.
-- **Headers** are the targets of backward jumps (`loopHeaders`, a linear decode). Only depth 0 is
-  compiled; the engine checks the frame's depth before entering.
+- **Headers** are the targets of backward jumps (`loopHeaders`, a linear decode).
+- **Operands at the header.** A header inside a try region or a for-of loop has operands on the
+  stack, and their layout is static: `ssa_translate.osrMarkers` lists them from the bytecode,
+  outermost first. A catch marker is a constant (`CatchOffset`). A for-of record whose loop has
+  the parser's shape (`for_of_start; goto next; body ... next: for_of_next 0; if_false body`) and
+  is open at the header is three slots, iterator and method (inputs) and its marker (a
+  constant), plus the element when the header is the body's start. Any other for_of_start
+  before the header refuses the artefact. Inputs follow the locals as arguments
+  `argumentCount + localCount + slot`; `OsrEntry.depth` is the slot count, and the engine enters
+  only at that depth (`knownHeader`). On every exit, return included, the engine pops those
+  operands and releases them; the exit state holds the whole stack.
+- **for-of steps.** `for_of_next` compiles for the interpreter's stand-in record over a fast
+  Array (`js_iterators.forOfStart`: the array in the iterator slot, the next index as an Int in
+  the method slot): unbox the index, `get.elem` with `k = ELEM_STEP`, whose miss (a hole, the
+  end, an array no longer fast) is a deopt exit at the `for_of_next`, then index + 1. That exit
+  is no OSR deopt when the record is a stand-in (`standInStep`): the interpreter takes the end
+  or the slow step as it would. A real record (Set, Map, string, generator, a custom iterator)
+  fails the unbox at the first step, which is an ordinary deopt and backs off.
 
 `jit_runtime.compileHot` compiles OSR code only for the header in the report, next to the
 normal entry; a function reported from entries gets none until a poll lands in one of its
@@ -113,8 +129,9 @@ word are arguments, as before). `OsrEntry` tables are runtime state, never store
 
 ## Limits
 
-- Depth-0 headers only (for-in and for-of keep their iterator on the stack; those loops use
-  opcodes outside the subset anyway).
+- for-in loops, and for-of over anything but a stand-in record, have no compiled step yet: they
+  need the generic instruction (stream N). A function's normal entry still refuses
+  `for_of_start`, so a for-of loop runs compiled only through OSR.
 - A loop in a generator, async function or module body is never entered (the translator refuses
   them; `vm.resume` frames would need their own transfer).
 - Loop hotness reports at the first back-edge poll in a frame. Calls also charge the counter, so a
