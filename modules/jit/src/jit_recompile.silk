@@ -28,7 +28,12 @@ struct Record {
   compiles: u32,
   /// The table entry of the code compiled last, or NONE.
   entry: u32,
-  sites: List<u32>
+  sites: List<u32>,
+  /// Bytecode bytes translated for it so far, normal and OSR lowerings and refusals alike:
+  /// what the compile budget counts (jit_runtime Options.compileBudget).
+  lowered: u64,
+  /// Whether its coming recompilation already waited for the function to prove hot again.
+  waited: bool
 }
 
 pub struct History { records: List<Record> }
@@ -36,7 +41,9 @@ pub struct History { records: List<Record> }
 /// What to do with a reported function: refuse it (with why), or compile it with `sites` as
 /// double sites. `record` names the History record to update afterwards; `recompile` says
 /// whether this is a function's second or later compilation.
-pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub recompile: bool, record: usize }
+/// kinds: for each of sites the operand kinds the entry recorded there (CompiledEntry.deoptKinds),
+/// 0 for a site of an earlier compilation.
+pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub kinds: List<u8>, pub recompile: bool, record: usize }
 
 /// FNV-1a over the code and the counts the translator reads.
 unsafe fn hashOf(function: &FunctionBytecode) -> u64 {
@@ -81,7 +88,7 @@ impl History {
       // Reported again: its code was unlinked (or it was refused and the engine re-armed it).
       let record = &mut self.records.asMutSlice()[same]
       if record.compiles > MAX_RECOMPILES {
-        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), recompile: true, record: same }
+        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), kinds: List<u8>.make(), recompile: true, record: same }
       }
       let mut sites = run copy(&record.sites)
       let mut widened = false
@@ -94,16 +101,28 @@ impl History {
           k = k + 1
         }
       }
+      let mut kinds = List<u8>.make()
+      let mut s: usize = 0
+      while s < sites.length() {
+        let mut kind: u8 = 0
+        if record.entry != NONE {
+          let entry = &entries.asSlice()[u32.toUsize(record.entry)]
+          let mut k: usize = 0
+          while k < u8.toUsize(entry.deoptPcCount) { if entry.deoptPcs[k] == sites.get(s) { kind = entry.deoptKinds[k] } k = k + 1 }
+        }
+        run kinds.append(kind)
+        s = s + 1
+      }
       if !widened {
         record.compiles = MAX_RECOMPILES + 1
-        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, recompile: true, record: same }
+        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, kinds: move kinds, recompile: true, record: same }
       }
-      return Plan { refuse: false, why: b"", sites: move sites, recompile: true, record: same }
+      return Plan { refuse: false, why: b"", sites: move sites, kinds: move kinds, recompile: true, record: same }
     }
     let mut sites = List<u32>.make()
     if alike < self.records.length() { sites = run copy(&self.records.asSlice()[alike].sites) }
-    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make() })
-    return Plan { refuse: false, why: b"", sites: move sites, recompile: false, record: self.records.length() - 1 }
+    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make(), lowered: 0, waited: false })
+    return Plan { refuse: false, why: b"", sites: move sites, kinds: List<u8>.make(), recompile: false, record: self.records.length() - 1 }
   }
 
   /// Records the outcome of `plan`: compiled into table entry `entry`, or NONE when refused.
@@ -111,8 +130,41 @@ impl History {
     let record = &mut self.records.asMutSlice()[plan.record]
     record.compiles = record.compiles + 1
     record.entry = entry
+    record.waited = false
     record.sites.clear()
     run record.sites.appendSlice(plan.sites.asSlice())
+  }
+}
+
+impl History {
+  /// Whether lowering `bytes` more bytecode bytes for plan's function stays within `budget`
+  /// (0: no budget); if so they are counted.
+  pub fn charge(self: &mut Self, plan: &Plan, bytes: usize, budget: u64) -> bool {
+    let record = &mut self.records.asMutSlice()[plan.record]
+    let total = record.lowered + usize.toU64(bytes)
+    if budget != 0 && total > budget { return false }
+    record.lowered = total
+    return true
+  }
+}
+
+/// Entries a recompilation waits for, as a multiple of the hot budget, per compilation so far.
+const BACKOFF: u32 = 8
+
+impl History {
+  /// How many hot budgets of entries plan's function must run before it is compiled again, or
+  /// 0 to compile now. Code that deoptimized until it was unlinked was wasted work, so each
+  /// recompilation asks for BACKOFF times more proof than the one before; asked once per
+  /// recompilation (the function is reported again when the entries are used up).
+  pub fn backoff(self: &mut Self, plan: &Plan) -> u32 {
+    if !plan.recompile || plan.refuse { return 0 }
+    let record = &mut self.records.asMutSlice()[plan.record]
+    if record.waited { return 0 }
+    record.waited = true
+    let mut wait: u32 = BACKOFF
+    let mut n: u32 = 1
+    while n < record.compiles && n < MAX_RECOMPILES { wait = wait * BACKOFF n = n + 1 }
+    return wait
   }
 }
 
