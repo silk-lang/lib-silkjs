@@ -12,10 +12,10 @@ import code_memory { CodeBlock, CodeMemory, MemoryError }
 import ssa { Function, Op, Type, Own, RootKind, SlotMode, NONE }
 import x64_backend { Lowering, Settings }
 import x64_backend as backend
-
-const INT: u64 = 4294967296
-const ARGUMENT: u64 = 25769803776
-const UNDEFINED: u64 = 8589934592
+import silk.core.option { Option }
+import silkjs.js_value { ValueBits }
+import value_layout { ValueLayout }
+import value_layout as layouts
 /// Bytecode offsets the hand-built function pretends to come from.
 pub const PC_ENTRY: u32 = 0
 pub const PC_HEADER: u32 = 7
@@ -69,9 +69,12 @@ pub effect fn sumFunction() -> Function ! OutOfMemoryError ? &mut Allocator {
   return move f
 }
 
+fn layout() -> ValueLayout {
+  return match layouts.probe() { Option<ValueLayout>.Some { value } => value Option<ValueLayout>.None => Intrinsic.trap("ValueBits layout not understood") }
+}
 effect fn compile(stress: u32) -> Code ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
   let f = run sumFunction()
-  match move run backend.lower(&f, Settings { stress: stress }) {
+  match move run backend.lower(&f, Settings { stress: stress, layout: layout() }) {
     Lowering.Code { value } => { return move value }
     Lowering.Unsupported { .. } => { return Intrinsic.trap("sum must lower") }
   }
@@ -83,46 +86,59 @@ effect fn publish(memory: &mut CodeMemory, code: &mut Code) -> CodeBlock ! Memor
   run writer.append(code.bytes.asSlice())
   return run writer.finish()
 }
-unsafe fn enter(block: &CodeBlock, argument: u64, state: *mut u64, counter: *mut i32, data: *mut i32) -> u32 {
+unsafe fn enter(block: &CodeBlock, argument: ValueBits, state: *mut u64, counter: *mut i32, data: *mut i32) -> u32 {
   let address = block.entry()
-  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(Pointer.fromRef(&address))
-  let function = unsafe Pointer.read<extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(slot)
-  let words: [u64; 1] = [argument]
-  return unsafe function(Pointer.fromRef<u64>(&words[0]), state, counter, unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(data))
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const ValueBits, *mut u64, *mut i32, ?*mut u8, ?*mut u8, ?*const u8) -> u32>(Pointer.fromRef(&address))
+  let function = unsafe Pointer.read<extern "C" fn(*const ValueBits, *mut u64, *mut i32, ?*mut u8, ?*mut u8, ?*const u8) -> u32>(slot)
+  let cells: [ValueBits; 1] = [argument]
+  return unsafe function(Pointer.fromRef<ValueBits>(&cells[0]), state, counter, unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(data), Pointer.null<u8>(), Pointer.null<u8>())
 }
+/// The ValueBits at state word `word`.
+fn at(state: &[u64; 16], word: usize) -> ValueBits {
+  return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*const u64, *const ValueBits>(Pointer.fromRef<u64>(&state[word])))
+}
+fn int(bits: ValueBits, expected: i32) -> bool { return match bits { ValueBits.Int { value } => value == expected _ => false } }
+fn undefined(bits: ValueBits) -> bool { return match bits { ValueBits.Undefined => true _ => false } }
+/// The i-th local or stack slot of an exit state.
+fn slotAt(state: &[u64; 16], index: usize) -> ValueBits { return at(state, 2 + 2 * index) }
 
 test effect fn compiledSumReturnsAndDeopts() -> () ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut code = run compile(0) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut memory = run CodeMemory.reserve(1048576)
   let block = run publish(&mut memory, &mut code)
-  let mut state: [u64; 6] = [0; 6]
+  let mut state: [u64; 16] = [0; 16]
   let mut counter: i32 = 10000
   let mut stress: i32 = 0
   let s = Pointer.fromMutRef<u64>(&mut state[0])
   let c = Pointer.fromMutRef<i32>(&mut counter)
   let d = Pointer.fromMutRef<i32>(&mut stress)
-  run Testing.expect(unsafe enter(&block, INT | 10, s, c, d) == 0 && state[0] == (INT | 45), "sum(10) returns the Int 45")
-  run Testing.expect(unsafe enter(&block, INT | 0, s, c, d) == 0 && state[0] == INT, "sum(0) returns the Int 0")
-  run Testing.expect(unsafe enter(&block, INT | 4294967295, s, c, d) == 0 && state[0] == INT, "sum(-1) returns the Int 0")
+  run Testing.expect(unsafe enter(&block, ValueBits.Int { value: 10 }, s, c, d) == 0 && int(at(&state, 0), 45) && state[2] == u32.toU64(PC_HEADER), "sum(10) returns the Int 45 and names its return")
+  run Testing.expect(unsafe enter(&block, ValueBits.Int { value: 0 }, s, c, d) == 0 && int(at(&state, 0), 0), "sum(0) returns the Int 0")
+  run Testing.expect(unsafe enter(&block, ValueBits.Int { value: -1 }, s, c, d) == 0 && int(at(&state, 0), 0), "sum(-1) returns the Int 0")
   // Not an Int: the entry guard leaves before anything ran, locals as the interpreter has them.
-  run Testing.expect(unsafe enter(&block, ARGUMENT, s, c, d) == 1 && state[0] == u32.toU64(PC_ENTRY) && state[1] == 0
-    && state[2] == UNDEFINED && state[3] == UNDEFINED, "a non-Int argument deopts at entry")
+  run Testing.expect(unsafe enter(&block, ValueBits.Float64 { value: 2.5 }, s, c, d) == 1 && state[0] == u32.toU64(PC_ENTRY) && state[1] == 0
+    && undefined(slotAt(&state, 0)) && undefined(slotAt(&state, 1)), "a non-Int argument deopts at entry")
   // 0 + 1 + ... + 65535 = 2147450880 fits; adding 65536 overflows, at i = 65536.
   counter = 1000000
-  run Testing.expect(unsafe enter(&block, INT | 70000, s, c, d) == 1 && state[0] == u32.toU64(PC_ADD) && state[1] == 2
-    && state[2] == (INT | 2147450880) && state[3] == (INT | 65536) && state[4] == (INT | 2147450880) && state[5] == (INT | 65536),
+  run Testing.expect(unsafe enter(&block, ValueBits.Int { value: 70000 }, s, c, d) == 1 && state[0] == u32.toU64(PC_ADD) && state[1] == 2
+    && int(slotAt(&state, 0), 2147450880) && int(slotAt(&state, 1), 65536) && int(slotAt(&state, 2), 2147450880) && int(slotAt(&state, 3), 65536),
     "an overflowing add deopts before itself with its operands on the stack")
   // The poll: three back edges then a poll exit at the loop header with i = 3.
   counter = 3
-  run Testing.expect(unsafe enter(&block, INT | 100, s, c, d) == 2 && state[0] == u32.toU64(PC_HEADER) && state[1] == 0
-    && state[2] == (INT | 3) && state[3] == (INT | 3), "the back edge leaves through its poll exit when the counter runs out")
+  run Testing.expect(unsafe enter(&block, ValueBits.Int { value: 100 }, s, c, d) == 2 && state[0] == u32.toU64(PC_HEADER) && state[1] == 0
+    && int(slotAt(&state, 0), 3) && int(slotAt(&state, 1), 3), "the back edge leaves through its poll exit when the counter runs out")
   run Testing.expect(counter == 0, "the poll consumed the counter as the interpreter's would")
   let mut stressed = run compile(5) |> Effect.provideMut<Allocator>(&mut allocator)
   let stressBlock = run publish(&mut memory, &mut stressed)
   counter = 10000 stress = 5
   // Guards checked: unbox, then per iteration add and inc. The 5th is the inc of i = 1.
-  run Testing.expect(unsafe enter(&stressBlock, INT | 10, s, c, d) == 1 && state[0] == u32.toU64(PC_INC)
-    && state[2] == (INT | 1) && state[3] == (INT | 1), "stress fails the Nth guard check")
+  run Testing.expect(unsafe enter(&stressBlock, ValueBits.Int { value: 10 }, s, c, d) == 1 && state[0] == u32.toU64(PC_INC)
+    && int(slotAt(&state, 0), 1) && int(slotAt(&state, 1), 1), "stress fails the Nth guard check")
   run Testing.expect(stress == 5, "stress re-arms its counter")
+}
+
+test effect fn valueLayoutIsUnderstood() -> () ! AssertionError<'static> {
+  let probed = layouts.probe()
+  run Testing.expect(probed.isSome(), "the engine's ValueBits layout is one compiled code understands")
 }

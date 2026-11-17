@@ -50,20 +50,38 @@ interpreter frame exactly as it always does (arguments, locals set to undefined,
 empty), then, out of line in `js_compiled.enter`, calls
 
 ```
-extern "C" fn(arguments: *const u64, state: *mut u64, counter: *mut i32, data: ?*mut u8) -> u32
+extern "C" fn(arguments: *const ValueBits, state: *mut u64, counter: *mut i32, data: ?*mut u8,
+  env: ?*mut u8, frame: *const CompiledFrame) -> u32        (js_compiled.CompiledCode)
 ```
 
-- `arguments`: one word per declared parameter, in the frame-state word encoding below: an
-  `Int` is kind 1 with its bits, a `Bool` kind 4, any other value kind 6 naming its own
-  parameter cell.
-  Unboxing is in the engine; the type guard is in the machine code.
-- `state`: `2 + locals + stackSize` words, written on every exit.
+(Milestone 7 changed this ABI, workstream J: before it arguments and exit slots were 64-bit
+"frame-state words", kind << 32 | payload, which cannot hold a heap reference or a double.)
+
+- `arguments`: the frame's argument cells, one `ValueBits` per declared parameter, borrowed.
+  The code copies them and never writes them or relies on their address (an OSR entry may pass
+  a temporary copy). `js_compiled.runCode` pads a short argument list with `Undefined` in a
+  copy. Type guards are in the machine code.
+- `state`: `js_compiled.stateWords(locals, stackSize)` words, written on every exit.
 - `counter`: the context's interrupt counter (`ContextState.interruptCounter`); compiled loops
   decrement it on every back edge like the interpreter and leave through a poll exit at zero.
 - `data`: the entry's embedder word (the stress counter of the deopt-stress configuration).
-- Result 0: returned; `state[0]` is the result as a frame-state word (an owned value: kind 6
-  hands the caller a retained copy of that argument). Result 1: deoptimization. Result 2:
+- `env`: the entry's environment word, the JIT's `jit_helpers.CompiledEnv` (the runtime and
+  the table of runtime helpers compiled code calls by index, never by address).
+- `frame`: what the function runs for (`js_compiled.CompiledFrame`, a C-layout struct of
+  pointers, all borrowed for the call): the receiver cell, the `FunctionBytecode` cell, the
+  context, the runtime, the closure's captured variable cells and the running scope.
+- Result 0: returned; `state` words 0-1 hold the result `ValueBits`, owned (the caller takes
+  the count), word 2 the bytecode offset of the `return`. Result 1: deoptimization. Result 2:
   interrupt poll (an exit that is not counted as a deopt).
+
+**Values in compiled code.** Every SSA value has a 16-byte slot; a boxed `value` is a
+`ValueBits` in the engine's own layout. Silk does not promise a union layout, so the JIT reads it
+from the engine at compile time (`value_layout.probe`: it writes each variant over zeros and over
+ones and finds the tag and payload bytes). On the build measured, the tag is the first word's low
+byte (Silk writes the whole word, so compiled code reads one byte and writes the word with zero
+upper bytes) and the payload the second word; the seven heap variants have consecutive tags, so
+"is a heap reference" is one range check. An unexpected layout refuses every function. The
+layout is a property of one engine build: a stored artefact must key on it.
 
 What this choice costs later: a compiled function always pays the interpreter frame setup and a
 native call, inline call sites lose their inline frame, and once compiled code calls other
@@ -79,24 +97,25 @@ immediates and returns 1 (or 2). The state is:
 - `state[0]`: the bytecode offset to resume at, from the start of `FunctionBytecode.code`, at
   the start of the instruction to re-execute (the state before it);
 - `state[1]`: operand stack depth;
-- then one word per local and per stack slot (bottom first). A word is a kind in bits 32..39
-  and a payload in bits 0..31: 0 leave the cell as it is, 1 `Int` (payload), 2 `Undefined`,
-  3 `Uninitialized`, 4 `Bool` (bit 0), 5 `Null`, 6 a retained copy of parameter `payload`
-  (G's `dup` of an argument). Arguments are not written: the SSA subset never writes one.
+- then one `ValueBits` (two words) per local and per stack slot, bottom first. Each owns one
+  count, which the interpreter frame takes over as it is: the exit stub has already added the
+  count of every `dup` slot and of every deferred `move` (below). Arguments are not written: the
+  SSA subset never writes one.
 
-`js_compiled.enter` writes those into the interpreter frame's locals, pushes the stack slots, sets `ip`, and `callInternal` continues into its ordinary
-`execute` loop, so everything after a deopt (exceptions, calls, polls, the debugger) is the
-interpreter's own. The interpreter re-executes the instruction that failed its guard (an `add`
-that overflowed makes its `Float64` there).
+`js_compiled.restore` copies those into the interpreter frame's locals, pushes the stack slots,
+sets `ip`, and `callInternal` continues into its ordinary `execute` loop, so everything after a
+deopt (exceptions, calls, polls, the debugger) is the interpreter's own. The interpreter
+re-executes the instruction that failed its guard (an `add` that overflowed makes its
+`Float64` there). `enter` is `runCode` (no `Machine`), then `result` or `restore`.
 
 Ownership: the frame's locals still hold what `callInternal` put there (`Undefined`), so writing
-an immediate over them needs no release. Retains are deferred to the engine: the only owned
-values the subset makes are `retain`s of an argument, which the backend holds as the
-argument's kind 6 word, `release` emits nothing, and each consumption that hands one to the
-engine (a `move` slot, `return`) makes the engine retain once. That is exact because G's
-verifier proves every owned value is consumed exactly once on every path. A `dup` slot of an
-argument is the same kind 6 word. The backend refuses a `retain` of anything but an argument;
-values that own counts of their own need a transferring kind when the subset grows.
+over them needs no release. Retains of argument values are deferred to the consumption: the
+only owned values the integer subset makes are `retain`s of an argument, which the backend holds
+as the argument's bits with no count, `release` emits nothing, and each consumption that hands
+one to the engine (a `move` slot, `return`) adds the count inline (`add dword [ref], 1` when the
+tag is a heap variant, which is all `HeapCell.retain` does). That is exact because G's verifier
+proves every owned value is consumed exactly once on every path. The backend refuses a `retain`
+of anything but an argument.
 
 After a deopt the function is kept: the entry counts deopts and the engine unlinks it
 (`FunctionBytecode.compiled = 0`) after `deoptLimit` deopts, since a guard that failed that
