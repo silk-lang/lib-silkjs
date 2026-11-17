@@ -130,6 +130,11 @@ __P.prototype.glob = function () { return __g; };
 __P.prototype.rec = function (k) { return k < 1 ? this.x : this.rec(k - 1) + 1; };
 __P.prototype.boom = function (k) { if (k > 4) throw new RangeError('b'); return k; };
 __P.prototype.len = function (o) { return o.length; };
+__P.prototype.clamp = function (v) { if (v < this.x) return this.x; if (v > this.y) return this.y; return v; };
+__P.prototype.far = function (u, v) { var r = u; if (u < v) { r = v; } return r - this.x; };
+__P.prototype.orx = function (u) { return u || this.x; };
+__P.prototype.mid = function (u) { return this.clamp(u) + this.far(u, 2); };
+__P.prototype.mark = function (u) { if (u > 2) { this.n = u; } return this.n; };
 Object.defineProperty(__P.prototype, 'acc', {get: function () { return this.x + 1; }, set: function (v) { this.n = v; }, configurable: true});
 function __Q(x) { this.x = x; this.y = 's'; this.n = 0; }
 __Q.prototype.getx = function () { return this.y; };
@@ -145,6 +150,11 @@ __Q.prototype.glob = function () { return this; };
 __Q.prototype.rec = function (k) { return k; };
 __Q.prototype.boom = function (k) { return 'q'; };
 __Q.prototype.len = function (o) { return 0; };
+__Q.prototype.clamp = function (v) { return v; };
+__Q.prototype.far = function (u, v) { return u ? v : this.x; };
+__Q.prototype.orx = function (u) { return this.y; };
+__Q.prototype.mid = function (u) { return this.orx(u); };
+__Q.prototype.mark = function (u) { return 0; };
 function __phase(name) { __out(name + ' ' + __sum + ' ' + __fin); }
 """
 # Why the prelude is shaped like this:
@@ -320,12 +330,14 @@ class Generator:
             # Calls of prototype methods from a loop (docs/jit/inlining.md): small ones a JIT may
             # inline (a getter, arithmetic on the receiver and arguments, a predicate, one store,
             # nested calls, recursion, missing and extra arguments, a global read), ones it may
-            # not (a store before a guard, a branch, a throw), an accessor pair and a constructor.
+            # not (a store before a guard, a throw), ones with branches (early returns, a local set
+            # on one path, a kept test, a store on one path), an accessor pair and a constructor.
             # The receiver's class and the methods themselves change in later phases.
             call = self.pick(["a.getx()", "a.sum(i)", "a.sum(b)", "a.less(b)", "a.two(i)", "a.self().x", "a.bump(i)",
                               "a.pick(i, b)", "a.pick(i)", "a.last(i)", "a.last(i, b, a)", "a.glob()", "a.rec(i & 3)",
                               "a.boom(i)", "a.sum(a.getx())", "a.sum.call(a, i)", "a.acc", "(a.setn(i), a.n)",
-                              "(a.acc = i, a.n)", "new __P(i, b).sum(i)", "a.len(b)", "a.two(a.two(i))", "a.self().self().getx()"])
+                              "(a.acc = i, a.n)", "new __P(i, b).sum(i)", "a.len(b)", "a.two(a.two(i))", "a.self().self().getx()",
+                              "a.clamp(i)", "a.clamp(b)", "a.far(i, b)", "a.orx(i)", "a.mid(i)", "a.mark(i)", "a.clamp(a.far(i, 3))"])
             return (f"var t = {self.pick(['0', 'b', '1'])}; for (var i = 0; i < {self.pick([2, 3, 6])}; i++) "
                     f"{{ t = {self.pick(['t + ' + call, '(t ^ ' + call + ')', '__clamp(t * 2 + ' + call + ')'])}; }} return t;")
         if flavor == "intbranch":
@@ -557,6 +569,7 @@ class Generator:
             "__P.prototype.getx = function () { return 'new'; };",
             "delete __P.prototype.getx;",
             "__P.prototype.sum = Math.max;",
+            "__P.prototype.clamp = function (v) { return v > 3 ? 'c' : v; }; __P.prototype.orx = __Q.prototype.orx;",
             "__P.prototype.self = function () { return {x: 's', getx: Math.abs}; };",
             "Object.setPrototypeOf(__P.prototype, __Q.prototype); delete __P.prototype.sum; delete __P.prototype.two;",
             "__g = 'g'; __P.prototype.setn = function (v) { this.n = v + 1; };",
