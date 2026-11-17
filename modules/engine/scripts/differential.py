@@ -128,7 +128,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method"]
+           "calls", "calls", "fields", "elements", "globals", "method", "aliases", "aliases"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -303,6 +303,20 @@ class Generator:
             return (f"var arr = [a, b, {self.integer()}, 2, 3]; var t = 0; "
                     f"for (var i = 0; i < arr.length; i++) {{ t = t + arr[i]; arr[i] = {self.pick(['t - i', 'i', 'a', 'arr[i] + 1'])}; }} "
                     f"{tail}for (var j = 0; j < {self.pick(['a.length', 'b.length', '2'])}; j++) {{ t = t + a[j]; }} return [t, arr];")
+        if flavor == "aliases":
+            # What an element or length read that keeps no count of its own (ssa_opt_elements)
+            # must survive: the array is the only owner of its strings and arrays, a store
+            # replaces the element read (the same slot or another) before the value is used
+            # again, and the length changes inside the loop that reads it.
+            step = self.pick([1, 2, 3])
+            move = self.pick([f"arr[(i * {step}) % n] = arr[i]; ", "arr[i] = arr[i]; ", "arr[n - 1 - i] = arr[i]; ",
+                              "arr[i] = 's' + i; ", "o.x = arr[i]; arr[i] = i; "])
+            use = self.pick(["arr[i].length", "arr[i][0]", "arr[(i + 1) % n].length", "o.x.length", "arr[i]"])
+            resize = self.pick(["", "", "if (i === 2) arr.length = 3; ", "if (i === 1) arr.length = 7; ",
+                                "if (i === 3) arr[arr.length] = 't' + i; "])
+            return (f"var arr = ['s' + a, [b, 'u' + b], 'q' + b, [a], 'r' + a + b]; var o = {{x: 'w' + a}}; var t = 0; "
+                    f"var n = arr.length; for (var i = 0; i < arr.length && i < 6; i++) {{ {move}t = __clamp(t + {use}); {resize}}} "
+                    f"return [t, arr, o.x];")
         if flavor == "globals":
             # A global read and stored in a loop.
             return (f"var t = 0; var n = b; if (n > 20) n = {self.pick([3, 20])}; "

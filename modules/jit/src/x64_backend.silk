@@ -38,6 +38,7 @@ import silkjs.js_compiled_objects as objects
 import ssa_liveness as liveness
 import ssa_calls as calls
 import x64_exits as exits
+import x64_typed as typed
 
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
@@ -98,6 +99,16 @@ pub struct Emitter {
   pub constants: List<Option<i32>>,
   /// The block being lowered: a jump to the next one falls through.
   current: u32,
+  /// `add.i32`/`sub.i32` done in place (result and first operand in one register): on
+  /// overflow each jumps to its label here, where the operation is undone before the exit
+  /// reads the operand.
+  undoLabels: List<Label>,
+  undoInsts: List<Inst>,
+  /// The typed array read and store routines (x64_typed), emitted after the blocks when used.
+  typedRead: Label,
+  typedWrite: Label,
+  readsTyped: bool,
+  writesTyped: bool,
 }
 
 pub fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES)) }
@@ -121,10 +132,14 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let inputs = (values + 1) * SLOT_BYTES
   let raw = inputs + INPUT_COUNT * 8 + 8 + pushes * 8
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
-  let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
+  let mut assembler = Assembler.make()
+  let typedRead = run assembler.label()
+  let typedWrite = run assembler.label()
+  let mut emitter = Emitter { a: move assembler, blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places,
-    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout() }
+    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), typedRead: typedRead, typedWrite: typedWrite, readsTyped: false, writesTyped: false }
   run emitter.countUses(&function)
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
@@ -163,6 +178,21 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
     }
     b = b + 1
   }
+  let mut u: usize = 0
+  while u < emitter.undoInsts.length() {
+    let inst = emitter.undoInsts.get(u)
+    emitter.a.bind(emitter.undoLabels.get(u))
+    let mut back = Alu.Add
+    if inst.op == Op.Add { back = Alu.Sub }
+    let place = emitter.at(inst.result)
+    run emitter.operate(back, place.gpr, inst.b)
+    run emitter.a.jmp(emitter.exitLabels.get(u32.toUsize(inst.exit)))
+    u = u + 1
+  }
+  let layout = emitter.settings.layout
+  let fields = emitter.fields
+  if emitter.readsTyped { run typed.emitRead(&mut emitter.a, &layout, &fields, typedRead) } else { emitter.a.bind(typedRead) }
+  if emitter.writesTyped { run typed.emitWrite(&mut emitter.a, &layout, &fields, typedWrite) } else { emitter.a.bind(typedWrite) }
   // Exit stubs: the interpreter state at each exit's bytecode boundary.
   run exits.emit(&mut emitter, &function)
   return Lowering.Code { value: run emitter.a.finish() }
@@ -280,9 +310,20 @@ impl Emitter {
     }
     if op == Op.Add || op == Op.Sub {
       run self.stressGuard(inst.exit)
-      let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
       let mut alu = Alu.Sub
       if op == Op.Add { alu = Alu.Add }
+      // In place when the result takes the first operand's register and the second operand
+      // is elsewhere: the exit reads the operand, so an overflow undoes the operation first.
+      let into = self.at(inst.result)
+      if into.kind == GPR && self.key(inst.a) == self.key(inst.result) && (self.constants.get(u32.toUsize(inst.b)).isSome() || self.key(inst.b) != self.key(inst.result)) {
+        run self.operate(alu, into.gpr, inst.b)
+        let undo = run self.a.label()
+        run self.a.jcc(Cond.Overflow, undo)
+        run self.undoLabels.append(undo)
+        run self.undoInsts.append(inst)
+        return ()
+      }
+      let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
       run self.operate(alu, Reg.Rax, inst.b)
       run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
       let place102 = self.at(inst.result) run putI32(&mut self.a, place102, Reg.Rax)
@@ -483,6 +524,9 @@ impl Emitter {
     if op == Op.GetElem || op == Op.PutElem || op == Op.GetLength {
       run self.stressGuard(inst.exit)
       let done = run self.a.label()
+      // A borrowed result (ssa_opt_borrow) takes no count. A length is a number: no count
+      // either way.
+      let borrowed = inst.result != NONE && function.value(inst.result).own == Own.Borrowed
       if op == Op.GetLength {
         // Inline: an Array keeps its length in slot 0.
         let layout = self.settings.layout
@@ -500,7 +544,6 @@ impl Emitter {
         run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
         run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
         run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
-        run self.retainBits(Reg.Rax, Reg.R9)
         run self.a.jmp(done)
         self.a.bind(slow)
       }
@@ -514,7 +557,7 @@ impl Emitter {
           run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
           run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
           run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
-          run self.retainBits(Reg.Rax, Reg.R9)
+          if !borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
         } else {
           // Only a non-heap value over a non-heap one: FastArrayData.store's plain and
           // clearHead stay true, and no count changes.
@@ -534,6 +577,20 @@ impl Emitter {
         }
         run self.a.jmp(done)
         self.a.bind(slow)
+        // Not a fast Array: a typed array's element through the function's routine.
+        run self.a.lea(Width.W64, Reg.R11, slotOf(inst.a))
+        let at = self.at(index) run getI32(&mut self.a, Reg.R8, at)
+        if op == Op.GetElem {
+          run self.a.lea(Width.W64, Reg.R10, slotOf(inst.result))
+          run self.a.call(self.typedRead)
+          self.readsTyped = true
+        } else {
+          run self.a.lea(Width.W64, Reg.R10, slotOf(inst.b))
+          run self.a.call(self.typedWrite)
+          self.writesTyped = true
+        }
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.NotEqual, done)
       }
       // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
       // get_length(env, object, out) -> 1 when done.
@@ -541,7 +598,7 @@ impl Emitter {
       if op == Op.GetElem {
         let index = self.at(inst.b) run getI32(&mut self.a, Reg.Rdx, index)
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
-        run self.callHelper(helpers.GET_ELEM)
+        if borrowed { run self.callHelper(helpers.GET_ELEM_BORROWED) } else { run self.callHelper(helpers.GET_ELEM) }
       } else if op == Op.PutElem {
         let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
@@ -558,10 +615,12 @@ impl Emitter {
     if op == Op.GetScope || op == Op.PutScope {
       run self.stressGuard(inst.exit)
       // get_scope(env, frame, site, out) / put_scope(env, frame, site, value) -> 1 when done;
-      // site = slot | checked << 31 | captured << 30.
+      // site = slot | checked << 31 | captured << 30 | borrowed << 29.
       let frame = self.input(INPUT_FRAME)
       let k = i32.wrappingToU32(inst.k)
-      let site = u32.bitOr(u32.bitOr(k & 0xffff, u32.shiftLeft(u32.shiftRight(k, 16) & 1, 31)), u32.shiftLeft(u32.shiftRight(k, 17) & 1, 30))
+      let mut site = u32.bitOr(u32.bitOr(k & 0xffff, u32.shiftLeft(u32.shiftRight(k, 16) & 1, 31)), u32.shiftLeft(u32.shiftRight(k, 17) & 1, 30))
+      // A borrowed result (ssa_opt_borrow) takes no count: bit 29.
+      if op == Op.GetScope && function.value(inst.result).own == Own.Borrowed { site = u32.bitOr(site, 0x20000000) }
       run self.a.load(Width.W64, Reg.Rsi, frame)
       run self.a.movImm32(Reg.Rdx, site)
       if op == Op.GetScope { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result)) run self.callHelper(helpers.GET_SCOPE) }
@@ -575,7 +634,10 @@ impl Emitter {
       // get_var(env, frame, index, out) / put_var(env, frame, index, value) -> 1 when done.
       let frame = self.input(INPUT_FRAME)
       run self.a.load(Width.W64, Reg.Rsi, frame)
-      run self.a.movImm32(Reg.Rdx, i32.wrappingToU32(inst.k))
+      let mut index = i32.wrappingToU32(inst.k)
+      // A borrowed result (ssa_opt_borrow) takes no count: bit 31.
+      if op == Op.GetVar && function.value(inst.result).own == Own.Borrowed { index = u32.bitOr(index, 0x80000000) }
+      run self.a.movImm32(Reg.Rdx, index)
       if op == Op.GetVar { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result)) run self.callHelper(helpers.GET_VAR) }
       else { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a)) run self.callHelper(helpers.PUT_VAR) }
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)

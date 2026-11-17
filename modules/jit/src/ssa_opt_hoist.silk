@@ -1,0 +1,336 @@
+//! Loop-invariant guards and loads, moved in front of their loop (docs/jit/code-quality.md,
+//! "Hoisting").
+//!
+//! A loop is a header block with a back edge from a latch (the translator's block that polls
+//! and jumps back). An instruction of the loop whose operands are all defined outside it, and
+//! whose answer nothing in the loop can change, moves to a new block on the loop's one entry
+//! edge. A guard among them gets a new exit there: the interpreter state at the loop's
+//! header as the entry edge carries it, so a failing guard resumes the interpreter at the
+//! header before the first iteration.
+//!
+//! What moves:
+//! - `unbox.*`, `check.tag` and exiting arithmetic of invariant operands, when their block runs
+//!   on every iteration (it dominates every latch): a guard that the loop would not have
+//!   reached must not fail in front of it;
+//! - the same for `get.length`, `get.field`, `get.var` and `get.scope` whose result is a
+//!   borrow (ssa_opt_borrow, ssa_ownership.borrowFields; an owned result would need its
+//!   release moved too), in a loop without what could change the answer: a call (anything),
+//!   `put.elem` (an append changes a length), `put.field` (a field; a length; a global is a
+//!   property), `put.var` and `put.scope` (bindings);
+//! - arithmetic and comparisons that cannot fail, from anywhere in the loop.
+//!
+//! A loop whose header is among `sites` (the offsets earlier code of this function
+//! deoptimized at, jit_recompile) is left alone: a hoisted guard that failed there says
+//! nothing about which instruction to widen, the guard left in the loop does.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import ssa { Function, Own, RootKind, Op, SlotMode, NONE, edgeCount, readsK }
+import ssa_verify { readsA, readsB }
+import ssa_ownership { fixSlots }
+
+/// Guards of invariant operands whose answer never changes.
+fn fixedGuard(op: Op) -> bool {
+  return op == Op.Unbox || op == Op.UnboxBool || op == Op.UnboxF64 || op == Op.CheckTag || op == Op.Add || op == Op.Sub || op == Op.Mul
+    || op == Op.Shr || op == Op.Mod || op == Op.Neg || op == Op.ToInt32 || op == Op.ExactI32
+}
+/// Operations that cannot fail and read nothing but their operands.
+fn pureOp(op: Op) -> bool {
+  return op == Op.ToF64 || op == Op.Cmp || op == Op.CmpF64 || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64
+    || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.Shl || op == Op.Sar || op == Op.BitNot || op == Op.NotBool || op == Op.Imul || op == Op.TagIs
+}
+
+/// The edges into each block (`edges[first[b] .. first[b + 1]]`) and the block each edge
+/// leaves, of a compacted function.
+struct Graph { first: List<u32>, edges: List<u32>, source: List<u32>, idom: List<u32> }
+
+effect fn graphOf(f: &Function) -> Graph ! OutOfMemoryError ? &mut Allocator {
+  let blocks = u32.toUsize(f.blockCount())
+  let mut source = List<u32>.make()
+  run source.appendRepeated(NONE, f.edges.length())
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      let mut e: u32 = 0
+      while e < edgeCount(last.op) { source.set(u32.toUsize(last.edge + e), b) e = e + 1 }
+    }
+    b = b + 1
+  }
+  let mut first = List<u32>.make()
+  run first.appendRepeated(0, blocks + 1)
+  let mut e: usize = 0
+  while e < f.edges.length() { let t = u32.toUsize(f.edges.get(e).target) + 1 let c = first.get(t) + 1 first.set(t, c) e = e + 1 }
+  let mut i: usize = 0
+  while i < blocks { let c = first.get(i + 1) + first.get(i) first.set(i + 1, c) i = i + 1 }
+  let mut next = List<u32>.make()
+  run next.appendSlice(first.asSlice())
+  let mut edges = List<u32>.make()
+  run edges.appendRepeated(0, f.edges.length())
+  e = 0
+  while e < f.edges.length() {
+    let t = u32.toUsize(f.edges.get(e).target)
+    let at = next.get(t)
+    edges.set(u32.toUsize(at), usize.toU32(e))
+    next.set(t, at + 1)
+    e = e + 1
+  }
+  // Immediate dominators over the reverse postorder the blocks are in.
+  let mut idom = List<u32>.make()
+  run idom.appendRepeated(NONE, blocks)
+  if blocks > 0 { idom.set(0, 0) }
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut x: usize = 1
+    while x < blocks {
+      let mut chosen = NONE
+      let mut k = first.get(x)
+      while k < first.get(x + 1) {
+        let pred = source.get(u32.toUsize(edges.get(u32.toUsize(k))))
+        if pred != NONE && idom.get(u32.toUsize(pred)) != NONE {
+          if chosen == NONE { chosen = pred } else { chosen = meet(&idom, chosen, pred) }
+        }
+        k = k + 1
+      }
+      if chosen != idom.get(x) { idom.set(x, chosen) changed = true }
+      x = x + 1
+    }
+  }
+  return Graph { first: move first, edges: move edges, source: move source, idom: move idom }
+}
+fn meet(idom: &List<u32>, a: u32, b: u32) -> u32 {
+  let mut x = a let mut y = b
+  while x != y {
+    while x > y { x = idom.get(u32.toUsize(x)) }
+    while y > x { y = idom.get(u32.toUsize(y)) }
+  }
+  return x
+}
+fn dominates(idom: &List<u32>, a: u32, b: u32) -> bool {
+  let mut x = b
+  while x > a { x = idom.get(u32.toUsize(x)) }
+  return x == a
+}
+fn has(list: &List<u32>, value: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == value { return true } i = i + 1 }
+  return false
+}
+
+/// Moves what the module comment lists out of every loop of a compacted function, one loop
+/// level per call. Answers whether anything moved; the caller compacts, and may call again
+/// to move instructions out of the next loop around.
+pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blockCount = f.blockCount()
+  // Any retreating edge at all? Most functions have no loop.
+  let mut loops = false
+  let mut scan: u32 = 0
+  while scan < blockCount && !loops {
+    let block = f.blocks.get(u32.toUsize(scan))
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      let mut e: u32 = 0
+      while e < edgeCount(last.op) { if f.edge(last.edge + e).target <= scan { loops = true } e = e + 1 }
+    }
+    scan = scan + 1
+  }
+  if !loops { return false }
+  let graph = run graphOf(&f.*)
+  f.work = f.work + usize.toU64(f.edges.length()) + u32.toU64(blockCount)
+  let values = f.values.length()
+  // member[b], released[v], moved[v] hold the serial of the loop that set them.
+  let mut member = List<u32>.make() run member.appendRepeated(0, u32.toUsize(blockCount))
+  let mut released = List<u32>.make() run released.appendRepeated(0, values)
+  let mut moved = List<u32>.make() run moved.appendRepeated(0, values)
+  let mut stack = List<u32>.make()
+  let mut paramOf = List<u32>.make()
+  let mut entryArgs = List<u32>.make()
+  let mut serial: u32 = 0
+  let mut changed = false
+  // Inner loops first: their headers come later in reverse postorder.
+  let mut h = blockCount
+  while h > 0 {
+    h = h - 1
+    // The back edges into h, and its one other edge.
+    let mut entry = NONE
+    let mut entries: u32 = 0
+    let mut lastLatch = NONE
+    let mut common = NONE
+    let mut k = graph.first.get(u32.toUsize(h))
+    while k < graph.first.get(u32.toUsize(h) + 1) {
+      let e = graph.edges.get(u32.toUsize(k))
+      let from = graph.source.get(u32.toUsize(e))
+      if from != NONE {
+        if from >= h && dominates(&graph.idom, h, from) {
+          if lastLatch == NONE || from > lastLatch { lastLatch = from }
+          if common == NONE { common = from } else { common = meet(&graph.idom, common, from) }
+        } else { entry = e entries = entries + 1 }
+      }
+      k = k + 1
+    }
+    if lastLatch == NONE || entries != 1 { continue }
+    serial = serial + 1
+    // The loop's blocks: h and whatever reaches a latch without passing h.
+    member.set(u32.toUsize(h), serial)
+    stack.clear()
+    k = graph.first.get(u32.toUsize(h))
+    while k < graph.first.get(u32.toUsize(h) + 1) {
+      let from = graph.source.get(u32.toUsize(graph.edges.get(u32.toUsize(k))))
+      if from != NONE && from >= h && dominates(&graph.idom, h, from) && member.get(u32.toUsize(from)) != serial { member.set(u32.toUsize(from), serial) run stack.append(from) }
+      k = k + 1
+    }
+    while stack.length() > 0 {
+      let b = stack.get(stack.length() - 1)
+      drop stack.pop()
+      let mut q = graph.first.get(u32.toUsize(b))
+      while q < graph.first.get(u32.toUsize(b) + 1) {
+        let from = graph.source.get(u32.toUsize(graph.edges.get(u32.toUsize(q))))
+        if from != NONE && member.get(u32.toUsize(from)) != serial { member.set(u32.toUsize(from), serial) run stack.append(from) }
+        q = q + 1
+      }
+    }
+    // What the loop does that could change an answer, the values it releases, and a poll
+    // (its exit is the state at the header, as a latch has it).
+    let mut calls = false let mut putsElem = false let mut putsField = false let mut putsBinding = false
+    let mut poll = NONE
+    let mut b = h
+    while b <= lastLatch {
+      if member.get(u32.toUsize(b)) == serial {
+        let block = f.blocks.get(u32.toUsize(b))
+        let mut i = block.firstInst
+        while i < block.firstInst + block.instCount {
+          let inst = f.inst(i)
+          if inst.block == b {
+            if inst.op == Op.Call { calls = true }
+            else if inst.op == Op.PutElem { putsElem = true }
+            else if inst.op == Op.PutField { putsField = true }
+            else if inst.op == Op.PutVar || inst.op == Op.PutScope { putsBinding = true }
+            else if inst.op == Op.Release && u32.toUsize(inst.a) < values { released.set(u32.toUsize(inst.a), serial) }
+            else if inst.op == Op.Poll && inst.exit != NONE { poll = i }
+          }
+          i = i + 1
+        }
+        f.work = f.work + u32.toU64(block.instCount)
+      }
+      b = b + 1
+    }
+    if poll == NONE { continue }
+    let state = f.exit(f.inst(poll).exit)
+    if has(sites, state.pc) { continue }
+    // The new block in front of the loop, made when the first instruction moves.
+    let mut front = NONE
+    let mut frontExit = NONE
+    let mut order: u32 = 2
+    let mut stop = false
+    b = h
+    while b <= lastLatch && !stop {
+      if member.get(u32.toUsize(b)) != serial { b = b + 1 continue }
+      let always = dominates(&graph.idom, b, common)
+      let block = f.blocks.get(u32.toUsize(b))
+      let mut i = block.firstInst
+      while i < block.firstInst + block.instCount {
+        let inst = f.inst(i)
+        let op = inst.op
+        let mut ok = inst.block == b
+        let mut guard = !pureOp(op)
+        if fixedGuard(op) { ok = ok && always }
+        else if op == Op.GetLength || op == Op.GetField || op == Op.GetVar || op == Op.GetScope {
+          ok = ok && always && !calls && !putsField && inst.result != NONE
+          if op == Op.GetLength { ok = ok && !putsElem } else { ok = ok && !putsBinding }
+          if ok {
+            // Only a borrow, and one whose root lives through the loop.
+            let info = f.value(inst.result)
+            ok = info.own == Own.Borrowed
+            if ok && info.rootKind == RootKind.Value {
+              ok = u32.toUsize(info.root) < values && released.get(u32.toUsize(info.root)) != serial && outside(&f.*, &member, &moved, serial, info.root)
+            } else if ok && info.rootKind == RootKind.Binding { ok = !putsBinding }
+            else if ok && info.rootKind == RootKind.None { ok = false }
+          }
+        } else if guard { ok = false }
+        if ok && readsA(op) { ok = outside(&f.*, &member, &moved, serial, inst.a) }
+        if ok && readsB(op) { ok = outside(&f.*, &member, &moved, serial, inst.b) }
+        if ok && readsK(op) { ok = outside(&f.*, &member, &moved, serial, i32.wrappingToU32(inst.k)) }
+        if ok && guard && frontExit == NONE {
+          // The state at the header as the entry edge carries it: a slot whose parameter
+          // the header kept takes that parameter's argument on the entry edge; any other
+          // slot kept one value around the loop, which the latch's state names.
+          let header = f.blocks.get(u32.toUsize(h))
+          let slots = f.localCount + state.stackDepth
+          paramOf.clear()
+          run paramOf.appendRepeated(NONE, u32.toUsize(slots))
+          let mut p: u32 = 0
+          while p < header.paramCount {
+            let at = f.value(f.paramAt(header, p)).state
+            if at < slots { paramOf.set(u32.toUsize(at), p) } else { ok = false }
+            p = p + 1
+          }
+          let incoming = f.edge(entry)
+          if incoming.argCount != header.paramCount { ok = false }
+          entryArgs.clear()
+          let mut s: u32 = 0
+          while ok && s < slots {
+            let at = paramOf.get(u32.toUsize(s))
+            let mut v = f.slot(state, s).value
+            if at != NONE { v = f.edgeArg(incoming, at) }
+            else if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
+            run entryArgs.append(v)
+            s = s + 1
+          }
+          if !ok { stop = true break }
+          if front == NONE { front = run split(&mut f, entry, h) }
+          drop run f.exitFor(i, state.pc, state.stackDepth)
+          frontExit = f.inst(i).exit
+          s = 0
+          while s < slots { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+          f.work = f.work + u32.toU64(slots)
+        }
+        if ok {
+          if front == NONE { front = run split(&mut f, entry, h) }
+          if guard {
+            let mut at = f.inst(i)
+            at.exit = frontExit
+            f.setInst(i, at)
+          }
+          f.moveInst(i, front, order)
+          order = order + 2
+          if inst.result != NONE && u32.toUsize(inst.result) < values { moved.set(u32.toUsize(inst.result), serial) }
+          changed = true
+        }
+        i = i + 1
+      }
+      b = b + 1
+    }
+  }
+  if changed { run fixSlots(&mut f) }
+  return changed
+}
+
+/// Whether `v` is defined outside the loop `serial` marks, or moved out of it already.
+fn outside(f: &Function, member: &List<u32>, moved: &List<u32>, serial: u32, v: u32) -> bool {
+  if u32.toUsize(v) >= moved.length() { return false }
+  if moved.get(u32.toUsize(v)) == serial { return true }
+  let block = f.value(v).block
+  return u32.toUsize(block) < member.length() && member.get(u32.toUsize(block)) != serial
+}
+
+/// A new block on edge `entry` into `header`: the edge goes to it with no arguments, and it
+/// jumps to the header with the arguments the edge had.
+effect fn split(f: &mut Function, entry: u32, header: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let old = f.edge(entry)
+  let mut args = List<u32>.make()
+  let mut g: u32 = 0
+  while g < old.argCount { run args.append(f.edgeArg(old, g)) g = g + 1 }
+  let front = run f.block()
+  let edge = run f.newEdge(header)
+  let mut i: usize = 0
+  while i < args.length() { run f.edgeArgument(args.get(i)) i = i + 1 }
+  let pc = f.inst(f.blocks.get(u32.toUsize(header)).firstInst).pc
+  run f.terminate(front, Op.Jump, NONE, edge, pc)
+  f.retarget(entry, front)
+  return front
+}

@@ -7,7 +7,7 @@ import silk.num.u32
 import js_heap { HeapCell, HeapHeader }
 import silk.core.option { Option }
 import js_value { ValueBits }
-import js_core_types { RuntimeState, VarRef, ObjectData, ObjectPayload, ShapeData, FieldCacheEntry, FastArrayData, FIELD_PROTO_KEY, SCOPE_OPERAND, scopeSlot }
+import js_core_types { RuntimeState, VarRef, ObjectData, ObjectPayload, ShapeData, FieldCacheEntry, FastArrayData, TypedArrayCache, FIELD_PROTO_KEY, SCOPE_OPERAND, scopeSlot }
 import js_scopes as scopes
 import silk.num.u16
 import thin_list { ThinList }
@@ -76,14 +76,15 @@ unsafe fn variableCell(frame: &CompiledFrame, index: u32) -> ?*mut HeapHeader {
   return unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(
     unsafe Pointer.assumeMany<?*mut HeapHeader>(frame.closureReferences), u32.toUsize(index)))
 }
-/// get_var and get_var_undef of an initialized binding: its value, retained into out. False
+/// get_var and get_var_undef of an initialized binding: its value into out, retained unless
+/// the reader borrows it from the binding (retain false). False
 /// for an uninitialized one (a TDZ read, or a global not yet defined), which the
 /// interpreter resolves or throws.
-pub unsafe fn readVariable(frame: &CompiledFrame, index: u32, out: *mut ValueBits) -> bool {
+pub unsafe fn readVariable(frame: &CompiledFrame, index: u32, retain: bool, out: *mut ValueBits) -> bool {
   let cell = match Pointer.nonNullMut<HeapHeader>(unsafe variableCell(frame, index)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
   let value = unsafe cells.read(cell)
   if match value { ValueBits.Uninitialized => true _ => false } { return false }
-  unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+  unsafe Pointer.write<ValueBits>(out, if retain { unsafe value.retained() } else { value })
   return true
 }
 /// put_var into an initialized, non-const binding of the value at source: the binding takes
@@ -109,12 +110,13 @@ unsafe fn scopeCell(frame: &CompiledFrame, slot: u32) -> ?*mut ValueBits {
   }
 }
 /// get_scope0 (checked false) or get_scope0_check (checked true: false for an uninitialized
-/// slot, which the interpreter throws for): the slot's value, retained into out.
-pub unsafe fn readScope(frame: &CompiledFrame, slot: u32, checked: bool, out: *mut ValueBits) -> bool {
+/// slot, which the interpreter throws for): the slot's value into out, retained unless the
+/// reader borrows it (retain false).
+pub unsafe fn readScope(frame: &CompiledFrame, slot: u32, checked: bool, retain: bool, out: *mut ValueBits) -> bool {
   let at = match Pointer.nonNullMut<ValueBits>(unsafe scopeCell(frame, slot)) { Option<*mut ValueBits>.Some { value } => value Option<*mut ValueBits>.None => { return false } }
   let value = unsafe Pointer.read<ValueBits>(at)
   if checked && match value { ValueBits.Uninitialized => true _ => false } { return false }
-  unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+  unsafe Pointer.write<ValueBits>(out, if retain { unsafe value.retained() } else { value })
   return true
 }
 /// put_scope0 or set_scope0 (checked false), or put_scope0_check (checked true: false with
@@ -132,18 +134,18 @@ pub unsafe fn writeScope(frame: &CompiledFrame, slot: u32, checked: bool, source
 /// get_var_ref or get_var_ref_check of an initialized binding (index: a slot of the running
 /// scope chain when SCOPE_OPERAND is set, else closure cell index): its value, retained into
 /// out. False for an uninitialized one, which the interpreter reads or throws for.
-pub unsafe fn readCaptured(frame: &CompiledFrame, index: u32, out: *mut ValueBits) -> bool {
+pub unsafe fn readCaptured(frame: &CompiledFrame, index: u32, retain: bool, out: *mut ValueBits) -> bool {
   if index >= u16.toU32(SCOPE_OPERAND) {
     if Pointer.isNull<HeapHeader>(frame.scope) { return false }
     let value = unsafe Pointer.read<ValueBits>(unsafe scopes.operandSlot(frame.scope, u32.wrappingToU16(index)))
     if match value { ValueBits.Uninitialized => true _ => false } { return false }
-    unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+    unsafe Pointer.write<ValueBits>(out, if retain { unsafe value.retained() } else { value })
     return true
   }
   let cell = match Pointer.nonNullMut<HeapHeader>(unsafe variableCell(frame, index)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
   let value = unsafe cells.read(cell)
   if match value { ValueBits.Uninitialized => true _ => false } { return false }
-  unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+  unsafe Pointer.write<ValueBits>(out, if retain { unsafe value.retained() } else { value })
   return true
 }
 /// put_var_ref, set_var_ref or put_var_ref_check into an initialized binding of the value at
@@ -173,6 +175,26 @@ pub unsafe fn readElement(object: ValueBits, index: i32, out: *mut ValueBits) ->
     Option<ValueBits>.Some { value } => { unsafe Pointer.write<ValueBits>(out, value) return true }
     Option<ValueBits>.None => { return false }
   }
+}
+/// readElement for a reader that borrows the element from the object: out holds it with no
+/// count of its own. False, with nothing kept, when the element is a cell only this read
+/// holds (nothing would keep it alive for the borrower).
+pub unsafe fn readElementBorrowed(object: ValueBits, index: i32, out: *mut ValueBits) -> bool {
+  let value = match unsafe properties.elementRead(object, ValueBits.Int { value: index }) {
+    Option<ValueBits>.Some { value } => value
+    Option<ValueBits>.None => { return false }
+  }
+  match ValueBits.heapReference(&value) {
+    Option<*mut HeapHeader>.Some { value: reference } => {
+      let mut anchor = ()
+      let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, reference)
+      if header.referenceCount <= 1 { drop header unsafe gc.releaseDeferred(value) return false }
+      header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1)
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  unsafe Pointer.write<ValueBits>(out, value)
+  return true
 }
 /// put_array_el of the value at source over an existing element of a fast Array (index below
 /// its length), or one past its end when it has room (the interpreter's appendElementAt): the
@@ -243,7 +265,11 @@ pub struct FieldLayout {
   pub exotic: u32, pub arrayClass: u32, pub protoKey: u64,
   /// A fast Array (class Array with the fast-array flag): the flag, then the word holding
   /// its first element's address and its 32-bit element count (FastArrayData.items).
-  pub fastArray: u32, pub elements: u32, pub elementCount: u32
+  pub fastArray: u32, pub elements: u32, pub elementCount: u32,
+  /// A typed array (class typedFirst to typedLast, the only classes whose payload is a
+  /// TypedArrayCache): its 64-bit element count (0 once detached), the word holding its
+  /// data address and its shared byte.
+  pub typedFirst: u32, pub typedLast: u32, pub typedCount: u32, pub typedData: u32, pub typedShared: u32
 }
 impl Copy for FieldLayout {}
 
@@ -276,7 +302,22 @@ pub fn fieldLayout() -> FieldLayout {
     }
     _ => ()
   }
+  let view = ObjectPayload.TypedArray { array: TypedArrayCache { view: header, shared: false, cachedData: Pointer.null<u8>(), count: 0, requiresExtensible: false, lazy: false } }
+  let mut typedCount: usize = 0
+  let mut typedData: usize = 0
+  let mut typedShared: usize = 0
+  match &view {
+    ObjectPayload.TypedArray { array } => {
+      let origin = Pointer.address<ObjectPayload>(Pointer.fromRef<ObjectPayload>(&view))
+      typedCount = payload + Pointer.address<u64>(Pointer.fromRef<u64>(&array.count)) - origin
+      typedData = payload + Pointer.address<?*mut u8>(Pointer.fromRef<?*mut u8>(&array.cachedData)) - origin
+      typedShared = payload + Pointer.address<bool>(Pointer.fromRef<bool>(&array.shared)) - origin
+    }
+    _ => ()
+  }
   return FieldLayout {
+    typedFirst: classes.JS_CLASS_UINT8C_ARRAY, typedLast: classes.JS_CLASS_FLOAT64_ARRAY,
+    typedCount: usize.toU32(typedCount), typedData: usize.toU32(typedData), typedShared: usize.toU32(typedShared),
     fastArray: u8.toU32(ObjectData.fastArrayFlag()), elements: usize.toU32(items), elementCount: usize.toU32(count),
     objectShape: usize.toU32(shape), objectSlots: usize.toU32(start + data.slotsWordOffset()),
     objectFlags: usize.toU32(start + data.flagsOffset()), objectClass: usize.toU32(start + data.classOffset()),

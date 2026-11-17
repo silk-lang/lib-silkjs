@@ -1,0 +1,150 @@
+//! Typed array element reads and stores for compiled code, as two routines a function's code
+//! holds once and calls (docs/jit/code-quality.md, "Typed arrays"): what
+//! js_typed_array_read.quickRead and js_typed_array_write.quickWrite do for the element kinds
+//! and values that need no conversion beyond a width. Each answers 0 in eax for everything
+//! else (another object, an index past the count, which is 0 once the buffer is detached, a
+//! shared buffer, Uint32, the BigInt and 16- and 32-bit float kinds, a clamped store, a double
+//! into an integer array), and the caller then asks the engine as before.
+//!
+//! Both take r11 = the address of the object's value, r8 = the index (an i32, zero-extended)
+//! and r10 = the address of the value read into or stored; they use rax, r8 to r11 and xmm0.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import asm_x64 { Assembler, Reg, Xmm, Mem, Width, Alu, Cond, Shift, Scale, Label }
+import value_layout { ValueLayout }
+import silkjs.js_compiled_objects { FieldLayout }
+
+fn off(value: u32) -> i32 { return u32.wrappingToI32(value) }
+
+effect fn loadTag(a: &mut Assembler, layout: &ValueLayout, dst: Reg, base: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mem = Mem.at(base, off(layout.tagOffset))
+  if layout.tagWidth == 1 { run a.loadZero8(dst, mem) }
+  else if layout.tagWidth == 2 { run a.loadZero16(dst, mem) }
+  else { run a.load(Width.W32, dst, mem) }
+}
+
+/// The checks both routines share: r11 becomes the data address and eax the element kind
+/// (class less the first typed class), or a jump to miss.
+effect fn view(a: &mut Assembler, layout: &ValueLayout, fields: &FieldLayout, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  run loadTag(&mut a, layout, Reg.Rax, Reg.R11)
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, off(layout.object()))
+  run a.jcc(Cond.NotEqual, miss)
+  run a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, 8))
+  run a.loadZero16(Reg.Rax, Mem.at(Reg.R11, off(fields.objectClass)))
+  run a.aluImm(Alu.Sub, Width.W32, Reg.Rax, off(fields.typedFirst))
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, off(fields.typedLast - fields.typedFirst))
+  run a.jcc(Cond.Above, miss)
+  run a.aluLoad(Alu.Cmp, Width.W64, Reg.R8, Mem.at(Reg.R11, off(fields.typedCount)))
+  run a.jcc(Cond.AboveOrEqual, miss)
+  run a.loadZero8(Reg.R9, Mem.at(Reg.R11, off(fields.typedShared)))
+  run a.test(Width.W32, Reg.R9, Reg.R9)
+  run a.jcc(Cond.NotEqual, miss)
+  run a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, off(fields.typedData)))
+}
+
+// Element kinds, as class ids less Uint8ClampedArray's (js_class_data).
+const UINT8C: i32 = 0
+const INT8: i32 = 1
+const UINT8: i32 = 2
+const INT16: i32 = 3
+const UINT16: i32 = 4
+const INT32: i32 = 5
+const UINT32: i32 = 6
+const FLOAT64: i32 = 11
+
+effect fn kind(a: &mut Assembler, which: i32, target: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, which)
+  run a.jcc(Cond.Equal, target)
+}
+
+/// The read routine at `entry`: the element as a ValueBits at [r10], eax 1.
+pub effect fn emitRead(a: &mut Assembler, layout: &ValueLayout, fields: &FieldLayout, entry: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  let miss = run a.label() let write = run a.label() let int = run a.label()
+  let f64 = run a.label() let i32s = run a.label() let u8s = run a.label() let i16s = run a.label() let u16s = run a.label() let i8s = run a.label()
+  a.bind(entry)
+  run view(&mut a, layout, fields, miss)
+  run kind(&mut a, FLOAT64, f64)
+  run kind(&mut a, INT32, i32s)
+  run kind(&mut a, UINT8, u8s)
+  run kind(&mut a, UINT8C, u8s)
+  run kind(&mut a, INT16, i16s)
+  run kind(&mut a, UINT16, u16s)
+  run kind(&mut a, INT8, i8s)
+  a.bind(miss)
+  run a.movImm32(Reg.Rax, 0)
+  run a.ret()
+  a.bind(f64)
+  run a.load(Width.W64, Reg.R9, Mem.indexed(Reg.R11, Reg.R8, Scale.Eight, 0))
+  run a.movImm64(Reg.Rax, layout.tagWord(layout.float64()))
+  run a.jmp(write)
+  a.bind(i32s)
+  run a.load(Width.W32, Reg.R9, Mem.indexed(Reg.R11, Reg.R8, Scale.Four, 0))
+  run a.jmp(int)
+  a.bind(i16s)
+  run a.loadZero16(Reg.R9, Mem.indexed(Reg.R11, Reg.R8, Scale.Two, 0))
+  run a.shiftImm(Shift.Shl, Width.W32, Reg.R9, 16)
+  run a.shiftImm(Shift.Sar, Width.W32, Reg.R9, 16)
+  run a.jmp(int)
+  a.bind(u16s)
+  run a.loadZero16(Reg.R9, Mem.indexed(Reg.R11, Reg.R8, Scale.Two, 0))
+  run a.jmp(int)
+  a.bind(i8s)
+  run a.loadZero8(Reg.R9, Mem.indexed(Reg.R11, Reg.R8, Scale.One, 0))
+  run a.shiftImm(Shift.Shl, Width.W32, Reg.R9, 24)
+  run a.shiftImm(Shift.Sar, Width.W32, Reg.R9, 24)
+  run a.jmp(int)
+  a.bind(u8s)
+  run a.loadZero8(Reg.R9, Mem.indexed(Reg.R11, Reg.R8, Scale.One, 0))
+  a.bind(int)
+  run a.movImm64(Reg.Rax, layout.tagWord(layout.int()))
+  a.bind(write)
+  run a.store(Width.W64, Mem.at(Reg.R10, 0), Reg.Rax)
+  run a.store(Width.W64, Mem.at(Reg.R10, 8), Reg.R9)
+  run a.movImm32(Reg.Rax, 1)
+  run a.ret()
+}
+
+/// The store routine at `entry`: the number at [r10] into the element, eax 1.
+pub effect fn emitWrite(a: &mut Assembler, layout: &ValueLayout, fields: &FieldLayout, entry: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  let miss = run a.label() let done = run a.label() let double = run a.label()
+  let s32 = run a.label() let s16 = run a.label() let s8 = run a.label()
+  a.bind(entry)
+  run view(&mut a, layout, fields, miss)
+  run loadTag(&mut a, layout, Reg.R9, Reg.R10)
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.R9, off(layout.int()))
+  run a.jcc(Cond.NotEqual, double)
+  run a.load(Width.W32, Reg.R9, Mem.at(Reg.R10, 8))
+  run kind(&mut a, INT32, s32)
+  run kind(&mut a, UINT8, s8)
+  run kind(&mut a, INT16, s16)
+  run kind(&mut a, UINT16, s16)
+  run kind(&mut a, INT8, s8)
+  run kind(&mut a, UINT32, s32)
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, FLOAT64)
+  run a.jcc(Cond.NotEqual, miss)
+  run a.intToDouble(Width.W32, Xmm.Xmm0, Reg.R9)
+  run a.storeDouble(Mem.indexed(Reg.R11, Reg.R8, Scale.Eight, 0), Xmm.Xmm0)
+  run a.jmp(done)
+  a.bind(double)
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.R9, off(layout.float64()))
+  run a.jcc(Cond.NotEqual, miss)
+  run a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, FLOAT64)
+  run a.jcc(Cond.NotEqual, miss)
+  run a.load(Width.W64, Reg.R9, Mem.at(Reg.R10, 8))
+  run a.store(Width.W64, Mem.indexed(Reg.R11, Reg.R8, Scale.Eight, 0), Reg.R9)
+  run a.jmp(done)
+  a.bind(miss)
+  run a.movImm32(Reg.Rax, 0)
+  run a.ret()
+  a.bind(s32)
+  run a.store(Width.W32, Mem.indexed(Reg.R11, Reg.R8, Scale.Four, 0), Reg.R9)
+  run a.jmp(done)
+  a.bind(s16)
+  run a.store16(Mem.indexed(Reg.R11, Reg.R8, Scale.Two, 0), Reg.R9)
+  run a.jmp(done)
+  a.bind(s8)
+  run a.store8(Mem.indexed(Reg.R11, Reg.R8, Scale.One, 0), Reg.R9)
+  a.bind(done)
+  run a.movImm32(Reg.Rax, 1)
+  run a.ret()
+}
