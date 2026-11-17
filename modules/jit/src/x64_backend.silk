@@ -11,10 +11,12 @@
 //! its first word, a bool 0 or 1. A boxed `value` is a ValueBits in the engine's own layout
 //! (value_layout.ValueLayout, probed from the engine): the arguments are the caller's cells,
 //! the exit state and the return value are ValueBits the engine takes over as they are.
-//! Retaining is deferred to the consumption: an owned value made by `retain` of an argument
-//! holds the argument's bits without a count, `release` emits nothing, and each consumption
-//! that hands it to the engine (a `move` exit slot, `return`) retains it once. That is exact
-//! because the verifier proves every owned value is consumed once on every path.
+//! Counts are real: `retain` adds one inline when the value is a heap reference (all
+//! HeapCell.retain does), `release` calls the engine's deferred release through the helper
+//! table, a `move` exit slot or `return` hands the count over, and a `dup` slot adds one.
+//!
+//! The six ABI inputs are stored in fixed frame slots by the prologue; a helper call clobbers
+//! the caller-saved registers, so after one the code reloads arguments, state, counter and data.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.num.i32
@@ -23,8 +25,9 @@ import silk.num.u8
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Shift, UnboundLabelError, Width }
-import ssa { Function, Inst, Op, Type, Own, RootKind, SlotMode }
+import ssa { Function, Inst, Op, Type, Own, SlotMode }
 import value_layout { ValueLayout }
+import jit_helpers as helpers
 
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
@@ -48,20 +51,22 @@ pub struct Settings {
   pub layout: ValueLayout
 }
 
-struct Emitter {
-  a: Assembler,
-  blockLabels: List<Label>,
-  exitLabels: List<Label>,
+pub struct Emitter {
+  pub a: Assembler,
+  pub blockLabels: List<Label>,
+  pub exitLabels: List<Label>,
   /// Bytes of the frame below the return address: values, then the edge scratch area.
-  frame: i32,
-  scratch: i32,
-  settings: Settings
+  pub frame: i32,
+  pub scratch: i32,
+  /// The frame slots holding the six ABI inputs, from rsp.
+  pub inputs: i32,
+  pub settings: Settings
 }
 
-fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES)) }
+pub fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES)) }
 /// The second word of a value's slot: a ValueBits' payload.
-fn payloadOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES + 8)) }
-fn word(base: Reg, offset: u32) -> Mem { return Mem.at(base, u32.wrappingToI32(offset)) }
+pub fn payloadOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES + 8)) }
+pub fn word(base: Reg, offset: u32) -> Mem { return Mem.at(base, u32.wrappingToI32(offset)) }
 
 /// Lowers function, which must be compacted and verified.
 pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
@@ -77,16 +82,19 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
     if edge.argCount > widest { widest = edge.argCount }
     e = e + 1
   }
-  // 16-byte aligned frame: the code makes no calls, but keep the ABI shape.
-  let raw = (values + widest) * SLOT_BYTES + 8
+  // 16-byte aligned at calls: entry rsp is 8 below a multiple of 16.
+  let inputs = (values + widest) * SLOT_BYTES
+  let raw = inputs + INPUT_COUNT * 8 + 8
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8)
   let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
-    frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), settings: move settings }
+    frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings }
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
   let mut x: usize = 0
   while x < function.exits.length() { run emitter.exitLabels.append(run emitter.a.label()) x = x + 1 }
   if frame != 0 { run emitter.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, frame) }
+  let mut k: u32 = 0
+  while k < INPUT_COUNT { let at = emitter.input(k) run emitter.a.store(Width.W64, at, inputRegister(k)) k = k + 1 }
   b = 0
   while b < function.blockCount() {
     let block = function.blocks.get(u32.toUsize(b))
@@ -107,19 +115,25 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   return Lowering.Code { value: run emitter.a.finish() }
 }
 
+/// The ABI inputs, in argument order: arguments, state, counter, data, env, frame.
+pub const INPUT_COUNT: u32 = 6
+pub const INPUT_ENV: u32 = 4
+pub const INPUT_FRAME: u32 = 5
+fn inputRegister(k: u32) -> Reg {
+  if k == 0 { return Reg.Rdi }
+  if k == 1 { return Reg.Rsi }
+  if k == 2 { return Reg.Rdx }
+  if k == 3 { return Reg.Rcx }
+  if k == 4 { return Reg.R8 }
+  return Reg.R9
+}
+
 /// The first reason function is outside what this backend lowers, or None.
 fn supported(function: &Function) -> Option<&'static [u8]> {
   if function.valueCount() > MAX_VALUES { return Option<&'static [u8]>.some(b"too many values") }
   let mut i: usize = 0
   while i < function.insts.length() {
     let inst = function.insts.get(i)
-    if inst.op == Op.Retain {
-      // Only a retain of an argument (its word, see the module comment).
-      let source = function.value(inst.a)
-      if !(source.own == Own.Borrowed && source.rootKind == RootKind.Argument) && source.own != Own.Imm {
-        return Option<&'static [u8]>.some(b"retain of a value that is not an argument")
-      }
-    }
     if inst.op == Op.Removed { return Option<&'static [u8]>.some(b"uncompacted function") }
     i = i + 1
   }
@@ -211,14 +225,23 @@ impl Emitter {
       return ()
     }
     if op == Op.Retain {
-      // Deferred: the bits now, the count when it is consumed (see the module comment).
       run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
       run self.a.load(Width.W64, Reg.R9, payloadOf(inst.a))
       run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
       run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+      run self.retainBits(Reg.Rax, Reg.R9)
       return ()
     }
-    if op == Op.Release { return () }
+    if op == Op.Release {
+      // Only a heap reference has a count to drop; the engine's deferred release does it.
+      let skip = run self.a.label()
+      run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
+      run self.heapTest(Reg.Rax, skip)
+      run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+      run self.callHelper(helpers.RELEASE)
+      self.a.bind(skip)
+      return ()
+    }
     if op == Op.Poll {
       run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rdx, 0), 1)
       run self.a.jcc(Cond.LessOrEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
@@ -317,23 +340,41 @@ impl Emitter {
     run self.a.load(Width.W64, Reg.R9, payloadOf(v))
     run self.a.store(Width.W64, word(base, offset), Reg.Rax)
     run self.a.store(Width.W64, word(base, offset + 8), Reg.R9)
-    if info.own == Own.Imm || mode == SlotMode.Imm { return () }
+    // A move hands its count over; a dup (a borrow) adds the slot's own.
+    if info.own == Own.Imm || mode == SlotMode.Imm || info.own == Own.Owned { return () }
     run self.retainBits(Reg.Rax, Reg.R9)
   }
   /// Adds one count to the ValueBits whose first word is in tagWord and payload in payload,
   /// when it is a heap reference (HeapCell.retain). Clobbers R10.
   effect fn retainBits(self: &mut Self, tagWord: Reg, payload: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
-    let layout = self.settings.layout
     let skip = run self.a.label()
+    run self.heapTest(tagWord, skip)
+    run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(payload, 0), 1)
+    self.a.bind(skip)
+  }
+  /// Jumps to notHeap unless the ValueBits whose first word is in tagWord is a heap
+  /// reference. Clobbers R10.
+  pub effect fn heapTest(self: &mut Self, tagWord: Reg, notHeap: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
     run self.a.mov(Width.W64, Reg.R10, tagWord)
     if layout.tagOffset != 0 { run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, u32.wrappingToU8(layout.tagOffset * 8)) }
     if layout.tagWidth == 1 { run self.a.aluImm(Alu.And, Width.W32, Reg.R10, 255) }
     else if layout.tagWidth == 2 { run self.a.aluImm(Alu.And, Width.W32, Reg.R10, 65535) }
     run self.a.aluImm(Alu.Sub, Width.W32, Reg.R10, u32.wrappingToI32(layout.heapLowest))
     run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, u32.wrappingToI32(layout.heapHighest - layout.heapLowest))
-    run self.a.jcc(Cond.Above, skip)
-    run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(payload, 0), 1)
-    self.a.bind(skip)
+    run self.a.jcc(Cond.Above, notHeap)
+  }
+  /// The frame slot of ABI input k.
+  pub fn input(self: &Self, k: u32) -> Mem { return Mem.at(Reg.Rsp, self.inputs + u32.wrappingToI32(k * 8)) }
+  /// Calls helper index with env as its first argument (the caller has set the others from
+  /// RSI on), then reloads the inputs the code keeps in registers. The result is in RAX.
+  pub effect fn callHelper(self: &mut Self, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let atE = self.input(INPUT_ENV) run self.a.load(Width.W64, Reg.Rdi, atE)
+    run self.a.callMem(Mem.at(Reg.Rdi, helpers.helperOffset(index)))
+    let at0 = self.input(0) run self.a.load(Width.W64, Reg.Rdi, at0)
+    let at1 = self.input(1) run self.a.load(Width.W64, Reg.Rsi, at1)
+    let at2 = self.input(2) run self.a.load(Width.W64, Reg.Rdx, at2)
+    let at3 = self.input(3) run self.a.load(Width.W64, Reg.Rcx, at3)
   }
   /// The stress configuration: every guard also fails on every Nth check.
   effect fn stressGuard(self: &mut Self, exit: u32) -> () ! OutOfMemoryError ? &mut Allocator {
