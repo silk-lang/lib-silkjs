@@ -31,6 +31,7 @@ import silkjs.js_gc as gc
 import silkjs.js_eval as eval
 import silkjs.js_intrinsic_install as intrinsics
 import silkjs.native_stack as stack
+import silkjs.js_compiled_objects as objects
 import code_memory { MemoryError }
 import asm_x64 { Code, LinkError, Relocation, UnboundLabelError }
 import x64_lower { Lowered }
@@ -254,6 +255,148 @@ test effect fn branchesFollowTheInterpreterAtNaN() -> ()
   }
 }
 
+test effect fn tagsAndGenericSitesStayCompiled() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut options = Options.make()
+  options.enabled = true options.threshold = 20 options.calls = true options.profile = 0
+  let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
+  unsafe jitRuntime.attach(&mut engine.services.jit, rt)
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exerciseGeneric(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
+    Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+const GENERIC: &[u8] = b"function kind(x){var k=0;if(x==null)k=k+1;if(typeof x===\"number\")k=k+2;if(typeof x===\"string\")k=k+4;if(typeof x===\"boolean\")k=k+8;if(x===undefined)k=k+16;if(x===null)k=k+32;if(x)k=k+64;if(!x)k=k+128;return k}function pick(a,b){var r=a??b;if(r?.length)return r.length;return r?1:0}function chain(o){var s=0;if(o&&o.n)s=s+o.n;return s+(o||{n:7}).n}function shuf(o,v){o.a=o.b=v;o.c+=1;return o.a+o.b+o.c}function P(x,y){this.x=x;this.y=y}function store(o,n){o.v=n;return n}function same(a,b){if(a==b)return 1;if(a!=null)return 2;return 3}function ne(a,b){return a!=b?1:0}function strict(a,b){return a===b?5:(a!==b?7:9)}function callee(k){try{return k+1}catch(e){return 0}}function caller(o,k){return o.m(k)+callee(k)}var W=[\"\",\"ab\",[1,2],null,undefined,\"xyz\"];var V=[0,1,-0,NaN,2.5,\"\",\"s\",\"abc\",true,false,null,undefined,{},[],Infinity,-1];var H={m:function(k){return k*2}};var S={set v(n){this.w=n}};function phase(r){var t=0;for(var q=0;q<r;q++)for(var i=0;i<V.length;i++){var a=V[i],b=V[(i*7)%V.length];t=(t*31+kind(a)+pick(W[i%6],W[(i+1)%6])*3+chain(i%3?{n:i}:null))%1000003;var o={a:0,b:0,c:i};t=(t+shuf(o,i))%1000003;var p=new P(i,q);t=(t+p.x+p.y+store(i&1?S:{},i)+same(a,b)*3+ne(a,b)*11+strict(a,b)+caller(H,i))%1000003}return t}"
+
+/// Tag tests (== null, typeof, ??, ?., truthiness of any value), stack shuffles, and sites
+/// that deoptimize at first: property adds, a setter, == and != that coerce, === on any
+/// values, a call to a callee only the interpreter runs. Recompiled, they take generic paths
+/// and stop deoptimizing. Checksums are node's.
+unsafe effect fn exerciseGeneric<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
+  ! JsException | AssertionError<'static> ? &mut Allocator {
+  drop run unsafe evaluate(&mut engine, context, GENERIC)
+  let warm = run unsafe evaluate(&mut engine, context, b"phase(60)")
+  run Testing.expect(isNumber(warm, 844324.0), "tag tests, shuffles and generic sites compute what the interpreter does")
+  engine.services.jit.collect()
+  // P (an add), store (a setter), same (== coerces), ne (!= coerces), caller (a callee only
+  // the interpreter runs) and the conditions on non-booleans (if_false8, if_true8: ToBoolean
+  // once their site deoptimized) deoptimize and are unlinked, those not inlined into phase
+  // (four). Each recompilation first waits for more entries (jit_recompile.backoff); three
+  // have run enough by now.
+  run Testing.expect(engine.services.jit.compiledFunctions >= 10 && engine.services.jit.waited == 4 && engine.services.jit.recompiled == 3, "the small functions compile, and recompile once at the sites that deoptimized")
+  // Refused for good: callee (catch) and the functions with object literals (object).
+  run Testing.expect(engine.services.jit.refused == 3 && engine.services.jit.unlinked == 4, "no recompiled function is unlinked or refused again")
+  let deopts = engine.services.jit.deopts
+  let runs = engine.services.jit.runs
+  let again = run unsafe evaluate(&mut engine, context, b"phase(20)")
+  run Testing.expect(isNumber(again, 501789.0), "the same answers once recompiled")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts == deopts && engine.services.jit.runs > runs + 1000, "recompiled, they run without deoptimizing")
+  run Testing.expect(engine.services.failures == 0, "no compile failed")
+}
+test effect fn typedArraysRunCompiled() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut options = Options.make()
+  options.enabled = true options.threshold = 20
+  let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
+  unsafe jitRuntime.attach(&mut engine.services.jit, rt)
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exerciseTyped(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
+    Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+const TYPED: &[u8] = b"var K=[Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,Float32Array,Float64Array];var V=[0,1,-1,127,128,-128,-129,255,256,-0,0.5,1.5,2.5,-1.5,32767,32768,-32769,65535,65536,2147483647,-2147483648,2147483648,4294967295,4294967296,-4294967297,1e10,-1e10,NaN,Infinity,-Infinity,3.7,-3.7,1e-7,0.1];var A=[];for(var j=0;j<K.length;j++)A.push(new K[j](8));class Sub extends Float64Array{};var S=new Sub(8);A.push(S);var buf=new ArrayBuffer(64);var D=new Int32Array(buf);A.push(D);function put(a,i,v){a[i]=v;return 0}function get(a,i){return a[i]}function mix(h,x){if(x===undefined)return (h*31+7)%1000003;if(x!==x)return (h*31+11)%1000003;if(x===Infinity)return (h*31+13)%1000003;if(x===-Infinity)return (h*31+17)%1000003;if(x===0&&1/x<0)return (h*31+19)%1000003;return (h*31+((x*1000)%1000003+1000003))%1000003}function phase(r){var h=0;for(var q=0;q<r;q++){for(var j=0;j<A.length;j++){var a=A[j];for(var k=0;k<V.length;k++){var i=(k+q)%10-1;put(a,i,V[k]);h=mix(h,get(a,i));h=mix(h,get(a,(k*3)%8))}}}return h}"
+
+/// Every element kind at its boundaries (min, max, one past each, NaN, -0, infinities,
+/// fractions, doubles past the int32 range), at index -1 and one past the end, on a subclass of
+/// Float64Array and on an Int32Array whose buffer is then detached. Checksums are node's.
+unsafe effect fn exerciseTyped<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
+  ! JsException | AssertionError<'static> ? &mut Allocator {
+  run Testing.expect(objects.fieldLayout().typedTagAt != u32.MAX, "the typed array payload's variant byte is found")
+  drop run unsafe evaluate(&mut engine, context, TYPED)
+  let warm = run unsafe evaluate(&mut engine, context, b"phase(60)")
+  run Testing.expect(isNumber(warm, 675558.3287050873), "typed array reads and writes store and load what the interpreter does")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.compiledFunctions >= 3, "put, get and mix compile")
+  let deopts = engine.services.jit.deopts
+  let again = run unsafe evaluate(&mut engine, context, b"phase(20)")
+  run Testing.expect(isNumber(again, 422693.5274514258), "the same answers once compiled")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts == deopts, "compiled, element reads and writes do not deoptimize")
+  let detached = run unsafe evaluate(&mut engine, context, b"buf.transfer(); phase(5)")
+  run Testing.expect(isNumber(detached, 950082.1782797128), "a detached buffer reads undefined and ignores stores")
+  run Testing.expect(engine.services.failures == 0, "no compile failed")
+}
+test effect fn mathCallsRunCompiled() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut options = Options.make()
+  // profile 0: with the recording on, this script leaves cells live at destroyRuntime (sent to O2).
+  options.enabled = true options.threshold = 20 options.calls = true options.profile = 0
+  let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
+  unsafe jitRuntime.attach(&mut engine.services.jit, rt)
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exerciseMath(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
+    Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+const MATH_CALLS: &[u8] = b"var X=[0,-0,0.5,-0.5,1.5,-1.5,2.5,-2.5,3,-7,1e300,-1e-300,NaN,Infinity,-Infinity,0.1,123.456,-98.765,2147483647.5,4294967296.25,\"3.5\",true,null];var M={floor:function(x){return 7},sqrt:Math.sqrt};function f1(x){return Math.floor(x)+Math.ceil(x)*3+Math.round(x)*5+Math.trunc(x)*7}function f2(x){return Math.sqrt(x)+Math.abs(x)+Math.sign(x)+Math.fround(x)}function f3(x,y,k,q){return Math.pow(k%5-2,(k+q)%4)+Math.atan2(x,y)+Math.sin(x)+Math.cos(y)+Math.exp(x/1000)+Math.log(y)}function f4(o,x){return o.floor(x)+o.sqrt(x)}function mix(h,x){if(x!==x)return (h*31+11)%1000003;if(x===Infinity)return (h*31+13)%1000003;if(x===-Infinity)return (h*31+17)%1000003;if(x===0&&1/x<0)return (h*31+19)%1000003;return (h*31+((x*1000)%1000003+1000003))%1000003}function phase(r){var h=0;for(var q=0;q<r;q++){for(var k=0;k<X.length;k++){var x=X[k],y=X[(k*5+q)%X.length];h=mix(h,f1(x));h=mix(h,f2(x));h=mix(h,f3(x,y,k,q));h=mix(h,f4(q&1?M:Math,x))}}return h}"
+
+/// Math functions on -0, halves, NaN, infinities, huge and tiny values, a string, a boolean and
+/// null (ToNumber: the call is made), an object with its own floor, then Math.floor replaced.
+/// Checksums are node's (Math.pow only on small integers: the engine's pow and V8's differ in
+/// the last bit elsewhere).
+unsafe effect fn exerciseMath<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
+  ! JsException | AssertionError<'static> ? &mut Allocator {
+  drop run unsafe evaluate(&mut engine, context, MATH_CALLS)
+  let warm = run unsafe evaluate(&mut engine, context, b"phase(60)")
+  run Testing.expect(isNumber(warm, 210551.21666310355), "Math calls answer what the interpreter does")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.compiledFunctions >= 4, "the functions calling Math compile")
+  let again = run unsafe evaluate(&mut engine, context, b"phase(20)")
+  run Testing.expect(isNumber(again, 719524.1224550679), "the same answers once compiled")
+  let replaced = run unsafe evaluate(&mut engine, context, b"Math.floor = function(x) { return 42 }; phase(5)")
+  run Testing.expect(isNumber(replaced, 451452.8671178892), "a replaced Math.floor is called")
+  run Testing.expect(engine.services.failures == 0, "no compile failed")
+}
 /// The function value source evaluates to: its FunctionBytecode cell (kept alive by a global).
 unsafe effect fn bytecodeOf<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader, source: &[u8]) -> *mut HeapHeader ! JsException ? &mut Allocator {
   let memory = engine.memory
@@ -690,7 +833,8 @@ test effect fn callsFromCompiledCode() -> ()
   let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
   let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut options = Options.make()
-  options.enabled = true options.threshold = 20 options.calls = true
+  // The script counts on when each function compiles: no recording before the first compilation.
+  options.enabled = true options.threshold = 20 options.calls = true options.profile = 0
   let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
   let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
   unsafe jitRuntime.attach(&mut engine.services.jit, rt)

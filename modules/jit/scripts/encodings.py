@@ -137,6 +137,8 @@ def cases() -> dict[str, list[tuple[str, str]]]:
         add("narrow", f"a.loadZero8({reg(r)}, {m})", f"movzx {NAME32[r]}, byte ptr {text}")
         add("narrow", f"a.loadZero16({reg(r)}, {m})", f"movzx {NAME32[r]}, word ptr {text}")
         add("narrow", f"a.loadSigned32({reg(r)}, {m})", f"movsxd {NAME64[r]}, dword ptr {text}")
+        add("narrow", f"a.loadSigned8({reg(r)}, {m})", f"movsx {NAME32[r]}, byte ptr {text}")
+        add("narrow", f"a.loadSigned16({reg(r)}, {m})", f"movsx {NAME32[r]}, word ptr {text}")
     for d, s in rotate([ALL, [0, 4, 5, 6, 7, 8, 15, 1, 2, 3]], 20):
         add("narrow", f"a.zeroExtend8({reg(d)}, {reg(s)})", f"movzx {NAME32[d]}, {NAME8[s]}")
         add("narrow", f"a.signExtend32({reg(d)}, {reg(s)})", f"movsxd {NAME64[d]}, {NAME32[s]}")
@@ -185,6 +187,8 @@ def cases() -> dict[str, list[tuple[str, str]]]:
         x = (i * 7 + 1) % 16
         add("doubles", f"a.loadDouble({xmm(x)}, {m})", f"movsd {'xmm' + str(x)}, qword ptr {text}")
         add("doubles", f"a.storeDouble({m}, {xmm(x)})", f"movsd qword ptr {text}, xmm{x}")
+        add("doubles", f"a.loadFloat({xmm(x)}, {m})", f"cvtss2sd {'xmm' + str(x)}, dword ptr {text}")
+        add("doubles", f"a.storeFloat({m}, {xmm(x)})", f"movss dword ptr {text}, xmm{x}")
     for op, mnemonic in SCALAR:
         for d, s in rotate([[0, 1, 7, 8, 15], [1, 9, 0, 15, 8]], 5):
             add("doubles", f"a.scalar(ScalarOp.{op}, {xmm(d)}, {xmm(s)})", f"{mnemonic} xmm{d}, xmm{s}")
@@ -200,6 +204,8 @@ def cases() -> dict[str, list[tuple[str, str]]]:
             add("doubles", f"a.doubleToInt(Width.{width}, {reg(r)}, {xmm(x)})", f"cvttsd2si {names[r]}, xmm{x}")
         add("doubles", f"a.bitsToDouble({xmm(x)}, {reg(r)})", f"movq xmm{x}, {NAME64[r]}")
         add("doubles", f"a.doubleToBits({reg(r)}, {xmm(x)})", f"movq {NAME64[r]}, xmm{x}")
+    for d, s in rotate([[0, 1, 7, 8, 15], [1, 9, 0, 15, 8]], 5):
+        add("doubles", f"a.doubleToFloat({xmm(d)}, {xmm(s)})", f"cvtsd2ss xmm{d}, xmm{s}")
 
     for r in ALL:
         add("control", f"a.jmpReg({reg(r)})", f"jmp {NAME64[r]}")

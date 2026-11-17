@@ -34,7 +34,9 @@ struct Record {
   /// what the compile budget counts (jit_runtime Options.compileBudget).
   lowered: u64,
   /// Whether its coming recompilation already waited for the function to prove hot again.
-  waited: bool
+  waited: bool,
+  /// Whether it was sent to record feedback before its first compilation (profile).
+  profiled: bool
 }
 
 pub struct History { records: List<Record> }
@@ -44,7 +46,9 @@ pub struct History { records: List<Record> }
 /// whether this is a function's second or later compilation.
 /// kinds: for each of sites the operand kinds the entry recorded there (CompiledEntry.deoptKinds),
 /// 0 for a site of an earlier compilation.
-pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub kinds: List<u8>, pub recompile: bool, record: usize }
+pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub kinds: List<u8>, pub recompile: bool, record: usize,
+  /// Where in `sites` the offsets its last code deoptimized at begin (the rest were known).
+  pub fresh: usize }
 
 /// FNV-1a over the code and the counts the translator reads.
 unsafe fn hashOf(function: &FunctionBytecode) -> u64 {
@@ -77,6 +81,29 @@ effect fn copy(from: &List<u32>) -> List<u32> ! OutOfMemoryError ? &mut Allocato
   run out.appendSlice(from.asSlice())
   return move out
 }
+/// Sites that go generic together: a store or a call that deoptimized names the function's
+/// other stores (a constructor adding its fields) or calls (to callees only the interpreter
+/// runs) too, since a deopt at the first leaves the rest unseen and each would cost a
+/// recompilation of its own. 0 for any other opcode.
+fn family(opcode: u8) -> u32 {
+  if opcode == op.OP_put_field || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 { return 1 }
+  if (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor { return 2 }
+  return 0
+}
+/// Adds to sites every instruction of function in the family of the one at pc.
+unsafe effect fn widenFamily(function: &FunctionBytecode, sites: &mut List<u32>, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let bytes = unsafe function.code.asSlice()
+  if u32.toUsize(pc) >= bytes.length { return () }
+  let kind = family(bytes[u32.toUsize(pc)])
+  if kind == 0 { return () }
+  let mut at: usize = 0
+  while at < bytes.length {
+    let size = u8.toUsize(op.opcodeInfo(bytes[at], true).size)
+    if size == 0 { return () }
+    if family(bytes[at]) == kind && !has(&sites, usize.toU32(at)) { run sites.append(usize.toU32(at)) }
+    at = at + size
+  }
+}
 fn has(list: &List<u32>, value: u32) -> bool {
   let mut i: usize = 0
   while i < list.length() { if list.get(i) == value { return true } i = i + 1 }
@@ -103,17 +130,22 @@ impl History {
     if same < self.records.length() {
       // Reported again: its code was unlinked (or it was refused and the engine re-armed it).
       let record = &mut self.records.asMutSlice()[same]
+      // Back from recording feedback: this is its first compilation.
+      if record.compiles == 0 && record.profiled {
+        return Plan { refuse: false, why: b"", sites: run copy(&record.sites), kinds: List<u8>.make(), recompile: false, record: same, fresh: 0 }
+      }
       if record.compiles > MAX_RECOMPILES {
-        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), kinds: List<u8>.make(), recompile: true, record: same }
+        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), kinds: List<u8>.make(), recompile: true, record: same, fresh: 0 }
       }
       let mut sites = run copy(&record.sites)
+      let fresh = sites.length()
       let mut widened = false
       if record.entry != NONE {
         let entry = &entries.asSlice()[u32.toUsize(record.entry)]
         let mut k: usize = 0
         while k < u8.toUsize(entry.deoptPcCount) {
           let pc = entry.deoptPcs[k]
-          if !has(&sites, pc) { run sites.append(pc) widened = true }
+          if !has(&sites, pc) { run sites.append(pc) run unsafe widenFamily(&function, &mut sites, pc) widened = true }
           k = k + 1
         }
       }
@@ -131,14 +163,14 @@ impl History {
       }
       if !widened {
         record.compiles = MAX_RECOMPILES + 1
-        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, kinds: move kinds, recompile: true, record: same }
+        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, kinds: move kinds, recompile: true, record: same, fresh: fresh }
       }
-      return Plan { refuse: false, why: b"", sites: move sites, kinds: move kinds, recompile: true, record: same }
+      return Plan { refuse: false, why: b"", sites: move sites, kinds: move kinds, recompile: true, record: same, fresh: fresh }
     }
     let mut sites = List<u32>.make()
     if alike < self.records.length() { sites = run copy(&self.records.asSlice()[alike].sites) }
-    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make(), lowered: 0, waited: false })
-    return Plan { refuse: false, why: b"", sites: move sites, kinds: List<u8>.make(), recompile: false, record: self.records.length() - 1 }
+    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make(), lowered: 0, waited: false, profiled: false })
+    return Plan { refuse: false, why: b"", sites: move sites, kinds: List<u8>.make(), recompile: false, record: self.records.length() - 1, fresh: 0 }
   }
 
   /// Records the outcome of `plan`: compiled into table entry `entry`, or NONE when refused.
@@ -171,7 +203,11 @@ impl History {
   /// How many hot budgets of entries plan's function must run before it is compiled again, or
   /// 0 to compile now. Code that deoptimized until it was unlinked was wasted work, so each
   /// recompilation asks for BACKOFF times more proof than the one before; asked once per
-  /// recompilation (the function is reported again when the entries are used up).
+  /// recompilation (the function is reported again when the entries are used up). While it
+  /// waits its count is above the hot budget, which the engine takes for a function without
+  /// code: compiled callers deoptimize at their calls to it and are unlinked too
+  /// (js_vm.reportedWithoutCode). Measured, that costs less than keeping them linked: a call
+  /// from compiled code to an interpreted function costs more than the interpreter's own.
   pub fn backoff(self: &mut Self, plan: &Plan) -> u32 {
     if !plan.recompile || plan.refuse { return 0 }
     let record = &mut self.records.asMutSlice()[plan.record]
@@ -181,6 +217,18 @@ impl History {
     let mut n: u32 = 1
     while n < record.compiles && n < MAX_RECOMPILES { wait = wait * BACKOFF n = n + 1 }
     return wait
+  }
+}
+
+impl History {
+  /// Whether plan's function should record feedback before it is compiled: once, before its
+  /// first compilation, unless another function with the same code already taught its sites.
+  pub fn profile(self: &mut Self, plan: &Plan) -> bool {
+    if plan.recompile || plan.refuse || plan.sites.length() != 0 { return false }
+    let record = &mut self.records.asMutSlice()[plan.record]
+    if record.compiles != 0 || record.profiled { return false }
+    record.profiled = true
+    return true
   }
 }
 
