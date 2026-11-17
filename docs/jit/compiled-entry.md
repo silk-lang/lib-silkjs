@@ -54,7 +54,8 @@ extern "C" fn(arguments: *const u64, state: *mut u64, counter: *mut i32, data: ?
 ```
 
 - `arguments`: one word per declared parameter, in the frame-state word encoding below: an
-  `Int` is kind 1 with its bits, any other value is kind 6 naming its own parameter cell.
+  `Int` is kind 1 with its bits, a `Bool` kind 4, any other value kind 6 naming its own
+  parameter cell.
   Unboxing is in the engine; the type guard is in the machine code.
 - `state`: `2 + locals + stackSize` words, written on every exit.
 - `counter`: the context's interrupt counter (`ContextState.interruptCounter`); compiled loops
@@ -88,16 +89,21 @@ immediates and returns 1 (or 2). The state is:
 interpreter's own. The interpreter re-executes the instruction that failed its guard (an `add`
 that overflowed makes its `Float64` there).
 
-Ownership: int code holds only immediates, and the frame's locals still hold what `enterFrame`
-put there (`Undefined`), so writing an immediate over them needs no release; kind 6 is the only
-retain. Boxed values (G's `Move`) need a kind that transfers a count; added when the backend
-produces them.
+Ownership: the frame's locals still hold what `callInternal` put there (`Undefined`), so writing
+an immediate over them needs no release. Retains are deferred to the engine: the only owned
+values the subset makes are `retain`s of an argument, which the backend holds as the
+argument's kind 6 word, `release` emits nothing, and each consumption that hands one to the
+engine (a `move` slot, `return`) makes the engine retain once. That is exact because G's
+verifier proves every owned value is consumed exactly once on every path. A `dup` slot of an
+argument is the same kind 6 word. The backend refuses a `retain` of anything but an argument;
+values that own counts of their own need a transferring kind when the subset grows.
 
 After a deopt the function is kept: the entry counts deopts and the engine unlinks it
 (`FunctionBytecode.compiled = 0`) after `deoptLimit` deopts, since a guard that failed that
 often will keep failing until feedback recompiles it. The code itself stays with the embedder,
-which frees all of it when the session ends. Poll exits do not count. `RuntimeState` keeps
-runtime-wide counters (runs, deopts, poll exits, unlinks) that `silkjs-jit-shell --jit-stats` prints.
+which frees all of it when the session ends. Poll exits do not count. Each `CompiledEntry`
+counts runs, deopts and poll exits; the JIT sums them, with compile counts, code bytes and
+compile time, for `silkjs-jit-shell --jit-stats`.
 
 ## 4. Ahead of time
 
@@ -105,3 +111,54 @@ Machine code is emitted with `asm_x64` and its relocation records only. The comp
 refers to nothing outside its arguments (the interrupt counter and the data word arrive as
 arguments), so its bytes contain no process-local pointer and could be stored and linked
 elsewhere. The table index in `FunctionBytecode` is runtime state and never serialized.
+
+Ran (`jit_engine_tests.compiledCodeLoadsIntoAnotherRuntime`): `sum` is lowered in one runtime,
+its `Code` (bytes and relocation records) is copied as plain data, and a second, fresh runtime
+in the same process checks that its own `sum` has the same bytecode, links the copy at a
+different address (`jit_runtime.install`), runs it and deopts it. What the artefact depends on,
+all of it data a loader can check rather than identities:
+
+- the bytecode it was translated from (offsets in exit stubs, local and stack counts): a loader
+  keys the code by the function's bytecode bytes and counts, as the test does;
+- nothing else. The code has no relocation, names no atom, shape, cell or function address,
+  and reads the interrupt counter and the stress word from its arguments. The table index and
+  the saved `frameCells`/`leaf` are runtime state written at link time.
+
+So for this subset "compile ahead, load later" is the same compiler run at another time plus a
+key match. It stops being free when compiled code calls a function, reads a property through a
+shape or uses an atom: those would need relocations against symbols the loader resolves per
+runtime (the `asm_x64` relocation records and `Code.link`'s symbol table are that mechanism).
+
+## 5. Limits as built
+
+- Leaf functions (`FunctionBytecode.leaf`, run frameless by `js_vm_leaf`) are never compiled:
+  leaf runs are not counted, so they never get hot. Linking clears `leaf` anyway (restored on
+  unlink) so a linked function is never run frameless.
+- A poll exit ends compiled execution for the rest of that call; the interpreter finishes the
+  loop (no re-entry, no OSR). The interrupt counter is shared with the interpreter and runs at
+  most 10000 back edges, so a compiled loop runs at most that many iterations per call.
+- Lowering: `ssa_input.inputOf |> ssa_translate.translate |> ssa_ownership.optimize |>
+  ssa_verify.verify |> x64_backend.lower`; the first stage that declines gives the refusal.
+
+## 6. Measurements
+
+All on the cloud container (x86-64 Linux), release builds.
+
+- Interpreter-only cost, no JIT attached (measured, `v8bench.py --instructions`): against a
+  4bd0ef29 build, all eight benchmarks 1.000x (largest change crypto +0.02%). Against 6341d15
+  with the first hook (a `compiled != 0` test in `enterFrame`): richards 1.010x, raytrace
+  1.004x; moving that refusal into the room check brought richards to 1.000x.
+- Differential (ran, `differential.py --count 3000 --configs plain,observed,jit,jit-stress,node`
+  on d07f63a): 3000 agree, 0 mismatch. `jit`: 994 programs ran compiled code, 978 deopted,
+  1166 functions compiled, 32468 refusals, 167839 compiled runs, 8560 deopts, 49 poll exits,
+  1025 unlinks. `jit-stress` (threshold 1, a guard fails every 3rd check, never unlinked): 1035
+  programs ran compiled code, 905772 runs, 859202 deopts. Refusals in 200 sampled programs
+  (ran, `--jit-dump`): opcode outside the subset 1801, a function scope 257, retain of a value
+  that is not an argument (backend) 71, closure variables 58.
+- Timing (measured on the 7f19981 shell and the 6341d15 engine, wall clock of the whole process, 5 runs each, 2,000,000 calls of `sum(100)`
+  from an interpreted loop): plain engine 1013-1328 ms (median 1279), JIT shell without `--jit`
+  1250-1336 ms (median 1276), with `--jit` 657-749 ms (median 695). Startup is 5-6 ms for all
+  three. Of the 1,999,000 compiled runs, 19,889 left through a poll exit (ran, d07f63a).
+- Code size and compile time (measured, `--jit-stats`): `sum` is 989 bytes and took 162-283 µs
+  to compile (first compile includes reserving code memory). Over the differential run, 1916
+  bytes per compiled function on average and 13.7 µs per hot report, refusals included.
