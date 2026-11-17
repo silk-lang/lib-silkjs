@@ -120,18 +120,18 @@ after that widens it.
 ## Measured
 
 Callgrind instructions for the whole run over the kernel's units (`--jit`; x86-64, one
-process, `--smc-check=all-non-file`), on the kernels of the scorecard, at commit bd65c68
-(before the merge of the doubles stream; the typed-array row there used two shared routines
-that the doubles stream's inline element code has since replaced). V8 is node 22 run the
-same way, less an empty script's run; both columns include their warm-up.
+process, `--smc-check=all-non-file`), on the kernels of the scorecard. Before is the tree
+without this work (for typed-array: both passes off, with the doubles stream's inline
+element code). V8 is node 22 run the same way, less an empty script's run; both columns
+include their warm-up.
 
 | Kernel | Before | After | Without hoisting | Without borrowing | V8 | After / V8 |
 | --- | --- | --- | --- | --- | --- | --- |
 | array-sum (`s + a[i]` over 1000 ints) | 78.2 | 35.2 | 52.2 | 69.2 | 13.1 | 2.7 |
 | sum-long (counted loop, one branch) | 15.4 | 11.4 | 11.4 | 11.4 | 16.5 | 0.7 |
 | nested (`s + i * j`, two loops) | 26.6 | 24.6 | 24.6 | 24.6 | 13.1 | 1.9 |
-| doubles (`s * 0.999 + i * 0.25`) | 20.4 | 18.4 | 18.4 | 18.4 | 17.3 | 1.1 |
-| typed-array (Float64Array multiply-add) | 462.6 | 188.0 | 307.7 | 383.6 | 16.3 | 11.5 |
+| doubles (`s * 0.999 + i * 0.25`) | 20.4 | 18.3 | 18.3 | 18.3 | 17.3 | 1.1 |
+| typed-array (Float64Array multiply-add) | 373.7 | 178.0 | 297.7 | 373.7 | 16.3 | 10.9 |
 
 ## What is left
 
@@ -140,7 +140,7 @@ same way, less an empty script's run; both columns include their warm-up.
   tests its tag again. Splitting `get.elem` into a hoistable `check.array`, a bounds check
   and a typed load needs a value type for the element storage; the bounds check then goes
   when the loop's bound is the hoisted length.
-- **typed-array.** Every element crosses a frame slot as a boxed double, and each access
+- **typed-array, 178 against 16.** Every element crosses a frame slot as a boxed double, and each access
   tests the class and the count again. The same
   split, with the element kind from feedback (js_feedback records no element sites yet),
   would make each read a load.
