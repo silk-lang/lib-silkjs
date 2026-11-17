@@ -564,3 +564,106 @@ Refusals (`--jit`): a call (needs `--jit-calls`) 723, deoptimized again where it
 widened 118, `get_array_el2` 89, `instanceof` 57, `if_not_nullish8` 54, `put_arg` 53. Deopt sites
 of recompiled functions, by opcode: `put_array_el` 116, `call_method` 80, `call2` 39, `add` 37,
 `put_field` 29, `mul` 26.
+
+## 2026-11-17 13:18 UTC: integration da86b81c (H machine-code leaf calls, J stores to a second shape and array appends)
+
+Same host, versions and tools (plus J's "refused after deoptimizing at" table in
+`jit_coverage.py`, empty in this run). Raw files:
+[`jit-scorecard-results/2026-11-17-da86b81c/`](jit-scorecard-results/2026-11-17-da86b81c/).
+
+### Kernels
+
+| Kernel | silkjs | silkjs-jit | silkjs-jit-calls | v8-jit | jsc-jit |
+|---|---:|---:|---:|---:|---:|
+| sum-calls | 5.74 | 1.04 (2.3/1.8) | 1.05 | 0.45 | 0.59 |
+| sum-long | 7.97 | 2.23 (2.5/4.2) | 2.20 | 0.90 | 0.54 |
+| nested | 8.36 | 1.75 (3.0/1.3) | 1.75 | 0.58 | 1.35 |
+| calls | 19.22 | 18.65 | **13.15 (22.4/16.7)** | 0.59 | 0.79 |
+| method | 25.53 | 25.83 | **16.94 (17.7/13.3)** | 0.95 | 1.27 |
+| doubles | 12.55 | 2.12 (1.3/1.2) | 2.12 | 1.60 | 1.70 |
+| array-sum | 8.35 | 3.09 (5.1/4.5) | 3.13 | 0.61 | 0.68 |
+| typed-array | 34.88 | 33.47 (32.8/35.5) | 33.28 | 1.02 | 0.94 |
+
+With `--jit-calls`, calls and method are now clearly faster than the interpreter (13.15 against
+19.22, 16.94 against 25.53) but still 17x to 22x behind V8. Without `--jit-calls` nothing changed
+from ea9965d0 beyond noise.
+
+### Octane 2
+
+| Engine | best round | median round | worst round |
+|---|---:|---:|---:|
+| silkjs | 7141 | 6900 | 6678 |
+| silkjs-jit | 6819 | 6611 | 6159 |
+| silkjs-jit-calls | 6183 | 6010 | 5731 |
+| v8-jitless | 5595 | 5428 | 5245 |
+| jsc-nojit | 4246 | 4163 | 3957 |
+| qjs | 3862 | 3761 | 3640 |
+| v8-jit | 64587 | 61738 | 58822 |
+| jsc-jit | 62917 | 61045 | 57393 |
+
+Against silkjs: silkjs-jit 0.958 (0.951 at ea9965d0), silkjs-jit-calls 0.871 (0.859). Clearly
+below with non-overlapping ranges: MandreelLatency 0.574, Mandreel 0.857, Gameboy 0.906, Box2D
+0.907, Splay 0.914. With `--jit-calls`: DeltaBlue 0.557 (0.470 before), Box2D 0.707, Richards
+0.902. The compile-cost picture is unchanged, so the default JIT stays below the interpreter until
+the OSR backoff (I) and compile budget (K) land.
+
+### Coverage and compile cost
+
+| Benchmark | hot / compiled / refused | deopts / unlinked | OSR compiled / runs / deopts | compile ms | code MB | compiled instr | compiler instr | top refusals |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| octane/richards | 26 / 0 / 26 | 0 / 0 | 4 / 32 / 32 | 1.3 | 0.01 | 0.001% | 0.193% | a call (calls from compiled code need --jit-calls) 11; `if_not_nullish8` 9; `is_undefined_or_null` 2 |
+| octane/deltablue | 72 / 17 / 55 | 136 / 17 | 33 / 125 / 125 | 6.2 | 0.09 | 0.033% | 0.455% | a call (calls from compiled code need --jit-calls) 42; deoptimized again where it was already widened 7; `if_nullish8` 4 |
+| octane/crypto | 58 / 10 / 48 | 56 / 7 | 66 / 164 / 162 | 24.7 | 0.76 | 0.185% | 2.079% | a call (calls from compiled code need --jit-calls) 22; deoptimized again where it was already widened 8; `perm3` 5 |
+| octane/raytrace | 37 / 4 / 33 | 24 / 3 | 10 / 83 / 69 | 5.5 | 0.14 | 0.258% | 1.298% | a call (calls from compiled code need --jit-calls) 27; `throw` 2; `special_object` 1 |
+| octane/earley-boyer | 66 / 1 / 65 | 0 / 0 | 29 / 166 / 99 | 5.3 | 0.06 | 0.000% | 0.091% | `instanceof` 25; a call (calls from compiled code need --jit-calls) 9; `if_not_null8` 6 |
+| octane/regexp | 20 / 3 / 17 | 16 / 2 | 93 / 70 / 70 | 7.3 | 0.23 | 0.977% | 1.716% | `regexp` 13; a call (calls from compiled code need --jit-calls) 2; deoptimized again where it was already widened 1 |
+| octane/splay | 62 / 5 / 57 | 24 / 3 | 49 / 361 / 361 | 28.9 | 0.97 | 0.171% | 0.849% | a call (calls from compiled code need --jit-calls) 51; `if_not_nullish8` 3; `throw` 2 |
+| octane/navier-stokes | 27 / 2 / 25 | 0 / 0 | 60 / 152 / 139 | 29.8 | 1.39 | 0.941% | 12.531% | `insert3` 8; `get_array_el3` 5; deoptimized again where it was already widened 4 |
+| octane/pdfjs | 115 / 10 / 105 | 48 / 6 | 118 / 280 / 279 | 32.4 | 1.08 | 0.005% | 5.793% | a call (calls from compiled code need --jit-calls) 34; `array_from` 17; deoptimized again where it was already widened 11 |
+| octane/mandreel | 117 / 27 / 90 | 192 / 24 | 149 / 283 / 278 | 898.9 | 25.73 | 0.038% | 34.016% | a call (calls from compiled code need --jit-calls) 37; `get_array_el2` 29; deoptimized again where it was already widened 17 |
+| octane/gbemu | 210 / 65 / 145 | 212 / 25 | 153 / 652 / 460 | 117.9 | 3.81 | 2.046% | 13.456% | `get_array_el2` 62; a call (calls from compiled code need --jit-calls) 30; `insert2` 11 |
+| octane/code-load | 27 / 6 / 21 | 40 / 5 | 21 / 3 / 2 | 5.7 | 0.08 | 0.000% | 0.000% | a call (calls from compiled code need --jit-calls) 5; `for_in_start` 5; `special_object` 5 |
+| octane/box2d | 162 / 29 / 133 | 171 / 21 | 128 / 171 / 167 | 76.2 | 3.74 | 0.205% | 23.734% | a call (calls from compiled code need --jit-calls) 54; `is_undefined` 27; `special_object` 16 |
+| octane/zlib | 37 / 0 / 37 | 0 / 0 | 104 / 157 / 156 | 3227.8 | 33.78 | 0.001% | 32.177% | `put_arg` 28; deoptimized again where it was already widened 8; recompiled too often 1 |
+| octane/typescript | 519 / 184 / 335 | 1388 / 172 | 129 / 246 / 229 | 219.0 | 5.89 | 0.839% | 12.578% | a call (calls from compiled code need --jit-calls) 216; `is_undefined_or_null` 29; `if_not_nullish8` 24 |
+| kernel/sum-calls | 4 / 1 / 3 | 0 / 0 | 3 / 1958 / 16 | 0.4 | 0.00 | 67.410% | 0.215% | a call (calls from compiled code need --jit-calls) 2; deoptimized again where it was already widened 1 |
+| kernel/sum-long | 1 / 1 / 0 | 0 / 0 | 1 / 2000 / 0 | 0.5 | 0.00 | 99.331% | 0.079% | - |
+| kernel/nested | 2 / 1 / 1 | 0 / 0 | 3 / 1798 / 2 | 0.8 | 0.01 | 95.665% | 0.493% | a call (calls from compiled code need --jit-calls) 1 |
+| kernel/calls | 5 / 0 / 5 | 0 / 0 | 4 / 24 / 24 | 0.5 | 0.00 | 0.000% | 0.015% | a call (calls from compiled code need --jit-calls) 4; deoptimized again where it was already widened 1 |
+| kernel/method | 5 / 0 / 5 | 0 / 0 | 4 / 24 / 24 | 0.6 | 0.00 | 0.000% | 0.013% | a call (calls from compiled code need --jit-calls) 4; deoptimized again where it was already widened 1 |
+| kernel/doubles | 4 / 1 / 3 | 0 / 0 | 3 / 988 / 16 | 0.5 | 0.00 | 67.946% | 0.497% | a call (calls from compiled code need --jit-calls) 2; deoptimized again where it was already widened 1 |
+| kernel/array-sum | 2 / 1 / 1 | 0 / 0 | 2 / 1997 / 3 | 0.4 | 0.01 | 98.683% | 0.054% | a call (calls from compiled code need --jit-calls) 1 |
+| kernel/typed-array | 5 / 3 / 2 | 24 / 3 | 4 / 3 / 3 | 1.6 | 0.03 | 0.000% | 0.089% | recompiled too often 1; a call (calls from compiled code need --jit-calls) 1 |
+
+With `--jit-calls`:
+
+| Benchmark | hot / compiled / refused | deopts / unlinked | compile ms | code MB | compiled instr | compiler instr | top refusals |
+|---|---:|---:|---:|---:|---:|---:|---|
+| octane/richards | 36 / 19 / 17 | 96 / 12 | 4.9 | 0.10 | 4.859% | 0.849% | `if_not_nullish8` 9; deoptimized again where it was already widened 4; `is_undefined_or_null` 2 |
+| octane/deltablue | 151 / 128 / 23 | 803 / 100 | 37.8 | 0.96 | 31.577% | 5.489% | deoptimized again where it was already widened 13; `if_nullish8` 4; a body too short to gain from compiling 3 |
+| octane/crypto | 72 / 37 / 35 | 264 / 33 | 49.6 | 1.41 | 0.752% | 4.880% | deoptimized again where it was already widened 13; `perm3` 7; `step_arg8` 4 |
+| octane/raytrace | 94 / 68 / 26 | 536 / 67 | 77.2 | 3.38 | 0.216% | 23.543% | deoptimized again where it was already widened 14; recompiled too often 7; `throw` 2 |
+| octane/earley-boyer | 74 / 17 / 57 | 114 / 14 | 8.9 | 0.15 | 0.081% | 0.347% | `instanceof` 24; deoptimized again where it was already widened 10; `if_null8` 5 |
+| octane/regexp | 18 / 5 / 13 | 32 / 4 | 7.3 | 0.24 | 0.974% | 1.951% | `regexp` 11; deoptimized again where it was already widened 1; recompiled too often 1 |
+| octane/splay | 302 / 289 / 13 | 2280 / 285 | 270.4 | 11.76 | 0.422% | 12.307% | deoptimized again where it was already widened 5; `throw` 3; `if_not_nullish8` 3 |
+| octane/navier-stokes | 27 / 5 / 22 | 24 / 3 | 39.7 | 1.59 | 0.945% | 12.080% | `insert3` 8; `get_array_el3` 5; deoptimized again where it was already widened 4 |
+| octane/pdfjs | 146 / 69 / 77 | 434 / 54 | 56.0 | 1.76 | 0.181% | 8.087% | `array_from` 17; deoptimized again where it was already widened 14; `typeof_is_undefined` 7 |
+| octane/mandreel | 151 / 88 / 63 | 607 / 75 | 1239.6 | 32.89 | 0.222% | 31.933% | `get_array_el2` 28; deoptimized again where it was already widened 18; recompiled too often 12 |
+| octane/gbemu | 217 / 113 / 104 | 534 / 63 | 185.0 | 4.46 | 2.074% | 31.280% | `get_array_el2` 49; deoptimized again where it was already widened 12; `insert2` 11 |
+| octane/code-load | 33 / 13 / 20 | 80 / 10 | 6.1 | 0.12 | 0.000% | 0.000% | `special_object` 8; deoptimized again where it was already widened 3; `for_in_start` 3 |
+| octane/box2d | 213 / 116 / 97 | 813 / 101 | 371.9 | 11.64 | 0.156% | 64.015% | `is_undefined` 25; `special_object` 15; deoptimized again where it was already widened 15 |
+| octane/zlib | 37 / 0 / 37 | 0 / 0 | 3256.4 | 33.78 | 0.001% | 32.198% | `put_arg` 28; deoptimized again where it was already widened 8; recompiled too often 1 |
+| octane/typescript | 1316 / 1085 / 231 | 8280 / 1030 | 1045.5 | 31.92 | 1.396% | 35.163% | deoptimized again where it was already widened 119; `is_undefined_or_null` 29; `if_not_nullish8` 24 |
+| kernel/sum-calls | 2 / 2 / 0 | 0 / 0 | 0.5 | 0.01 | 67.345% | 0.282% | - |
+| kernel/sum-long | 1 / 1 / 0 | 0 / 0 | 0.3 | 0.00 | 99.331% | 0.079% | - |
+| kernel/nested | 2 / 2 / 0 | 0 / 0 | 0.9 | 0.01 | 95.551% | 0.568% | - |
+| kernel/calls | 2 / 2 / 0 | 0 / 0 | 0.4 | 0.00 | 87.633% | 8.364% | - |
+| kernel/method | 2 / 2 / 0 | 0 / 0 | 0.6 | 0.01 | 96.769% | 0.029% | - |
+| kernel/doubles | 2 / 2 / 0 | 0 / 0 | 0.6 | 0.01 | 67.773% | 0.681% | - |
+| kernel/array-sum | 2 / 2 / 0 | 0 / 0 | 0.5 | 0.01 | 98.643% | 0.080% | - |
+| kernel/typed-array | 5 / 4 / 1 | 24 / 3 | 1.5 | 0.04 | 0.000% | 0.099% | recompiled too often 1 |
+
+Refusals (`--jit`): a call (needs `--jit-calls`) 729, deoptimized again where it was already
+widened 115, `get_array_el2` 91, `instanceof` 56, `if_not_nullish8` 53, `put_arg` 53, `array_from`
+40. Deopt sites of recompiled functions: `put_array_el` 114, `call_method` 76, `call2` 43, `add`
+37, `mul` 26, `put_field` 21.
