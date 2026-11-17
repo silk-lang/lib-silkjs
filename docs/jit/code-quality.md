@@ -35,6 +35,10 @@ what each read needs kept away:
 An element or a length read from an object that itself borrows from a binding borrows from
 the binding too, and ends at both lists.
 
+"A call" is any instruction not listed in `ssa_opt_borrow.quiet`: the instructions known not
+to run the program's code or free a holder. An instruction a stream adds later ends every
+borrow and stops hoisting in its loop until it is listed there.
+
 The helpers follow: `get_var` and `get_scope` take a flag (bit 31 of the index, bit 29 of
 the site) and do not retain; `get_elem_borrowed` (helper 121) gives its count back, and
 answers 0 when the element is a cell only the read holds (nothing would keep it alive for a
@@ -72,7 +76,13 @@ header as the back edge carries it; the entry state is built from it slot by slo
 - any other slot lost its parameter because it holds one value around the loop; the latch's
   slot names it. If that value is defined inside the loop the pass gives the loop up.
 
-A loop with more than one entry edge, or no `poll`, is left alone.
+A loop with more than one entry edge, or no `poll`, is left alone. So is the loop of an
+inlined body (docs/jit/inlining.md), and an instruction of an inlined body stays in its loop:
+it may read the frame `inline.frame` builds there.
+
+**Code entered at the loop.** In an OSR artefact (docs/jit/osr.md) the entry edge comes from
+the entry block, so the front block sits between the entry and the header and a moved guard
+exits with the values the entry brought (`ssa_tests.goldenHoistedInLoopEntry`).
 
 **Recompilation.** A deopt at a hoisted guard is recorded at the header's offset, which
 says nothing about which instruction to widen. So a loop whose header is among the offsets
@@ -86,29 +96,33 @@ after that widens it.
   the operation runs there, two instructions where there were four. The exit state reads
   the operand, so the overflow jump goes to a short piece after the blocks that undoes the
   operation and then jumps to the exit.
-- **Typed arrays.** `get.elem` and `put.elem` on anything but a fast Array called the engine
-  (about 100 instructions with the register saves). A function that has such an instruction
-  now holds two routines (`x64_typed.silk`), emitted once after its blocks and called with a
-  near call: what `quickRead` and `quickWrite` do for Int8 to Int32, Uint8, Uint16 and
-  Float64 elements (and Uint32 stores), with an Int or, for Float64, a double value. Each
-  answers 0 for everything else (another object, an index past the count, which is 0 once
-  the buffer is detached, a shared buffer, the other kinds, a clamped or converting store),
-  and the code then calls the engine as before.
 - An Array's length is a number: its inline read took a count it never needed.
 
 ## What it is checked with
 
-- `ssa_tests.goldenBorrowedElements`, `goldenHoistedLength`: the form after the passes.
-- The differential's `aliases` flavour (modules/engine/scripts/differential.py): the array
-  is the only owner of its strings and arrays, a store replaces the element just read (the
-  same slot or another) before the value is used again, and the length changes inside the
-  loop that reads it. `jit-stress` takes every guard's exit in turn, the hoisted ones
-  included, so a wrong entry state shows as a wrong checksum.
+- `ssa_tests.goldenBorrowedElements`, `goldenHoistedLength`, `goldenHoistedInLoopEntry`: the
+  form after the passes.
+- The differential (modules/engine/scripts/differential.py):
+  - flavour `aliases`: the array is the only owner of its strings and arrays, a store
+    replaces the element just read (the same slot or another) before the value is used
+    again, and the length changes inside the loop that reads it;
+  - flavour `hoists`: a loop reads a field, a global, a length or a typed array element that
+    does not change, and then it does, at one iteration or at every one: the shape through a
+    call (`__poke`: add, delete and re-add, a getter, a double) or a store, the binding, the
+    array's length, the typed array's buffer (`__cut`: detached, shrunk, grown);
+  - flavour `conversions`: conversions of loop-invariant values on -0, NaN, doubles and
+    non-numbers, with the sign of zero in the checksum;
+  - the long loops read an array's length and a global's field, in code entered at the loop;
+  - configurations `jit-no-hoist` and `jit-no-borrow` run without one pass each, so a
+    mismatch is pinned on a pass. `jit-stress` takes every guard's exit in turn, the hoisted
+    ones included, so a wrong entry state shows as a wrong checksum.
 
 ## Measured
 
 Callgrind instructions for the whole run over the kernel's units (`--jit`; x86-64, one
-process, `--smc-check=all-non-file`), on the kernels of the scorecard. V8 is node 22 run the
+process, `--smc-check=all-non-file`), on the kernels of the scorecard, at commit bd65c68
+(before the merge of the doubles stream; the typed-array row there used two shared routines
+that the doubles stream's inline element code has since replaced). V8 is node 22 run the
 same way, less an empty script's run; both columns include their warm-up.
 
 | Kernel | Before | After | Without hoisting | Without borrowing | V8 | After / V8 |
@@ -126,8 +140,8 @@ same way, less an empty script's run; both columns include their warm-up.
   tests its tag again. Splitting `get.elem` into a hoistable `check.array`, a bounds check
   and a typed load needs a value type for the element storage; the bounds check then goes
   when the loop's bound is the hoisted length.
-- **typed-array, 188 against 16.** Three reads and a store through the routines cost about
-  35 instructions each, and every element crosses a frame slot as a boxed double. The same
+- **typed-array.** Every element crosses a frame slot as a boxed double, and each access
+  tests the class and the count again. The same
   split, with the element kind from feedback (js_feedback records no element sites yet),
   would make each read a load.
 - **nested, 25 against 13.** `mul.i32` spends eight instructions on overflow and -0; the
