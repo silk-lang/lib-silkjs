@@ -136,5 +136,7 @@ cost 13 times the smaller and 1,220 per byte.
 - Code that is compiled and then unlinked is still the largest waste where the cause is not a
   number guess: see the last paragraph of "Recording before the first compilation". Those
   sites need a slow path in compiled code instead of an exit.
-- `OSR_BUDGET_NS` is wall time, so what compiles differs between a native run and one under
-  callgrind, and between callgrind runs: typescript's totals vary by 5 to 7 percent.
+- `OSR_BUDGET_NS` is wall time (read), so what compiles can differ between a native run and
+  one under callgrind. typescript's callgrind totals varied by 5 to 7 percent between runs of
+  the same binary and flags (measured: 16.8G, 18.1G, 18.8G); whether the budget is the cause
+  was not traced.
