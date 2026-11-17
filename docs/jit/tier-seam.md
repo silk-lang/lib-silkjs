@@ -279,6 +279,52 @@ earley-boyer (+0.82 percent). Most of that is not the counting:
 This address sensitivity will move with any change to the size of a heap cell, so it is a property
 of that cache rather than of this hook (open question 7).
 
+### The receiver cache fix
+
+The cache is `RuntimeState.receiverCache`, the constructor receiver cache, probed by
+`js_gc.receiverWay` (64 entries, 16 sets of 4 ways, keyed by the constructor's cell address). On
+earley-boyer one constructor (`sc_Pair`, through `js_gc.plannedShape`) is entered 532,558 times. At
+`42b98426` it sits in way 0 of its set; once `FunctionBytecode` grew by 8 bytes it sat in way 2,
+behind two other constructors of the same set, and every construct paid two missed probes of
+136-byte entries: 13 instructions, 6.92 million in all, which is the whole control-build delta
+(measured, callgrind `--dump-instr=yes`). Two unrelated 8-byte cell growths on `42b98426`
+(`ShapeData`, `VarRef`) left earley-boyer at 1.000x (measured), so the effect is specific to which
+address `sc_Pair` gets, not to any growth.
+
+The probe now starts at the set's last hit, so the way a constructor landed in no longer decides
+its cost:
+- `RuntimeState.receiverFunctions` holds each entry's constructor address apart from the entry
+  (`ReceiverCacheEntry.function` is gone), so a set's four keys share one cache line and a probe
+  is one compare with scaled addressing.
+- `RuntimeState.receiverHints` holds, per set, the way of its last hit. `receiverWay` compares the
+  hinted way, then the four ways in order (`otherWay`, inlined), which also moves the hint.
+  `refillReceiver` points the hint at the way it fills.
+- A miss is returned as the way plus `RECEIVER_MISS`, so callers do not reload the key to learn
+  whether the way they got holds their constructor.
+
+`v8bench.py --instructions` against `42b98426`, every variant measured (round-to-round spread of
+the baseline under 0.0006 percent). The first three variants sit on `6341d15`, the kept one on
+`4bd0ef2`; "Fix without hook" is the kept cache on `42b98426` itself:
+
+| Benchmark | Hook, old cache (`4bd0ef2`) | Packed keys | + hint | + miss in way | + inline fallback (kept) | Fix without hook |
+| --- | --- | --- | --- | --- | --- | --- |
+| richards | 0.9987x | 0.9987x | 0.9987x | 0.9987x | 0.9987x | 1.0000x |
+| deltablue | 1.0002x | 1.0003x | 1.0002x | 1.0002x | 0.9999x | 0.9998x |
+| crypto | 0.9998x | 1.0000x | 0.9999x | 0.9998x | 1.0000x | 1.0000x |
+| raytrace | 0.9992x | 1.0034x | 1.0026x | 1.0022x | 1.0008x | 1.0021x |
+| earley-boyer | 1.0075x | 1.0046x | 1.0008x | 1.0008x | 1.0005x | 0.9991x |
+| regexp | 1.0012x | 1.0012x | 1.0012x | 1.0012x | 1.0012x | 1.0000x |
+| splay | 1.0008x | 1.0008x | 1.0007x | 1.0007x | 1.0007x | 1.0000x |
+| navier-stokes | 1.0000x | 1.0000x | 1.0000x | 1.0000x | 1.0000x | 1.0000x |
+
+Raytrace constructs two constructors of one set in alternation (about 50,000 times each way per
+run), so the hint changes on every second construct there; with the fallback out of line that cost
+a call each time (the "+ hint" column). The probe itself is shorter than before on every path; the
+raytrace delta that remains (+0.16 percent with the hook, +0.21 percent without) moves between
+variants that do not touch raytrace's probes. For the packed-key variant callgrind put it in a few
+instructions of spills and register moves scattered over the interpreter's construct paths, not in
+the probe (measured); the kept variant was not traced that far.
+
 ## Open questions
 
 1. Generator and async resumption (`vm.resume`) is not counted. A generator that is created
@@ -296,9 +342,11 @@ of that cache rather than of this hook (open question 7).
    back into the loop. Not decided here.
 6. Which getters on the generic path (`js_property_get.silk`) reach `callInternal` and which run
    natively without it was not traced exhaustively.
-7. The earley-boyer cost above is a probe-order effect in an address-keyed 4-way cache on the
-   call path. Probing the ways in parallel, or a hash that spreads cell addresses better, would
-   remove it, and would also make benchmark deltas of unrelated changes less noisy. Not tried.
+7. Settled: the earley-boyer cost was the receiver cache's probe order (see "The receiver cache
+   fix"). Two other address-keyed caches still probe two ways in a fixed order
+   (`js_gc.pinConstructed`'s `constructPins` and `js_construct_eval.cacheWay`'s `constructCache`);
+   neither showed up in these measurements, but a change that moves cells can still shift their
+   hits by one probe.
 8. Leaf runs are not counted (see above). If a tier needs leaves reported on their own, counting
    in `leaves.miss`-style credit bookkeeping or sampling at the interrupt poll would be cheaper
    than one decrement per run. Not measured.
