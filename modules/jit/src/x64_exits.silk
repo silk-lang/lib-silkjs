@@ -1,0 +1,233 @@
+//! Exit tables for x64_backend (jit_exit_state has the format and the reason): one record per
+//! exit, chunks shared between records, a two-instruction stub per exit and one common stub
+//! per function that hands the record to the EXIT_STATE helper.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import asm_x64 { Alu, Label, Mem, Reg, Width }
+import ssa { Function, Op, Type, Own, SlotMode, NONE }
+import x64_regalloc { GPR, XMM, gprAt, gprCount, xmmAt }
+import x64_backend { Emitter, SLOT_BYTES, INPUT_ENV }
+import jit_helpers as helpers
+import jit_exit_state as state
+
+/// js_compiled.EXIT_DEOPT and EXIT_POLL.
+const EXIT_DEOPT: u32 = 1
+const EXIT_POLL: u32 = 2
+
+/// The records and chunks of one function, as u32 words; chunks are told apart by content.
+struct Tables {
+  records: List<u32>,
+  /// Word index in `records` of each exit's record.
+  recordAt: List<u32>,
+  chunks: List<u32>,
+  /// Open addressing over chunk numbers (NONE: empty); its length is a power of two.
+  buckets: List<u32>,
+  chunkCount: u32,
+}
+
+const CHUNK_WORDS: usize = 16
+
+fn hashChunk(words: &[u32]) -> u32 {
+  let mut hash: u32 = 2166136261
+  let mut i: usize = 0
+  while i < words.length { hash = u32.wrappingMultiply(u32.bitXor(hash, words[i]), 16777619) i = i + 1 }
+  return hash
+}
+
+impl Tables {
+  effect fn make() -> Tables ! OutOfMemoryError ? &mut Allocator {
+    let mut buckets = List<u32>.make()
+    run buckets.appendRepeated(NONE, 64)
+    return Tables { records: List<u32>.make(), recordAt: List<u32>.make(), chunks: List<u32>.make(), buckets: move buckets, chunkCount: 0 }
+  }
+  fn same(self: &Self, chunk: u32, words: &[u32]) -> bool {
+    let base = u32.toUsize(chunk) * CHUNK_WORDS
+    let mut i: usize = 0
+    while i < CHUNK_WORDS { if self.chunks.get(base + i) != words[i] { return false } i = i + 1 }
+    return true
+  }
+  fn place(self: &mut Self, chunk: u32, hash: u32) -> () {
+    let mask = usize.toU32(self.buckets.length()) - 1
+    let mut at = u32.bitAnd(hash, mask)
+    while self.buckets.get(u32.toUsize(at)) != NONE { at = u32.bitAnd(at + 1, mask) }
+    self.buckets.set(u32.toUsize(at), chunk)
+  }
+  /// The number of the chunk holding `words` (CHUNK_WORDS of them), stored once.
+  effect fn intern(self: &mut Self, words: &[u32]) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let hash = hashChunk(words)
+    let mask = usize.toU32(self.buckets.length()) - 1
+    let mut at = u32.bitAnd(hash, mask)
+    while true {
+      let found = self.buckets.get(u32.toUsize(at))
+      if found == NONE { break }
+      if self.same(found, words) { return found }
+      at = u32.bitAnd(at + 1, mask)
+    }
+    let chunk = self.chunkCount
+    run self.chunks.appendSlice(words)
+    self.chunkCount = chunk + 1
+    // Half full: double and place every chunk again.
+    if u32.toUsize(self.chunkCount) * 2 > self.buckets.length() {
+      let size = self.buckets.length() * 2
+      self.buckets.clear()
+      run self.buckets.appendRepeated(NONE, size)
+      let mut c: u32 = 0
+      while c < self.chunkCount {
+        let base = u32.toUsize(c) * CHUNK_WORDS
+        let mut copy: [u32; 16] = [0; 16]
+        let mut i: usize = 0
+        while i < CHUNK_WORDS { copy[i] = self.chunks.get(base + i) i = i + 1 }
+        self.place(c, hashChunk(&copy))
+        c = c + 1
+      }
+    } else { self.place(chunk, hash) }
+    return chunk
+  }
+}
+
+/// The exit stubs, the common stub and the tables of `function`'s exits, at the end of the
+/// code. Each exit label is bound to its stub.
+pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  let exitCount = function.exits.length()
+  if exitCount == 0 { return () }
+  // What each exit returns: a poll's is an interrupt, a call's the status in its result slot.
+  let mut codes = List<u32>.make()
+  run codes.appendRepeated(EXIT_DEOPT, exitCount)
+  let mut i: usize = 0
+  while i < function.insts.length() {
+    let inst = function.insts.get(i)
+    if inst.exit != NONE {
+      if inst.op == Op.Poll { codes.set(u32.toUsize(inst.exit), EXIT_POLL) }
+      else if inst.op == Op.Call { codes.set(u32.toUsize(inst.exit), u32.bitOr(state.CODE_FROM_FRAME, inst.result * SLOT_BYTES)) }
+    }
+    i = i + 1
+  }
+  let mut tables = run Tables.make()
+  let chunkSize = u32.toUsize(state.CHUNK)
+  let mut x: usize = 0
+  while x < exitCount {
+    let exit = function.exits.get(x)
+    let count = function.localCount + exit.stackDepth
+    // Kind and operand per entry: one per slot, then the releases.
+    let mut entries = List<u32>.make()
+    let mut s: u32 = 0
+    while s < count {
+      let slot = function.slot(exit, s)
+      let v = slot.value
+      let info = function.value(v)
+      let kind = e.places.kind(v)
+      let mut entry = state.ENTRY_VALUE
+      let mut operand = v * SLOT_BYTES
+      if info.ty == Type.I32 || info.ty == Type.Bool {
+        let boolean = info.ty == Type.Bool
+        match e.constants.get(u32.toUsize(v)) {
+          Option<i32>.Some { value } => { entry = state.ENTRY_INT_CONST operand = i32.wrappingToU32(value) }
+          Option<i32>.None => {
+            if kind == GPR {
+              operand = u8.toU32(e.places.register(v))
+              if boolean { entry = state.ENTRY_BOOL_REGISTER } else { entry = state.ENTRY_INT_REGISTER }
+            } else if boolean { entry = state.ENTRY_BOOL_FRAME } else { entry = state.ENTRY_INT_FRAME }
+          }
+        }
+      } else if info.ty == Type.F64 {
+        if kind == XMM { operand = u8.toU32(e.places.register(v)) entry = state.ENTRY_F64_REGISTER }
+        else { entry = state.ENTRY_F64_FRAME }
+      } else if !(info.own == Own.Imm || slot.mode == SlotMode.Imm || info.own == Own.Owned) {
+        // A move hands its count over; a dup (a borrow) adds the slot's own.
+        entry = state.ENTRY_VALUE_RETAIN
+      }
+      run entries.append(entry)
+      run entries.append(operand)
+      s = s + 1
+    }
+    let total = usize.toU32(entries.length() / 2)
+    run tables.recordAt.append(usize.toU32(tables.records.length()))
+    run tables.records.append(exit.pc)
+    run tables.records.append(exit.stackDepth)
+    run tables.records.append(codes.get(x))
+    run tables.records.append(count)
+    run tables.records.append(total)
+    let mut at: usize = 0
+    while at < entries.length() {
+      let mut words: [u32; 16] = [0; 16]
+      let mut within: usize = 0
+      while within < chunkSize * 2 && at < entries.length() {
+        words[within] = entries.get(at)
+        within = within + 1
+        at = at + 1
+      }
+      let chunk = run tables.intern(&words)
+      // The chunk's number for now; its offset once the records' size is known.
+      run tables.records.append(chunk)
+    }
+    x = x + 1
+  }
+  // Stubs: the record's address, then the common stub.
+  let common = run e.a.label()
+  let mut recordLabels = List<Label>.make()
+  x = 0
+  while x < exitCount {
+    let label = run e.a.label()
+    run recordLabels.append(label)
+    e.a.bind(e.exitLabels.get(x))
+    run e.a.leaLabel(Reg.Rax, label)
+    run e.a.jmp(common)
+    x = x + 1
+  }
+  // The common stub: RAX the record, RSI the state. The registers go below the frame, where
+  // the helper reads them; the frame base is then DUMP_BYTES above RSP.
+  e.a.bind(common)
+  run e.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, state.DUMP_BYTES)
+  let mut r: usize = 0
+  while r < gprCount() {
+    if e.saves(r) { run e.a.store(Width.W64, Mem.at(Reg.Rsp, usize.toI32(r) * 8), gprAt(r)) }
+    r = r + 1
+  }
+  let mut doubles: u32 = 0
+  let mut v: u32 = 0
+  while v < function.valueCount() {
+    if e.places.kind(v) == XMM { doubles = u32.bitOr(doubles, u32.shiftLeft(1, u8.toU32(e.places.register(v)))) }
+    v = v + 1
+  }
+  let mut d: u32 = 0
+  while d < state.DUMP_DOUBLES {
+    if u32.bitAnd(u32.shiftRight(doubles, d), 1) != 0 {
+      run e.a.storeDouble(Mem.at(Reg.Rsp, u32.wrappingToI32((state.DUMP_INTEGERS + d) * 8)), xmmAt(u32.toUsize(d)))
+    }
+    d = d + 1
+  }
+  run e.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.Rsp, state.DUMP_BYTES + e.inputs + u32.wrappingToI32(INPUT_ENV * 8)))
+  run e.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, state.DUMP_BYTES))
+  run e.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
+  run e.a.mov(Width.W64, Reg.R8, Reg.Rsp)
+  run e.a.callMem(Mem.at(Reg.Rdi, helpers.helperOffset(helpers.EXIT_STATE)))
+  run e.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, state.DUMP_BYTES)
+  run e.unwind()
+  run e.a.ret()
+  // The tables: records, then chunks.
+  let recordWords = usize.toU32(tables.records.length())
+  x = 0
+  let mut word: usize = 0
+  while x < exitCount {
+    let start = tables.recordAt.get(x)
+    e.a.bind(recordLabels.get(x))
+    let mut end = recordWords
+    if x + 1 < exitCount { end = tables.recordAt.get(x + 1) }
+    while usize.toU32(word) < end {
+      let mut value = tables.records.get(word)
+      if usize.toU32(word) >= start + state.RECORD_HEAD {
+        value = (recordWords + value * usize.toU32(CHUNK_WORDS) - start) * 4
+      }
+      run e.a.data32(value)
+      word = word + 1
+    }
+    x = x + 1
+  }
+  word = 0
+  while word < tables.chunks.length() { run e.a.data32(tables.chunks.get(word)) word = word + 1 }
+}

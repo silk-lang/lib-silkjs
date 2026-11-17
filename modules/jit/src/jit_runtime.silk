@@ -14,11 +14,10 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.u32
 import silk.num.u64
-import silk.num.i64
 import silk.num.usize
 import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_compiled as compiled
-import silkjs.js_core_types { FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
+import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
 import silkjs.js_runtime as runtime
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
 import silkjs.cli_io as io
@@ -33,6 +32,7 @@ import ssa_input { inputOf }
 import ssa_translate { loopHeaders, loopRegion, translateOsr, Refusal as TranslateRefusal }
 import ssa { Function }
 import jit_helpers { CompiledEnv }
+import jit_cost { Cost, now }
 
 struct LoopBook { sites: List<u32>, spent: u64 }
 
@@ -69,11 +69,18 @@ pub struct Options {
   /// --jit-calls: compile functions that make calls (call exits, compiled-entry.md 7.3). Off by
   /// default until calls between compiled functions are direct: through the engine a call costs
   /// more than the interpreter's inline call.
-  pub calls: bool
+  pub calls: bool,
+  /// --jit-compile-budget=N: bytecode bytes a function may have translated in all, over its
+  /// normal and OSR lowerings and recompilations (0: no budget). Every lowering translates the
+  /// whole body, once per loop header for OSR, so compile cost grows with size times headers
+  /// times reports while the run it can speed up does not.
+  pub compileBudget: u32
 }
+/// The compile budget's default, in bytecode bytes (measured: K-doubles report, "Compile budget").
+pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 impl Options {
   pub fn make() -> Self {
-    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false }
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET }
   }
 }
 
@@ -119,7 +126,13 @@ pub struct Jit {
   /// Functions linked for on-stack replacement only (their normal entry was refused).
   pub osrOnly: u64,
   pub osrRuns: u64,
-  pub osrDeopts: u64
+  pub osrDeopts: u64,
+  /// Compile time by phase and the sizes compiled (jit_cost).
+  pub cost: Cost,
+  /// Lowerings skipped by the compile budget (Options.compileBudget).
+  pub overBudget: u64,
+  /// Recompilations put off until the function ran more (jit_recompile.backoff).
+  pub waited: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
@@ -131,7 +144,7 @@ impl Jit {
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
       history: History.make(), recompiled: 0,
-      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0 }
+      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -162,6 +175,16 @@ impl Jit {
     run line.appendSlice(b" osr-deopts ") run decimal(&mut line, self.osrDeopts)
     run line.appendSlice(b" code-bytes ") run decimal(&mut line, self.codeBytes)
     run line.appendSlice(b" compile-ns ") run decimal(&mut line, self.compileNanoseconds)
+    run line.appendSlice(b" translate-ns ") run decimal(&mut line, self.cost.translate)
+    run line.appendSlice(b" optimize-ns ") run decimal(&mut line, self.cost.optimize)
+    run line.appendSlice(b" verify-ns ") run decimal(&mut line, self.cost.verify)
+    run line.appendSlice(b" backend-ns ") run decimal(&mut line, self.cost.backend)
+    run line.appendSlice(b" attempts ") run decimal(&mut line, self.cost.attempts)
+    run line.appendSlice(b" bytecode-bytes ") run decimal(&mut line, self.cost.bytecodeBytes)
+    run line.appendSlice(b" ssa-translated ") run decimal(&mut line, self.cost.translated)
+    run line.appendSlice(b" ssa-optimized ") run decimal(&mut line, self.cost.optimized)
+    run line.appendSlice(b" over-budget ") run decimal(&mut line, self.overBudget)
+    run line.appendSlice(b" waited ") run decimal(&mut line, self.waited)
     run line.append(10)
     return move line
   }
@@ -219,13 +242,6 @@ effect fn hex(line: &mut List<u8>, value: u8) -> () ! OutOfMemoryError ? &mut Al
   run line.append(table[u8.toUsize(u8.shiftRight(value, 4))]) run line.append(table[u8.toUsize(value & 15)])
 }
 
-unsafe extern "C" fn clock_gettime(clock: i32, time: *mut i64) -> i32
-/// CLOCK_MONOTONIC in nanoseconds.
-pub fn now() -> u64 {
-  let mut time: [i64; 2] = [0; 2]
-  drop unsafe clock_gettime(1, Pointer.fromMutRef<i64>(&mut time[0]))
-  return i64.wrappingToU64(time[0]) * 1000000000 + i64.wrappingToU64(time[1])
-}
 fn hotAddress() -> *const u8 {
   let function: extern "C" fn(*mut HeapHeader, *mut HeapHeader, ?*mut u8) -> () = jitHotFunction
   let slot = unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut HeapHeader, *mut HeapHeader, ?*mut u8) -> (), *const *const u8>(Pointer.fromRef(&function))
@@ -297,7 +313,39 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
     if jit.options.dump { run say(b"jit: refused: ", plan.why) }
     return ()
   }
-  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, jit.options.calls, &plan.sites))
+  // A recompilation after an unlink waits for more entries first (jit_recompile.backoff); a
+  // report from a loop poll is a loop running now and compiles at once.
+  if loopPc == NO_LOOP {
+    let wait = jit.history.backoff(&plan)
+    if wait != 0 {
+      drop function
+      let mut base = jit.options.threshold
+      if base == 0 { base = HOT_ENTRY_BUDGET }
+      let mut entries = u32.MAX / 4
+      if base < entries / wait { entries = base * wait }
+      let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
+      owner.hotness = entries
+      drop owner
+      jit.waited = jit.waited + 1
+      jit.reported = jit.reported - 1
+      jit.recompiled = jit.recompiled - 1
+      if jit.options.dump { run say(b"jit: waits before recompiling", b"") }
+      return ()
+    }
+  }
+  let bytes = (unsafe function.code.asSlice()).length
+  if !jit.history.charge(&plan, bytes, u32.toU64(jit.options.compileBudget)) {
+    jit.refused = jit.refused + 1
+    jit.overBudget = jit.overBudget + 1
+    if jit.options.dump { run say(b"jit: refused: ", b"over the compile budget (--jit-compile-budget)") }
+    run jit.history.remember(&plan, recompile.noEntry())
+    return ()
+  }
+  let mut cost = Cost.make()
+  cost.dump = jit.options.dump
+  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, jit.options.calls, &plan.sites, &mut cost))
+  jit.cost.add(&cost)
+  if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
   drop function
   // OSR code only for the loop whose poll reported the function; other headers compile when
   // a poll lands at them (addHeader).
@@ -401,7 +449,11 @@ unsafe effect fn compileHeader(jit: &mut Jit, bytecode: *mut HeapHeader, doubleS
       Result<Function, TranslateRefusal | OutOfMemoryError>.Failure { .. } => ()
     }
   }
-  let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, jit.options.calls, doubleSites, header))
+  let mut cost = Cost.make()
+  cost.dump = jit.options.dump
+  let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, jit.options.calls, doubleSites, header, &mut cost))
+  jit.cost.add(&cost)
+  if jit.options.dump { run dumpCost(b"jit: cost osr", &cost) }
   drop function
   let result = match move lowered {
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
@@ -511,6 +563,20 @@ effect fn sayRefusal(reason: &Refusal) -> () ! OutOfMemoryError ? &mut Allocator
   let mut line = List<u8>.make()
   run line.appendSlice(b"jit: refused: ") run line.appendSlice(reason.text())
   if reason.hasOpcode { run line.appendSlice(b": ") run line.appendSlice(op.opcodeName(reason.opcode, true)) }
+  run line.append(10)
+  io.stderr(line.asSlice())
+}
+/// --jit-dump: one compilation's phase times and sizes.
+effect fn dumpCost(prefix: &[u8], cost: &Cost) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(prefix)
+  run line.appendSlice(b" bytes ") run decimal(&mut line, cost.bytecodeBytes)
+  run line.appendSlice(b" ssa ") run decimal(&mut line, cost.translated)
+  run line.appendSlice(b" optimized ") run decimal(&mut line, cost.optimized)
+  run line.appendSlice(b" translate-ns ") run decimal(&mut line, cost.translate)
+  run line.appendSlice(b" optimize-ns ") run decimal(&mut line, cost.optimize)
+  run line.appendSlice(b" verify-ns ") run decimal(&mut line, cost.verify)
+  run line.appendSlice(b" backend-ns ") run decimal(&mut line, cost.backend)
   run line.append(10)
   io.stderr(line.asSlice())
 }
