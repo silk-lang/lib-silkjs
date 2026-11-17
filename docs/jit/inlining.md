@@ -62,9 +62,11 @@ undefined). The differences from translating a function's own code:
 
 `Inst.frame` tells the backend whose `CompiledFrame` an instruction reads: field sites,
 variables, scopes and atoms of an inlined body belong to the callee's code, closure and
-scope. `inline.frame` builds that frame on the native stack exactly as a direct call builds
-one (compiled-entry.md 7.7): the closure's bytecode cell, captured cells and scope, the
-caller's realm and runtime, and the callee's code address.
+scope. `inline.frame` reserves that frame on the native stack (nine words per target) and
+emits nothing: the fast paths read the callee's code address from its relocation symbol and
+the runtime from the caller's own frame, and only a path that calls a helper fills the frame
+first, as a direct call builds one (compiled-entry.md 7.7): the closure's bytecode cell,
+captured cells and scope, the caller's realm and runtime, and the callee's code address.
 
 ## 3. Guards and exits
 
