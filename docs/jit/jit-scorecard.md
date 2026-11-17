@@ -349,6 +349,6 @@ currently slower than interpreting it, so `--jit-calls` is right to stay off by 
 Refusals without `--jit-calls` (all rows): `get_var` 237, `put_field` 186, `get_scope0` 171, a
 call (needs `--jit-calls`) 74, `get_array_el2` 41, `get_array_el` 38, `get_var_ref` 30. With
 `--jit-calls`: `get_var` 232, `put_field` 186, `get_scope0` 171, `get_array_el2` 41,
-`get_array_el` 40, `get_var_ref` 35, `get_length` 26. `push_this` no longer appears: H's
-translation takes `this`, so methods now stop at their first property write (`put_field`) or
+`get_array_el` 40, `get_var_ref` 35, `get_length` 26. `push_this` no longer appears
+(INFERRED from the counts, not read in code: the translator now takes `this`), so methods now stop at their first property write (`put_field`) or
 global read (`get_var`).
