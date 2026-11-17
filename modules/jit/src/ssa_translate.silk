@@ -21,7 +21,7 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import silkjs.js_atom_data as atoms
-import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
+import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE, ELEM_STEP }
 import ssa_calls as calls
 import ssa
 
@@ -115,6 +115,7 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
+    || opcode == op.OP_for_of_next
     || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode)
     || exceptionOpcode(opcode)
     || opcode == op.OP_instanceof
@@ -292,9 +293,17 @@ effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &
   return run shapeAt(input, 0, false, true, 0, u32.MAX, &none)
 }
 
-/// The catch instructions whose try bodies enclose loop header pc, outermost first: their
-/// markers are the operand stack under the header (an OSR entry's base; js_compiled_osr
-/// enters only when the frame's operands are exactly such markers).
+/// osrMarkers' slot kinds besides a catch's pc: a value the frame passes in (an OSR input),
+/// a for-of record's marker (CatchOffset 0), and a layout this cannot tell (no OSR entry).
+pub const SLOT_VALUE: u32 = 4294967295
+pub const SLOT_FOR_OF: u32 = 4294967294
+pub const SLOT_UNKNOWN: u32 = 4294967293
+
+/// The operand stack under loop header pc, bottom first, from the constructs that enclose it:
+/// a try body's catch marker (the catch's pc), and a for-of loop's record (its iterable or
+/// iterator, its next method or index, its marker) with the element on top at its body's first
+/// instruction. js_compiled_osr enters only a frame with exactly this many operands; another
+/// construct that leaves operands (for-in) makes the count differ.
 pub effect fn osrMarkers(input: &FunctionInput, header: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
   let mut out = List<u32>.make()
   let length = input.code.length()
@@ -307,6 +316,33 @@ pub effect fn osrMarkers(input: &FunctionInput, header: u32) -> List<u32> ! OutO
     if opcode == op.OP_catch {
       let handler = usize.toI64(pc + 1) + i32.toI64(i32At(input, pc + 1))
       if handler > usize.toI64(at) { run out.append(usize.toU32(pc)) }
+    }
+    if opcode == op.OP_for_of_start {
+      // for_of_start; goto next; body: ...; next: for_of_next 0; if_false body (the parser's
+      // for-of): the record is live from the body to the branch.
+      let jump = pc + size
+      let mut open = false
+      let mut known = false
+      if jump < length && isGoto(byteAt(input, jump)) {
+        let next = targetOf(input, jump)
+        if next > usize.toI64(jump) && next + 2 < usize.toI64(length) {
+          let step = i64.toUsize(next)
+          let branch = step + 2
+          if byteAt(input, step) == op.OP_for_of_next && byteAt(input, step + 1) == 0 && isBranch(byteAt(input, branch)) {
+            let body = targetOf(input, branch)
+            let bodyStart = jump + sizeAt(input, jump)
+            if body == usize.toI64(bodyStart) {
+              known = true
+              open = bodyStart <= at && at <= branch
+              if open {
+                run out.append(SLOT_VALUE) run out.append(SLOT_VALUE) run out.append(SLOT_FOR_OF)
+                if at == bodyStart { run out.append(SLOT_VALUE) }
+              }
+            }
+          }
+        }
+      }
+      if !known { run out.append(SLOT_UNKNOWN) }
     }
     pc = pc + size
   }
@@ -333,9 +369,12 @@ effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: b
   let mut c0: i32 = -1
   let mut m: usize = 0
   while m < markers.length() {
-    let at = u32.toUsize(markers.get(m))
-    catchLevel.set(at, usize.toI32(m)) catchParent.set(at, c0)
-    c0 = u32.wrappingToI32(markers.get(m))
+    let kind = markers.get(m)
+    if kind < SLOT_UNKNOWN {
+      let at = u32.toUsize(kind)
+      catchLevel.set(at, usize.toI32(m)) catchParent.set(at, c0)
+      c0 = u32.wrappingToI32(kind)
+    }
     m = m + 1
   }
   let d0 = usize.toI32(markers.length())
@@ -1378,6 +1417,28 @@ impl Translator {
       run self.push(r)
       return true
     }
+    if opcode == op.OP_for_of_next {
+      // A stand-in record (js_iterators.forOfStart: the array, then its next index as an Int)
+      // steps a fast Array's element here; anything else exits, and the interpreter steps.
+      let offset = u8.toUsize(byteAt(input, pc + 1))
+      if self.stack.length() < 3 + offset { fail refuse(at, opcode, b"iterator record missing") }
+      let method = self.top(2 + offset)
+      let array = self.top(3 + offset)
+      if self.f.value(array).ty != Type.Value { fail refuse(at, opcode, b"an iterator record of an unboxed number") }
+      let position = run self.int(method, at)
+      if position == NONE { fail refuse(at, opcode, b"an iterator record of a boolean") }
+      let one = run self.constant(1, at)
+      let next = run self.arith(Op.Add, position, one, at)
+      let element = run self.f.emit(self.current, Op.GetElem, true, Type.Value, Own.Owned, array, position, ELEM_STEP, at)
+      let last = self.f.lastInst() run self.exitHere(last, at)
+      run self.release(method, at)
+      let methodAt = self.stack.length() - 2 - offset
+      self.stack.set(methodAt, next)
+      run self.push(element)
+      let done = run self.imm(Imm.False, at)
+      run self.push(done)
+      return true
+    }
     if objectOpcode(opcode) { return run self.object(input, pc) }
     if callOpcode(opcode) { return run self.call(input, pc) }
     if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
@@ -2083,11 +2144,16 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
   let begin = u32.toUsize(header)
   let region = run loopRegion(input, header)
   let markers = run osrMarkers(input, header)
+  let mut u: usize = 0
+  while u < markers.length() {
+    if markers.get(u) == SLOT_UNKNOWN { fail refuse(header, op.OP_for_of_start, b"a for-of loop of an unknown layout before the header") }
+    u = u + 1
+  }
   let shapeOf = run shapeAt(input, begin, true, calls, region.start, region.end, &markers)
   let back = run loopsBack(input, begin, calls, &region)
   if !back { fail refuse(header, byteAt(input, begin), b"every path around the loop leaves through an exit") }
   let length = input.code.length()
-  let mut t = Translator { f: Function.make(input.argumentCount + input.localCount, input.localCount), blockAt: List<u32>.make(), current: 0,
+  let mut t = Translator { f: Function.make(input.argumentCount + input.localCount + usize.toU32(markers.length()), input.localCount), blockAt: List<u32>.make(), current: 0,
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
@@ -2116,10 +2182,25 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     run t.locals.append(r)
     i = i + 1
   }
-  // The catch markers under the header, as the catch instructions pushed them.
+  // The operands under the header: catch and for-of markers as their instructions pushed them,
+  // and the frame's values (inputs after the locals), owned as locals are.
   let mut m: usize = 0
   while m < markers.length() {
-    let at = u32.toUsize(markers.get(m))
+    let kind = markers.get(m)
+    if kind == SLOT_VALUE {
+      let a = run t.argument(input.argumentCount + input.localCount + usize.toU32(m), header)
+      let r = run t.f.emit(t.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, header)
+      run t.stack.append(r)
+      m = m + 1
+      continue
+    }
+    if kind == SLOT_FOR_OF {
+      let mark = run t.f.emit(t.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, ssa.IMM_CATCH, header)
+      run t.stack.append(mark)
+      m = m + 1
+      continue
+    }
+    let at = u32.toUsize(kind)
     let handler = usize.toI64(at + 1) + i32.toI64(i32At(input, at + 1))
     if handler > 2147483647 - 8 { fail refuse(header, op.OP_catch, b"a catch handler outside the code") }
     let marker = run t.f.emit(t.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, ssa.IMM_CATCH + i64.wrappingToI32(handler), header)
