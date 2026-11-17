@@ -634,6 +634,7 @@ unsafe effect fn enterBase<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
   let mut frame = CompiledFrame.of(&machine)
   if callWords != 0 {
     unsafe Pointer.write<u64>(block, 0)
+    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(unsafe Pointer.assumeManyMut<u64>(block), compiled.CALL_CALLEE_EXIT), 0)
     frame.calls = unsafe Intrinsic.pointerRequalify<*mut u64, ?*mut u64>(block)
   }
   let mut exit = unsafe compiled.runCode(index, &frame, machine.arguments, parameters, state)
@@ -693,12 +694,37 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
   // A known local function's value needs the caller's frame: the interpreter makes that call.
   if let ValueBits.FunctionBytecode { .. } = function { return compiled.CALL_DEOPT }
+  // So does a bytecode callee js_hotness already reported that has no code (refused, or
+  // waiting to compile): the interpreter's inline call costs less than a base frame, and
+  // enough of these deopts unlink a caller whose calls stay interpreted. One not yet hot is
+  // called here, which counts its entry.
+  if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION
+    && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT)) == 0
+    && unsafe reportedWithoutCode(machine.runtime, (unsafe activation.calleeOf(function)).bytecode) {
+    return compiled.CALL_DEOPT
+  }
   let receiver = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 1))
   let argv = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(area, 2), count: count }
   // Backtraces name the call as the interpreter's would: the offset just past it.
   let size = u8.toUsize(op.opcodeInfo(unsafe machine.byteAt(pc), true).size)
   unsafe machine.setPc(pc + size)
   unsafe machine.publishPc()
+  let calleeExit = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT))
+  if calleeExit != 0 {
+    // The code ran a compiled callee directly and it left: finish it interpreted.
+    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT), 0)
+    let resume = compiled.Resume { state: unsafe Pointer.atMut<u64>(words, compiled.CALL_STATE), exit: u64.wrappingToU32(calleeExit),
+      index: u64.wrappingToU32(u64.shiftRight(calleeExit, 32)) }
+    let resumed = run Intrinsic.catchFailure<JsException>(unsafe callResuming(&mut hooks, memory, machine.context, function, receiver,
+      ValueBits.Undefined, &argv, activation.COPY_ARGUMENTS, resume), failedJs)
+    match move resumed {
+      ValueBits result => {
+        unsafe Pointer.write<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_RESULT)), result)
+        return compiled.CALL_RETURNED
+      }
+      FailedJs { .. } => { return compiled.CALL_THREW }
+    }
+  }
   let called = run Intrinsic.catchFailure<JsException>(unsafe callFromCompiled(&mut hooks, memory, &machine, function, receiver, argv), failedJs)
   match move called {
     ValueBits result => {
@@ -707,6 +733,55 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
     }
     FailedJs { .. } => { return compiled.CALL_THREW }
   }
+}
+/// Whether bytecode has no machine code although js_hotness reported it (its count was set
+/// past the runtime's budget then).
+unsafe fn reportedWithoutCode(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if code.compiled != 0 { return false }
+  let left = code.hotness
+  drop code
+  return left > (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).hotEntryBudget
+}
+/// The direct call compiled code makes through the CALL_FAST helper, from the call block at
+/// block (site and area as for EXIT_CALL): a linked bytecode closure whose code makes no calls
+/// runs at once on the area's cells, while instructions are not observed. Returns a
+/// compiled.FAST_* status. Needs no hooks: only machine code runs.
+pub unsafe fn fastCall(frame: &compiled.CompiledFrame, block: *mut u64) -> u32 {
+  let words = unsafe Pointer.assumeManyMut<u64>(block)
+  let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
+  let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
+  if !function.isObject() || unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION { return compiled.FAST_GENERIC }
+  let callee = unsafe activation.calleeOf(function)
+  let index = unsafe compiledIndex(callee.bytecode)
+  if index == 0 { return compiled.FAST_GENERIC }
+  let runtime = frame.runtime
+  let anchor = ()
+  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).observeInstructions || unsafe compiled.callWords(runtime, index) != 0 {
+    return compiled.FAST_GENERIC
+  }
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, callee.bytecode)
+  let stateWords = compiled.stateWords(u16.toUsize(code.variableCount), u16.toUsize(code.stackSize))
+  let realm = code.realm
+  drop code
+  if stateWords > compiled.CALL_STATE_WORDS { return compiled.FAST_GENERIC }
+  let site = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_SITE))
+  let count = u64.toUsize(u64.shiftRight(site, 32))
+  // A closure's captures come from its object; the caller pointer is only a non-null filler.
+  let filler = unsafe Intrinsic.pointerReinterpret<*const compiled.CompiledFrame, *const Machine>(Pointer.fromRef<compiled.CompiledFrame>(&frame))
+  let captures = unsafe activation.capturesOf(function, callee.bytecode, filler, false)
+  let receiver = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 1))
+  let calleeFrame = compiled.CompiledFrame { thisValue: receiver, bytecode: callee.bytecode, context: realm, runtime: runtime,
+    closureReferences: captures.references, scope: captures.scope, calls: Pointer.null<u64>() }
+  let state = unsafe Pointer.atMut<u64>(words, compiled.CALL_STATE)
+  let exit = unsafe compiled.runCode(index, &calleeFrame, unsafe Pointer.atMut<ValueBits>(area, 2), count, state)
+  if exit == compiled.EXIT_RETURNED {
+    unsafe Pointer.write<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_RESULT)), unsafe compiled.result(state))
+    return compiled.FAST_RETURNED
+  }
+  unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT), u64.bitOr(u32.toU64(exit), u64.shiftLeft(u32.toU64(index), 32)))
+  return compiled.FAST_EXITED
 }
 /// A call made by compiled code threw (compiled.ENTER_THREW): machine holds the state at
 /// that call and the exception is pending, as when execute fails there. Unwinds as the

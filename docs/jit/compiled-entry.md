@@ -281,10 +281,8 @@ No value is held in a register across a call: everything a later exit needs is i
 AOT: the block offsets and exit codes are fixed by the ABI; the block lives on the native stack
 of `enterBase`. No per-runtime value enters the code bytes.
 
-Cost (measured, callgrind): the generic call micro `callsx.js` runs 105.3M instructions with
-`--jit-calls` against 68.7M interpreted; Box2D (Octane, 3 runs) with `--jit-calls` compiles 2
-functions with calls and runs 1.3 percent more instructions than plain. Direct calls (7.4) are
-what would make calls pay off.
+Cost (measured, callgrind): with call exits alone, a call from compiled code costs more than
+the interpreter's inline call (7.4 has the numbers), which is why `--jit-calls` stays off.
 
 Box2D under `--jit` (measured): the inline `apply`/`call`/`Reflect.apply` and lazy-`arguments`
 paths in `callInline` refused linked targets and built an arguments object instead, which made
@@ -293,16 +291,42 @@ now runs a linked target from those paths frameless, and `lowerFunction` refuses
 than 3 bytes (nothing to gain, ~180 instructions of entry per call). Box2D with `--jit` is now
 0.12 percent below plain (2,506.5M against 2,509.5M).
 
-### 7.4 Direct calls to a known compiled callee
+### 7.4 Direct calls to a compiled callee
 
-`js_feedback` records call targets (94 percent of call sites are monomorphic). When a site's
-feedback names one closure, the call is lowered as: compare the callee's `FunctionBytecode`
-(loaded from the function object) with the bytecode the feedback named (passed through a
-per-compilation constant table, never as an address in the code), and when it is linked, call
-`js_compiled.runCode`'s machine code directly with the argument area as its `arguments` and a
-`CompiledFrame` built in the caller's frame; any other callee takes the generic helper. A
-callee deopt returns `EXIT_DEOPT` to the caller's call site, which then runs the helper's
-"resume" entry (build the callee's base frame from its exit state and finish it interpreted).
+As built (behind `--jit-calls`, like 7.3). Before taking the call exit, the code calls helper
+`CALL_FAST` (jit_helpers, index 32) with the frame and the call block; the helper is
+`js_vm.fastCall`, which needs no hooks because only machine code runs:
+
+- When the callee is a bytecode closure linked to code that makes no calls, instructions are
+  not observed, and its exit state fits the block's `CALL_STATE` area (64 words), it builds the
+  callee's `CompiledFrame` (receiver = the area's cell, captures from the closure object) and
+  runs `runCode` on the area's argument cells. A return writes the owned result to
+  `CALL_RESULT` and the caller continues **without leaving** (`FAST_RETURNED`).
+- A callee that leaves at a deopt or poll has already run: its state stays in `CALL_STATE`
+  and `CALL_CALLEE_EXIT` names its exit and index (`FAST_EXITED`). The caller then takes the
+  call exit as usual, and `compiledCall` finishes the callee interpreted from that state
+  (`callResuming` with a `Resume`), so nothing runs twice.
+- Anything else is `FAST_GENERIC`: the ordinary call exit of 7.3.
+
+The guard is dynamic (the callee's own `compiled` index), not call-target feedback: a site
+whose callee changes still takes the right path, and no address enters the code. Values live
+across a call are already in their slots (x64_regalloc), so the helper call needs nothing but
+the usual input reload.
+
+**Calls to interpreted code.** A call exit to a bytecode callee that has no code costs more
+than the interpreter's inline call (a base frame through `callInternal`). When js_hotness has
+already reported that callee (its count is past the runtime's budget) and it still has no code,
+it was refused or is waiting to compile, so `compiledCall` answers `CALL_DEOPT`: the caller
+deoptimizes there and the interpreter makes the call; enough of these unlink the caller. A
+callee that is not hot yet is still called through the exit, which counts its entry, so a
+callee that is hot only through compiled callers still gets compiled.
+
+Measured (callgrind, `--jit --jit-calls`): `each(inc, 10)` 3000 times, 18,992 direct calls,
+21.8M instructions with call exits only, 17.4M with direct calls, 15.2M interpreted. Box2D
+(Octane, 3 runs): 2,549.3M before the interpreted-callee rule, 2,511.0M after (plain
+2,509.5M). The remaining gap to the interpreter on the micro is the helper (about 90
+instructions per call, `fastCall` and `capturesOf`) and `runCode` (about 57); calling the
+callee's code from machine code would remove both but needs object layouts in the code.
 
 ### 7.5 Inlining (design only unless time allows)
 
