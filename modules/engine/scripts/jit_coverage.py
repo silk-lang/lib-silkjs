@@ -59,6 +59,7 @@ FIXED_RUNNER = PRINT + """for (var s = 0; s < BenchmarkSuite.suites.length; s++)
 }
 """
 STAT = re.compile(r"(\S+) (\d+)")
+SCORE = re.compile(r"^(\S[^:]*: )\d+(\.\d+)?$")
 
 
 def source(directory, files):
@@ -92,17 +93,49 @@ def counters(shell, path, cwd, timeout):
     # "jit: deopt operands: <op> <decisive>/<next>" follows a deopt-site line (J2, cb9be3f).
     operands = collections.Counter(line[len("jit: deopt operands: "):] for line in done.stderr.splitlines()
                                    if line.startswith("jit: deopt operands: "))
+    osr_deopted = collections.Counter(line[len("jit: osr deoptimized at: "):] for line in done.stderr.splitlines()
+                                      if line.startswith("jit: osr deoptimized at: "))
     errors = [line for line in done.stdout.splitlines() if "ERROR" in line]
     return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "deopted": dict(deopted),
-            "stuck": dict(stuck), "operands": dict(operands),
-            "errors": errors}
+            "stuck": dict(stuck), "operands": dict(operands), "osr_deopted": dict(osr_deopted),
+            "errors": errors, "output": normal_output(done.stdout)}
 
 
-def compiled_fraction(shell, path, cwd, timeout):
+def normal_output(text):
+    """Stdout without the numbers that differ between runs: scores ("Name: 1234") and kernel times."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith("kernel ") and line.count(" ") == 2:
+            line = line.rsplit(" ", 1)[0]
+        out.append(SCORE.sub(r"\1#", line))
+    return out
+
+
+def plain_output(shell, path, cwd, timeout):
+    """The plain engine's run of the same script (the shell with no flag), for the pass/fail check."""
+    env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
+    done = subprocess.run([shell, path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+    return {"exit": done.returncode, "output": normal_output(done.stdout), "tail": (done.stdout + done.stderr)[-400:]}
+
+
+def verdict(jit, plain):
+    """pass when the JIT run exits like the plain run, reports no ERROR and prints the same lines."""
+    if jit["exit"] != plain["exit"]:
+        return "FAIL exit %d vs %d" % (jit["exit"], plain["exit"])
+    if jit["errors"]:
+        return "FAIL " + jit["errors"][0][:120]
+    if jit["output"] != plain["output"]:
+        diff = [(a, b) for a, b in zip(jit["output"], plain["output"]) if a != b]
+        return "FAIL output differs" + (": %r vs %r" % diff[0] if diff else " in length")
+    return "pass"
+
+
+def compiled_fraction(shell, path, cwd, timeout, flags=None):
+    flags = ["--jit", *EXTRA, "--jit-stats"] if flags is None else flags
     with tempfile.NamedTemporaryFile(suffix=".callgrind") as out:
         env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
         done = subprocess.run(["valgrind", "--tool=callgrind", "--smc-check=all-non-file", "--callgrind-out-file=" + out.name,
-                               shell, "--jit", *EXTRA, "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+                               shell, *flags, path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if done.returncode != 0 or " done" not in done.stdout:
             return {"exit": done.returncode, "error": (done.stdout + done.stderr)[-600:]}
         total, unknown, compiling = per_object(out.name, compiler_functions(shell))
@@ -173,6 +206,8 @@ def main():
     parser.add_argument("--instructions", action="store_true", help="also run fixed iterations under callgrind")
     parser.add_argument("--kernels", action="store_true", help="also measure bench/kernels")
     parser.add_argument("--calls", action="store_true", help="run the JIT with --jit-calls")
+    parser.add_argument("--plain-instructions", action="store_true",
+                        help="with --instructions, also run the fixed iterations with no flag, for the ratio to plain")
     parser.add_argument("--json", default="")
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()
@@ -217,8 +252,12 @@ def main():
             with open(fixed_path, "w", encoding="utf-8") as f:
                 f.write(fixed_text)
             entry = {"counters": counters(shell, score_path, cwd, args.timeout)}
+            entry["plain"] = plain_output(shell, score_path, cwd, args.timeout)
+            entry["verdict"] = verdict(entry["counters"], entry["plain"])
             if args.instructions:
                 entry["callgrind"] = compiled_fraction(shell, fixed_path, cwd, args.timeout)
+                if args.plain_instructions:
+                    entry["callgrind_plain"] = compiled_fraction(shell, fixed_path, cwd, args.timeout, flags=[])
             results[label] = entry
             s = entry["counters"]["stats"]
             line = "%-22s exit %d hot %s compiled %s refused %s runs %s deopts %s polls %s unlinked %s" % (
@@ -227,6 +266,10 @@ def main():
             if "callgrind" in entry:
                 c = entry["callgrind"]
                 line += " compiled-instr %s" % ("%.4f%%" % (100 * c["fraction"]) if c.get("exit") == 0 else "FAILED")
+                p = entry.get("callgrind_plain", {})
+                if c.get("exit") == 0 and p.get("exit") == 0 and p["instructions"]:
+                    line += " instr/plain %.4f" % (c["instructions"] / p["instructions"])
+            line += " " + entry["verdict"]
             print(line, flush=True)
             # Compile cost: what the JIT spent against what it ran (regressions like zlib's show here).
             cost = "%-22s   cost: compile-ms %.1f code-bytes %s osr-compiled %s osr-runs %s osr-deopts %s" % (
@@ -265,6 +308,17 @@ def main():
         print("\ndeopt sites by opcode and operand kinds met at compile time (decisive/next):")
         for name, count in operands.most_common(16):
             print("  %5d  %s" % (count, name))
+    osr = collections.Counter()
+    for entry in results.values():
+        osr.update(entry["counters"].get("osr_deopted", {}))
+    if osr:
+        print("\nOSR deoptimization sites, by opcode:")
+        for name, count in osr.most_common(12):
+            print("  %5d  %s" % (count, name))
+    failed = [(k, e["verdict"]) for k, e in results.items() if e["verdict"] != "pass"]
+    print("\noutput equal to the plain engine's: %d of %d pass" % (len(results) - len(failed), len(results)))
+    for k, why in failed:
+        print("  %-22s %s" % (k, why))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"shell": shell, "results": results}, f, indent=1)
