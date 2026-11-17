@@ -126,7 +126,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -341,6 +341,33 @@ class Generator:
             return (f"var k = {self.pick(['a', '0', 'b', '2147483646'])}; var s = 0; "
                     f"for (var i = 0; i < {self.pick([3, 8, 40])}; i++) {{ {form}; s = s + (k++ & 7) + ({keep}); }} "
                     f"return [k, s];")
+        if flavor == "tests":
+            # Nullish, undefined and typeof tests (J2) on values of every type, as branch
+            # conditions and as values; `??` keeps its operand on one edge only.
+            test = self.pick(["x == null", "x === undefined", "x === null", "x != null", "typeof x === 'undefined'",
+                              "typeof x === 'function'", "typeof x === 'string'", "typeof x === 'object'",
+                              "typeof x === 'number'", "(x ?? 7) === 7", "x !== undefined"])
+            value = self.pick(["typeof x", "x ?? i", "x == null", "typeof x === 'boolean'", "x === null || x === undefined"])
+            return (f"var vs = [a, b, null, undefined, {{x: 1}}, 'x', 0, NaN, __sumthis, true, [1], -0]; var c = 0; var w = []; "
+                    f"for (var i = 0; i < vs.length; i++) {{ var x = vs[i]; if ({test}) c = c + i + 1; w[w.length] = {value}; }} "
+                    f"return [c, w.length, String(w[{self.pick([0, 1, 3, 7])}])];")
+        if flavor == "shuffles":
+            # Compound assignments to properties and elements, postfix updates, chained stores
+            # and optional chaining: the stack shuffle opcodes (insert, perm, rot, swap).
+            step = self.pick(["o.x += i", "o.x -= b", "arr[i & 3]++", "s += o.y++", "s += arr[i & 3]--",
+                              "o.z = o.w = i", "p = q = i - a", "arr[i & 3] *= 1", "o.y ^= i"])
+            other = self.pick(["s += p + q", "s += o?.x", "s += (o.x -= 1)", "s += o.z", "s += arr[1]"])
+            return (f"var o = {{x: a, y: b, z: 0, w: 0}}; var arr = [a, b, 1, 2]; var s = 0; var p = 0; var q = 0; "
+                    f"for (var i = 0; i < {self.pick([3, 8, 30])}; i++) {{ {step}; {other}; }} "
+                    f"return [s, o.x, o.y, o.z, arr[0], arr[1], arr[2], arr[3], p, q];")
+        if flavor == "instanceof":
+            # instanceof on classes and subclasses, primitives on the left, and right operands
+            # that decline the fast path: a bound function, a custom Symbol.hasInstance.
+            right = self.pick(["P", "Q", "Object", "Array", "Function", "P", "Q", "P.bind(null)", "H"])
+            return (f"class P {{}} class Q extends P {{}} class H {{ static [Symbol.hasInstance](v) {{ return v === 1; }} }} "
+                    f"var C = {right}; var vs = [a, b, new P(), new Q(), {{}}, [1], 1, 's', null, undefined, __sumthis]; var c = 0; "
+                    f"for (var i = 0; i < vs.length; i++) {{ if (vs[i] instanceof C) c = c + i + 1; if (vs[i] instanceof P) c = c * 2 + 1; }} "
+                    f"return c;")
         raise ValueError(flavor)
 
     def function(self) -> str:
