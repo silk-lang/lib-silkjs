@@ -446,6 +446,6 @@ deoptimized again where it was already widened 125, `get_var_ref` 90, `get_array
 `instanceof` 55, `if_not_nullish8` 50, `put_arg` 50. With `--jit-calls`: `call_constructor` 304,
 deoptimized again where it was already widened 265, `get_var_ref` 92, `get_array_el2` 77,
 `instanceof` 53, recompiled too often 41. `get_var`, `put_field` and `get_scope0` (the top three
-last time) are gone. Compiled share rose most on deltablue with `--jit-calls` (15.8%), richards
+last time) are out of the top twelve. Compiled share rose most on deltablue with `--jit-calls` (15.8%), richards
 (3.0%) and gbemu (1.3% default), but deopt churn is now large: typescript 1,256 deopts and 156
 unlinked by default, 5,156 and 642 with `--jit-calls`.
