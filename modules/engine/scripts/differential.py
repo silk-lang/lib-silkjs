@@ -40,6 +40,8 @@ are compared with.
                                                 every third guard check deoptimizing, never unlinked
   jit-calls  {jit} --jit --jit-calls ...        jit, also compiling functions that make calls
   jit-calls-stress                              jit-stress with --jit-calls
+  jit-inline-stress                             jit-calls with stressed guards after a warm-up, so
+                                                inlined bodies (docs/jit/inlining.md) leave mid-way
 
 Adding a configuration: for a one-off run pass `--config NAME=TEMPLATE` (repeatable; the name is
 appended to --configs). To make it permanent, add NAME: TEMPLATE to BUILTIN in this script, and
@@ -78,6 +80,7 @@ BUILTIN = {
     "jit-stress": "{jit} --jit --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-calls": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-calls-stress": "{jit} --jit --jit-calls --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
+    "jit-inline-stress": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stress=5 --jit-deopt-limit=0 --jit-stats={stats} {file}",
 }
 REFERENCES = {"node"}
 
@@ -112,6 +115,35 @@ function __clamp(v) {
   if (v !== null && typeof v === 'object') return 'o';
   return v;
 }
+function __P(x, y) { this.x = x; this.y = y; this.n = 0; }
+__P.prototype.getx = function () { return this.x; };
+__P.prototype.sum = function (k) { return this.x * k + this.y; };
+__P.prototype.less = function (o) { return this.x < o; };
+__P.prototype.setn = function (v) { this.n = v; };
+__P.prototype.self = function () { return this; };
+__P.prototype.two = function (k) { return this.sum(k) + this.getx(); };
+__P.prototype.bump = function (k) { this.n = k; return this.x + k; };
+__P.prototype.pick = function (u, v, w) { return w === undefined ? u : v; };
+__P.prototype.last = function (u, v) { return v; };
+__P.prototype.glob = function () { return __g; };
+__P.prototype.rec = function (k) { return k < 1 ? this.x : this.rec(k - 1) + 1; };
+__P.prototype.boom = function (k) { if (k > 4) throw new RangeError('b'); return k; };
+__P.prototype.len = function (o) { return o.length; };
+Object.defineProperty(__P.prototype, 'acc', {get: function () { return this.x + 1; }, set: function (v) { this.n = v; }, configurable: true});
+function __Q(x) { this.x = x; this.y = 's'; this.n = 0; }
+__Q.prototype.getx = function () { return this.y; };
+__Q.prototype.sum = function (k) { return k - 1; };
+__Q.prototype.less = function (o) { return true; };
+__Q.prototype.setn = function (v) { this.n = 7; };
+__Q.prototype.self = function () { return null; };
+__Q.prototype.two = function (k) { return this.getx(); };
+__Q.prototype.bump = function (k) { return k; };
+__Q.prototype.pick = Math.max;
+__Q.prototype.last = function (u) { return u; };
+__Q.prototype.glob = function () { return this; };
+__Q.prototype.rec = function (k) { return k; };
+__Q.prototype.boom = function (k) { return 'q'; };
+__Q.prototype.len = function (o) { return 0; };
 function __phase(name) { __out(name + ' ' + __sum + ' ' + __fin); }
 """
 # Why the prelude is shaped like this:
@@ -127,7 +159,8 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "tries", "tries", "tdz"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "tries", "tries", "tdz",
+           "protos", "protos", "protos"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -282,6 +315,18 @@ class Generator:
             call = self.pick(["a.f(i, b)", "a.g(i, b)", "h(i)", "a.f.call(a, b, i)", "a.f.apply(a, [i, b])", "a.f(a.f(i), i)",
                               "b(i)", "a.k(i)"])
             return (f"var t = {self.pick(['0', 'b', '1'])}; var h = a.f; for (var i = 0; i < {self.pick([2, 3, 6])}; i++) "
+                    f"{{ t = {self.pick(['t + ' + call, '(t ^ ' + call + ')', '__clamp(t * 2 + ' + call + ')'])}; }} return t;")
+        if flavor == "protos":
+            # Calls of prototype methods from a loop (docs/jit/inlining.md): small ones a JIT may
+            # inline (a getter, arithmetic on the receiver and arguments, a predicate, one store,
+            # nested calls, recursion, missing and extra arguments, a global read), ones it may
+            # not (a store before a guard, a branch, a throw), an accessor pair and a constructor.
+            # The receiver's class and the methods themselves change in later phases.
+            call = self.pick(["a.getx()", "a.sum(i)", "a.sum(b)", "a.less(b)", "a.two(i)", "a.self().x", "a.bump(i)",
+                              "a.pick(i, b)", "a.pick(i)", "a.last(i)", "a.last(i, b, a)", "a.glob()", "a.rec(i & 3)",
+                              "a.boom(i)", "a.sum(a.getx())", "a.sum.call(a, i)", "a.acc", "(a.setn(i), a.n)",
+                              "(a.acc = i, a.n)", "new __P(i, b).sum(i)", "a.len(b)", "a.two(a.two(i))", "a.self().self().getx()"])
+            return (f"var t = {self.pick(['0', 'b', '1'])}; for (var i = 0; i < {self.pick([2, 3, 6])}; i++) "
                     f"{{ t = {self.pick(['t + ' + call, '(t ^ ' + call + ')', '__clamp(t * 2 + ' + call + ')'])}; }} return t;")
         if flavor == "intbranch":
             return (f"var t = a; for (var i = 0; i < {self.pick([4, 9])}; i++) {{ if (t {self.pick(['>', '<', '>=', '==='])} b) "
@@ -467,6 +512,11 @@ class Generator:
             return self.pick(["{x: i, f: function (v, w) { return (v * 3 + (this.x | 0)) | 0; }, g: Math.max, "
                               "k: function (v) { if (v > 4) throw new RangeError('k' + v); return v; }}",
                               "{x: i, f: Math.min, g: function (v) { return typeof v; }, k: Math.abs}"])
+        if kind == "inst":
+            return "new __P(i, i + 1)"
+        if kind == "instB":
+            return self.pick(["new __Q(i)", "new __P(i + 0.5, 's')", "new __P('p', i)", "Object.create(__P.prototype)",
+                              "{getx: Math.abs, sum: function (k) { return k; }, x: 3}", "new __P(2147483647, i)"])
         if kind == "odd":
             return self.pick(["null", "undefined", "true", "{valueOf: function () { return i; }}", "Symbol.iterator"])
         raise ValueError(kind)
@@ -505,12 +555,13 @@ class Generator:
             lines.append(self.function())
         names = [f"f{n}" for n in range(count)]
         stable = self.pick([("int", "int"), ("int", "int"), ("objectA", "objectA"), ("double", "double"),
-                            ("array", "int"), ("typed", "int"), ("int", "typed"), ("withf", "int")])
+                            ("array", "int"), ("typed", "int"), ("int", "typed"), ("withf", "int"),
+                            ("inst", "int"), ("inst", "int"), ("inst", "array")])
         # Stable types, hot enough for a tiering engine to specialise each function.
         for name in names:
             lines += self.loop(f"hot {name}", self.hot, name, stable)
         # Changed types and shapes: what was specialised must be given up.
-        kinds = ["int", "big", "double", "string", "objectA", "objectB", "array", "typed", "typedB", "odd", "withf"]
+        kinds = ["int", "big", "double", "string", "objectA", "objectB", "array", "typed", "typedB", "odd", "withf", "inst", "instB"]
         for name in names:
             changed = (self.pick(kinds), self.pick(kinds))
             lines += self.loop(f"types {name}", self.pick([3, 17, 64]), name, changed)
@@ -546,6 +597,24 @@ class Generator:
         ]))
         lines += [f"for (var i = 0; i < 32; i++) {{ __try({victim}, holder, holder); __try(reads, holder, holder); }}",
                   "__phase('proto changed');"]
+        # Changed methods: a call site that ran one method hot (inlined, perhaps) meets another
+        # receiver class, then the same class with the method replaced, removed or made native.
+        for name in names:
+            lines += self.loop(f"inline stable {name}", self.hot, name, ("inst", "int"))
+        for name in names:
+            lines += self.loop(f"inline class {name}", self.pick([3, 40]), name, ("instB", "int"))
+        lines.append(self.pick([
+            "__P.prototype.sum = __Q.prototype.sum;",
+            "__P.prototype.getx = function () { return 'new'; };",
+            "delete __P.prototype.getx;",
+            "__P.prototype.sum = Math.max;",
+            "__P.prototype.self = function () { return {x: 's', getx: Math.abs}; };",
+            "Object.setPrototypeOf(__P.prototype, __Q.prototype); delete __P.prototype.sum; delete __P.prototype.two;",
+            "__g = 'g'; __P.prototype.setn = function (v) { this.n = v + 1; };",
+            "Object.defineProperty(__P.prototype, 'acc', {get: function () { return 's'; }, configurable: true});",
+        ]))
+        for name in names:
+            lines += self.loop(f"inline changed {name}", self.pick([17, 64]), name, ("inst", "int"))
         # Back to the stable types: code that deoptimised must still be right, and may tier up again.
         for name in names[:2]:
             lines += self.loop(f"again {name}", self.hot, name, stable)
