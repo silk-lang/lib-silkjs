@@ -514,26 +514,108 @@ reads and H's inlined activation push (`a701fc89`, not merged yet). That is why 
 stays off by default, and why Octane's geomean has not moved (L at `34c3ae88`: silkjs 5763,
 silkjs-jit 5829, silkjs-jit-calls 5287, v8-jit 52964, jsc-jit 51590).
 
-In progress, not merged (heads as reported by the workers):
+### Milestone 7, third round (2026-11-17): calls from machine code, compile cost
 
-- H `a701fc89` on `claude/project-thread-g1zedu`: `new` from compiled code, inlined activation
-  push; next is calling the callee's code from machine code (the entry looked up through the
-  table, no address in code).
-- J `484f69d` on `claude/project-thread-k45qjk`: field reads inline through the bytecode's own
-  inline key (about 29 instructions, 21 when borrowed), inline release, inline array length and
-  elements, borrowed field results, transition stores, outer captured variables.
-- K: making the recompile path converge (7 deltablue functions refused with "deoptimized again
-  where it was already widened"), tag tests and stack ops (`if_nullish8`, `is_undefined_or_null`,
-  `insert2`), then typed arrays and Math.
-- L `250f9a9` on `claude/project-thread-6ys4ab`: scorecard section for `34c3ae88`, a
-  `silkjs-jit-calls` column.
+Heads pushed after `4e5e3dba`, each gated by the lead with the chain below (RAN, all exit 0
+except the native suite's two known `js_for_in_tests` failures; interpreter-only instructions
+MEASURED against the previous head, 1.000x on all eight at every step):
+
+| Head | Contents |
+| --- | --- |
+| `ea9965d0` | H `a701fc89` (`new` from compiled code, inlined activation push), J `484f69d` (inline keyed field reads, array length and elements) |
+| `da86b81c` | H `94c98b74` (machine-code direct calls for leaf callees), J `e2cf2db8` |
+| `3d6558e6` | H `da834ff7` (cheaper interpreted-to-compiled entry), J `1622c07` (type tests, truthiness), I `5445fea` (OSR entry speculation) |
+| `ed2454e9` | H `8b963ca4` (nested callees from machine code), J `84f23162` (stack shuffles), L `af0449aa` |
+| `8f5cc66e` | O2 `1e70f07` (exit tables instead of code per exit, linear ownership pass and verifier, recompile backoff), I `9acf8f4` (OSR compiled lazily per polled header, backoff), J `cb9be3f4` (`instanceof`, `deoptKinds`), L `fd6c6a6f` |
+
+Gate chain, from `modules/engine`, one step at a time (`/home/user/bins/gate.sh` on the lead's
+container holds it): `silk test --manifest-path ../jit/silk.toml --no-cache`; `(cd ../jit &&
+python3 scripts/encodings.py --check)`; `silk build --release`; `silk build --release
+--manifest-path ../jit/shell/silk.toml`; `python3 scripts/v8bench.py --instructions <previous
+engine> <new engine>`; `python3 scripts/differential.py --count 3000 --configs
+plain,observed,jit,jit-stress,jit-calls,jit-calls-stress,jit-inline-stress,node` (add
+`jit-eager,jit-calls-eager` once O2's recording is merged: recording cuts what the other
+configs compile); `--self-test`; `python3 scripts/jit_kernels.py --rounds 7 --engines
+silkjs,silkjs-jit,silkjs-jit-calls,v8-jit,jsc-jit`; `silk test src/tests.silk -o
+build/core-tests --optimization speed --debug false`. About 100 minutes. Never start a chain
+while another runs.
+
+Kernels at `8f5cc66e`, MEASURED by the lead (ms per `kernel()` call, median of 7):
+
+| Kernel | silkjs | silkjs-jit | silkjs-jit-calls | v8-jit | jsc-jit | best jit vs v8 / jsc |
+| --- | --- | --- | --- | --- | --- | --- |
+| sum-calls | 128.4 | 23.2 | 19.2 | 11.3 | 13.9 | 1.7x / 1.4x |
+| sum-long | 167.7 | 17.4 | 16.4 | 21.5 | 12.9 | 0.8x / 1.3x |
+| nested | 170.9 | 37.3 | 38.6 | 12.1 | 27.0 | 3.1x / 1.4x |
+| calls | 203.6 | 218.8 | 155.8 | 7.0 | 8.9 | 22x / 18x |
+| method | 285.7 | 297.2 | 200.8 | 9.2 | 14.3 | 22x / 14x |
+| doubles | 135.6 | 23.3 | 25.2 | 15.5 | 20.4 | 1.5x / 1.1x |
+| array-sum | 198.4 | 79.5 | 71.6 | 12.5 | 13.9 | 5.7x / 5.2x |
+| typed-array | 413.5 | 289.8 | 300.7 | 11.2 | 10.8 | 26x / 27x |
+
+Findings of this round:
+
+- **Compile cost made `--jit` slower than the interpreter on Octane.** L MEASURED at `4e5e3dba`
+  geomean silkjs 6832, silkjs-jit 6324 (0.926); zlib went from 56.10G to 83.66G instructions
+  (superlinear `ssa_ownership`, 85 OSR compilations, 23.9 MB of code). Fixed by K `43536460`
+  (zlib compile share 33.5 to 1.15 percent, worker-measured), I `f253780` and O2 `1e70f07`
+  (zlib code 24 MB to 3 MB). O2 worker-measured at `1e70f07`: `--jit` between 0.977x and 1.077x
+  of plain instructions on Octane; `--jit --jit-calls` up to 1.5x to 1.7x.
+- **Calls still lose.** O1 worker-measured on deltablue with `--jit --jit-calls` at `5fa2348`:
+  1.188x plain; of the 140M extra instructions about 50M are compiling, 57M call glue
+  (`startActivation`, `callForCompiled`, `linkedCall`), and compiled code is only about 20
+  percent cheaper than the interpreter work it replaces (264,700 global reads through a
+  helper). 23 of 48 functions end unlinked, mostly from a call to a callee without code being
+  counted as a deopt of the caller.
+- L at `da86b81c` (worker-measured): Octane geomean silkjs 6900, silkjs-jit 6611 (0.958),
+  silkjs-jit-calls 6010, v8-jit 61738, jsc-jit 61045.
+
+### Phase 2 of milestone 7 (Julia, 2026-11-17)
+
+Julia's direction: prove x86-64 first (arm64 macOS waits); widen coverage right away so
+benchmarks stop falling back; keep optimization going in parallel; Opus sessions implement from
+detailed plans, Fable sessions optimize from goals and measurements; start milestone 8 as soon
+as 7 is done. Briefs are in `/mnt/project-files/jit/briefs/` (`M7b-common.md` first), reports in
+`/mnt/project-files/jit/reports/`.
+
+| Stream | Thread branch (`claude/project-thread-*`) | Scope | Latest head reported |
+| --- | --- | --- | --- |
+| N (H) | `g1zedu` | generic instruction exits (`SITE_GENERIC`), `SITE_CALL_ALWAYS` for callees without code | `bd6e6d9f` |
+| J2 (J) | `k45qjk` | type tests, shuffles, `instanceof`, equality on any values, argument writes, global read cache | `8982524` |
+| P | `j8unvc` | try/catch/finally, throw, uninitialized-local checks, OSR in try regions | `cff4712` |
+| Q (I) | `xytm2y` | OSR code that calls, then `for-of` and `for-in` | `92a10b8` |
+| K2 (K) | `ikmpm7` | typed arrays inline, Math calls, ToInt32 of doubles, arithmetic sites | `8a0767d3` |
+| O1 | `5supa2` | calls and inlining (small prototype methods behind a callee check) | `5fa2348` |
+| O2 | `h2d0uv` | compile cost, recording before the first compilation (`--jit-profile`), then guard hoisting | `704c57e` |
+| L | `6ys4ab` | Octane and v8 series against V8 and JSC per integration head, coverage tools | `fd6c6a6f` |
+
+In the gate when this was written: `8f5cc66e` + P `cff4712` + I `92a10b8` + O1 `5fa2348`, with
+one lead patch (`0e21d6e2`: bodies with try regions or checked locals are not inlined, because
+the translator's `catchTop` and `tdz` tables are the caller's).
+
+Rules that came out of merging: a stream that changes a shared encoding (exit state, call
+block, `CompiledEntry` layout) announces it to the affected threads and the lead before coding;
+streams merge each other's reported heads before handing over, so the lead's merge is trivial;
+`silk check` can serve a stale result after a merge, `silk check --no-server` does not.
+
+### Exit criteria for milestone 7 and what milestone 8 is
+
+Milestone 7 is done when, on x86-64 Linux: `--jit` with calls on is at or below the interpreter
+in instructions on every Octane and v8 benchmark; calls are the default (`--jit-no-calls`
+remains for debugging); the common refusals and repeated deopts in L's coverage tables are gone.
+
+Milestone 8, to start at once after that: feedback-driven inlining beyond small methods and
+load/check elimination across calls; compilation off the main thread; persisted code (AOT only
+because it is the same compiler run at another time); an evaluation of regexp compilation;
+pause and p99 latency and a `d8` column in the scorecard. arm64 follows once x86-64 is proven.
 
 ## Next steps
 
-1. Merge milestone 7 sub-steps as they pass their checks, rerunning each one's key commands.
-2. Decide from L's coverage numbers which refusal reasons to remove next.
-3. Open from earlier milestones: no pause or p99 measurement, no `d8` column, feedback has no
-   consumer yet (K's recompilation is the first), and AOT has no file format.
+1. Gate and merge heads in the order they are reported; rerun each one's key commands.
+2. Take refusal and deopt reasons from L's coverage tables and O1's and O2's per-benchmark
+   breakdowns, and assign each to the stream that owns the opcode.
+3. Open from earlier milestones: no pause or p99 measurement, no `d8` column, AOT has no file
+   format.
 
 Every session doing this work needs `silk-lang/silk` attached with GitHub API access as well as
 `silk-lang/lib-silkjs`: the Silk installer reads the release API and gets HTTP 403 otherwise
