@@ -264,3 +264,91 @@ which now stop one opcode later: zlib at `put_arg` (all 15), mandreel at `get_va
 up from 10). Still at most 0.021% of any Octane benchmark's instructions run compiled (Box2D).
 `push_this` (J) remains the reason that blocks the most functions; `get_var` (H) is second and
 now blocks all of mandreel.
+
+## 2026-11-17 05:56 UTC: integration 34c3ae88 (H landed: compiled calls, `--jit-calls`)
+
+Same host and versions. Branch merges integration `34c3ae88` (`d235d8d`) and adds a
+`silkjs-jit-calls` column: `silkjs-jit-shell --jit --jit-calls` (harness, `jit_kernels.py`;
+`jit_coverage.py --flags=--jit-calls`). Raw files:
+[`jit-scorecard-results/2026-11-17-34c3ae88/`](jit-scorecard-results/2026-11-17-34c3ae88/).
+The first `bench-octane` attempt refused to measure because a leftover `silkc task` process (from
+compiling the edited task) was alive; it was rerun after that process exited. Nothing else ran.
+
+### Kernels
+
+Median ns per inner iteration over 7 processes (ratio to v8-jit / jsc-jit).
+
+| Kernel | silkjs | silkjs-jit | silkjs-jit-calls | v8-jit | jsc-jit | outcome |
+|---|---:|---:|---:|---:|---:|---|
+| sum-calls | 6.75 | **1.91 (3.4/2.8)** | 1.87 | 0.56 | 0.69 | compiled, 73.1% of instructions compiled |
+| sum-long | 9.88 | 9.56 | 9.78 | 1.06 | 0.73 | never hot |
+| nested | 10.52 | **2.54 (4.1/2.2)** | 2.50 | 0.62 | 1.15 | compiled, 65.3% |
+| calls | 23.78 | 26.21 | 25.80 | 0.61 | 0.92 | refused (`add` is a leaf, never hot; `loop` refused) |
+| method | 29.93 | 30.24 | **73.94 (80.3/51.8)** | 0.92 | 1.43 | --jit-calls compiles both functions: 19.8M compiled runs, 0 deopts, 31.2% compiled, 2.4x slower than the interpreter |
+| doubles | 16.68 | **5.01 (2.9/2.4)** | 5.10 | 1.72 | 2.05 | compiled, 78.2% |
+| array-sum | 11.70 | 10.52 | 10.39 | 0.68 | 0.73 | refused |
+| typed-array | 42.71 | 43.30 | 43.07 | 1.13 | 0.95 | refused |
+
+### Box2D, independently
+
+Callgrind, 3 fixed iterations ([`box2d-instructions.log`](jit-scorecard-results/2026-11-17-34c3ae88/box2d-instructions.log)):
+no flag 2,508.1M; `--jit --jit-threshold=100000000` 0.9978x; `--jit` 1.0008x (nothing compiled:
+the two small functions that cost +4.3% in the baseline now need `--jit-calls`); `--jit
+--jit-calls` 1.0134x (3 compiled, 48,133 runs). Splay: `--jit` 1.0001x, `--jit --jit-calls`
+1.0118x (8 compiled, 56 deopts, 7 unlinked, 3 recompiled). So the baseline regression is gone in
+the default `--jit` configuration (CONFIRMED by instruction count); the wall-time Octane line below
+(Box2D silkjs-jit 1.109x) is noise in the other direction, since nothing compiles there.
+
+### Octane 2
+
+| Engine | best round | median round | worst round |
+|---|---:|---:|---:|
+| silkjs | 5961 | 5763 | 5568 |
+| silkjs-jit | 6010 | 5829 | 5569 |
+| silkjs-jit-calls | 5447 | 5287 | 5150 |
+| v8-jitless | 4638 | 4464 | 4285 |
+| jsc-nojit | 3479 | 3385 | 3259 |
+| qjs | 3197 | 3056 | 2924 |
+| v8-jit | 55923 | 52964 | 51068 |
+| jsc-jit | 54695 | 51590 | 48998 |
+
+Geometric mean of per-benchmark medians against silkjs: silkjs-jit 1.012 (noise), silkjs-jit-calls
+0.917. With `--jit-calls`, DeltaBlue drops to 0.384 (778 to 819 against 2017 to 2112) and
+Richards to 0.857, the two benchmarks where it compiles the most (9.1% and 1.3% of instructions
+in compiled code). Like the method kernel, compiled code that calls back into the engine is
+currently slower than interpreting it, so `--jit-calls` is right to stay off by default.
+
+### Coverage
+
+| Benchmark | --jit hot / compiled | --jit compiled instr | --jit-calls compiled | runs | deopts | unlinked | --jit-calls compiled instr | top refusals with --jit-calls |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| octane/richards | 22 / 0 | 0.0000% | 1 | 3725696 | 0 | 0 | 1.3000% | `get_var` 5; `put_field` 5; `if_not_nullish8` 3 |
+| octane/deltablue | 39 / 0 | 0.0001% | 9 | 20944894 | 16 | 2 | 9.1411% | `get_var` 20; `put_field` 6; deoptimized again where it was already widened 1 |
+| octane/crypto | 25 / 0 | 0.0000% | 2 | 258786 | 0 | 0 | 0.0316% | `get_var` 9; `get_loc_el8` 4; `put_field` 4 |
+| octane/raytrace | 25 / 0 | 0.0000% | 4 | 179448 | 24 | 3 | 0.0920% | `get_var` 18; `put_field` 3; `push_atom_value` 1 |
+| octane/earley-boyer | 49 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_var` 20; a function scope: invalid 8; `if_not_null8` 5 |
+| octane/regexp | 2 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_scope0` 1; `put_field` 1 |
+| octane/splay | 14 / 0 | 0.0000% | 18 | 391340 | 136 | 17 | 0.1499% | `get_var` 7; `get_scope0` 2; deoptimized again where it was already widened 2 |
+| octane/navier-stokes | 3 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_scope0` 3 |
+| octane/pdfjs | 55 / 2 | 0.0000% | 2 | 10820 | 0 | 0 | 0.0000% | `get_scope0` 15; `get_var` 7; `push_atom_value` 7 |
+| octane/mandreel | 48 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_var` 48 |
+| octane/gbemu | 120 / 0 | 0.0000% | 1 | 25504 | 0 | 0 | 0.0081% | `put_field` 61; `get_array_el2` 41; `get_array_el` 12 |
+| octane/code-load | 8 / 0 | 0.0003% | 0 | 0 | 0 | 0 | 0.0003% | `get_var` 3; `fclosure8` 2; `push_atom_value` 1 |
+| octane/box2d | 122 / 0 | 0.0000% | 7 | 243823 | 0 | 0 | 0.1723% | `get_scope0` 38; `is_undefined` 21; `put_field` 19 |
+| octane/zlib | 15 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `put_arg` 15 |
+| octane/typescript | 332 / 0 | 0.0000% | 37 | 5615738 | 32 | 4 | 0.9110% | `get_scope0` 105; `put_field` 66; `get_var_ref` 32 |
+| kernel/sum-calls | 1 / 1 | 73.1102% | 1 | 199000 | 0 | 0 | 73.1100% | - |
+| kernel/sum-long | 0 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | - |
+| kernel/nested | 1 / 1 | 65.3110% | 1 | 19000 | 0 | 0 | 65.3108% | - |
+| kernel/calls | 1 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_var` 1 |
+| kernel/method | 1 / 0 | 0.0000% | 2 | 19841129 | 0 | 0 | 31.1741% | - |
+| kernel/doubles | 1 / 1 | 78.1734% | 1 | 99000 | 0 | 0 | 78.1731% | - |
+| kernel/array-sum | 1 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_arg_length8` 1 |
+| kernel/typed-array | 1 / 0 | 0.0000% | 0 | 0 | 0 | 0 | 0.0000% | `get_var` 1 |
+
+Refusals without `--jit-calls` (all rows): `get_var` 237, `put_field` 186, `get_scope0` 171, a
+call (needs `--jit-calls`) 74, `get_array_el2` 41, `get_array_el` 38, `get_var_ref` 30. With
+`--jit-calls`: `get_var` 232, `put_field` 186, `get_scope0` 171, `get_array_el2` 41,
+`get_array_el` 40, `get_var_ref` 35, `get_length` 26. `push_this` no longer appears: H's
+translation takes `this`, so methods now stop at their first property write (`put_field`) or
+global read (`get_var`).
