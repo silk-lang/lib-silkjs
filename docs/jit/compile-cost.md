@@ -59,6 +59,12 @@ exits that agree on a run of eight slots share it. Kinds: an i32, bool or double
 slot or in a register; a constant; a value handed over as it is; a value with one count added
 (a borrow); and, after the slots, a value the exit releases.
 
+An exit's last chunk, when it has fewer than eight entries, is stored at its own length after
+the full chunks (the helper reads only the entries the record counts), shared with one of the
+four tails before it when equal. Measured, code bytes with calls compiled: deltablue (v8 copy)
+193 KB to 178 KB for 3,406 bytecode bytes (57 to 52 bytes per bytecode byte), box2d 875 KB to
+809 KB (19.2 to 17.8), zlib 482 KB to 443 KB (5.9 to 5.4).
+
 Nothing in a record is an address or a runtime identity: offsets are relative to the record,
 so the code stays loadable into another runtime.
 
@@ -73,7 +79,7 @@ The first code guessed int32 at every arithmetic site and a boolean at every bra
 learned otherwise 8 deopts and one recompilation at a time (`jit_recompile`).
 
 Now a function reported hot is not compiled at once. `jit_runtime.compileHot` starts a
-`js_feedback` recording of it (`--jit-profile=N`, default 500 instructions plus 2 per bytecode
+`js_feedback` recording of it (`--jit-profile=N`, default 100 instructions plus 2 per bytecode
 byte; 0 compiles at once) and sets its entry count to 24, or to the hot budget when that is
 smaller: a count above the budget would make the engine take it for a function without code
 (`js_vm.reportedWithoutCode`). At its next report, from those entries or from a poll in one of
@@ -89,12 +95,21 @@ its loops, `learn` stops the recording and reads it:
   comparison on a string, object or other non-number, a named property of a non-object, a
   store to objects of five or more shapes.
 
+Each refusal has a bit in `Options.foresee` (`--jit-foresee=MASK`, `jit_runtime.FORESEE_*`:
+callee 1, numbers 2, receiver 4, store 8). A bit stands for an exit compiled code takes today;
+when that exit becomes a slow path, clear the bit and those functions compile again.
+
 A function the translator's first walk refuses (`ssa_translate.admits`) is not recorded.
 Recording runs the whole runtime in the observed loop, about 170 instructions per bytecode
 instruction (feedback.md), so the length is a trade. Measured on Octane with calls compiled,
-instructions for one iteration at N = 0, 200, 500, 2000: box2d 1458M, 1573M, 1363M, 1413M;
-typescript 18.1G, 13.66G, 13.66G, 14.43G; splay 1559M, 1441M, 1458M, 1612M; deltablue 78.0M,
-78.5M, 83.6M, 92.9M; richards 53.0M, 54.1M, 55.1M, 57.1M.
+instructions for one iteration. Fixed length N = 0, 200, 500, 2000 (no per-byte part): box2d
+1458M, 1573M, 1363M, 1413M; typescript 18.1G, 13.66G, 13.66G, 14.43G; splay 1559M, 1441M,
+1458M, 1612M; deltablue 78.0M, 78.5M, 83.6M, 92.9M; richards 53.0M, 54.1M, 55.1M, 57.1M.
+With 2 per bytecode byte added, N = 1, 100, 500: box2d 1263M, 1307M, 1227M; typescript
+13.01G, 13.24G, 13.27G; splay 1488M, 1461M, 1509M; raytrace 202M, 191M, 199M; crypto 775M,
+775M, 787M; richards 53.8M, 53.5M, 59.4M (52.2M with no recording). Tiny runs where nothing
+was unlinked only pay: the per-byte part keeps that near 3 percent on richards, where a fixed
+500 cost 14 percent.
 
 The recompile wait (`jit_recompile.backoff`) leaves the waiting function's count above the
 hot budget on purpose. Counting the wait in reports of one budget each, which keeps compiled

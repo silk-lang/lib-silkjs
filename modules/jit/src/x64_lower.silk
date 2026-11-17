@@ -1,5 +1,5 @@
 //! From a hot FunctionBytecode to machine code for the compiled-entry ABI
-//! (docs/jit/compiled-entry.md): bytecode -> SSA (ssa_translate, ssa_ownership, ssa_verify;
+//! (docs/jit/compiled-entry.md): bytecode -> SSA (ssa_translate, ssa_opt, ssa_verify;
 //! docs/jit/ssa.md) -> x64_backend. A function the translator, the verifier or the backend
 //! does not take is refused with its reason.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -9,10 +9,11 @@ import silk.core.result { Result }
 import silkjs.js_core_types { FunctionBytecode }
 import asm_x64 { Code, UnboundLabelError }
 import ssa { Function }
+import silkjs.js_opcode_data as op
 import ssa_input { inputOf }
-import ssa_translate { translate, translateOsr, Refusal as TranslateRefusal }
+import ssa_translate { translate, translateOsr, CallTarget, Refusal as TranslateRefusal }
 import ssa_verify { verify, VerifyError }
-import ssa_ownership
+import ssa_opt
 import ssa_calls as calls
 import x64_backend { Lowering, Settings }
 import x64_backend as backend
@@ -30,8 +31,10 @@ impl Refusal {
   pub fn text(self: &Self) -> &'static [u8] { return self.why }
 }
 /// Code and its call block size (js_core_types.CompiledEntry.callWords: 0 when it makes no
-/// calls), or a refusal.
-pub union Lowered { Code { pub value: Code, pub callWords: u32 }, Refused { pub reason: Refusal } }
+/// calls), or a refusal. inlined: the CallTarget.id of each inline target the code names, in
+/// symbol order (Code.link's symbol 2k is target k's FunctionBytecode cell, 2k + 1 the first
+/// byte of its code); empty when nothing was inlined.
+pub union Lowered { Code { pub value: Code, pub callWords: u32, pub inlined: List<u32> }, Refused { pub reason: Refusal } }
 
 /// Bodies shorter than this (in bytecode bytes: `return_undef`, a constant or an argument
 /// returned) gain nothing compiled: entering compiled code costs more than the interpreter's
@@ -41,24 +44,29 @@ const MIN_CODE_BYTES: usize = 3
 pub unsafe effect fn lowerFunction(function: &FunctionBytecode, stress: u32, allowCalls: bool) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
   let none = List<u32>.make()
   let mut cost = Cost.make()
-  return run unsafe lowerEntry(function, stress, allowCalls, &none, NO_HEADER, &mut cost)
+  return run unsafe lowerEntry(function, stress, allowCalls, &none, NO_HEADER, &mut cost, List<CallTarget>.make())
 }
 /// lowerFunction with `doubleSites` (ssa_translate.FunctionInput.doubleSites) from earlier
 /// compilations' deopts (jit_recompile).
 pub unsafe effect fn lowerWithSites(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
-  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, NO_HEADER, &mut cost)
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, NO_HEADER, &mut cost, List<CallTarget>.make())
+}
+/// lowerWithSites that may inline the calls `targets` describes (docs/jit/inlining.md).
+pub unsafe effect fn lowerInlining(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, targets: List<CallTarget>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, NO_HEADER, &mut cost, move targets)
 }
 /// lowerWithSites for an on-stack-replacement entry at loop header pc `header`
 /// (ssa_translate.translateOsr). OSR code makes calls only with allowCalls and when
 /// translateOsr finds that safe; otherwise calls are side exits there.
 pub unsafe effect fn lowerOsr(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, header: u32, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
-  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, header, &mut cost)
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, header, &mut cost, List<CallTarget>.make())
 }
 const NO_HEADER: u32 = 4294967295
-unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, header: u32, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, header: u32, cost: &mut Cost, targets: List<CallTarget>) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
   if header == NO_HEADER && (unsafe function.code.asSlice()).length < MIN_CODE_BYTES { return refused(b"a body too short to gain from compiling") }
   let mut input = run inputOf(function)
   run input.doubleSites.appendSlice(doubleSites.asSlice())
+  input.targets = move targets
   cost.attempts = cost.attempts + 1
   cost.bytecodeBytes = cost.bytecodeBytes + usize.toU64(input.code.length())
   let t0 = now()
@@ -77,7 +85,7 @@ unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls
   }
   cost.translated = cost.translated + usize.toU64(ssa.insts.length())
   if !allowCalls && calls.makesCalls(&ssa) { return refused(b"a call (calls from compiled code need --jit-calls)") }
-  run ssa_ownership.optimize(&mut ssa)
+  run ssa_opt.pipeline(&mut ssa, cost.passes, doubleSites)
   let t2 = now()
   cost.optimize = cost.optimize + (t2 - t1)
   cost.optimized = cost.optimized + usize.toU64(ssa.insts.length())
@@ -97,6 +105,15 @@ unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls
     let mut out = List<u8>.make()
     run out.appendSlice(b"jit: optimized ssa\n")
     run ssa.print(&mut out)
+    let mut m: usize = 0
+    while m < ssa.inlineMisses.length() {
+      let miss = ssa.inlineMisses.get(m)
+      run out.appendSlice(b"jit: not inlined: ")
+      run out.appendSlice(miss.why)
+      if miss.opcode != 0 { run out.appendSlice(b": ") run out.appendSlice(op.opcodeName(miss.opcode, true)) }
+      run out.append(10)
+      m = m + 1
+    }
     io.stderr(out.asSlice())
   }
   let layout = match layouts.probe() {
@@ -106,7 +123,11 @@ unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls
   let lowering = run backend.lower(&ssa, Settings { stress: stress, layout: layout })
   cost.backend = cost.backend + (now() - t3)
   match move lowering {
-    Lowering.Code { value } => { return Lowered.Code { value: move value, callWords: calls.callWords(&ssa) } }
+    Lowering.Code { value } => {
+      let mut inlined = List<u32>.make()
+      run inlined.appendSlice(ssa.inlineTargets.asSlice())
+      return Lowered.Code { value: move value, callWords: calls.callWords(&ssa), inlined: move inlined }
+    }
     Lowering.Unsupported { reason } => { return refused(reason.why) }
   }
 }

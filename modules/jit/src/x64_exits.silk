@@ -28,9 +28,16 @@ struct Tables {
   /// Open addressing over chunk numbers (NONE: empty); its length is a power of two.
   buckets: List<u32>,
   chunkCount: u32,
+  /// Partial last chunks, at their own length, emitted after `chunks`; tailAt is where each begins.
+  tails: List<u32>,
+  tailAt: List<u32>
 }
 
 const CHUNK_WORDS: usize = 16
+/// In a record's chunk word before emission: the rest is a word offset into Tables.tails.
+const TAIL: u32 = 2147483648
+/// How many of the latest tails a new one is compared with.
+const TAILS_SEEN: usize = 4
 
 fn hashChunk(words: &[u32]) -> u32 {
   let mut hash: u32 = 2166136261
@@ -43,7 +50,7 @@ impl Tables {
   effect fn make() -> Tables ! OutOfMemoryError ? &mut Allocator {
     let mut buckets = List<u32>.make()
     run buckets.appendRepeated(NONE, 64)
-    return Tables { records: List<u32>.make(), recordAt: List<u32>.make(), chunks: List<u32>.make(), buckets: move buckets, chunkCount: 0 }
+    return Tables { records: List<u32>.make(), recordAt: List<u32>.make(), chunks: List<u32>.make(), buckets: move buckets, chunkCount: 0, tails: List<u32>.make(), tailAt: List<u32>.make() }
   }
   fn same(self: &Self, chunk: u32, words: &[u32]) -> bool {
     let base = u32.toUsize(chunk) * CHUNK_WORDS
@@ -56,6 +63,28 @@ impl Tables {
     let mut at = u32.bitAnd(hash, mask)
     while self.buckets.get(u32.toUsize(at)) != NONE { at = u32.bitAnd(at + 1, mask) }
     self.buckets.set(u32.toUsize(at), chunk)
+  }
+  /// The word offset in `tails` of the first `used` words of `words`: an exit's last, partial
+  /// chunk, stored at its own length (the helper reads only the entries the record counts).
+  /// Equal to one of the last few tails, it shares that one: neighbouring exits often agree.
+  effect fn tail(self: &mut Self, words: &[u32], used: usize) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let mut back: usize = 0
+    while back < TAILS_SEEN && back < self.tailAt.length() {
+      let at = u32.toUsize(self.tailAt.get(self.tailAt.length() - 1 - back))
+      let mut end = self.tails.length()
+      if back > 0 { end = u32.toUsize(self.tailAt.get(self.tailAt.length() - back)) }
+      if end - at >= used {
+        let mut i: usize = 0
+        while i < used && self.tails.get(at + i) == words[i] { i = i + 1 }
+        if i == used { return usize.toU32(at) }
+      }
+      back = back + 1
+    }
+    let at = usize.toU32(self.tails.length())
+    run self.tailAt.append(at)
+    let mut i: usize = 0
+    while i < used { run self.tails.append(words[i]) i = i + 1 }
+    return at
   }
   /// The number of the chunk holding `words` (CHUNK_WORDS of them), stored once.
   effect fn intern(self: &mut Self, words: &[u32]) -> u32 ! OutOfMemoryError ? &mut Allocator {
@@ -145,6 +174,15 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
       run entries.append(operand)
       s = s + 1
     }
+    // What an inlined body still owned (Exit.drops): released once the state is written.
+    while s < function.slotCount(exit) {
+      let slot = function.slot(exit, s)
+      if slot.mode == SlotMode.Move {
+        run entries.append(state.ENTRY_RELEASE)
+        run entries.append(slot.value * SLOT_BYTES)
+      }
+      s = s + 1
+    }
     let total = usize.toU32(entries.length() / 2)
     run tables.recordAt.append(usize.toU32(tables.records.length()))
     run tables.records.append(exit.pc)
@@ -163,9 +201,12 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
         within = within + 1
         at = at + 1
       }
-      let chunk = run tables.intern(&words)
-      // The chunk's number for now; its offset once the records' size is known.
-      run tables.records.append(chunk)
+      // The chunk's number for now, or TAIL with a tail's word offset; its byte offset once
+      // the records' size is known.
+      let mut named: u32 = 0
+      if within < chunkSize * 2 { named = u32.bitOr(TAIL, run tables.tail(&words, within)) }
+      else { named = run tables.intern(&words) }
+      run tables.records.append(named)
     }
     x = x + 1
   }
@@ -223,7 +264,8 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
     while usize.toU32(word) < end {
       let mut value = tables.records.get(word)
       if usize.toU32(word) >= start + state.RECORD_HEAD {
-        value = (recordWords + value * usize.toU32(CHUNK_WORDS) - start) * 4
+        if u32.bitAnd(value, TAIL) != 0 { value = (recordWords + usize.toU32(tables.chunks.length()) + u32.bitAnd(value, TAIL - 1) - start) * 4 }
+        else { value = (recordWords + value * usize.toU32(CHUNK_WORDS) - start) * 4 }
       }
       run e.a.data32(value)
       word = word + 1
@@ -232,4 +274,6 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
   }
   word = 0
   while word < tables.chunks.length() { run e.a.data32(tables.chunks.get(word)) word = word + 1 }
+  word = 0
+  while word < tables.tails.length() { run e.a.data32(tables.tails.get(word)) word = word + 1 }
 }

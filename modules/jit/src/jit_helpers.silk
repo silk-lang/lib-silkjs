@@ -13,6 +13,7 @@ import silkjs.js_value { ValueBits }
 import silkjs.js_gc as gc
 import silkjs.js_compiled { CompiledFrame }
 import silkjs.js_compiled_objects as objects
+import silkjs.js_compiled_math as mathematics
 import silkjs.js_vm as vm
 import silkjs.js_compiled as compiled
 import jit_exit_state { jitExitState }
@@ -75,11 +76,22 @@ pub const EQUALS: u32 = 14
 /// area as for EXIT_CALL), made at once when the callee is linked code that makes no calls
 /// (js_vm.fastCall); a js_compiled.FAST_* status.
 pub const CALL_FAST: u32 = 32
+/// call_pop(env, activation: *mut u8) -> (): pops an activation machine code pushed, called
+/// and saw return, when its frame was published meanwhile (js_vm.popDirect).
+pub const CALL_POP: u32 = 33
 
+// ---- K: 96-127 ----
+/// math(env, area: *const ValueBits, count: u32, out: *mut ValueBits) -> u32: a call block's
+/// callee, receiver and count arguments; 1 with the result in out when the callee is a Math
+/// function of Numbers (js_compiled_math.mathCall), else 0 and the call is made.
+pub const MATH: u32 = 98
 // ---- compile cost and code quality: 120-127 (from K's range) ----
 /// exit_state(env, state, frame, record, dump) -> u32: writes the interpreter state an exit
 /// record describes and returns the exit status (jit_exit_state).
 pub const EXIT_STATE: u32 = 120
+/// get_elem_borrowed(env, object, index, out) -> u32: get_elem for a result that borrows from
+/// the object (ssa_opt_borrow): out takes no count.
+pub const GET_ELEM_BORROWED: u32 = 121
 
 /// The layout compiled code reads: offsets below are part of the code ABI.
 pub struct CompiledEnv {
@@ -133,10 +145,25 @@ impl CompiledEnv {
     env.helpers[u32.toUsize(EQUALS)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const ValueBits, *const ValueBits, u32) -> u32, *const ?*const u8>(Pointer.fromRef(&equalsOf)))
     let callFast: extern "C" fn(*mut CompiledEnv, *const CompiledFrame, *mut u64) -> u32 = jitCallFast
     env.helpers[u32.toUsize(CALL_FAST)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const CompiledFrame, *mut u64) -> u32, *const ?*const u8>(Pointer.fromRef(&callFast)))
+    let math: extern "C" fn(*mut CompiledEnv, *const ValueBits, u32, *mut ValueBits) -> u32 = jitMath
+    env.helpers[u32.toUsize(MATH)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const ValueBits, u32, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&math)))
+    let callPop: extern "C" fn(*mut CompiledEnv, *mut u8) -> () = jitCallPop
+    env.helpers[u32.toUsize(CALL_POP)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *mut u8) -> (), *const ?*const u8>(Pointer.fromRef(&callPop)))
+    let getElemBorrowed: extern "C" fn(*mut CompiledEnv, *const ValueBits, i32, *mut ValueBits) -> u32 = jitGetElemBorrowed
+    env.helpers[u32.toUsize(GET_ELEM_BORROWED)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const ValueBits, i32, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&getElemBorrowed)))
     let exitState: extern "C" fn(*mut u8, *mut u64, *mut u8, *mut u32, *mut u64) -> u32 = jitExitState
     env.helpers[u32.toUsize(EXIT_STATE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut u8, *mut u64, *mut u8, *mut u32, *mut u64) -> u32, *const ?*const u8>(Pointer.fromRef(&exitState)))
     return env
   }
+}
+
+export "C" fn jitMath(env: *mut CompiledEnv, area: *const ValueBits, count: u32, out: *mut ValueBits) -> u32 {
+  if unsafe mathematics.mathCall(area, count, out) { return 1 }
+  return 0
+}
+
+export "C" fn jitCallPop(env: *mut CompiledEnv, activation: *mut u8) -> () {
+  unsafe vm.popDirect(activation)
 }
 
 export "C" fn jitRelease(env: *mut CompiledEnv, value: *const ValueBits) -> () {
@@ -168,7 +195,8 @@ export "C" fn jitAtomValue(env: *mut CompiledEnv, frame: *const CompiledFrame, s
 export "C" fn jitGetVar(env: *mut CompiledEnv, frame: *const CompiledFrame, index: u32, out: *mut ValueBits) -> u32 {
   let anchor = ()
   let running = unsafe Pointer.borrow<(), CompiledFrame>(&anchor, frame)
-  if unsafe objects.readVariable(&running, index, out) { return 1 }
+  // index: closure variable | borrowed << 31.
+  if unsafe objects.readVariable(&running, index & 0x7fffffff, (index & 0x80000000) == 0, out) { return 1 }
   return 0
 }
 
@@ -182,8 +210,10 @@ export "C" fn jitPutVar(env: *mut CompiledEnv, frame: *const CompiledFrame, inde
 export "C" fn jitGetScope(env: *mut CompiledEnv, frame: *const CompiledFrame, site: u32, out: *mut ValueBits) -> u32 {
   let anchor = ()
   let running = unsafe Pointer.borrow<(), CompiledFrame>(&anchor, frame)
-  if (site & 0x40000000) != 0 { if unsafe objects.readCaptured(&running, site & 0xffff, out) { return 1 } return 0 }
-  if unsafe objects.readScope(&running, site & 0xffff, (site & 0x80000000) != 0, out) { return 1 }
+  // site: slot | checked << 31 | captured << 30 | borrowed << 29.
+  let retain = (site & 0x20000000) == 0
+  if (site & 0x40000000) != 0 { if unsafe objects.readCaptured(&running, site & 0xffff, retain, out) { return 1 } return 0 }
+  if unsafe objects.readScope(&running, site & 0xffff, (site & 0x80000000) != 0, retain, out) { return 1 }
   return 0
 }
 
@@ -197,6 +227,11 @@ export "C" fn jitPutScope(env: *mut CompiledEnv, frame: *const CompiledFrame, si
 
 export "C" fn jitGetElem(env: *mut CompiledEnv, object: *const ValueBits, index: i32, out: *mut ValueBits) -> u32 {
   if unsafe objects.readElement(unsafe Pointer.read<ValueBits>(object), index, out) { return 1 }
+  return 0
+}
+
+export "C" fn jitGetElemBorrowed(env: *mut CompiledEnv, object: *const ValueBits, index: i32, out: *mut ValueBits) -> u32 {
+  if unsafe objects.readElementBorrowed(unsafe Pointer.read<ValueBits>(object), index, out) { return 1 }
   return 0
 }
 
