@@ -17,6 +17,9 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_compiled as compiled
+import silkjs.js_compiled_inline as inline
+import silkjs.js_value { ValueBits }
+import ssa_translate { CallTarget }
 import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
 import silkjs.js_runtime as runtime
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
@@ -50,6 +53,13 @@ pub const CAPACITY: usize = 4096
 /// u64 words of the runtime's activation stack (js_vm.runActivations): 2 MiB, room for about a
 /// thousand nested activations before calls take native frames.
 pub const ACTIVATION_WORDS: usize = 262144
+/// Inline targets one runtime's code may name (each retained until the runtime goes).
+pub const KEPT_CAPACITY: usize = 16384
+/// Candidates looked up for one compilation, nested ones included, and how deep they nest.
+const MAX_CANDIDATES: usize = 48
+const CANDIDATE_DEPTH: u32 = 2
+/// A callee longer than this many bytes of code is not a candidate (ssa_translate's limit).
+const CANDIDATE_BYTES: usize = 96
 /// Address space reserved for machine code.
 const CODE_BYTES: usize = 67108864
 
@@ -66,6 +76,9 @@ pub struct Options {
   pub stats: bool,
   /// --jit-dump: print each hot function's bytecode and the compile outcome to stderr.
   pub dump: bool,
+  /// --jit-no-inline clears it: method calls whose site names one small plain function run
+  /// that function's body in place, guarded by its identity (docs/jit/inlining.md).
+  pub inlining: bool,
   /// --jit-calls: compile functions that make calls (call exits, compiled-entry.md 7.3). Off by
   /// default until calls between compiled functions are direct: through the engine a call costs
   /// more than the interpreter's inline call.
@@ -80,7 +93,7 @@ pub struct Options {
 pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 impl Options {
   pub fn make() -> Self {
-    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET }
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, inlining: true }
   }
 }
 
@@ -90,6 +103,10 @@ pub struct Jit {
   entries: List<CompiledEntry>,
   /// Storage lent to the runtime for its activation stack (never grows, so never moves).
   activations: List<u64>,
+  /// Storage lent to the runtime for the inline targets it keeps alive (js_compiled_inline).
+  kept: List<ValueBits>,
+  /// Functions inlined into installed code, by site.
+  pub inlinedSites: u64,
   /// One CompiledEnv, in storage that never moves (every entry's env points at it).
   pub env: List<CompiledEnv>,
   blocks: List<CodeBlock>,
@@ -138,9 +155,10 @@ impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
     let entries = run List<CompiledEntry>.makeWithCapacity(CAPACITY)
     let activations = run List<u64>.makeWithCapacity(ACTIVATION_WORDS)
+    let kept = run List<ValueBits>.makeWithCapacity(KEPT_CAPACITY)
     let mut env = run List<CompiledEnv>.makeWithCapacity(1)
     drop env.appendWithinCapacity(CompiledEnv.make())
-    return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, activations: move activations, env: move env, blocks: List<CodeBlock>.make(),
+    return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, activations: move activations, kept: move kept, inlinedSites: 0, env: move env, blocks: List<CodeBlock>.make(),
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
       history: History.make(), recompiled: 0,
@@ -168,6 +186,7 @@ impl Jit {
     run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
     run line.appendSlice(b" recompiled ") run decimal(&mut line, self.recompiled)
     run line.appendSlice(b" direct-calls ") run decimal(&mut line, self.env.get(0).directCalls)
+    run line.appendSlice(b" inlined ") run decimal(&mut line, self.inlinedSites)
     run line.appendSlice(b" osr-compiled ") run decimal(&mut line, self.osrCompiled)
     run line.appendSlice(b" osr-refused ") run decimal(&mut line, self.osrRefused)
     run line.appendSlice(b" osr-only ") run decimal(&mut line, self.osrOnly)
@@ -273,6 +292,8 @@ pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
   unsafe runtime.setCompiledTable(rt, unsafe Intrinsic.pointerRequalify<?[*]mut CompiledEntry, ?*mut CompiledEntry>(table), usize.toU32(CAPACITY))
   let stack = unsafe jit.activations.storage()
   unsafe runtime.setActivationStack(rt, unsafe Intrinsic.pointerRequalify<?[*]mut u64, ?*mut u64>(stack), ACTIVATION_WORDS)
+  let kept = unsafe jit.kept.storage()
+  unsafe inline.setKept(rt, unsafe Intrinsic.pointerRequalify<?[*]mut ValueBits, ?*mut ValueBits>(kept), KEPT_CAPACITY)
 }
 
 /// LibcServices.hotFunction through HotHandler: compile bytecode or refuse it.
@@ -343,7 +364,12 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   }
   let mut cost = Cost.make()
   cost.dump = jit.options.dump
-  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, jit.options.calls, &plan.sites, &mut cost))
+  // What its method calls called last, to inline (docs/jit/inlining.md): cells[id] is the
+  // FunctionBytecode cell of the target a CallTarget names.
+  let mut cells = List<?*mut HeapHeader>.make()
+  let mut targets = List<CallTarget>.make()
+  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells) }
+  let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
   drop function
@@ -361,7 +387,13 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
   }
   let mut callWords: u32 = 0
-  if let Lowered.Code { callWords: words, .. } = &result { callWords = words }
+  // The inline targets the code names, in symbol order.
+  let mut used = List<?*mut HeapHeader>.make()
+  if let Lowered.Code { callWords: words, inlined, .. } = &result {
+    callWords = words
+    let mut k: usize = 0
+    while k < inlined.length() { run used.append(cells.get(u32.toUsize(inlined.get(k)))) k = k + 1 }
+  }
   let mut code = match move result {
     Lowered.Code { value, .. } => move value
     Lowered.Refused { reason } => {
@@ -374,8 +406,9 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
     }
   }
   if jit.options.dump { run dumpMachine(&code) }
-  let installed = run unsafe install(&mut jit, bytecode, &mut code, callWords, &plan.sites, spent)
+  let installed = run unsafe installLinked(&mut jit, bytecode, &mut code, callWords, &plan.sites, spent, &used)
   if !installed { jit.refused = jit.refused + 1 return () }
+  jit.inlinedSites = jit.inlinedSites + usize.toU64(used.length())
   run jit.history.remember(&plan, usize.toU32(jit.entries.length() - 1))
   jit.compiledFunctions = jit.compiledFunctions + 1
   if jit.options.dump { run say(b"jit: compiled", b"") }
@@ -461,7 +494,7 @@ unsafe effect fn compileHeader(jit: &mut Jit, bytecode: *mut HeapHeader, doubleS
   }
   let mut osrCallWords: u32 = 0
   let mut code = match move result {
-    Lowered.Code { value, callWords } => { osrCallWords = callWords move value }
+    Lowered.Code { value, callWords, .. } => { osrCallWords = callWords move value }
     Lowered.Refused { reason } => {
       jit.osrRefused = jit.osrRefused + 1
       if jit.options.dump { run say(b"jit: osr refused: ", reason.text()) }
@@ -469,8 +502,9 @@ unsafe effect fn compileHeader(jit: &mut Jit, bytecode: *mut HeapHeader, doubleS
     }
   }
   if jit.memory.isNone() { jit.memory = Option<CodeMemory>.some(run CodeMemory.reserve(CODE_BYTES)) }
+  let noSymbols: [usize; 1] = [0]
   let block = match &mut jit.memory {
-    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code)
+    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, Slice.view<usize>(&noSymbols, 0, 0))
     Option<CodeMemory>.None => { return refusedHeader(header) }
   }
   jit.codeBytes = jit.codeBytes + usize.toU64(code.bytes.length())
@@ -527,10 +561,28 @@ fn blankEntry(code: ?*const u8, data: ?*mut u8, env: ?*mut u8, deoptLimit: u32, 
 /// links bytecode to it. callWords: its call block size (Lowered.Code.callWords). False when
 /// the table is full.
 pub unsafe effect fn install(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mut Code, callWords: u32, sites: &List<u32>, spent: u64) -> bool ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  let none = List<?*mut HeapHeader>.make()
+  return run unsafe installLinked(&mut jit, bytecode, &mut code, callWords, sites, spent, &none)
+}
+/// install for code that names inline targets: targets holds each one's FunctionBytecode
+/// cell, in symbol order (Lowered.Code.inlined). Each is kept alive for the runtime's life
+/// first; false, with nothing linked, when that cannot be done.
+unsafe effect fn installLinked(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mut Code, callWords: u32, sites: &List<u32>, spent: u64, targets: &List<?*mut HeapHeader>) -> bool ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
   if jit.entries.length() >= CAPACITY { return false }
+  let attachedRuntime = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
+  // Per target: the address of its cell, then of the first byte of its code.
+  let mut symbols = List<usize>.make()
+  let mut s: usize = 0
+  while s < targets.length() {
+    let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(targets.get(s))
+    if !(unsafe inline.keep(attachedRuntime, cell)) { return false }
+    run symbols.append(Pointer.address<HeapHeader>(cell))
+    run symbols.append(Pointer.address<u8>(unsafe inline.codeStart(cell)))
+    s = s + 1
+  }
   if jit.memory.isNone() { jit.memory = Option<CodeMemory>.some(run CodeMemory.reserve(CODE_BYTES)) }
   let block = match &mut jit.memory {
-    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code)
+    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, symbols.asSlice())
     Option<CodeMemory>.None => { return false }
   }
   let entry = block.entry()
@@ -552,11 +604,42 @@ pub unsafe effect fn install(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mu
   return true
 }
 
-/// Links code for the address it will run at and publishes it.
-effect fn publish(memory: &mut CodeMemory, code: &mut Code) -> CodeBlock ! MemoryError | LinkError {
+/// The inline candidates of bytecode (docs/jit/inlining.md): for each get_field2 whose site
+/// cache names a small plain function on a prototype, that function, with its own candidates
+/// while depth allows. cells receives each one's FunctionBytecode cell address, at its id.
+unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
+  let mut targets = List<CallTarget>.make()
+  let rt = match Pointer.nonNullMut<HeapHeader>(jit.runtime) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return move targets } }
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let bytes = unsafe function.code.asSlice()
+  let mut pc: usize = 0
+  while pc < bytes.length && cells.length() < MAX_CANDIDATES {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    if opcode == op.OP_get_field2 {
+      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc))) {
+        let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
+        if (unsafe callee.code.asSlice()).length <= CANDIDATE_BYTES {
+          let mut input = run inputOf(&callee)
+          let id = usize.toU32(cells.length())
+          run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
+          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells) }
+          run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input })
+        }
+      }
+    }
+    pc = pc + size
+  }
+  return move targets
+}
+
+/// Links code for the address it will run at, with symbols for its relocations, and
+/// publishes it.
+effect fn publish(memory: &mut CodeMemory, code: &mut Code, symbols: &[usize]) -> CodeBlock ! MemoryError | LinkError {
   let mut writer = run memory.allocate(code.bytes.length())
-  let none: [usize; 1] = [0]
-  run code.link(writer.address(), Slice.view<usize>(&none, 0, 0))
+  run code.link(writer.address(), symbols)
   run writer.append(code.bytes.asSlice())
   return run writer.finish()
 }

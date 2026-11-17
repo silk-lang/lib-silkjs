@@ -5,6 +5,8 @@
 //! return releases every local and leftover operand. `ssa_ownership` removes what it can prove
 //! redundant. Anything outside the subset fails with `Refusal`; nothing is guessed.
 import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
@@ -45,6 +47,35 @@ pub struct FunctionInput {
   /// Some local is captured by a closure (VarDef.isCaptured): a callee could read or write
   /// its frame cell, so on-stack-replacement code that holds it must not make calls.
   pub capturedLocals: bool,
+  /// Call sites that may be inlined (docs/jit/inlining.md): what the embedder saw each one
+  /// call when it compiled. A hint: the code guards the callee's identity where it is used.
+  pub targets: List<CallTarget>,
+}
+
+/// The function the call that follows the `get_field2` at `pc` called last: `input` describes
+/// it and `id` names it to the embedder (`Function.inlineTargets`).
+pub struct CallTarget { pub pc: u32, pub id: u32, pub input: FunctionInput }
+
+/// Inlined bodies nest at most this deep, and are at most this many bytes of code each.
+const MAX_INLINE_DEPTH: u32 = 3
+const MAX_INLINE_BYTES: usize = 96
+/// Inlined call sites one function may have (each takes a frame record on the native stack).
+const MAX_INLINE_SITES: usize = 16
+
+/// What an inlined body may be made of: the subset without control flow (a return ends it).
+fn inlinable(opcode: u8) -> bool { return supported(opcode) && !isBranch(opcode) && !isGoto(opcode) }
+
+/// Whether `operation` changes nothing a later exit to the state before the call would have
+/// to undo (counts aside: the exit drops what the body owns). Anything not listed is an
+/// effect, so an operation added later is one until it is put here.
+fn withoutEffect(operation: Op) -> bool {
+  return operation == Op.Arg || operation == Op.ConstI32 || operation == Op.Imm || operation == Op.Unbox || operation == Op.UnboxBool
+    || operation == Op.BoxI32 || operation == Op.BoxBool || operation == Op.Add || operation == Op.Sub || operation == Op.Mul
+    || operation == Op.Cmp || operation == Op.Retain || operation == Op.Release || operation == Op.CheckTag
+    || operation == Op.GetField || operation == Op.AtomValue || operation == Op.GetVar || operation == Op.GetScope
+    || operation == Op.GetElem || operation == Op.GetLength || operation == Op.Truthy || operation == Op.TagIs || operation == Op.TypeofAtom
+    || operation == Op.CheckCallee || operation == Op.InlineFrame
+    || operation == Op.ConstF64 || ssa.isNumberOp(operation)
 }
 
 /// Constant kinds of `NumberConstant`.
@@ -432,6 +463,23 @@ struct Translator {
   /// parameters (by value) are proven initialized.
   tdz: Tdz,
   initialized: List<bool>,
+  // ---- inlining (docs/jit/inlining.md): the state of the inlined body being translated.
+  /// How many inlined bodies deep the translator is; 0 in the function's own code.
+  depth: u32,
+  /// The outermost inlined call: its pc, the function's locals and operands before it (the
+  /// state every exit inside leaves to) and the first instruction of the attempt.
+  rootPc: u32,
+  rootLocals: List<u32>,
+  rootStack: List<u32>,
+  rootInst: usize,
+  /// The locals and operands of the inlined bodies around the current one.
+  held: List<u32>,
+  /// The current body's arguments (the caller's operands), receiver and parameter count.
+  args: List<u32>,
+  receiver: u32,
+  formals: u32,
+  /// A guard came after an effect: the attempt fails.
+  broken: bool,
   /// On-stack replacement: argument n's number, guarded once at entry, or NONE (or empty).
   argNumbers: List<u32>,
 }
@@ -548,8 +596,31 @@ impl Translator {
   fn pop(self: &mut Self) -> u32 { return self.stack.pop().unwrapOr(NONE) }
   fn top(self: &Self, depth: usize) -> u32 { return self.stack.get(self.stack.length() - depth) }
 
+  /// The parameters of the code being translated: the function's, or an inlined body's.
+  fn argumentLimit(self: &Self) -> usize { if self.depth != 0 { return u32.toUsize(self.formals) } return u32.toUsize(self.f.argumentCount) }
+
+  /// The exit of a guard inside an inlined body: the function's state before the outermost
+  /// inlined call, where the interpreter makes that call itself. Sound only while the bodies
+  /// have had no effect; what they own is dropped (Exit.drops).
+  effect fn inlineExit(self: &mut Self, inst: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut before = self.rootInst
+    while before < u32.toUsize(inst) { if !withoutEffect(self.f.insts.get(before).op) { self.broken = true } before = before + 1 }
+    drop run self.f.exitFor(inst, self.rootPc, usize.toU32(self.rootStack.length()))
+    let mut i: usize = 0
+    while i < self.rootLocals.length() { let v = self.rootLocals.get(i) run self.slot(v) i = i + 1 }
+    i = 0
+    while i < self.rootStack.length() { let v = self.rootStack.get(i) run self.slot(v) i = i + 1 }
+    i = 0
+    while i < self.held.length() { let v = self.held.get(i) if self.isOwned(v) { run self.f.dropAt(v, SlotMode.Move) } i = i + 1 }
+    i = 0
+    while i < self.locals.length() { let v = self.locals.get(i) if self.isOwned(v) { run self.f.dropAt(v, SlotMode.Move) } i = i + 1 }
+    i = 0
+    while i < self.stack.length() { let v = self.stack.get(i) if self.isOwned(v) { run self.f.dropAt(v, SlotMode.Move) } i = i + 1 }
+  }
+
   /// Gives instruction `inst` an exit at `pc` with the current state.
   effect fn exitHere(self: &mut Self, inst: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.depth != 0 { run self.inlineExit(inst) return () }
     drop run self.f.exitFor(inst, pc, usize.toU32(self.stack.length()))
     let mut i: usize = 0
     while i < self.locals.length() { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
@@ -598,6 +669,11 @@ impl Translator {
   }
   /// Argument `n`'s bits, borrowed from its cell.
   effect fn argument(self: &mut Self, n: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    // In an inlined body: the caller's operand as it is (possibly unboxed), or undefined.
+    if self.depth != 0 {
+      if u32.toUsize(n) < self.args.length() { return self.args.get(u32.toUsize(n)) }
+      return run self.imm(Imm.Undefined, pc)
+    }
     if u32.toUsize(n) < self.argNumbers.length() && self.argNumbers.get(u32.toUsize(n)) != NONE { return self.argNumbers.get(u32.toUsize(n)) }
     let v = run self.f.emit(self.current, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, u32.wrappingToI32(n), pc)
     self.f.setOwnership(v, Own.Borrowed, RootKind.Argument, n)
@@ -1030,11 +1106,12 @@ impl Translator {
     else if opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3 { index = u8.toUsize(opcode - op.OP_get_arg0) }
     let isArgument = opcode == op.OP_get_arg || (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3)
     if index != usize.MAX {
-      if isArgument { if index >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") } }
+      if isArgument { if index >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") } }
       else if index >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
     }
     if isArgument {
       let a = run self.argument(usize.toU32(index), at)
+      if self.depth != 0 { let shared = run self.share(a, at) run self.push(shared) return true }
       let r = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, at)
       run self.push(r) return true
     }
@@ -1154,7 +1231,7 @@ impl Translator {
       } else { left = self.top(1) }
       let mut right = NONE
       if opcode >= op.OP_add_top_arg8 {
-        if rightIndex >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") }
+        if rightIndex >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") }
         right = run self.argument(usize.toU32(rightIndex), at)
       } else {
         if rightIndex >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
@@ -1390,6 +1467,8 @@ impl Translator {
     if method { let given = self.top(count + 2) receiver = run self.boxed(given, at) }
     else if construct { let given = self.top(count + 1) receiver = run self.boxed(given, at) }
     else { receiver = run self.imm(Imm.Undefined, at) }
+    if method && run self.inlined(input, function, receiver, count, at) { return true }
+    if self.depth != 0 { fail refuse(at, opcode, b"a call inside an inlined body") }
     let mut i: usize = 0
     while i < count {
       let argument = self.top(count - i)
@@ -1404,6 +1483,136 @@ impl Translator {
     while i < depth { let v = self.pop() run self.release(v, at) i = i + 1 }
     run self.push(r)
     return true
+  }
+
+  // ---- inlining (docs/jit/inlining.md) ----
+
+  /// The index in `input.targets` of what the method call of `function` (the value a cached
+  /// field read of this code made) may inline, or usize.MAX.
+  fn inlineTarget(self: &Self, input: &FunctionInput, function: u32, pc: u32) -> usize {
+    if self.depth >= MAX_INLINE_DEPTH || self.f.inlineTargets.length() >= MAX_INLINE_SITES { return usize.MAX }
+    // A call that left compiled code before (a deopt recorded at its pc) is not inlined again.
+    if self.depth == 0 {
+      let mut s: usize = 0
+      while s < self.doubleSites.length() { if self.doubleSites.get(s) == pc { return usize.MAX } s = s + 1 }
+    }
+    let info = self.f.value(function)
+    if info.def == NONE { return usize.MAX }
+    let read = self.f.inst(info.def)
+    if read.op != Op.GetField || read.k != FIELD_CACHED || read.frame != self.f.frame { return usize.MAX }
+    let mut t: usize = 0
+    while t < input.targets.length() {
+      let target = &input.targets.asSlice()[t]
+      if target.pc == read.pc {
+        let callee = &target.input
+        if !callee.normal || callee.closureVars != 0 || callee.scopeSlots != 0 { return usize.MAX }
+        if callee.code.length() == 0 || callee.code.length() > MAX_INLINE_BYTES { return usize.MAX }
+        return t
+      }
+      t = t + 1
+    }
+    return usize.MAX
+  }
+
+  /// Translates the method call at `pc` of `function` with `count` arguments as the body of
+  /// the function its site last called, guarded by that function's identity, when it can:
+  /// true, with the operands replaced by the result. False with nothing changed otherwise.
+  effect fn inlined(self: &mut Self, input: &FunctionInput, function: u32, receiver: u32, count: usize, pc: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let t = self.inlineTarget(input, function, pc)
+    if t == usize.MAX { return false }
+    let target = &input.targets.asSlice()[t]
+    let mark = self.f.mark()
+    let outer = self.depth
+    let savedLocals = run copyList(&self.locals)
+    let savedStack = run copyList(&self.stack)
+    if outer == 0 {
+      self.rootPc = pc
+      self.rootLocals = run copyList(&self.locals)
+      self.rootStack = run copyList(&self.stack)
+      self.rootInst = self.f.insts.length()
+      self.broken = false
+    }
+    // The guard and the frame run for the caller: its exit is the caller's.
+    let k = usize.toI32(self.f.inlineTargets.length())
+    run self.f.inlineTargets.append(target.id)
+    drop run self.f.emit(self.current, Op.CheckCallee, false, Type.I32, Own.Unboxed, function, NONE, k, pc)
+    let guard = self.f.lastInst() run self.exitHere(guard, pc)
+    drop run self.f.emit(self.current, Op.InlineFrame, false, Type.I32, Own.Unboxed, function, NONE, k, pc)
+    // Into the body: the caller's state is held, the operands become the arguments.
+    let heldBefore = self.held.length()
+    if outer != 0 { run self.held.appendSlice(savedLocals.asSlice()) run self.held.appendSlice(savedStack.asSlice()) }
+    let mut args = List<u32>.make()
+    let mut i: usize = 0
+    while i < count { run args.append(self.top(count - i)) i = i + 1 }
+    let outerArgs = Intrinsic.replace(self.args, move args)
+    let outerReceiver = self.receiver
+    let outerFormals = self.formals
+    let outerFrame = self.f.frame
+    let outerSites = Intrinsic.replace(self.doubleSites, List<u32>.make())
+    self.receiver = receiver
+    self.formals = target.input.argumentCount
+    self.f.frame = i32.wrappingToU32(k) + 1
+    self.depth = outer + 1
+    self.locals.clear() self.stack.clear()
+    let outcome = run Effect.result(self.inlineBody(&target.input, pc))
+    self.depth = outer
+    self.f.frame = outerFrame
+    self.args = move outerArgs
+    self.receiver = outerReceiver
+    self.formals = outerFormals
+    self.doubleSites = move outerSites
+    self.held.truncate(heldBefore)
+    self.locals = move savedLocals
+    self.stack = move savedStack
+    let result = match move outcome {
+      Result<u32, Refusal | OutOfMemoryError>.Success { value } => value
+      Result<u32, Refusal | OutOfMemoryError>.Failure { error } => {
+        match move error {
+          Refusal { .. } => NONE
+          OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+        }
+      }
+    }
+    if result == NONE || self.broken {
+      // Nothing of the attempt stays; an attempt around this one fails with it.
+      self.f.rollback(mark)
+      return false
+    }
+    // The call's operands (function, receiver, arguments) go, the result takes their place.
+    i = 0
+    while i < count + 2 { let v = self.pop() run self.release(v, pc) i = i + 1 }
+    run self.push(result)
+    return true
+  }
+
+  /// The body of an inlined function: its instructions in order up to its return, whose
+  /// value this returns (owned by the caller from here, or unboxed).
+  effect fn inlineBody(self: &mut Self, callee: &FunctionInput, callPc: u32) -> u32 ! Refusal | OutOfMemoryError ? &mut Allocator {
+    // Validates the code as the function's own is: sizes, operand stack depths.
+    drop run shape(callee)
+    let undefined = run self.imm(Imm.Undefined, callPc)
+    let mut l: u32 = 0
+    while l < callee.localCount { run self.locals.append(undefined) l = l + 1 }
+    let length = callee.code.length()
+    let mut pc: usize = 0
+    while pc < length {
+      let opcode = byteAt(callee, pc)
+      let at = usize.toU32(pc)
+      if !inlinable(opcode) { fail refuse(at, opcode, b"control flow in an inlined body") }
+      if opcode == op.OP_return {
+        let v = self.pop()
+        run self.releaseAll(at)
+        return v
+      }
+      if opcode == op.OP_return_undef {
+        run self.releaseAll(at)
+        return run self.imm(Imm.Undefined, at)
+      }
+      drop run self.instruction(callee, pc)
+      if self.broken { fail refuse(at, opcode, b"a guard after an effect in an inlined body") }
+      pc = pc + sizeAt(callee, pc)
+    }
+    fail refuse(usize.toU32(length), 0, b"control falls off the end of the code")
   }
 
   // ---- objects (workstream J) ----
@@ -1443,7 +1652,7 @@ impl Translator {
   /// Local `index` or argument `index` (the fused element forms' operands).
   effect fn slotValue(self: &mut Self, argument: bool, index: usize, pc: u32, opcode: u8) -> u32 ! Refusal | OutOfMemoryError ? &mut Allocator {
     if argument {
-      if index >= u32.toUsize(self.f.argumentCount) { fail refuse(pc, opcode, b"argument index out of range") }
+      if index >= self.argumentLimit() { fail refuse(pc, opcode, b"argument index out of range") }
       return run self.argument(usize.toU32(index), pc)
     }
     if index >= self.locals.length() { fail refuse(pc, opcode, b"local index out of range") }
@@ -1452,6 +1661,13 @@ impl Translator {
   effect fn object(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
     let opcode = byteAt(input, pc)
     let at = usize.toU32(pc)
+    if opcode == op.OP_push_this && self.depth != 0 {
+      // The call's receiver operand, an object as below.
+      let receiver = self.receiver
+      run self.checkTag(receiver, -1, at)
+      let r = run self.share(receiver, at)
+      run self.push(r) return true
+    }
     if opcode == op.OP_push_this {
       // Only an object receiver: anything else needs the interpreter's mode checks.
       let t = run self.f.emit(self.current, Op.This, true, Type.Value, Own.Borrowed, NONE, NONE, 0, at)
@@ -1482,7 +1698,7 @@ impl Translator {
         if index >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
         o = self.locals.get(index)
       } else {
-        if index >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") }
+        if index >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") }
         o = run self.argument(usize.toU32(index), at)
       }
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
@@ -1622,7 +1838,7 @@ impl Translator {
         if source >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
         v = self.locals.get(source)
       } else {
-        if source >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") }
+        if source >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") }
         v = run self.argument(usize.toU32(source), at)
       }
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
@@ -1646,7 +1862,9 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make() }
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
+    depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -1873,7 +2091,9 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make() }
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
+    depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
