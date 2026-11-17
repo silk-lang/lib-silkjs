@@ -111,8 +111,37 @@ pub enum RelocationKind {
 pub struct Relocation { pub offset: usize, pub kind: RelocationKind, pub symbol: u32, pub addend: i64 }
 impl Copy for Relocation {}
 
-struct Fixup { offset: usize, label: usize }
+/// A label reference: the 4-byte field at `offset` gets the label's displacement. A `jmp` or
+/// `jcc` (`kind` JUMP or BRANCH) may shrink to its 2-byte form in `finish`; `short` says whether
+/// it does and `before` how many bytes the shrunk references before it save.
+struct Fixup { offset: usize, label: usize, kind: u8, short: bool, before: usize }
 impl Copy for Fixup {}
+
+const FIXED: u8 = 0
+const JUMP: u8 = 1
+const BRANCH: u8 = 2
+
+/// The bytes a reference saves when it shrinks: `jmp` 5 to 2, `jcc` 6 to 2.
+fn saving(fixup: Fixup) -> usize {
+  if !fixup.short { return 0 }
+  if fixup.kind == JUMP { return 3 }
+  return 4
+}
+
+/// Where the byte at `offset` of the unshrunk code ends up once the short references shrink.
+/// `fixups` are in offset order and their `before` fields are current.
+fn moved(fixups: &List<Fixup>, offset: usize) -> usize {
+  // The last reference whose field starts before `offset`: it and all before it shrink first.
+  let mut low: usize = 0
+  let mut high = fixups.length()
+  while low < high {
+    let middle = (low + high) / 2
+    if fixups.get(middle).offset < offset { low = middle + 1 } else { high = middle }
+  }
+  if low == 0 { return offset }
+  let last = fixups.get(low - 1)
+  return offset - last.before - saving(last)
+}
 
 /// `Assembler.finish` failed because a jump, call or `leaLabel` refers to a label that was never
 /// bound. `label` is the label's creation order, counting from 0.
@@ -520,21 +549,26 @@ impl Assembler {
     self.labels.set(label.index, self.code.length())
   }
   effect fn reference(self: &mut Self, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.fixups.append(Fixup { offset: self.code.length(), label: label.index })
+    run self.referenceOf(label, FIXED)
+  }
+  effect fn referenceOf(self: &mut Self, label: Label, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.fixups.append(Fixup { offset: self.code.length(), label: label.index, kind: kind, short: kind != FIXED, before: 0 })
     self.imm32(0)
   }
-  /// `jmp label`, always with a 32-bit displacement (5 bytes).
+  /// `jmp label`. Emitted with a 32-bit displacement (5 bytes); `finish` shrinks it to the
+  /// 2-byte form when the displacement fits in 8 bits.
   pub effect fn jmp(self: &mut Self, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.room()
     self.byte(0xe9)
-    run self.reference(label)
+    run self.referenceOf(label, JUMP)
   }
-  /// `jcc label`: jumps when `cond` holds, always with a 32-bit displacement (6 bytes).
+  /// `jcc label`: jumps when `cond` holds. Emitted with a 32-bit displacement (6 bytes);
+  /// `finish` shrinks it to the 2-byte form when the displacement fits in 8 bits.
   pub effect fn jcc(self: &mut Self, cond: Cond, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.room()
     self.byte(0x0f)
     self.byte(0x80 + Cond.value(cond))
-    run self.reference(label)
+    run self.referenceOf(label, BRANCH)
   }
   /// `call label`: calls code in the same assembly.
   pub effect fn call(self: &mut Self, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -591,20 +625,94 @@ impl Assembler {
 
   /// Resolves every label reference and returns the code with its relocation records.
   ///
+  /// Every `jmp` and `jcc` whose displacement fits in 8 bits takes its 2-byte form, as an
+  /// assembler's branch relaxation does: all start short, and one that does not reach grows,
+  /// until none changes. Offsets taken with `offset` before `finish` do not account for this.
+  ///
   /// Fails with `UnboundLabelError` when an instruction refers to a label that `bind` never
   /// positioned.
   pub effect fn finish(self: Self) -> Code ! UnboundLabelError {
     return match move self {
-      Assembler { code: bytes, labels, fixups, relocations } => {
+      Assembler { code: bytes, labels, fixups: references, relocations: records } => {
         let mut code = move bytes
+        let mut fixups = move references
+        let mut relocations = move records
         let mut index: usize = 0
         while index < fixups.length() {
+          let label = fixups.get(index).label
+          if labels.get(label) == usize.MAX { fail UnboundLabelError { label: label } }
+          index = index + 1
+        }
+        // Grow the references that do not reach until none changes. A reference only grows,
+        // so this ends; it gives the same sizes as llvm-mc's relaxation.
+        let mut changed = true
+        while changed {
+          changed = false
+          let mut saved: usize = 0
+          index = 0
+          while index < fixups.length() {
+            let mut fixup = fixups.get(index)
+            fixup.before = saved
+            fixups.set(index, fixup)
+            saved = saved + saving(fixup)
+            index = index + 1
+          }
+          index = 0
+          while index < fixups.length() {
+            let mut fixup = fixups.get(index)
+            if fixup.short {
+              let end = usize.wrappingToI64(moved(&fixups, fixup.offset + 4))
+              let target = usize.wrappingToI64(moved(&fixups, labels.get(fixup.label)))
+              if target - end < -128 || target - end > 127 {
+                fixup.short = false
+                fixups.set(index, fixup)
+                changed = true
+              }
+            }
+            index = index + 1
+          }
+        }
+        // Compact: each short reference's instruction becomes its opcode and an 8-bit field.
+        // Bytes only move left, so this works in place.
+        let mut from: usize = 0
+        let mut to: usize = 0
+        index = 0
+        while index < fixups.length() {
           let fixup = fixups.get(index)
-          let target = labels.get(fixup.label)
-          if target == usize.MAX { fail UnboundLabelError { label: fixup.label } }
-          // Both offsets are below 2^31: the displacement is relative to the end of its field.
-          let distance = usize.wrappingToI64(target) - usize.wrappingToI64(fixup.offset) - 4
-          patch32(&mut code, fixup.offset, i64.wrappingToI32(distance))
+          if fixup.short {
+            let start = fixup.offset - 1 - u8.toUsize(fixup.kind - 1)
+            while from < start { let byte = code.get(from) code.set(to, byte) from = from + 1 to = to + 1 }
+            let mut opcode: u8 = 0xeb
+            if fixup.kind == BRANCH { opcode = code.get(fixup.offset - 1) - 0x10 }
+            code.set(to, opcode)
+            code.set(to + 1, 0)
+            from = fixup.offset + 4
+            to = to + 2
+          }
+          index = index + 1
+        }
+        while from < code.length() { let byte = code.get(from) code.set(to, byte) from = from + 1 to = to + 1 }
+        code.truncate(to)
+        index = 0
+        while index < fixups.length() {
+          let fixup = fixups.get(index)
+          let target = usize.wrappingToI64(moved(&fixups, labels.get(fixup.label)))
+          if fixup.short {
+            // The field is the instruction's last byte; its start moved by the savings before it.
+            let field = fixup.offset - fixup.before - 1 - u8.toUsize(fixup.kind - 1) + 1
+            code.set(field, i64.wrappingToU8(target - usize.wrappingToI64(field) - 1))
+          } else {
+            // Both offsets are below 2^31: the displacement is relative to the end of its field.
+            let field = fixup.offset - fixup.before
+            patch32(&mut code, field, i64.wrappingToI32(target - usize.wrappingToI64(field) - 4))
+          }
+          index = index + 1
+        }
+        index = 0
+        while index < relocations.length() {
+          let mut record = relocations.get(index)
+          record.offset = moved(&fixups, record.offset)
+          relocations.set(index, record)
           index = index + 1
         }
         return Code { bytes: move code, relocations: move relocations }

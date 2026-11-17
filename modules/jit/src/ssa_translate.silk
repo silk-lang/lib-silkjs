@@ -5,7 +5,9 @@
 //! return releases every local and leftover operand. `ssa_ownership` removes what it can prove
 //! redundant. Anything outside the subset fails with `Refusal`; nothing is guessed.
 import silk.collections.list { List }
+import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
 import silk.num.i8
 import silk.num.i16
 import silk.num.i32
@@ -13,10 +15,12 @@ import silk.num.i64
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
 import ssa_calls as calls
+import ssa
 
 /// What the translator reads about a function: plain numbers and the code bytes, nothing that
 /// points into a runtime, so it can be serialized (ahead-of-time compilation).
@@ -32,7 +36,21 @@ pub struct FunctionInput {
   pub scopeSlots: u32,
   /// A plain function (not a generator or async).
   pub normal: bool,
+  /// The function's constants as numbers, by constant index (docs/jit/doubles.md).
+  pub numberConstants: List<NumberConstant>,
+  /// Bytecode offsets of arithmetic and comparison sites to compile as numbers (f64) rather
+  /// than int32: sites that deoptimized in an earlier compilation of the same code.
+  pub doubleSites: List<u32>,
 }
+
+/// Constant kinds of `NumberConstant`.
+pub const CONSTANT_OTHER: u8 = 0
+pub const CONSTANT_INT: u8 = 1
+pub const CONSTANT_DOUBLE: u8 = 2
+/// A constant of the function: an Int (`bits` its i32 bits), a Float64 (`bits` its f64 bits)
+/// or something else.
+pub struct NumberConstant { pub kind: u8, pub bits: u64 }
+impl Copy for NumberConstant {}
 
 /// Why a function was not translated. `pc` and `opcode` name the instruction, when one is to
 /// blame (else `pc` is NONE).
@@ -62,7 +80,7 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
-    || objectOpcode(opcode) || callOpcode(opcode)
+    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode)
 }
 
 /// Workstream H's calls: `call0`..`call3`, `call` and `call_method`.
@@ -79,8 +97,26 @@ pub fn objectOpcode(opcode: u8) -> bool {
 pub const FIELD_KEYED: i32 = 0
 pub const FIELD_CACHED: i32 = 1
 
+/// The opcodes the number and operator part translates (docs/jit/doubles.md).
+pub fn numberOpcode(opcode: u8) -> bool {
+  return opcode == op.OP_div || opcode == op.OP_mod || opcode == op.OP_shl || opcode == op.OP_sar || opcode == op.OP_shr
+    || opcode == op.OP_and || opcode == op.OP_xor || opcode == op.OP_or || opcode == op.OP_shl_imm || opcode == op.OP_sar_imm
+    || opcode == op.OP_and_imm || opcode == op.OP_or_imm || opcode == op.OP_neg || opcode == op.OP_plus || opcode == op.OP_not
+    || opcode == op.OP_lnot || opcode == op.OP_post_inc || opcode == op.OP_post_dec || opcode == op.OP_push_const
+    || opcode == op.OP_push_const8 || opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8
+}
+/// `if_true_keep8`/`if_false_keep8`: a branch whose taken edge keeps the tested value.
+fn keepBranch(opcode: u8) -> bool { return opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 }
+
 fn isBranch(opcode: u8) -> bool {
   return opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
+    || keepBranch(opcode)
+}
+/// The double operation of an int32 one (`add`, `sub`, `mul`).
+fn doubleOf(operation: Op) -> Op {
+  if operation == Op.Sub { return Op.SubF64 }
+  if operation == Op.Mul { return Op.MulF64 }
+  return Op.AddF64
 }
 fn isGoto(opcode: u8) -> bool { return opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16 }
 fn isReturn(opcode: u8) -> bool { return opcode == op.OP_return || opcode == op.OP_return_undef }
@@ -105,6 +141,10 @@ fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
   let mut displacement: i32 = 0
   if opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_goto { displacement = i32At(input, pc + 1) }
   else if opcode == op.OP_goto16 { displacement = i16At(input, pc + 1) }
+  else if keepBranch(opcode) {
+    // dup, if_*8, drop in one: the displacement counts from its own byte, the second.
+    return usize.toI64(pc + 2) + i32.toI64(i8At(input, pc + 2))
+  }
   else { displacement = i8At(input, pc + 1) }
   return usize.toI64(pc + 1) + i32.toI64(displacement)
 }
@@ -146,7 +186,10 @@ effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &
           let target = targetOf(input, pc)
           if target < 0 || target >= usize.toI64(length) { fail refuse(usize.toU32(pc), opcode, b"jump outside the code") }
           let t = i64.toUsize(target)
-          run mark(&mut leader, &mut depth, &mut work, &mut workDepth, t, d, pc, opcode)
+          // The taken edge of a keep branch still has the tested value.
+          let mut taken = d
+          if keepBranch(opcode) { taken = d + 1 }
+          run mark(&mut leader, &mut depth, &mut work, &mut workDepth, t, taken, pc, opcode)
           if isBranch(opcode) { run mark(&mut leader, &mut depth, &mut work, &mut workDepth, pc + size, d, pc, opcode) }
           going = false
         } else {
@@ -191,6 +234,8 @@ struct Translator {
   current: u32,
   locals: List<u32>,
   stack: List<u32>,
+  /// FunctionInput.doubleSites, copied.
+  doubleSites: List<u32>,
 }
 
 impl Translator {
@@ -220,6 +265,7 @@ impl Translator {
     let info = self.f.value(v)
     if info.ty == Type.I32 { run self.f.slotAt(v, SlotMode.Int, NONE) }
     else if info.ty == Type.Bool { run self.f.slotAt(v, SlotMode.Bool, NONE) }
+    else if info.ty == Type.F64 { run self.f.slotAt(v, SlotMode.F64, NONE) }
     else if info.own == Own.Owned { run self.f.slotAt(v, SlotMode.Move, NONE) }
     else if info.own == Own.Imm { run self.f.slotAt(v, SlotMode.Imm, NONE) }
     else {
@@ -234,6 +280,11 @@ impl Translator {
     let ty = self.f.value(v).ty
     if ty == Type.I32 { return v }
     if ty == Type.Bool { return NONE }
+    if ty == Type.F64 {
+      let exact = run self.f.emit(self.current, Op.ExactI32, true, Type.I32, Own.Unboxed, v, NONE, 0, pc)
+      let at = self.f.lastInst() run self.exitHere(at, pc)
+      return exact
+    }
     let r = run self.f.emit(self.current, Op.Unbox, true, Type.I32, Own.Unboxed, v, NONE, 0, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
     return r
@@ -261,6 +312,7 @@ impl Translator {
     let ty = self.f.value(v).ty
     if ty == Type.I32 { return run self.f.emit(self.current, Op.BoxI32, true, Type.Value, Own.Imm, v, NONE, 0, pc) }
     if ty == Type.Bool { return run self.f.emit(self.current, Op.BoxBool, true, Type.Value, Own.Imm, v, NONE, 0, pc) }
+    if ty == Type.F64 { return run self.f.emit(self.current, Op.BoxF64, true, Type.Value, Own.Imm, v, NONE, 0, pc) }
     return v
   }
 
@@ -342,6 +394,7 @@ impl Translator {
   /// `add`/`sub`/`mul` or a comparison of the two top operands.
   effect fn binary(self: &mut Self, opcode: u8, pc: u32) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
     let a = self.top(2) let b = self.top(1)
+    if self.numberSite(pc, a, b) { run self.numberBinary(opcode, pc) return () }
     let x = run self.int(a, pc) let y = run self.int(b, pc)
     if x == NONE || y == NONE { fail refuse(pc, opcode, b"a boolean operand of arithmetic") }
     let mut r = NONE
@@ -371,9 +424,206 @@ impl Translator {
       let zero = run self.constant(0, pc)
       return run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, v, zero, u8.toI32(Cmp.value(Cmp.Ne)), pc)
     }
+    if ty == Type.F64 {
+      // A double is false at 0, -0 and NaN: x != 0 with NaN unequal to everything is exactly that.
+      let zero = run self.doubleConstant(0.0, pc)
+      return run self.f.emit(self.current, Op.CmpF64, true, Type.Bool, Own.Unboxed, v, zero, u8.toI32(Cmp.value(Cmp.Ne)), pc)
+    }
     let c = run self.f.emit(self.current, Op.UnboxBool, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
     return c
+  }
+
+  // ---- numbers and the remaining operators (docs/jit/doubles.md) ----
+
+  /// Whether the arithmetic or comparison at `pc` on `a` and `b` runs on doubles: an operand is
+  /// one already, or the site deoptimized as int32 in an earlier compilation.
+  fn numberSite(self: &Self, pc: u32, a: u32, b: u32) -> bool {
+    if self.f.value(a).ty == Type.F64 || self.f.value(b).ty == Type.F64 { return true }
+    let mut i: usize = 0
+    while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { return true } i = i + 1 }
+    return false
+  }
+  /// `v` as a double: itself, converted from an i32, or unboxed with a number guard at `pc`.
+  /// NONE for a bool (refused by the caller).
+  effect fn number(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.f.value(v).ty
+    if ty == Type.F64 { return v }
+    if ty == Type.I32 { return run self.f.emit(self.current, Op.ToF64, true, Type.F64, Own.Unboxed, v, NONE, 0, pc) }
+    if ty == Type.Bool { return NONE }
+    let r = run self.f.emit(self.current, Op.UnboxF64, true, Type.F64, Own.Unboxed, v, NONE, 0, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    return r
+  }
+  /// `v` as ToInt32 would make it, for a bitwise operator: an i32 as it is, a double truncated
+  /// (guarded), a boxed value guarded as an Int (as a number on a double site). NONE for a bool.
+  effect fn int32(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.f.value(v).ty
+    if ty == Type.I32 { return v }
+    if ty == Type.Bool { return NONE }
+    let mut x = v
+    if ty == Type.Value {
+      if !self.numberSite(pc, v, v) { return run self.int(v, pc) }
+      x = run self.number(v, pc)
+    }
+    let r = run self.f.emit(self.current, Op.ToInt32, true, Type.I32, Own.Unboxed, x, NONE, 0, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    return r
+  }
+  effect fn doubleConstant(self: &mut Self, value: f64, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let bits = f64.toBits(value)
+    let mut index: usize = 0
+    while index < self.f.numbers.length() && self.f.numbers.get(index) != bits { index = index + 1 }
+    if index == self.f.numbers.length() { run self.f.numbers.append(bits) }
+    return run self.f.emit(self.current, Op.ConstF64, true, Type.F64, Own.Unboxed, NONE, NONE, usize.toI32(index), pc)
+  }
+  /// `add`/`sub`/`mul`/`div` or a comparison of the two top operands, on doubles.
+  effect fn numberBinary(self: &mut Self, opcode: u8, pc: u32) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let a = self.top(2) let b = self.top(1)
+    let x = run self.number(a, pc) let y = run self.number(b, pc)
+    if x == NONE || y == NONE { fail refuse(pc, opcode, b"a boolean operand of arithmetic") }
+    let mut r = NONE
+    if opcode == op.OP_add { r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, y, 0, pc) }
+    else if opcode == op.OP_sub { r = run self.f.emit(self.current, Op.SubF64, true, Type.F64, Own.Unboxed, x, y, 0, pc) }
+    else if opcode == op.OP_mul { r = run self.f.emit(self.current, Op.MulF64, true, Type.F64, Own.Unboxed, x, y, 0, pc) }
+    else if opcode == op.OP_div { r = run self.f.emit(self.current, Op.DivF64, true, Type.F64, Own.Unboxed, x, y, 0, pc) }
+    else {
+      let mut kind = Cmp.Lt
+      if opcode == op.OP_lte { kind = Cmp.Le }
+      else if opcode == op.OP_gt { kind = Cmp.Gt }
+      else if opcode == op.OP_gte { kind = Cmp.Ge }
+      else if opcode == op.OP_eq || opcode == op.OP_strict_eq { kind = Cmp.Eq }
+      else if opcode == op.OP_neq || opcode == op.OP_strict_neq { kind = Cmp.Ne }
+      r = run self.f.emit(self.current, Op.CmpF64, true, Type.Bool, Own.Unboxed, x, y, u8.toI32(Cmp.value(kind)), pc)
+    }
+    drop self.pop() drop self.pop()
+    run self.release(a, pc) run self.release(b, pc)
+    run self.push(r)
+  }
+  /// A guarded or plain int32 operation of `x` and `y` (both i32).
+  effect fn intOperation(self: &mut Self, operation: Op, x: u32, y: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let r = run self.f.emit(self.current, operation, true, Type.I32, Own.Unboxed, x, y, 0, pc)
+    if ssa.numberOpHasExit(operation) { let last = self.f.lastInst() run self.exitHere(last, pc) }
+    return r
+  }
+  /// The opcodes of `numberOpcode`.
+  effect fn numberInstruction(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let opcode = byteAt(input, pc)
+    let at = usize.toU32(pc)
+    if opcode == op.OP_push_const || opcode == op.OP_push_const8 {
+      let mut index: usize = 0
+      if opcode == op.OP_push_const8 { index = u8.toUsize(byteAt(input, pc + 1)) } else { index = u32.toUsize(i32.wrappingToU32(i32At(input, pc + 1))) }
+      if index >= input.numberConstants.length() { fail refuse(at, opcode, b"a constant index out of range") }
+      let constant = input.numberConstants.get(index)
+      if constant.kind == CONSTANT_INT { let c = run self.constant(u32.wrappingToI32(u64.wrappingToU32(constant.bits)), at) run self.push(c) return true }
+      if constant.kind == CONSTANT_DOUBLE { let c = run self.doubleConstant(f64.fromBits(constant.bits), at) run self.push(c) return true }
+      fail refuse(at, opcode, b"a constant that is not a number")
+    }
+    if opcode == op.OP_div { run self.numberBinary(opcode, at) return true }
+    if opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8 {
+      let a = self.top(1)
+      let k = i8At(input, pc + 1)
+      let mut kind = Cmp.Eq
+      if opcode == op.OP_strict_neq_imm8 { kind = Cmp.Ne }
+      let mut r = NONE
+      if self.numberSite(at, a, a) {
+        let x = run self.number(a, at)
+        if x == NONE { fail refuse(at, opcode, b"a boolean compared with a number") }
+        let c = run self.doubleConstant(i32.toF64(k), at)
+        r = run self.f.emit(self.current, Op.CmpF64, true, Type.Bool, Own.Unboxed, x, c, u8.toI32(Cmp.value(kind)), at)
+      } else {
+        // A bool is never strictly equal to a number; anything else is speculated an Int.
+        if self.f.value(a).ty == Type.Bool { fail refuse(at, opcode, b"a boolean compared with a number") }
+        let x = run self.int(a, at)
+        let c = run self.constant(k, at)
+        r = run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, x, c, u8.toI32(Cmp.value(kind)), at)
+      }
+      drop self.pop() run self.release(a, at) run self.push(r)
+      return true
+    }
+    if opcode == op.OP_lnot {
+      let a = self.top(1)
+      let c = run self.condition(a, at)
+      let r = run self.f.emit(self.current, Op.NotBool, true, Type.Bool, Own.Unboxed, c, NONE, 0, at)
+      drop self.pop() run self.release(a, at) run self.push(r)
+      return true
+    }
+    if opcode == op.OP_neg || opcode == op.OP_plus || opcode == op.OP_post_inc || opcode == op.OP_post_dec {
+      let a = self.top(1)
+      if self.numberSite(at, a, a) {
+        let x = run self.number(a, at)
+        if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+        drop self.pop() run self.release(a, at)
+        if opcode == op.OP_neg { let r = run self.f.emit(self.current, Op.NegF64, true, Type.F64, Own.Unboxed, x, NONE, 0, at) run self.push(r) }
+        else if opcode == op.OP_plus { run self.push(x) }
+        else {
+          let mut k: f64 = 1.0
+          if opcode == op.OP_post_dec { k = -1.0 }
+          let c = run self.doubleConstant(k, at)
+          let r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, c, 0, at)
+          run self.push(x) run self.push(r)
+        }
+        return true
+      }
+      let x = run self.int(a, at)
+      if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+      if opcode == op.OP_neg {
+        let r = run self.f.emit(self.current, Op.Neg, true, Type.I32, Own.Unboxed, x, NONE, 0, at)
+        let last = self.f.lastInst() run self.exitHere(last, at)
+        drop self.pop() run self.release(a, at) run self.push(r)
+      } else if opcode == op.OP_plus {
+        drop self.pop() run self.release(a, at) run self.push(x)
+      } else {
+        let one = run self.constant(1, at)
+        let mut operation = Op.Add
+        if opcode == op.OP_post_dec { operation = Op.Sub }
+        let r = run self.arith(operation, x, one, at)
+        drop self.pop() run self.release(a, at) run self.push(x) run self.push(r)
+      }
+      return true
+    }
+    if opcode == op.OP_not {
+      let a = self.top(1)
+      let x = run self.int32(a, at)
+      if x == NONE { fail refuse(at, opcode, b"a boolean operand of a bitwise operator") }
+      let r = run self.f.emit(self.current, Op.BitNot, true, Type.I32, Own.Unboxed, x, NONE, 0, at)
+      drop self.pop() run self.release(a, at) run self.push(r)
+      return true
+    }
+    if opcode == op.OP_shl_imm || opcode == op.OP_sar_imm || opcode == op.OP_and_imm || opcode == op.OP_or_imm {
+      let a = self.top(1)
+      let x = run self.int32(a, at)
+      if x == NONE { fail refuse(at, opcode, b"a boolean operand of a bitwise operator") }
+      let k = run self.constant(i16At(input, pc + 1), at)
+      let mut operation = Op.Shl
+      if opcode == op.OP_sar_imm { operation = Op.Sar }
+      else if opcode == op.OP_and_imm { operation = Op.BitAnd }
+      else if opcode == op.OP_or_imm { operation = Op.BitOr }
+      let r = run self.intOperation(operation, x, k, at)
+      drop self.pop() run self.release(a, at) run self.push(r)
+      return true
+    }
+    // The two-operand bitwise operators and %.
+    let a = self.top(2) let b = self.top(1)
+    if opcode == op.OP_mod {
+      if self.numberSite(at, a, b) { fail refuse(at, opcode, b"% of doubles (fmod)") }
+      let x = run self.int(a, at) let y = run self.int(b, at)
+      if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+      let r = run self.intOperation(Op.Mod, x, y, at)
+      drop self.pop() drop self.pop() run self.release(a, at) run self.release(b, at) run self.push(r)
+      return true
+    }
+    let x = run self.int32(a, at) let y = run self.int32(b, at)
+    if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of a bitwise operator") }
+    let mut operation = Op.BitAnd
+    if opcode == op.OP_or { operation = Op.BitOr }
+    else if opcode == op.OP_xor { operation = Op.BitXor }
+    else if opcode == op.OP_shl { operation = Op.Shl }
+    else if opcode == op.OP_sar { operation = Op.Sar }
+    else if opcode == op.OP_shr { operation = Op.Shr }
+    let r = run self.intOperation(operation, x, y, at)
+    drop self.pop() drop self.pop() run self.release(a, at) run self.release(b, at) run self.push(r)
+    return true
   }
 
   /// Translates the instruction at `pc` (not a terminator of control flow unless it is one).
@@ -457,6 +707,17 @@ impl Translator {
     }
     if opcode == op.OP_add_imm || opcode == op.OP_inc || opcode == op.OP_dec {
       let a = self.top(1)
+      if self.numberSite(at, a, a) {
+        let mut k: i32 = 1
+        if opcode == op.OP_add_imm { k = i16At(input, pc + 1) }
+        if opcode == op.OP_dec { k = -1 }
+        let x = run self.number(a, at)
+        if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+        let c = run self.doubleConstant(i32.toF64(k), at)
+        let r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, c, 0, at)
+        drop self.pop() run self.release(a, at) run self.push(r)
+        return true
+      }
       let x = run self.int(a, at)
       if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
       let mut k: i32 = 1
@@ -470,6 +731,19 @@ impl Translator {
     }
     if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_step_loc8 {
       let v = self.locals.get(index)
+      if self.numberSite(at, v, v) {
+        let mut k: f64 = 1.0
+        let mut mode: u8 = 1
+        if opcode == op.OP_step_loc8 { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { k = -1.0 } }
+        else if opcode == op.OP_dec_loc { k = -1.0 }
+        let x = run self.number(v, at)
+        if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+        let c = run self.doubleConstant(k, at)
+        let r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, c, 0, at)
+        run self.store(index, r, at)
+        if opcode == op.OP_step_loc8 { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
+        return true
+      }
       let x = run self.int(v, at)
       if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
       let one = run self.constant(1, at)
@@ -485,6 +759,14 @@ impl Translator {
     }
     if opcode == op.OP_add_loc {
       let b = self.top(1) let v = self.locals.get(index)
+      if self.numberSite(at, v, b) {
+        let x = run self.number(v, at) let y = run self.number(b, at)
+        if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+        let r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, y, 0, at)
+        drop self.pop() run self.release(b, at)
+        run self.store(index, r, at)
+        return true
+      }
       let x = run self.int(v, at) let y = run self.int(b, at)
       if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
       let r = run self.arith(Op.Add, x, y, at)
@@ -513,6 +795,14 @@ impl Translator {
         if rightIndex >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
         right = self.locals.get(rightIndex)
       }
+      if self.numberSite(at, left, right) {
+        let x = run self.number(left, at) let y = run self.number(right, at)
+        if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
+        let r = run self.f.emit(self.current, doubleOf(operation), true, Type.F64, Own.Unboxed, x, y, 0, at)
+        if !twoLocals { drop self.pop() run self.release(left, at) }
+        run self.push(r)
+        return true
+      }
       let x = run self.int(left, at) let y = run self.int(right, at)
       if x == NONE || y == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
       let r = run self.arith(operation, x, y, at)
@@ -522,6 +812,32 @@ impl Translator {
     }
 
     // Control.
+    if keepBranch(opcode) {
+      // Taken keeps the tested value on the stack; the fall-through drops it, in a block of
+      // its own that receives the whole state and releases the value.
+      let v = self.top(1)
+      let c = run self.condition(v, at)
+      let taken = run self.destination(i64.toUsize(targetOf(input, pc)), at)
+      let dropBlock = run self.f.block()
+      let mut i: usize = 0
+      while i < self.locals.length() + self.stack.length() { drop run self.f.addParam(dropBlock, Type.Value, Own.Owned) i = i + 1 }
+      let mut first = NONE
+      if opcode == op.OP_if_true_keep8 { first = run self.edgeTo(taken, at) drop run self.edgeTo(dropBlock, at) }
+      else { first = run self.edgeTo(dropBlock, at) drop run self.edgeTo(taken, at) }
+      run self.f.terminate(self.current, Op.Branch, c, first, at)
+      self.current = dropBlock
+      let params = run self.f.paramsOf(dropBlock)
+      let local = self.locals.length()
+      self.locals.clear() self.stack.clear()
+      i = 0
+      while i < params.length() {
+        if i < local { run self.locals.append(params.get(i)) } else { run self.stack.append(params.get(i)) }
+        i = i + 1
+      }
+      let dropped = self.pop() run self.release(dropped, at)
+      run self.jumpTo(pc + size, at)
+      return false
+    }
     if isBranch(opcode) {
       let v = self.top(1)
       let c = run self.condition(v, at)
@@ -553,6 +869,7 @@ impl Translator {
     }
     if objectOpcode(opcode) { return run self.object(input, pc) }
     if callOpcode(opcode) { return run self.call(input, pc) }
+    if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
     fail refuse(at, opcode, b"opcode outside the subset")
   }
 
@@ -659,7 +976,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
   let shapeOf = run shape(input)
   let length = input.code.length()
   let mut t = Translator { f: Function.make(input.argumentCount, input.localCount), blockAt: List<u32>.make(), current: 0,
-    locals: List<u32>.make(), stack: List<u32>.make() }
+    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.

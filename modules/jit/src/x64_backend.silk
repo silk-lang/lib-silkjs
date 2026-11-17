@@ -2,10 +2,10 @@
 //! (docs/jit/compiled-entry.md, js_compiled.CompiledCode):
 //!   extern "C" fn(arguments: *const ValueBits, state: *mut u64, counter: *mut i32, data: ?*mut u8,
 //!     env: ?*mut CompiledEnv, frame: *const CompiledFrame) -> u32
-//! Correctness and the deoptimization path come first, code quality later: every SSA value
-//! lives in its own 8-byte stack slot, every instruction loads its operands into scratch
-//! registers and stores its result, and an edge copies its arguments through a scratch area
-//! into the target's parameters (a parallel move). No register allocation.
+//! Integers, bools and doubles live in registers where x64_regalloc finds one, else in their
+//! slot; a boxed `value` always lives in its slot. Every instruction reads its operands into
+//! scratch registers, computes there, and writes its result last, after any exit. An edge is a
+//! parallel move from its arguments' places to the target's parameters'.
 //!
 //! Values. Every SSA value has a 16-byte slot. An i32 value's slot holds it zero-extended in
 //! its first word, a bool 0 or 1. A boxed `value` is a ValueBits in the engine's own layout
@@ -25,9 +25,12 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.core.option { Option }
-import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Shift, UnboundLabelError, Width }
-import ssa { Function, Inst, Op, Type, Own, SlotMode }
+import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Shift, UnboundLabelError, Width, Xmm }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB }
 import value_layout { ValueLayout }
+import x64_backend_float as float
+import x64_regalloc { Allocation, Place, GPR, XMM, getI32, putI32, aluWith, getF64, putF64, getBits, putBits, gprAt, gprCount }
+import x64_regalloc as regalloc
 import jit_helpers as helpers
 import silkjs.js_compiled as compiled
 import ssa_liveness as liveness
@@ -73,7 +76,9 @@ pub struct Emitter {
   pub scratch: i32,
   /// The frame slots holding the six ABI inputs, from rsp.
   pub inputs: i32,
-  pub settings: Settings
+  pub settings: Settings,
+  /// Where each value lives (x64_regalloc).
+  places: Allocation,
 }
 
 pub fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES)) }
@@ -88,23 +93,24 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
     Option<&'static [u8]>.None => ()
   }
   let values = function.valueCount()
-  let mut widest: u32 = 0
-  let mut e: usize = 0
-  while e < function.edges.length() {
-    let edge = function.edges.get(e)
-    if edge.argCount > widest { widest = edge.argCount }
-    e = e + 1
-  }
-  // 16-byte aligned at calls: entry rsp is 8 below a multiple of 16.
-  let inputs = (values + widest) * SLOT_BYTES
-  let raw = inputs + INPUT_COUNT * 8 + 8
-  let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8)
+  let places = run regalloc.allocate(&function)
+  let mut pushes: u32 = 0
+  let mut r: usize = 0
+  while r < gprCount() { if u32.bitAnd(u32.shiftRight(places.savedMask, usize.toU32(r)), 1) != 0 { pushes = pushes + 1 } r = r + 1 }
+  // Values, one edge scratch slot, then the ABI inputs; 16-byte aligned at calls below the
+  // return address and the saved registers.
+  let inputs = (values + 1) * SLOT_BYTES
+  let raw = inputs + INPUT_COUNT * 8 + 8 + pushes * 8
+  let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
   let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
-    resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame, scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings }
+    resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
+    scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places }
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
   let mut x: usize = 0
   while x < function.exits.length() { run emitter.exitLabels.append(run emitter.a.label()) x = x + 1 }
+  r = 0
+  while r < gprCount() { if emitter.saves(r) { run emitter.a.push(gprAt(r)) } r = r + 1 }
   if frame != 0 { run emitter.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, frame) }
   let mut k: u32 = 0
   while k < INPUT_COUNT { let at = emitter.input(k) run emitter.a.store(Width.W64, at, inputRegister(k)) k = k + 1 }
@@ -170,6 +176,9 @@ fn supported(function: &Function) -> Option<&'static [u8]> {
 }
 
 impl Emitter {
+  fn saves(self: &Self, index: usize) -> bool { return u32.bitAnd(u32.shiftRight(self.places.savedMask, usize.toU32(index)), 1) != 0 }
+  /// Where value v lives.
+  fn at(self: &Self, v: u32) -> Place { return self.places.place(v, slotOf(v)) }
   effect fn instruction(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
     let op = inst.op
     if op == Op.Arg {
@@ -182,6 +191,8 @@ impl Emitter {
       return ()
     }
     if op == Op.ConstI32 {
+      let out = self.at(inst.result)
+      if out.kind == GPR { run self.a.movImm32(out.gpr, i32.wrappingToU32(inst.k)) return () }
       run self.a.storeImm(Width.W64, slotOf(inst.result), 0)
       run self.a.storeImm(Width.W32, slotOf(inst.result), inst.k)
       return ()
@@ -197,7 +208,9 @@ impl Emitter {
       run self.stressGuard(inst.exit)
       let tag = self.settings.layout.int()
       run self.tagGuard(inst.a, tag, inst.exit)
-      // A 32-bit load zero-extends: the slot holds the i32.
+      // A 32-bit load zero-extends: the place holds the i32.
+      let out = self.at(inst.result)
+      if out.kind == GPR { run self.a.load(Width.W32, out.gpr, payloadOf(inst.a)) return () }
       run self.a.load(Width.W32, Reg.Rax, payloadOf(inst.a))
       run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
       return ()
@@ -208,26 +221,25 @@ impl Emitter {
       run self.tagGuard(inst.a, tag, inst.exit)
       run self.a.loadZero8(Reg.Rax, payloadOf(inst.a))
       run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 1)
-      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      let place101 = self.at(inst.result) run putI32(&mut self.a, place101, Reg.Rax)
       return ()
     }
     if op == Op.BoxI32 || op == Op.BoxBool {
-      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
+      let place1 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place1)
       run self.boxInto(op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
       return ()
     }
     if op == Op.Add || op == Op.Sub {
-      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
-      run self.a.load(Width.W32, Reg.R8, slotOf(inst.b))
       run self.stressGuard(inst.exit)
-      if op == Op.Add { run self.a.alu(Alu.Add, Width.W32, Reg.Rax, Reg.R8) } else { run self.a.alu(Alu.Sub, Width.W32, Reg.Rax, Reg.R8) }
+      let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
+      if op == Op.Add { let place3 = self.at(inst.b) run aluWith(&mut self.a, Alu.Add, Reg.Rax, place3) } else { let place4 = self.at(inst.b) run aluWith(&mut self.a, Alu.Sub, Reg.Rax, place4) }
       run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
-      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      let place102 = self.at(inst.result) run putI32(&mut self.a, place102, Reg.Rax)
       return ()
     }
     if op == Op.Mul {
-      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
-      run self.a.load(Width.W32, Reg.R8, slotOf(inst.b))
+      let place5 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place5)
+      let place6 = self.at(inst.b) run getI32(&mut self.a, Reg.R8, place6)
       run self.stressGuard(inst.exit)
       // -0: a zero product with a negative operand, which (a | b) < 0 detects.
       run self.a.mov(Width.W32, Reg.R9, Reg.Rax)
@@ -241,16 +253,15 @@ impl Emitter {
       run self.a.jcc(Cond.Sign, self.exitLabels.get(u32.toUsize(inst.exit)))
       self.a.bind(fine)
       run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      let place103 = self.at(inst.result) run putI32(&mut self.a, place103, Reg.Rax)
       return ()
     }
     if op == Op.Cmp {
-      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
-      run self.a.load(Width.W32, Reg.R8, slotOf(inst.b))
       run self.a.movImm32(Reg.R9, 0)
-      run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.R8)
+      let place7 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place7)
+      let place8 = self.at(inst.b) run aluWith(&mut self.a, Alu.Cmp, Reg.Rax, place8)
       run self.a.setcc(condition(inst.k), Reg.R9)
-      run self.a.store(Width.W64, slotOf(inst.result), Reg.R9)
+      let place104 = self.at(inst.result) run putI32(&mut self.a, place104, Reg.R9)
       return ()
     }
     if op == Op.Retain {
@@ -271,6 +282,42 @@ impl Emitter {
       self.a.bind(skip)
       return ()
     }
+    if op == Op.UnboxF64 {
+      // An Int converts exactly (cvtsi2sd of the signed i32), a Float64 is its payload bits.
+      run self.stressGuard(inst.exit)
+      let layout = self.settings.layout
+      let notInt = run self.a.label()
+      let done = run self.a.label()
+      run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES + layout.tagOffset)))
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+      run self.a.jcc(Cond.NotEqual, notInt)
+      run self.a.load(Width.W32, Reg.Rax, payloadOf(inst.a))
+      run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax)
+      let place105 = self.at(inst.result) run putF64(&mut self.a, place105, Xmm.Xmm0)
+      run self.a.jmp(done)
+      self.a.bind(notInt)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+      run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+      run self.a.load(Width.W64, Reg.Rax, payloadOf(inst.a))
+      let place106 = self.at(inst.result) run putBits(&mut self.a, place106, Reg.Rax)
+      self.a.bind(done)
+      return ()
+    }
+    if op == Op.BoxF64 {
+      let place9 = self.at(inst.a) run getBits(&mut self.a, Reg.Rax, place9)
+      run self.boxDoubleInto(Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
+      return ()
+    }
+    if isNumberOp(op) || op == Op.ConstF64 {
+      let mut exit = self.blockLabels.get(0)
+      if inst.exit != NONE { run self.stressGuard(inst.exit) exit = self.exitLabels.get(u32.toUsize(inst.exit)) }
+      let mut right = regalloc.spilled(slotOf(0)) let mut out = regalloc.spilled(slotOf(0)) let mut left = regalloc.spilled(slotOf(0))
+      if inst.b != NONE && numberOpReadsB(inst.op) { right = self.at(inst.b) }
+      if inst.a != NONE && inst.op != Op.ConstF64 { left = self.at(inst.a) }
+      if inst.result != NONE { out = self.at(inst.result) }
+      run float.lowerNumber(&mut self.a, &function, inst, left, right, out, exit)
+      return ()
+    }
     if op == Op.Poll {
       run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rdx, 0), 1)
       run self.a.jcc(Cond.LessOrEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
@@ -282,8 +329,9 @@ impl Emitter {
     }
     if op == Op.Branch {
       let otherwise = run self.a.label()
-      run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a))
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      let condition = self.at(inst.a)
+      if condition.kind == GPR { run self.a.test(Width.W32, condition.gpr, condition.gpr) }
+      else { run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a)) run self.a.test(Width.W32, Reg.Rax, Reg.Rax) }
       run self.a.jcc(Cond.Equal, otherwise)
       run self.edge(&function, inst.edge)
       self.a.bind(otherwise)
@@ -377,31 +425,100 @@ impl Emitter {
   effect fn edge(self: &mut Self, function: &Function, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let edge = function.edge(index)
     let target = function.blocks.get(u32.toUsize(edge.target))
+    // A parallel move: emit any move whose destination no pending move still reads; when
+    // only cycles are left, park one source in the scratch place and go on.
+    let mut from = List<u32>.make()
+    let mut to = List<u32>.make()
     let mut i: u32 = 0
     while i < edge.argCount {
-      let from = function.edgeArg(edge, i)
-      let to = self.scratch + u32.wrappingToI32(i * SLOT_BYTES)
-      run self.a.load(Width.W64, Reg.Rax, slotOf(from))
-      run self.a.store(Width.W64, Mem.at(Reg.Rsp, to), Reg.Rax)
-      if function.value(from).ty == Type.Value {
-        run self.a.load(Width.W64, Reg.Rax, payloadOf(from))
-        run self.a.store(Width.W64, Mem.at(Reg.Rsp, to + 8), Reg.Rax)
-      }
+      let source = function.edgeArg(edge, i)
+      let into = function.paramAt(target, i)
+      if self.key(source) != self.key(into) { run from.append(source) run to.append(into) }
       i = i + 1
     }
-    i = 0
-    while i < edge.argCount {
-      let into = function.paramAt(target, i)
-      let from = self.scratch + u32.wrappingToI32(i * SLOT_BYTES)
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, from))
-      run self.a.store(Width.W64, slotOf(into), Reg.Rax)
-      if function.value(into).ty == Type.Value {
-        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, from + 8))
-        run self.a.store(Width.W64, payloadOf(into), Reg.Rax)
+    let mut parked = NONE
+    let mut done = List<bool>.make()
+    run done.appendRepeated(false, from.length())
+    let mut left = from.length()
+    while left > 0 {
+      let mut progress = false
+      let mut m: usize = 0
+      while m < from.length() {
+        if !done.get(m) {
+          let blocked = self.readByPending(&from, &done, m, self.key(to.get(m)), parked)
+          if !blocked {
+            run self.moveValue(&function, from.get(m), to.get(m), from.get(m) == parked)
+            done.set(m, true) left = left - 1 progress = true
+            if from.get(m) == parked { parked = NONE }
+          }
+        }
+        m = m + 1
       }
-      i = i + 1
+      if !progress {
+        // Every pending move is in a cycle: park the first one's source.
+        let mut first: usize = 0
+        while done.get(first) { first = first + 1 }
+        parked = from.get(first)
+        run self.park(&function, parked)
+      }
     }
     run self.a.jmp(self.blockLabels.get(u32.toUsize(edge.target)))
+  }
+  /// What v's place is, as a number: equal numbers are the same storage.
+  fn key(self: &Self, v: u32) -> u32 {
+    let kind = self.places.kind(v)
+    if kind == GPR { return 1000000 + u8.toU32(self.places.register(v)) }
+    if kind == XMM { return 2000000 + u8.toU32(self.places.register(v)) }
+    return v
+  }
+  fn readByPending(self: &Self, from: &List<u32>, done: &List<bool>, except: usize, key: u32, parked: u32) -> bool {
+    let mut n: usize = 0
+    while n < from.length() {
+      // A parked source is read from the scratch place, not its own.
+      if n != except && !done.get(n) && from.get(n) != parked && self.key(from.get(n)) == key { return true }
+      n = n + 1
+    }
+    return false
+  }
+  /// Copies v's place to the scratch place (rax, xmm0 or the scratch slot).
+  effect fn park(self: &mut Self, function: &Function, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let ty = function.value(v).ty
+    if ty == Type.F64 { let place10 = self.at(v) run getF64(&mut self.a, Xmm.Xmm0, place10) return () }
+    if ty == Type.I32 || ty == Type.Bool { let place11 = self.at(v) run getI32(&mut self.a, Reg.R11, place11) return () }
+    run self.a.load(Width.W64, Reg.Rax, slotOf(v))
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch), Reg.Rax)
+    run self.a.load(Width.W64, Reg.Rax, payloadOf(v))
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch + 8), Reg.Rax)
+  }
+  /// Copies value from's place (or the scratch place, when parked) into value into's.
+  effect fn moveValue(self: &mut Self, function: &Function, from: u32, into: u32, parked: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let ty = function.value(into).ty
+    let target = self.at(into)
+    if ty == Type.F64 {
+      if parked { run putF64(&mut self.a, target, Xmm.Xmm0) return () }
+      let source = self.at(from)
+      if target.kind == XMM { run getF64(&mut self.a, target.xmm, source) return () }
+      if source.kind == XMM { run putF64(&mut self.a, target, source.xmm) return () }
+      run self.a.load(Width.W64, Reg.Rax, source.mem)
+      run self.a.store(Width.W64, target.mem, Reg.Rax)
+      return ()
+    }
+    if ty == Type.I32 || ty == Type.Bool {
+      if parked { run putI32(&mut self.a, target, Reg.R11) return () }
+      let source = self.at(from)
+      if target.kind == GPR { run getI32(&mut self.a, target.gpr, source) return () }
+      if source.kind == GPR { run putI32(&mut self.a, target, source.gpr) return () }
+      run self.a.load(Width.W64, Reg.Rax, source.mem)
+      run self.a.store(Width.W64, target.mem, Reg.Rax)
+      return ()
+    }
+    let mut tagAt = slotOf(from)
+    let mut payloadAt = payloadOf(from)
+    if parked { tagAt = Mem.at(Reg.Rsp, self.scratch) payloadAt = Mem.at(Reg.Rsp, self.scratch + 8) }
+    run self.a.load(Width.W64, Reg.Rax, tagAt)
+    run self.a.store(Width.W64, slotOf(into), Reg.Rax)
+    run self.a.load(Width.W64, Reg.Rax, payloadAt)
+    run self.a.store(Width.W64, payloadOf(into), Reg.Rax)
   }
   /// Exits unless value v's tag field is tag.
   effect fn tagGuard(self: &mut Self, v: u32, tag: u32, exit: u32) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -428,14 +545,28 @@ impl Emitter {
     run self.a.store(Width.W64, word(base, offset), Reg.R8)
     run self.a.store(Width.W64, word(base, offset + 8), payload)
   }
+  /// Writes the double whose bits are in bits as a Float64 ValueBits at base + offset. An
+  /// integral double stays a Float64, as the interpreter's own arithmetic leaves it
+  /// (docs/jit/doubles.md). Clobbers R8.
+  effect fn boxDoubleInto(self: &mut Self, bits: Reg, base: Reg, offset: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    run self.a.movImm64(Reg.R8, layout.tagWord(layout.float64()))
+    run self.a.store(Width.W64, word(base, offset), Reg.R8)
+    run self.a.store(Width.W64, word(base, offset + 8), bits)
+  }
   /// Writes value v as a ValueBits at base + offset for the engine to take over, as an exit
   /// slot of mode writes it: an i32 or bool boxed, an `imm` as it is, an owned value or a
   /// borrow (`move`, `dup`) with one count added. Clobbers RAX, R8, R9, R10.
   effect fn valueInto(self: &mut Self, function: &Function, v: u32, mode: SlotMode, base: Reg, offset: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let info = function.value(v)
     if info.ty == Type.I32 || info.ty == Type.Bool {
-      run self.a.load(Width.W32, Reg.Rax, slotOf(v))
+      let place12 = self.at(v) run getI32(&mut self.a, Reg.Rax, place12)
       run self.boxInto(info.ty == Type.Bool, Reg.Rax, base, offset)
+      return ()
+    }
+    if info.ty == Type.F64 {
+      let place13 = self.at(v) run getBits(&mut self.a, Reg.Rax, place13)
+      run self.boxDoubleInto(Reg.Rax, base, offset)
       return ()
     }
     run self.a.load(Width.W64, Reg.Rax, slotOf(v))
@@ -554,9 +685,15 @@ impl Emitter {
   }
   /// Restores the stack and returns code.
   effect fn leave(self: &mut Self, code: u32) -> () ! OutOfMemoryError ? &mut Allocator {
-    if self.frame != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, self.frame) }
+    run self.unwind()
     run self.a.movImm32(Reg.Rax, code)
     run self.a.ret()
+  }
+  /// Frees the frame and pops the saved registers (the prologue in reverse). Keeps RAX.
+  effect fn unwind(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.frame != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, self.frame) }
+    let mut r = gprCount()
+    while r > 0 { r = r - 1 if self.saves(r) { run self.a.pop(gprAt(r)) } }
   }
   effect fn exitStub(self: &mut Self, function: &Function, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let exit = function.exit(index)
@@ -578,7 +715,7 @@ impl Emitter {
     let owner = exitOwner(&function, index)
     if owner.op == Op.Call {
       run self.a.load(Width.W32, Reg.Rax, slotOf(owner.result))
-      if self.frame != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, self.frame) }
+      run self.unwind()
       run self.a.ret()
       return ()
     }
