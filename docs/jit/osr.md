@@ -16,9 +16,12 @@ Everything happens at the interrupt poll on a backward jump, which the plain dis
 already takes at most every `JS_INTERRUPT_COUNTER_INIT` (10000) back edges and calls. The
 poll branch of each back-edge arm (ten arms in `js_vm.silk`: `if_false`, `if_true` and their
 8-bit forms, `goto`, `goto8`, `goto16`, `if_nullish8`, `if_not_nullish8`, the fused loop
-prefix) calls `js_compiled_osr.atPoll` after `interrupts.handle`, with the frame written
-back. Nothing is added outside that branch, so the interpreter-only fast path is unchanged.
-The observed loop never calls it (`!observe` is a constant there).
+prefix) is one call to `backEdgePoll` (`js_vm.silk`, out of line), which runs
+`interrupts.handle`, reports a hand-off to the observed loop, and otherwise calls
+`js_compiled_osr.atPoll` with the frame written back. The observed loop never reaches
+`atPoll`. Measured: adding the `atPoll` call inside each arm cost richards +0.35 percent
+instructions, all of it in the dispatch loop's own code (register pressure), none on the poll
+path; with the whole slow path behind one out-of-line call the eight benchmarks are 1.000x.
 
 `atPoll` looks at the running frame, base or inline (`current` in `executeLoop`):
 
