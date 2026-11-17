@@ -1,0 +1,121 @@
+//! What an embedder's compiler asks the engine in order to inline a call (docs/jit/inlining.md):
+//! which function a call site would call right now, read from state the interpreter already
+//! keeps, and a place to keep such a function alive while code that names it exists. Nothing
+//! here runs JavaScript or fails; a null answer means "do not inline".
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import silk.core.option { Option }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FunctionKind, FIELD_PROTO_KEY, fieldCacheIndex }
+import js_gc { HeapHooks }
+import js_gc as gc
+
+/// The FunctionBytecode cell of the bytecode closure that the get_field2 at offset pc of
+/// bytecode last read from a prototype (its site cache entry, still current), or null: the
+/// method a call_method after it would call. A snapshot, to be guarded where it is used.
+pub unsafe fn methodTarget(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32) -> ?*mut HeapHeader {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let site = Pointer.address<u8>(unsafe code.code.start()) + u32.toUsize(pc) + 1
+  let realm = code.realm
+  drop code
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.fieldCache[fieldCacheIndex(site)]
+  if entry.site != site { return Pointer.null<HeapHeader>() }
+  if u64.bitAnd(entry.key, FIELD_PROTO_KEY) == 0 { return Pointer.null<HeapHeader>() }
+  if entry.epoch != state.shapeEpoch { return Pointer.null<HeapHeader>() }
+  let holder = match Pointer.nonNullMut<HeapHeader>(entry.holder) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() } }
+  let index = entry.holderIndex
+  drop state
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+  let found = (unsafe object.slotUnchecked(index)).valueBits()
+  drop object
+  let target = match Pointer.nonNullMut<HeapHeader>(unsafe closureBytecode(found)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() } }
+  // An inlined body runs for the caller's realm.
+  if Pointer.address<HeapHeader>((unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, target)).realm) != Pointer.address<HeapHeader>(realm) { return Pointer.null<HeapHeader>() }
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(target)
+}
+/// Whether target, a FunctionBytecode cell a call of caller's was recorded calling
+/// (js_feedback), is one a compiler may inline there: a plain function of caller's realm.
+pub unsafe fn plainTarget(target: *mut HeapHeader, caller: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, target)
+  if code.kind != FunctionKind.Normal { return false }
+  return Pointer.address<HeapHeader>(code.realm) == Pointer.address<HeapHeader>((unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, caller)).realm)
+}
+/// Why methodTarget finds none for the `get_field2` at pc (for a compiler's dump): 0 it finds
+/// one, 1 the cache entry is another site's, 2 it is not a prototype hit, 3 its epoch is
+/// stale, 4 no holder, 5 the slot holds no plain bytecode closure, 6 another realm's.
+pub unsafe fn methodMiss(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32) -> u32 {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let site = Pointer.address<u8>(unsafe code.code.start()) + u32.toUsize(pc) + 1
+  let realm = code.realm
+  drop code
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.fieldCache[fieldCacheIndex(site)]
+  if entry.site != site { return 1 }
+  if u64.bitAnd(entry.key, FIELD_PROTO_KEY) == 0 { return 2 }
+  if entry.epoch != state.shapeEpoch { return 3 }
+  let holder = match Pointer.nonNullMut<HeapHeader>(entry.holder) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return 4 } }
+  let index = entry.holderIndex
+  drop state
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+  let found = (unsafe object.slotUnchecked(index)).valueBits()
+  drop object
+  let target = match Pointer.nonNullMut<HeapHeader>(unsafe closureBytecode(found)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return 5 } }
+  if Pointer.address<HeapHeader>((unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, target)).realm) != Pointer.address<HeapHeader>(realm) { return 6 }
+  return 0
+}
+/// The FunctionBytecode cell of value when it is a bytecode closure of a plain function, or null.
+pub unsafe fn closureBytecode(value: ValueBits) -> ?*mut HeapHeader {
+  let reference = match value { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return Pointer.null<HeapHeader>() } }
+  drop data
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if code.kind != FunctionKind.Normal { return Pointer.null<HeapHeader>() }
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(bytecode)
+}
+/// The first byte of bytecode's code: what CompiledFrame.code holds for it.
+pub unsafe fn codeStart(bytecode: *mut HeapHeader) -> *const u8 {
+  let anchor = ()
+  return unsafe (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)).code.start()
+}
+/// Lends the runtime capacity cells where keep stores what compiled code names by address
+/// (inline targets); destroyRuntime releases them. Null and 0 take the storage back.
+pub unsafe fn setKept(runtime: *mut HeapHeader, storage: ?*mut ValueBits, capacity: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.compiled.kept = storage state.compiled.keptCapacity = capacity state.compiled.keptCount = 0
+}
+/// Retains bytecode, a FunctionBytecode cell, until the runtime is destroyed, so its address
+/// keeps naming it. False, with nothing kept, when the storage is full.
+pub unsafe fn keep(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> bool {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let count = state.compiled.keptCount
+  if count >= state.compiled.keptCapacity { return false }
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.compiled.kept))
+  state.compiled.keptCount = count + 1
+  drop state
+  unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, count), unsafe (ValueBits.FunctionBytecode { reference: bytecode }).retained())
+  return true
+}
+/// Releases every kept value (destroyRuntime).
+pub unsafe fn releaseKept<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let count = state.compiled.keptCount
+  let storage = state.compiled.kept
+  state.compiled.keptCount = 0
+  drop state
+  if count == 0 { return () }
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(storage))
+  let mut index: usize = 0
+  while index < count { unsafe gc.release(&mut hooks, runtime, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, index))) index = index + 1 }
+}

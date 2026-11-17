@@ -170,6 +170,25 @@ unsafe effect fn exercise<'m>(engine: &mut Engine<'m, Compiling>, context: *mut 
   run Testing.expect(isInt(hop, 81336), "an OSR-only function returns the interpreter's answers through every call path")
   run Testing.expect(engine.services.jit.osrOnly == onlyBefore + 1 && engine.services.jit.osrRuns >= runsBefore + 4,
     "it is linked once, and loops reached by spread and apply calls enter its OSR code")
+  // Each loop gets OSR code when a poll lands at its header, and the code covers that loop
+  // only: leaving it is the loop finishing, not a deopt.
+  let compiledBefore = engine.services.jit.osrCompiled
+  let deoptsTwo = engine.services.jit.osrDeopts
+  let two = run unsafe evaluate(&mut engine, context,
+    b"function two(n){let o={k:1};let s=o.k;for(let i=0;i<n;i++){s=s+1}for(let j=0;j<n;j++){s=s+2}return s+o.k};two(100000)")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(two, 300002), "two loops entered by on-stack replacement return the interpreter's answer")
+  run Testing.expect(engine.services.jit.osrCompiled == compiledBefore + 2 && engine.services.jit.osrDeopts == deoptsTwo,
+    "each loop header compiles once, on its first poll, and finishing a loop is no deopt")
+  // A linked function's OSR code that keeps deopting (its add overflows) is entered again only
+  // after 1, 3, 7, ... polls, and never after ENTRY_DEOPTS deopts.
+  drop run unsafe evaluate(&mut engine, context, b"function big(n){let s=0;for(let i=0;i<n;i++)s=s+100000;return s};for(var k=0;k<30;k++)big(1)")
+  let deoptsBig = engine.services.jit.osrDeopts
+  let big = run unsafe evaluate(&mut engine, context, b"big(600000)")
+  engine.services.jit.collect()
+  run Testing.expect(isNumber(big, 60000000000.0), "a backed-off OSR loop returns the interpreter's answer")
+  run Testing.expect(engine.services.jit.osrDeopts > deoptsBig && engine.services.jit.osrDeopts <= deoptsBig + 6,
+    "a deopting OSR entry backs off and stops being entered")
   run Testing.expect(engine.services.failures == 0, "no compile failed")
 }
 test effect fn hotFunctionsRunCompiledCodeAndDeopt() -> ()
@@ -295,7 +314,8 @@ unsafe effect fn aotExercise<'m>(engine: &mut Engine<'m, Compiling>, context: *m
     Option<Code>.None => { return Intrinsic.trap("no code") }
   }
   run Testing.expect(code.relocations.length() == 0, "the compiled artefact refers to no external address")
-  let installed = run unsafe jitRuntime.install(&mut engine.services.jit, header, &mut code, 0)
+  let noSites = List<u32>.make()
+  let installed = run unsafe jitRuntime.install(&mut engine.services.jit, header, &mut code, 0, &noSites, 0)
   run Testing.expect(installed, "installed")
   let ten = run unsafe evaluate(&mut engine, context, case.calls[0])
   let hundred = run unsafe evaluate(&mut engine, context, case.calls[1])
@@ -413,15 +433,38 @@ unsafe effect fn exerciseObjects<'m>(engine: &mut Engine<'m, Compiling>, context
   let truthy = run unsafe evaluate(&mut engine, context, b"function cnt(a,n){let c=0;for(let i=0;i<n;i++){if(a[i])c++}return c}var M=[0,1,{},'',null,'x',2.5,undefined,NaN,-0];var c=0;for(var k=0;k<100;k++)c=c+cnt(M,10);c")
   run Testing.expect(isInt(truthy, 400), "if on numbers, strings, objects, null and undefined")
   // Nullish, undefined and typeof tests, as conditions and as values (checksum from node).
+  engine.services.jit.collect()
   let deoptsTests = engine.services.jit.deopts
   let tested = run unsafe evaluate(&mut engine, context, b"function tt(a,n){let c=0;for(let i=0;i<n;i++){const x=a[i];if(x==null)c+=1;if(x===undefined)c+=2;if(x===null)c+=4;if(typeof x==='undefined')c+=8;if(typeof x==='function')c+=16;if(typeof x==='string')c+=32;if(typeof x==='object')c+=256;const y=x??7;if(y===7)c+=64;if(x!=null)c+=128}return c}var T=[0,1,{},'',null,'x',2.5,undefined,function(){},Math.max,true,[1]];var s=0;for(var k=0;k<100;k++)s=s+tt(T,12);s")
   run Testing.expect(isInt(tested, 228800), "nullish, undefined and typeof tests on values of every type")
   let numbers = run unsafe evaluate(&mut engine, context, b"function tn(n){let c=0;for(let i=0;i<n;i++){if(i==null)c+=1;if(typeof i==='number')c+=2;if(typeof (i<3)==='boolean')c+=4}return c}var u=0;for(var k=0;k<100;k++)u=u+tn(5);u")
   run Testing.expect(isInt(numbers, 3000), "tests on unboxed numbers and booleans fold")
-  run Testing.expect(engine.services.jit.deopts == deoptsTests, "the tests never deopt")
+  // Only `y === 7` on a boxed y deopts (strict_eq_imm8 unboxes), once, before it widens.
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts <= deoptsTests + 20, "the tests deopt at most at the strict_eq site")
   // Compound assignments and chained stores: the stack shuffles (checksum from node).
   let shuffled = run unsafe evaluate(&mut engine, context, b"function sh(o,a,n){let s=0;for(let i=0;i<n;i++){o.x+=i;s+=o.y++;s+=a[i&3]++;let p,q;p=q=i;s+=p+q;o.z=o.w=i;s+=o.z;s+=(o.x-=1);a[0]*=1;s+=a[1]--}return s+o.x+o.y+a[0]+a[1]+a[2]+a[3]}var t=0;for(var k=0;k<100;k++)t=(t+sh({x:1,y:2,w:0,z:0},[1,2,3,4],6))|0;t")
   run Testing.expect(isInt(shuffled, 13200), "compound assignments, postfix updates and chained stores")
+  // instanceof on classes, subclasses, plain and native constructors (checksum from node).
+  engine.services.jit.collect()
+  let deoptsInstance = engine.services.jit.deopts
+  let compiledInstance = engine.services.jit.compiledFunctions
+  let instances = run unsafe evaluate(&mut engine, context, b"class CA{} class CB extends CA{} function CF(){} function io(a,n){let c=0;for(let i=0;i<n;i++){const x=a[i];if(x instanceof CA)c+=1;if(x instanceof CB)c+=2;if(x instanceof CF)c+=4;if(x instanceof Object)c+=8;if(x instanceof Array)c+=16;c+=(x instanceof Function)?32:0}return c}var IV=[new CA,new CB,new CF,{},[1],1,'s',null,undefined,function(){},Object.create(null),2.5];var s=0;for(var k=0;k<100;k++)s=s+io(IV,12);s")
+  run Testing.expect(isInt(instances, 10400), "instanceof on classes, subclasses and primitives")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts == deoptsInstance, "instanceof on ordinary constructors never deopts")
+  run Testing.expect(engine.services.jit.compiledFunctions > compiledInstance, "a function with instanceof compiles")
+  // A bound function and a custom Symbol.hasInstance decline to the full operator.
+  let declined = run unsafe evaluate(&mut engine, context, b"var CBA=CA.bind(null);class CH{static [Symbol.hasInstance](v){return v===1}}function iox(a,n,C){let c=0;for(let i=0;i<n;i++){if(a[i] instanceof C)c++}return c}var q=0;for(var k=0;k<100;k++)q=q+iox(IV,12,CA);q")
+  run Testing.expect(isInt(declined, 200), "instanceof in a loop")
+  let compiledDeclined = engine.services.jit.compiledFunctions
+  engine.services.jit.collect()
+  let deoptsDeclined = engine.services.jit.deopts
+  run Testing.expect(compiledDeclined > compiledInstance, "iox compiles")
+  let bound = run unsafe evaluate(&mut engine, context, b"iox(IV,12,CBA)*1000+iox(IV,12,CH)*100000")
+  run Testing.expect(isInt(bound, 102000), "instanceof through a bound function and @@hasInstance")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.deopts > deoptsDeclined, "a declined instanceof deopts")
   let plain = run unsafe evaluate(&mut engine, context, b"var O={};fill(O,2);O[1]")
   run Testing.expect(isInt(plain, 2), "a store into a plain object deopts")
   let strings = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<100;k++)t=t+lens('abc',10);t")
@@ -490,7 +533,9 @@ unsafe effect fn exerciseCalls<'m>(engine: &mut Engine<'m, Compiling>, context: 
   // calls from compiled each and is reported at a later interrupt poll.
   let hot = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<3000;k++)t=t+each(inc,10);t")
   run Testing.expect(isInt(hot, 165000), "calls from a compiled loop return what the interpreter's do")
-  run Testing.expect(engine.services.jit.compiledFunctions == 2, "each compiles, and inc, hot only through compiled calls, too")
+  // The script's own loop compiles too when a poll lands on its back edge rather than in each.
+  let compiledHot = engine.services.jit.compiledFunctions
+  run Testing.expect(compiledHot == 2 || compiledHot == 3, "each compiles, and inc, hot only through compiled calls, too")
   engine.services.jit.collect()
   run Testing.expect(engine.services.jit.runs >= 100 && engine.services.jit.deopts == 0, "and they run compiled without a deopt")
   run Testing.expect(engine.services.jit.env.get(0).directCalls >= 100, "compiled each calls compiled inc directly")
@@ -613,6 +658,22 @@ unsafe effect fn exerciseCalls<'m>(engine: &mut Engine<'m, Compiling>, context: 
   engine.services.jit.collect()
   run Testing.expect(isInt(stays, 22000) && engine.services.jit.unlinked == unlinkedLater && engine.services.jit.deopts == deoptsLater
     && engine.services.jit.runs >= runsLater + 400, "and then calls it from compiled code and stays linked")
+  // Small prototype methods inlined behind a callee check (docs/jit/inlining.md): a read, a
+  // nested call, and a body that ends in a store.
+  let inlinedBefore = engine.services.jit.inlinedSites
+  let inlined = run unsafe evaluate(&mut engine, context,
+    b"function V(x,y){this.x=x;this.y=y;this.n=0}V.prototype.getx=function(){return this.x};V.prototype.sum=function(k){return this.getx()+this.y+k};V.prototype.setn=function(v){this.n=v};function walk(o,n){let s=0;for(let i=0;i<n;i++){o.setn(i);s=s+o.sum(i)+o.n}return s}var vv=new V(3,4);var iw=0;for(var k=0;k<300;k++)iw=iw+walk(vv,10);iw")
+  run Testing.expect(isInt(inlined, 300 * (70 + 45 + 45)), "inlined methods return what the interpreter's do")
+  run Testing.expect(engine.services.jit.inlinedSites > inlinedBefore, "and walk's call sites were inlined")
+  // A guard inside an inlined body leaves at the caller's call: a string where the body saw
+  // ints, then a receiver the body cannot read, which throws the interpreter's TypeError.
+  let bodyDeopt = run unsafe evaluate(&mut engine, context, b"var vs=new V('a','b');walk(vs,2)==='0ab00ab11'?1:0")
+  run Testing.expect(isInt(bodyDeopt, 1), "a deopt inside an inlined body finishes in the interpreter with the same answer")
+  let bodyThrow = run unsafe evaluate(&mut engine, context, b"var vt=new V(1,2);vt.getx=function(){return this.missing.x};var bt=0;try{walk(vt,3)}catch(e){bt=e instanceof TypeError&&vt.n===0?1:2}bt")
+  run Testing.expect(isInt(bodyThrow, 1), "a throwing callee where one was inlined")
+  // The target changes after the code was compiled: the callee check fails and the call is made.
+  let retargeted = run unsafe evaluate(&mut engine, context, b"var before=walk(vv,10);V.prototype.getx=function(){return 100};var after=walk(vv,10);V.prototype.sum=function(k){return k};before===160&&after===1130&&walk(vv,10)===90?1:0")
+  run Testing.expect(isInt(retargeted, 1), "a replaced method is called, not the inlined one")
   run Testing.expect(engine.services.failures == 0, "no compile failed")
 }
 test effect fn callsFromCompiledCode() -> ()
@@ -623,7 +684,8 @@ test effect fn callsFromCompiledCode() -> ()
   let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
   let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut options = Options.make()
-  options.enabled = true options.threshold = 20 options.calls = true
+  // The script counts on when each function compiles: no recording before the first compilation.
+  options.enabled = true options.threshold = 20 options.calls = true options.profile = 0
   let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
   let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
   unsafe jitRuntime.attach(&mut engine.services.jit, rt)

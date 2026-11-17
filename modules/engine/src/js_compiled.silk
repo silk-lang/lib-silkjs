@@ -14,6 +14,9 @@ import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_core_types { FunctionBytecode, ContextState, RuntimeState, CompiledEntry }
 import js_vm_state { Machine }
+import js_core_types { ObjectData, ObjectPayload }
+import js_class_data as classes
+import js_opcode_data as op
 
 /// What compiled code returned (its u32 result).
 pub const EXIT_RETURNED: u32 = 0
@@ -91,7 +94,7 @@ pub const DIRECT_RUNTIME_OBSERVE: i32 = 3048
 pub const DIRECT_RUNTIME_ENTRIES: i32 = 3552
 pub const DIRECT_RUNTIME_COUNT: i32 = 3560
 /// A CompiledEntry's size and the fields a direct call reads.
-pub const DIRECT_ENTRY_BYTES: u32 = 152
+pub const DIRECT_ENTRY_BYTES: u32 = 160
 pub const DIRECT_ENTRY_CODE: i32 = 0
 pub const DIRECT_ENTRY_DATA: i32 = 8
 pub const DIRECT_ENTRY_ENV: i32 = 16
@@ -316,7 +319,7 @@ pub unsafe fn restore(machine: &mut Machine, index: u32, exit: u32, state: *mut 
   if exit == EXIT_POLL { after.polls = after.polls + 1 }
   else if exit == EXIT_DEOPT {
     after.deopts = after.deopts + 1
-    recordDeoptPc(&mut after, pc)
+    recordDeopt(&mut after, pc, unsafe deoptKind(&machine.*, pc, depth))
     unlink = after.deoptLimit != 0 && after.deopts >= u32.toU64(after.deoptLimit)
     frameCells = after.frameCells
     leaf = after.leaf
@@ -336,12 +339,98 @@ pub unsafe fn linkedFrameCells(runtime: *mut HeapHeader, index: u32) -> u32 {
   let entrySlot = unsafe entryAt(runtime, index)
   let anchor = () return (unsafe Pointer.borrow<(), CompiledEntry>(&anchor, unsafe Intrinsic.pointerRequalify<*mut CompiledEntry, *const CompiledEntry>(entrySlot))).frameCells
 }
-/// Notes pc among entry's first distinct deopt offsets.
-pub fn recordDeoptPc(entry: &mut CompiledEntry, pc: usize) -> () {
+/// Notes pc among entry's first distinct deopt offsets, with operands of unknown kind.
+pub fn recordDeoptPc(entry: &mut CompiledEntry, pc: usize) -> () { recordDeopt(&mut entry, pc, KIND_NONE) }
+/// Notes pc and the operand kinds there (deoptKind) among entry's first distinct deopt offsets;
+/// a pc keeps the kinds of its first deopt.
+pub fn recordDeopt(entry: &mut CompiledEntry, pc: usize, kinds: u8) -> () {
   let offset = usize.toU32(pc)
   let mut index: usize = 0
   while index < u8.toUsize(entry.deoptPcCount) { if entry.deoptPcs[index] == offset { return () } index = index + 1 }
-  if entry.deoptPcCount < 4 { entry.deoptPcs[u8.toUsize(entry.deoptPcCount)] = offset entry.deoptPcCount = entry.deoptPcCount + 1 }
+  if entry.deoptPcCount < 4 {
+    entry.deoptPcs[u8.toUsize(entry.deoptPcCount)] = offset
+    entry.deoptKinds[u8.toUsize(entry.deoptPcCount)] = kinds
+    entry.deoptPcCount = entry.deoptPcCount + 1
+  }
+}
+/// Operand kinds (CompiledEntry.deoptKinds), one nibble each.
+pub const KIND_NONE: u8 = 0
+pub const KIND_INT: u8 = 1
+pub const KIND_FLOAT64: u8 = 2
+pub const KIND_BOOL: u8 = 3
+pub const KIND_UNDEFINED: u8 = 4
+pub const KIND_NULL: u8 = 5
+pub const KIND_STRING: u8 = 6
+/// A symbol or a BigInt.
+pub const KIND_SYMBOL: u8 = 7
+/// A known local function (its value is its FunctionBytecode, js_compiler_known) without
+/// linked code; with linked code it is KIND_LINKED_FUNCTION.
+pub const KIND_LOCAL_FUNCTION: u8 = 8
+pub const KIND_OBJECT: u8 = 9
+pub const KIND_ARRAY: u8 = 10
+/// A bytecode function (a closure or a known local one) whose bytecode has compiled code
+/// linked, and a closure without.
+pub const KIND_LINKED_FUNCTION: u8 = 11
+pub const KIND_BYTECODE_FUNCTION: u8 = 12
+pub const KIND_NATIVE_FUNCTION: u8 = 13
+pub const KIND_BOUND_FUNCTION: u8 = 14
+/// A proxy or any other exotic or callable class.
+pub const KIND_OTHER: u8 = 15
+pub unsafe fn operandKind(value: ValueBits) -> u8 {
+  if value.isString() { return KIND_STRING }
+  if value.isBigInt() { return KIND_SYMBOL }
+  match value {
+    ValueBits.Int { .. } => { return KIND_INT }
+    ValueBits.Float64 { .. } => { return KIND_FLOAT64 }
+    ValueBits.Bool { .. } => { return KIND_BOOL }
+    ValueBits.Undefined => { return KIND_UNDEFINED }
+    ValueBits.Null => { return KIND_NULL }
+    ValueBits.Symbol { .. } => { return KIND_SYMBOL }
+    ValueBits.FunctionBytecode { reference } => {
+      let anchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      if function.compiled != 0 { return KIND_LINKED_FUNCTION }
+      return KIND_LOCAL_FUNCTION
+    }
+    ValueBits.Object { reference } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      let classId = object.classId()
+      if classId == classes.JS_CLASS_BYTECODE_FUNCTION {
+        let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return KIND_OTHER } }
+        drop object
+        let codeAnchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, bytecode)
+        if function.compiled != 0 { return KIND_LINKED_FUNCTION }
+        return KIND_BYTECODE_FUNCTION
+      }
+      if classId == classes.JS_CLASS_C_FUNCTION { return KIND_NATIVE_FUNCTION }
+      if classId == classes.JS_CLASS_BOUND_FUNCTION { return KIND_BOUND_FUNCTION }
+      if classId == classes.JS_CLASS_ARRAY { return KIND_ARRAY }
+      if object.isExotic() || classId == classes.JS_CLASS_PROXY { return KIND_OTHER }
+      return KIND_OBJECT
+    }
+    _ => { return KIND_OTHER }
+  }
+}
+/// The kinds of the operands the instruction at pc meets on machine's restored stack of depth
+/// values: for a call its callee and (call_method) receiver, otherwise the top two.
+pub unsafe fn deoptKind(machine: &Machine, pc: usize, depth: usize) -> u8 {
+  let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  let code = unsafe bytecode.code.asSlice()
+  if pc >= code.length { return KIND_NONE }
+  let opcode = code[pc]
+  let mut first: usize = 1
+  let mut second: usize = 2
+  if opcode >= op.OP_call0 && opcode <= op.OP_call3 { first = u8.toUsize(opcode - op.OP_call0) + 1 second = 0 }
+  else if (opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor) && pc + 2 < code.length {
+    let argc = u8.toUsize(code[pc + 1]) + u8.toUsize(code[pc + 2]) * 256
+    first = argc + 1 second = 0
+    if opcode == op.OP_call_method { second = argc + 2 }
+    if opcode == op.OP_call_constructor { first = argc + 2 }
+  }
+  drop bytecode
+  let mut kinds: u8 = 0
+  if first <= depth { kinds = unsafe operandKind(unsafe machine.top(first)) }
+  if second != 0 && second <= depth { kinds = kinds | (unsafe operandKind(unsafe machine.top(second))) * 16 }
+  return kinds
 }
 /// An unlinked function counts its entries again from the runtime's hot budget, so the
 /// embedder hears of it again and can compile it anew from what deoptimized.
