@@ -21,9 +21,9 @@ import silk.num.usize
 pub const NONE: u32 = 4294967295
 
 /// The type of a value.
-pub enum Type { I32, Bool, Value }
+pub enum Type { I32, Bool, Value, F64 }
 
-/// The ownership of a value. `Unboxed` is the only one an `i32` or `bool` has; a `value` is
+/// The ownership of a value. `Unboxed` is the only one an `i32`, `bool` or `f64` has; a `value` is
 /// `Owned` (one count, consumed exactly once on every path), `Borrowed` (no count, valid while
 /// its root is) or `Imm` (no heap reference, needs no count).
 pub enum Own { Unboxed, Owned, Borrowed, Imm }
@@ -68,6 +68,51 @@ pub enum Op {
   Branch,
   /// Terminator: `return a`, transferring `a` to the caller.
   Return,
+  // ---- numbers beyond int32 and the remaining int32 operators (docs/jit/doubles.md) ----
+  /// `const.f64 k`: the double `Function.numbers[k]`.
+  ConstF64,
+  /// `unbox.f64 a`: guard, exits unless `a` is a number (an Int converts exactly).
+  UnboxF64,
+  /// `box.f64 a`: a Float64.
+  BoxF64,
+  /// `f64 a`: the i32 `a` as a double (exact).
+  ToF64,
+  /// `add.f64`, `sub.f64`, `mul.f64`, `div.f64 a, b`: IEEE, no guard.
+  AddF64,
+  SubF64,
+  MulF64,
+  DivF64,
+  /// `cmp.f64 a, b` with the `Cmp` in `k`: a bool; every comparison with NaN is false but `ne`.
+  CmpF64,
+  /// `neg.f64 a`, `sqrt.f64 a`, `abs.f64 a`.
+  NegF64,
+  SqrtF64,
+  AbsF64,
+  /// `floor.f64 a`: Math.floor, no guard (NaN, infinities and -0 stay themselves).
+  FloorF64,
+  /// `toint32 a`: ToInt32 of the double `a`; guard, exits when the truncation leaves the
+  /// int64 range (NaN, infinities, huge values), which the interpreter answers instead.
+  ToInt32,
+  /// `int.f64 a`: the double `a` as an i32 when it is one exactly (not -0); guard otherwise.
+  ExactI32,
+  /// int32 bitwise operators, never failing: `and`, `or`, `xor`, `shl`, `sar` (count & 31).
+  BitAnd,
+  BitOr,
+  BitXor,
+  Shl,
+  Sar,
+  /// `shr a, b` (>>>): guard, exits when the unsigned result is not an int32.
+  Shr,
+  /// `mod.i32 a, b`: guard, exits unless b > 0 and the result is not -0.
+  Mod,
+  /// `neg.i32 a`: guard, exits on 0 (-0) and the minimum (overflow).
+  Neg,
+  /// `not.i32 a` (~a).
+  BitNot,
+  /// `not.bool a` (!a).
+  NotBool,
+  /// `imul.i32 a, b`: Math.imul, the low 32 bits of the product; never fails.
+  Imul,
   /// Deleted by a pass; `compact` drops it.
   Removed,
 }
@@ -79,7 +124,7 @@ pub enum Cmp { Lt, Le, Gt, Ge, Eq, Ne }
 pub enum Imm { Undefined, Null, False, True, Uninitialized }
 
 /// How a deoptimization exit writes a slot. See docs/jit/ssa.md.
-pub enum SlotMode { Int, Bool, Imm, Move, Dup }
+pub enum SlotMode { Int, Bool, Imm, Move, Dup, F64 }
 
 pub struct ValueInfo {
   pub ty: Type,
@@ -146,6 +191,8 @@ pub struct Function {
   pub edgeArgs: List<u32>,
   pub exits: List<Exit>,
   pub slots: List<Slot>,
+  /// The bits of the doubles `const.f64` names, by index.
+  pub numbers: List<u64>,
   nextOrder: u32,
 }
 
@@ -169,7 +216,7 @@ impl Function {
     return Function { argumentCount: argumentCount, localCount: localCount, blocks: List<Block>.make(),
       params: List<u32>.make(), insts: List<Inst>.make(), values: List<ValueInfo>.make(),
       edges: List<Edge>.make(), edgeArgs: List<u32>.make(), exits: List<Exit>.make(),
-      slots: List<Slot>.make(), nextOrder: 0 }
+      slots: List<Slot>.make(), numbers: List<u64>.make(), nextOrder: 0 }
   }
 
   pub fn valueCount(self: &Self) -> u32 { return usize.toU32(self.values.length()) }
@@ -422,7 +469,7 @@ impl Function {
     i = 0
     while i < newInsts.length() {
       let mut inst = newInsts.get(i)
-      if inst.a != NONE && inst.op != Op.Arg && inst.op != Op.ConstI32 && inst.op != Op.Imm { inst.a = renumber.get(u32.toUsize(inst.a)) }
+      if inst.a != NONE && inst.op != Op.Arg && inst.op != Op.ConstI32 && inst.op != Op.Imm && inst.op != Op.ConstF64 { inst.a = renumber.get(u32.toUsize(inst.a)) }
       if inst.b != NONE { inst.b = renumber.get(u32.toUsize(inst.b)) }
       if inst.edge != NONE {
         let first = usize.toU32(newEdges.length())
@@ -519,6 +566,7 @@ impl Function {
     let info = self.value(v)
     if info.ty == Type.I32 { run text(&mut out, b"i32") return () }
     if info.ty == Type.Bool { run text(&mut out, b"bool") return () }
+    if info.ty == Type.F64 { run text(&mut out, b"f64") return () }
     run text(&mut out, b"value ")
     if info.own == Own.Owned { run text(&mut out, b"owned") }
     else if info.own == Own.Imm { run text(&mut out, b"imm") }
@@ -556,6 +604,13 @@ impl Function {
       else if op == Op.Mul { run text(&mut out, b"mul.i32 ") }
       else { run text(&mut out, cmpName(inst.k)) run text(&mut out, b".i32 ") }
       run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b)
+    }
+    else if op == Op.ConstF64 { run text(&mut out, b"const.f64 #") run number(&mut out, i32.wrappingToU32(inst.k)) }
+    else if isNumberOp(op) {
+      run text(&mut out, numberOpName(op))
+      if op == Op.CmpF64 { run text(&mut out, cmpName(inst.k)) run text(&mut out, b".f64") }
+      run text(&mut out, b" ") run operand(&mut out, inst.a)
+      if numberOpReadsB(op) { run text(&mut out, b", ") run operand(&mut out, inst.b) }
     }
     else if op == Op.Retain { run text(&mut out, b"retain ") run operand(&mut out, inst.a) }
     else if op == Op.Release { run text(&mut out, b"release ") run operand(&mut out, inst.a) }
@@ -598,6 +653,7 @@ pub fn slotModeName(mode: SlotMode) -> &'static [u8] {
   if mode == SlotMode.Bool { return b"bool" }
   if mode == SlotMode.Imm { return b"imm" }
   if mode == SlotMode.Move { return b"move" }
+  if mode == SlotMode.F64 { return b"f64" }
   return b"dup"
 }
 
@@ -620,4 +676,46 @@ pub effect fn signed(out: &mut List<u8>, value: i32) -> () ! OutOfMemoryError ? 
     return ()
   }
   run number(&mut out, i32.wrappingToU32(value))
+}
+
+/// The printed name of a K operation (docs/jit/doubles.md), or empty. `cmp.f64` prints its
+/// comparison after this prefix.
+pub fn numberOpName(op: Op) -> &'static [u8] {
+  if op == Op.UnboxF64 { return b"unbox.f64" }
+  if op == Op.BoxF64 { return b"box.f64" }
+  if op == Op.ToF64 { return b"f64" }
+  if op == Op.AddF64 { return b"add.f64" }
+  if op == Op.SubF64 { return b"sub.f64" }
+  if op == Op.MulF64 { return b"mul.f64" }
+  if op == Op.DivF64 { return b"div.f64" }
+  if op == Op.CmpF64 { return b"" }
+  if op == Op.NegF64 { return b"neg.f64" }
+  if op == Op.SqrtF64 { return b"sqrt.f64" }
+  if op == Op.AbsF64 { return b"abs.f64" }
+  if op == Op.FloorF64 { return b"floor.f64" }
+  if op == Op.ToInt32 { return b"toint32" }
+  if op == Op.ExactI32 { return b"int.f64" }
+  if op == Op.BitAnd { return b"and.i32" }
+  if op == Op.BitOr { return b"or.i32" }
+  if op == Op.BitXor { return b"xor.i32" }
+  if op == Op.Shl { return b"shl.i32" }
+  if op == Op.Sar { return b"sar.i32" }
+  if op == Op.Shr { return b"shr.i32" }
+  if op == Op.Mod { return b"mod.i32" }
+  if op == Op.Neg { return b"neg.i32" }
+  if op == Op.BitNot { return b"not.i32" }
+  if op == Op.NotBool { return b"not.bool" }
+  if op == Op.Imul { return b"imul.i32" }
+  return b""
+}
+/// Whether a K operation is one (numberOpName nonempty or `cmp.f64`).
+pub fn isNumberOp(op: Op) -> bool { return op == Op.CmpF64 || numberOpName(op).length > 0 }
+/// Whether a K operation reads operand `b`.
+pub fn numberOpReadsB(op: Op) -> bool {
+  return op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64 || op == Op.BitAnd
+    || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.Mod || op == Op.Imul
+}
+/// Whether a K operation is a guard (carries an exit).
+pub fn numberOpHasExit(op: Op) -> bool {
+  return op == Op.UnboxF64 || op == Op.ToInt32 || op == Op.ExactI32 || op == Op.Shr || op == Op.Mod || op == Op.Neg
 }

@@ -1,8 +1,9 @@
 //! Simplification and the ownership pass (docs/jit/ssa.md, "The ownership pass").
 //!
 //! `optimize` runs, to a fixed point: folding `unbox (box x)`, dropping counts on immediates,
-//! sharing one `arg n` per argument, removing trivial block parameters and unboxing parameters
-//! that only ever receive boxed integers or booleans; then the argument-web rule, which turns
+//! sharing one `arg n` per argument, removing trivial block parameters, unboxing parameters
+//! that only ever receive boxed numbers or booleans and replacing repeated instructions by the
+//! one that dominates them; then the argument-web rule, which turns
 //! counted copies of arguments into borrows when nothing returns them. Every rewrite keeps the
 //! verifier's rules; the tests verify after it.
 import silk.collections.list { List }
@@ -10,8 +11,8 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Edge, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount }
-import ssa_verify { readsA, readsB }
+import ssa { Function, Edge, Inst, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount, isNumberOp, numberOpHasExit }
+import ssa_verify { readsA, readsB, dominators }
 
 /// Replaces every use of `from` by `to`: operands, edge arguments, exit slots and roots.
 pub fn replaceAll(f: &mut Function, from: u32, to: u32) -> () {
@@ -109,6 +110,16 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
       let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
     } else if inst.op == Op.UnboxBool && defOp(&f.*, inst.a) == Op.BoxBool {
       let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.UnboxF64 && defOp(&f.*, inst.a) == Op.BoxF64 {
+      let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.UnboxF64 && defOp(&f.*, inst.a) == Op.BoxI32 {
+      // An Int converts exactly: no guard left.
+      let mut converted = inst converted.op = Op.ToF64 converted.a = defOperand(&f.*, inst.a) converted.exit = NONE
+      f.insts.set(i, converted) changed = true
+    } else if inst.op == Op.Unbox && defOp(&f.*, inst.a) == Op.BoxF64 {
+      // Still a guard: the double must be an int32 exactly.
+      let mut exact = inst exact.op = Op.ExactI32 exact.a = defOperand(&f.*, inst.a)
+      f.insts.set(i, exact) changed = true
     } else if inst.op == Op.Retain && f.value(inst.a).own == Own.Imm {
       replaceAll(&mut f, inst.result, inst.a) removeInst(&mut f, i) changed = true
     } else if inst.op == Op.Release && !isOwned(&f.*, inst.a) {
@@ -121,6 +132,7 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
 
 fn pure(op: Op) -> bool {
   return op == Op.BoxI32 || op == Op.BoxBool || op == Op.ConstI32 || op == Op.Imm || op == Op.Arg || op == Op.Cmp
+    || (isNumberOp(op) && !numberOpHasExit(op)) || op == Op.ConstF64
 }
 
 /// Removes pure instructions whose result nothing uses. Returns whether any went.
@@ -224,26 +236,23 @@ effect fn unboxParam(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocat
     while g < block.paramCount {
       let p = f.paramAt(block, g)
       if f.value(p).ty == Type.Value {
-        let args = run incoming(&f.*, b, g)
-        let mut ints = true let mut bools = true let mut any = false
-        let mut k: usize = 0
-        while k < args.length() {
-          let a = args.get(k)
-          if a != p {
-            any = true
-            let o = defOp(&f.*, a)
-            if o != Op.BoxI32 { ints = false }
-            if o != Op.BoxBool { bools = false }
-          }
-          k = k + 1
-        }
-        if any && (ints || bools) {
+        let members = run webOf(&f.*, p)
+        let ints = run webFrom(&f.*, &members, Op.BoxI32, Op.BoxI32)
+        let bools = run webFrom(&f.*, &members, Op.BoxBool, Op.BoxBool)
+        if ints || bools {
           let mut ty = Type.Bool
           let mut boxOp = Op.BoxBool
           let mut unboxOp = Op.UnboxBool
           let mut mode = SlotMode.Bool
           if ints { ty = Type.I32 boxOp = Op.BoxI32 unboxOp = Op.Unbox mode = SlotMode.Int }
-          run unbox(&mut f, b, g, p, ty, boxOp, unboxOp, mode)
+          let mut m: usize = 0
+          while m < members.length() {
+            let q = members.get(m)
+            let at = paramPosition(&f.*, q)
+            let home = f.value(q).block
+            run unbox(&mut f, home, at, q, ty, boxOp, unboxOp, mode, &members)
+            m = m + 1
+          }
           return true
         }
       }
@@ -254,14 +263,69 @@ effect fn unboxParam(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocat
   return false
 }
 
-effect fn unbox(f: &mut Function, b: u32, g: u32, p: u32, ty: Type, boxOp: Op, unboxOp: Op, mode: SlotMode) -> () ! OutOfMemoryError ? &mut Allocator {
+/// The block parameters connected to `p` through edge arguments, `p` first: what must be
+/// unboxed together when a value only ever passes between them unchanged on some edges (a
+/// counter updated on one branch only).
+effect fn webOf(f: &Function, p: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut members = List<u32>.make()
+  run members.append(p)
+  let mut k: usize = 0
+  while k < members.length() {
+    let q = members.get(k)
+    let args = run incoming(&f, f.value(q).block, paramPosition(&f, q))
+    let mut n: usize = 0
+    while n < args.length() {
+      let a = args.get(n)
+      let info = f.value(a)
+      if info.def == NONE && info.ty == Type.Value && !contains(&members, a) { run members.append(a) }
+      n = n + 1
+    }
+    k = k + 1
+  }
+  return move members
+}
+/// Whether every argument entering the web from outside is made by `first` or `second`, with
+/// at least one `first`.
+effect fn webFrom(f: &Function, members: &List<u32>, first: Op, second: Op) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut seen = false
+  let mut m: usize = 0
+  while m < members.length() {
+    let q = members.get(m)
+    let args = run incoming(&f, f.value(q).block, paramPosition(&f, q))
+    let mut n: usize = 0
+    while n < args.length() {
+      let a = args.get(n)
+      if !contains(&members, a) {
+        let o = defOp(&f, a)
+        if o == first { seen = true } else if o != second { return false }
+      }
+      n = n + 1
+    }
+    m = m + 1
+  }
+  return seen
+}
+fn contains(list: &List<u32>, v: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == v { return true } i = i + 1 }
+  return false
+}
+/// Parameter `p`'s index in its block.
+fn paramPosition(f: &Function, p: u32) -> u32 {
+  let block = f.blocks.get(u32.toUsize(f.value(p).block))
+  let mut g: u32 = 0
+  while g < block.paramCount { if f.paramAt(block, g) == p { return g } g = g + 1 }
+  return NONE
+}
+
+effect fn unbox(f: &mut Function, b: u32, g: u32, p: u32, ty: Type, boxOp: Op, unboxOp: Op, mode: SlotMode, members: &List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
   // Incoming boxes give their unboxed operand instead.
   let mut e: usize = 0
   while e < f.edges.length() {
     let edge = f.edges.get(e)
     if edge.target == b {
       let a = f.edgeArg(edge, g)
-      if a != p { let x = defOperand(&f.*, a) f.setEdgeArg(edge.firstArg + g, x) }
+      if a != p && !contains(&members, a) { let x = defOperand(&f.*, a) f.setEdgeArg(edge.firstArg + g, x) }
     }
     e = e + 1
   }
@@ -293,7 +357,7 @@ effect fn unbox(f: &mut Function, b: u32, g: u32, p: u32, ty: Type, boxOp: Op, u
     let target = f.blocks.get(u32.toUsize(edge.target))
     let mut k: u32 = 0
     while k < edge.argCount {
-      if f.edgeArg(edge, k) == p && f.paramAt(target, k) != p {
+      if f.edgeArg(edge, k) == p && f.paramAt(target, k) != p && !contains(&members, f.paramAt(target, k)) {
         let source = sourceBlock(&f.*, usize.toU32(e))
         let at = terminatorIndex(&f.*, source)
         let boxed = run f.insertBefore(at, boxOp, true, Type.Value, Own.Imm, p, NONE, 0)
@@ -329,9 +393,10 @@ fn fixSlots(f: &mut Function) -> () {
     let mut slot = f.slots.get(i)
     // A boxed i32 or bool is written from its unboxed operand.
     let o = defOp(&f.*, slot.value)
-    if o == Op.BoxI32 || o == Op.BoxBool { slot.value = defOperand(&f.*, slot.value) }
+    if o == Op.BoxI32 || o == Op.BoxBool || o == Op.BoxF64 { slot.value = defOperand(&f.*, slot.value) }
     let info = f.value(slot.value)
     if info.ty == Type.I32 { slot.mode = SlotMode.Int slot.root = NONE }
+    else if info.ty == Type.F64 { slot.mode = SlotMode.F64 slot.root = NONE }
     else if info.ty == Type.Bool { slot.mode = SlotMode.Bool slot.root = NONE }
     else if info.own == Own.Owned { slot.mode = SlotMode.Move slot.root = NONE }
     else if info.own == Own.Imm { slot.mode = SlotMode.Imm slot.root = NONE }
@@ -352,6 +417,8 @@ pub effect fn simplify(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocat
     fixSlots(&mut f)
     if run deadCode(&mut f) { going = true run f.compact() }
     if run unboxParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
+    else if run unboxNumberParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
+    if run commonValues(&mut f) { going = true fixSlots(&mut f) run f.compact() }
   }
 }
 
@@ -466,4 +533,177 @@ pub effect fn borrowArguments(f: &mut Function) -> bool ! OutOfMemoryError ? &mu
 pub effect fn optimize(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
   run simplify(&mut f)
   if run borrowArguments(&mut f) { run f.compact() run simplify(&mut f) }
+}
+
+// ---- numbers (docs/jit/doubles.md) ----
+
+/// Unboxes one `value` parameter whose incoming arguments are all `box.f64` or `box.i32` (at
+/// least one `box.f64`) or the parameter itself: it becomes an `f64` parameter, the `box.i32`
+/// arguments arrive converted. Returns whether one was unboxed.
+effect fn unboxNumberParam(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut b: u32 = 1
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut g: u32 = 0
+    while g < block.paramCount {
+      let p = f.paramAt(block, g)
+      if f.value(p).ty == Type.Value {
+        let members = run webOf(&f.*, p)
+        if run webFrom(&f.*, &members, Op.BoxF64, Op.BoxI32) {
+          let mut m: usize = 0
+          while m < members.length() {
+            let q = members.get(m)
+            let home = f.value(q).block
+            let at = paramPosition(&f.*, q)
+            run unboxNumber(&mut f, home, at, q, &members)
+            m = m + 1
+          }
+          return true
+        }
+      }
+      g = g + 1
+    }
+    b = b + 1
+  }
+  return false
+}
+
+effect fn unboxNumber(f: &mut Function, b: u32, g: u32, p: u32, members: &List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    if edge.target == b {
+      let a = f.edgeArg(edge, g)
+      if a != p && !contains(&members, a) {
+        let x = defOperand(&f.*, a)
+        if defOp(&f.*, a) == Op.BoxF64 { f.setEdgeArg(edge.firstArg + g, x) }
+        else {
+          let at = terminatorIndex(&f.*, sourceBlock(&f.*, usize.toU32(e)))
+          let converted = run f.insertBefore(at, Op.ToF64, true, Type.F64, Own.Unboxed, x, NONE, 0)
+          f.setEdgeArg(edge.firstArg + g, converted)
+        }
+      }
+    }
+    e = e + 1
+  }
+  f.setType(p, Type.F64)
+  f.setOwnership(p, Own.Unboxed, RootKind.None, NONE)
+  let mut i: usize = 0
+  let count = f.insts.length()
+  while i < count {
+    let inst = f.insts.get(i)
+    if readsA(inst.op) && inst.a == p {
+      if inst.op == Op.UnboxF64 { replaceAll(&mut f, inst.result, p) removeInst(&mut f, i) }
+      else if inst.op == Op.Unbox { let mut exact = inst exact.op = Op.ExactI32 f.insts.set(i, exact) }
+      else if inst.op == Op.Release { removeInst(&mut f, i) }
+      else if inst.op == Op.Retain {
+        let mut changed = inst changed.op = Op.BoxF64 f.insts.set(i, changed)
+        f.setOwnership(inst.result, Own.Imm, RootKind.None, NONE)
+      }
+      else if inst.op != Op.BoxF64 && !takesDouble(inst.op) {
+        let boxed = run f.insertBefore(usize.toU32(i), Op.BoxF64, true, Type.Value, Own.Imm, p, NONE, 0)
+        let mut user = f.insts.get(i) user.a = boxed f.insts.set(i, user)
+      }
+    }
+    if readsB(inst.op) && inst.b == p && !takesDouble(inst.op) {
+      let boxed = run f.insertBefore(usize.toU32(i), Op.BoxF64, true, Type.Value, Own.Imm, p, NONE, 0)
+      let mut user = f.insts.get(i) user.b = boxed f.insts.set(i, user)
+    }
+    i = i + 1
+  }
+  e = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    let target = f.blocks.get(u32.toUsize(edge.target))
+    let mut k: u32 = 0
+    while k < edge.argCount {
+      if f.edgeArg(edge, k) == p && f.paramAt(target, k) != p && !contains(&members, f.paramAt(target, k)) {
+        let at = terminatorIndex(&f.*, sourceBlock(&f.*, usize.toU32(e)))
+        let boxed = run f.insertBefore(at, Op.BoxF64, true, Type.Value, Own.Imm, p, NONE, 0)
+        f.setEdgeArg(edge.firstArg + k, boxed)
+      }
+      k = k + 1
+    }
+    e = e + 1
+  }
+  i = 0
+  while i < f.slots.length() {
+    let mut slot = f.slots.get(i)
+    if slot.value == p { slot.mode = SlotMode.F64 slot.root = NONE f.slots.set(i, slot) }
+    i = i + 1
+  }
+}
+
+/// Whether `op` reads doubles (an earlier rewrite of this parameter's unbox made it read the
+/// parameter itself).
+fn takesDouble(op: Op) -> bool {
+  return op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64 || op == Op.NegF64
+    || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.ToInt32 || op == Op.ExactI32
+}
+
+// ---- common values (docs/jit/ssa.md, "Common values") ----
+//
+// An instruction that repeats one which dominates it, with the same operation, operands and
+// constant, is replaced by it. That covers pure operations and guards alike: a guard's outcome
+// depends only on its operands (a tag, an overflow, a range), so once the dominating copy did
+// not exit the repeat cannot exit either. The repeated `unbox.i32` of an argument in a loop
+// condition is the case that matters: the loop no longer checks the tag each time round.
+
+/// Whether two instructions of `op` with the same operands always give the same result.
+/// Excludes what has an effect (counts, polls, terminators) and `box.f64`, whose result
+/// representation is the ABI's business.
+fn repeatable(op: Op) -> bool {
+  return op == Op.ConstI32 || op == Op.Imm || op == Op.Arg || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32
+    || op == Op.BoxBool || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.ConstF64
+    || (isNumberOp(op) && op != Op.BoxF64)
+}
+
+fn sameInst(f: &Function, x: Inst, y: Inst) -> bool {
+  if x.op != y.op || x.k != y.k { return false }
+  if readsA(x.op) && x.a != y.a { return false }
+  if readsB(x.op) && x.b != y.b { return false }
+  // ConstI32, Imm, Arg and ConstF64 are told apart by `k` alone.
+  return f.value(x.result).ty == f.value(y.result).ty
+}
+
+fn dominates(idom: &List<u32>, a: u32, b: u32) -> bool {
+  // Blocks are in reverse postorder, so a dominator has the smaller index.
+  let mut x = b
+  while x > a { x = idom.get(u32.toUsize(x)) }
+  return x == a
+}
+
+/// Replaces every repeated instruction by the one that dominates it, on a compacted function.
+/// Returns whether any went; the caller compacts.
+effect fn commonValues(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let idom = run dominators(&f.*)
+  // Kept candidates, in block order then instruction order; a dominating one comes first.
+  let mut kept = List<u32>.make()
+  let mut changed = false
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if repeatable(inst.op) && inst.result != NONE {
+        let mut found = NONE
+        let mut j: usize = 0
+        while j < kept.length() && found == NONE {
+          let earlier = f.inst(kept.get(j))
+          if sameInst(&f.*, earlier, inst) && dominates(&idom, earlier.block, b) { found = earlier.result }
+          j = j + 1
+        }
+        if found == NONE { run kept.append(i) }
+        else {
+          replaceAll(&mut f, inst.result, found)
+          let mut gone = inst gone.op = Op.Removed f.insts.set(u32.toUsize(i), gone)
+          changed = true
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  return changed
 }

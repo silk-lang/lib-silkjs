@@ -21,10 +21,13 @@ import silkjs.js_core_types { FunctionBytecode, CompiledEntry, OsrEntry, HostHoo
 import silkjs.js_runtime as runtime
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
 import silkjs.cli_io as io
+import silkjs.js_opcode_data as op
 import code_memory { CodeMemory, CodeBlock, MemoryError }
 import asm_x64 { Code, LinkError, UnboundLabelError }
-import x64_lower { Lowered }
+import x64_lower { Lowered, Refusal }
 import x64_lower as lower
+import jit_recompile { History }
+import jit_recompile as recompile
 import ssa_input { inputOf }
 import ssa_translate { loopHeaders }
 import jit_helpers { CompiledEnv }
@@ -79,6 +82,10 @@ pub struct Jit {
   pub deopts: u64,
   pub polls: u64,
   pub unlinked: u64,
+  /// Earlier compilations per function and their deopt sites (jit_recompile).
+  history: History,
+  /// Reports of functions compiled or refused before (recompilations attempted).
+  pub recompiled: u64,
   /// Loop-header entries (docs/jit/osr.md): per linked function, the list its
   /// CompiledEntry.osr points into (never appended to once linked).
   osrLists: List<List<OsrEntry>>,
@@ -97,6 +104,7 @@ impl Jit {
     return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, env: move env, blocks: List<CodeBlock>.make(),
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
+      history: History.make(), recompiled: 0,
       osrLists: List<List<OsrEntry>>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
@@ -119,6 +127,7 @@ impl Jit {
     run line.appendSlice(b" deopts ") run decimal(&mut line, self.deopts)
     run line.appendSlice(b" polls ") run decimal(&mut line, self.polls)
     run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
+    run line.appendSlice(b" recompiled ") run decimal(&mut line, self.recompiled)
     run line.appendSlice(b" osr-compiled ") run decimal(&mut line, self.osrCompiled)
     run line.appendSlice(b" osr-refused ") run decimal(&mut line, self.osrRefused)
     run line.appendSlice(b" osr-only ") run decimal(&mut line, self.osrOnly)
@@ -219,9 +228,16 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let anchor = ()
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   if jit.options.dump { run unsafe dumpBytecode(&function) }
-  let lowered = run Effect.result(unsafe lower.lowerFunction(&function, jit.options.stress))
+  let plan = run unsafe jit.history.plan(&function, Pointer.address<HeapHeader>(bytecode), &jit.entries)
+  if plan.recompile { jit.recompiled = jit.recompiled + 1 }
+  if plan.refuse {
+    jit.refused = jit.refused + 1
+    if jit.options.dump { run say(b"jit: refused: ", plan.why) }
+    return ()
+  }
+  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, &plan.sites))
   drop function
-  let osr = run unsafe compileLoops(&mut jit, bytecode)
+  let osr = run unsafe compileLoops(&mut jit, bytecode, &plan.sites)
   let result = match move lowered {
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
@@ -230,13 +246,16 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
     Lowered.Code { value } => move value
     Lowered.Refused { reason } => {
       jit.refused = jit.refused + 1
-      if jit.options.dump { run say(b"jit: refused: ", reason.text()) }
-      if osr.length() > 0 { run unsafe installOsrOnly(&mut jit, bytecode, move osr) }
+      if jit.options.dump { run sayRefusal(&reason) }
+      let mut linked = recompile.noEntry()
+      if osr.length() > 0 { linked = run unsafe installOsrOnly(&mut jit, bytecode, move osr) }
+      run jit.history.remember(&plan, linked)
       return ()
     }
   }
   let installed = run unsafe install(&mut jit, bytecode, &mut code)
   if !installed { jit.refused = jit.refused + 1 return () }
+  run jit.history.remember(&plan, usize.toU32(jit.entries.length() - 1))
   jit.compiledFunctions = jit.compiledFunctions + 1
   if jit.options.dump { run say(b"jit: compiled", b"") }
   let last = jit.entries.length() - 1
@@ -245,7 +264,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
 
 /// Compiles and publishes an on-stack-replacement entry for each loop header of bytecode
 /// (docs/jit/osr.md), refusals counted and skipped.
-unsafe effect fn compileLoops(jit: &mut Jit, bytecode: *mut HeapHeader) -> List<OsrEntry> ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+unsafe effect fn compileLoops(jit: &mut Jit, bytecode: *mut HeapHeader, doubleSites: &List<u32>) -> List<OsrEntry> ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
   let mut entries = List<OsrEntry>.make()
   let anchor = ()
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
@@ -255,7 +274,7 @@ unsafe effect fn compileLoops(jit: &mut Jit, bytecode: *mut HeapHeader) -> List<
   while position < headers.length() {
     let header = headers.get(position)
     position = position + 1
-    let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, header))
+    let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, doubleSites, header))
     let result = match move lowered {
       Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
       Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 continue }
@@ -295,8 +314,10 @@ unsafe effect fn attachOsr(jit: &mut Jit, index: usize, list: List<OsrEntry>) ->
   entries[index].osrCount = count
 }
 /// Links bytecode, whose normal entry was refused, for on-stack replacement only.
-unsafe effect fn installOsrOnly(jit: &mut Jit, bytecode: *mut HeapHeader, list: List<OsrEntry>) -> () ! OutOfMemoryError ? &mut Allocator {
-  if jit.entries.length() >= CAPACITY { return () }
+/// Returns its table index (for jit_recompile, which reads its OSR deopt sites) or
+/// recompile.noEntry() when the table is full.
+unsafe effect fn installOsrOnly(jit: &mut Jit, bytecode: *mut HeapHeader, list: List<OsrEntry>) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  if jit.entries.length() >= CAPACITY { return recompile.noEntry() }
   let index = jit.entries.length()
   // The osr code reads the stress countdown through the entry's data word, as normal code does.
   let mut stress: ?*mut u8 = Pointer.null<u8>()
@@ -306,14 +327,15 @@ unsafe effect fn installOsrOnly(jit: &mut Jit, bytecode: *mut HeapHeader, list: 
   }
   let env = unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0]))
   let added = jit.entries.appendWithinCapacity(blankEntry(Pointer.null<u8>(), stress, env, jit.options.deoptLimit))
-  if !added { return () }
+  if !added { return recompile.noEntry() }
   run unsafe attachOsr(&mut jit, index, move list)
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
   unsafe runtime.linkOsr(attached, bytecode, usize.toU32(index))
   jit.osrOnly = jit.osrOnly + 1
+  return usize.toU32(index)
 }
 fn blankEntry(code: ?*const u8, data: ?*mut u8, env: ?*mut u8, deoptLimit: u32) -> CompiledEntry {
-  return CompiledEntry { code: code, data: data, env: env, deoptLimit: deoptLimit, frameCells: 0, leaf: 0, runs: 0, deopts: 0, polls: 0,
+  return CompiledEntry { code: code, data: data, env: env, deoptLimit: deoptLimit, frameCells: 0, leaf: 0, runs: 0, deopts: 0, polls: 0, deoptPcs: [0; 4], deoptPcCount: 0,
     osr: Pointer.null<OsrEntry>(), osrCount: 0, osrRuns: 0, osrDeopts: 0 }
 }
 
@@ -352,6 +374,13 @@ effect fn publish(memory: &mut CodeMemory, code: &mut Code) -> CodeBlock ! Memor
   run code.link(writer.address(), Slice.view<usize>(&none, 0, 0))
   run writer.append(code.bytes.asSlice())
   return run writer.finish()
+}
+effect fn sayRefusal(reason: &Refusal) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(b"jit: refused: ") run line.appendSlice(reason.text())
+  if reason.hasOpcode { run line.appendSlice(b": ") run line.appendSlice(op.opcodeName(reason.opcode, true)) }
+  run line.append(10)
+  io.stderr(line.asSlice())
 }
 effect fn say(prefix: &[u8], text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut line = List<u8>.make()

@@ -424,6 +424,55 @@ benchmarks it targets.
 | K. Doubles and code quality | unboxed doubles, recompilation from feedback, remaining operators, typed arrays and Math intrinsics, register allocation |
 | L. Measurement | a `silkjs-jit` column in the comparison harness, per-benchmark compile coverage, feature kernels against V8 and JSC, `docs/jit/jit-scorecard.md` as a dated series |
 
+### Milestone 7 progress
+
+Merged so far, with the lead's own reruns (2026-11-17, all RAN on this host unless marked):
+
+| Merge | Head | What it adds | Lead's checks |
+| --- | --- | --- | --- |
+| K. Doubles and code quality | `f87c61d3` | f64 values in SSA, remaining arithmetic and comparison operators, short jumps, guard removal, recompilation after deopt (`deoptPcs` in `CompiledEntry`, hotness rearmed on unlink, at most 2 recompiles), linear-scan register allocation, J's ABI | JIT tests 65 passed; `encodings.py --check` current; engine and shell release builds exit 0; `v8bench.py --instructions` against the 14e41811 engine 1.000x on all eight; `differential.py --count 3000 --configs plain,observed,jit,jit-stress,node` agree 3000, mismatch 0 (jit: compiled 1850, deopts 13214, recompiled 1607); `--self-test` PASS; native suite 564 passed, 2 failed (the two known `js_for_in_tests`) |
+| L. Measurement | `e47ae731` (merge of `d473e12`) | `silkjs-jit` harness column, `bench/kernels/`, `scripts/jit_kernels.py`, `scripts/jit_coverage.py`, `docs/jit/jit-scorecard.md` | JIT tests 65 passed; builds exit 0; differential 600 agree; `jit_kernels.py --rounds 7` exit 0 (table below) |
+
+A first gate run on K's earlier head `ea2ca9d` timed out in the differential (exit 124): three
+seeds ended `timeout` in every configuration because a new generator flavour (numloop) produced
+programs that ran too long. `f87c61d3` fixes the generator; it was not an engine fault.
+
+The shared compiled-code ABI is frozen (J, `a6c063b`, already inside K's merge):
+`CompiledCode = extern "C" fn(args, state, counter, data, env, frame) -> u32`, `stateWords = 3 +
+2*(locals+stack)`, a return writes an owned ValueBits to words 0-1 and the return pc to word 2,
+an exit writes pc, depth and one ValueBits per slot. `CompiledEnv.helpers[128]` is split J 0-31,
+H 32-63, I 64-95, K 96-127.
+
+Kernels at `e47ae731`, MEASURED by the lead (`python3 scripts/jit_kernels.py --rounds 7`, ms per
+`kernel()` call, median of 7 processes; compile and warmup included, startup excluded):
+
+| Kernel | silkjs | silkjs-jit | v8-jit | jsc-jit | silkjs-jit vs v8 / jsc | Compiled? |
+| --- | --- | --- | --- | --- | --- | --- |
+| sum-calls | 128.3 | 37.9 | 10.7 | 11.7 | 3.5x / 3.2x | yes |
+| sum-long | 191.9 | 163.9 | 21.4 | 11.8 | 7.7x / 13.9x | never reported hot (needs I's OSR) |
+| nested | 152.4 | 49.2 | 10.6 | 25.4 | 4.7x / 1.9x | yes |
+| calls | 189.5 | 204.3 | 6.4 | 8.3 | 31.8x / 24.5x | refused (needs H) |
+| method | 264.0 | 291.2 | 9.4 | 12.6 | 31.1x / 23.1x | refused (needs H, J) |
+| doubles | 118.2 | 39.1 | 15.8 | 17.7 | 2.5x / 2.2x | yes |
+| array-sum | 197.5 | 213.7 | 13.3 | 12.6 | 16.1x / 17.0x | refused (needs J) |
+| typed-array | 377.9 | 373.8 | 13.2 | 10.0 | 28.3x / 37.5x | refused (needs J, K) |
+
+Where code compiles it is 2.2x to 4.7x behind V8 and JSC; where it is refused it runs at
+interpreter speed, 16x to 38x behind. Octane as a whole does not move yet (L, worker-measured at
+14e41811: geomean silkjs 5959, silkjs-jit 5858, v8-jit 54836, jsc-jit 52714), because at most
+0.014 percent of any benchmark's instructions run compiled. The most-blocking refusal is
+`push_this` (602 hot functions), then `get_arg_field8` (107) and `get_var` (94).
+
+Open finding (L, worker-measured, sent to H): Box2D executes 4.3 percent more instructions with
+`--jit`, with only 2 functions compiled. Hypothesis, read not proved: linking sets
+`STUB_FRAME_CELLS`, the inline call path refuses, and callers build a real arguments object.
+
+Not merged yet (heads as reported by the workers; each conflicts with K's merge in the SSA and
+backend files and must merge the integration branch first): I `c84db2e` on
+`claude/project-thread-xytm2y` (OSR, poll re-entry, loop hotness), H `fd3a8307` on
+`claude/project-thread-g1zedu` (direct compiled entry from inline call sites), J `b7b8c7f` on
+`claude/project-thread-k45qjk` (real retain/release, property reads through a helper).
+
 ## Next steps
 
 1. Merge milestone 7 sub-steps as they pass their checks, rerunning each one's key commands.
