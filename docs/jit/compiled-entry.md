@@ -328,6 +328,42 @@ Measured (callgrind, `--jit --jit-calls`): `each(inc, 10)` 3000 times, 18,992 di
 instructions per call, `fastCall` and `capturesOf`) and `runCode` (about 57); calling the
 callee's code from machine code would remove both but needs object layouts in the code.
 
+### 7.6 Callees that make calls: the activation stack and native nesting
+
+As built (behind `--jit-calls`). Code that makes calls no longer needs a base frame of its own.
+Each such run is an **activation**: a LIFO record on a per-runtime side stack that the JIT lends
+the engine (`runtime.setActivationStack`, 2 MiB, `CompiledTable.activations`). A record holds
+the `CompiledFrame`, the prepared code, the argument cells, the exit state, the call block and
+a `StackFrame` that is published only when something reads the frame chain.
+
+- **Nesting.** `fastCall` (CALL_FAST) pushes an activation for a linked callee whose code makes
+  calls and runs it at once on the native stack, up to 64 levels (`NATIVE_NESTING`). A return
+  writes the result into the caller's `CALL_RESULT`, pops, and the caller goes on without
+  leaving. Any other exit is recorded in the child's activation, and the caller's block is
+  marked `CALLEE_PUSHED` (with the child at `CALL_STATE`), so every native level returns at once
+  to the runner.
+- **Runner.** `runActivations` continues the innermost activation from its recorded exit:
+  calls the code cannot make go through the engine (`activationCall`, with the CALL_DEOPT rule
+  of 7.4), and a deopt, poll or throw is finished interpreted from the saved state
+  (`callResuming`, or `callKnown` for a known root), then the parent continues with the result.
+  Interpreted callers enter code that makes calls the same way (`callCompiled` from
+  `callInline`), on the caller's operand cells.
+- **Depth.** When the side stack is full, or past the native nesting limit, the call is generic
+  (`callInternal`), whose stack check raises the engine's usual RangeError. Measured maximum
+  recursion: plain 2273, `--jit-calls` 1842.
+- **Frames.** Before a call through the engine and before a deopt finish, `publishActivations`
+  links the activations' `StackFrame`s, so backtraces, `arguments` and the active function see
+  the compiled callers (backtraces name the call's pc + 1, as the interpreter does).
+- **GC.** Every value a native frame or call block holds across a call owns a count; the
+  refcount collector treats running activations as external roots, so nothing needs scanning.
+- **AOT.** The side stack, its records and the prepared code pointers are per runtime and never
+  stored; the code only sees the ABI's block offsets, `CALLEE_PUSHED` and CALL_FAST's index.
+
+The design is a side stack rather than calls from a C helper straight into the engine because
+the engine's call path is generic over its hooks and allocator effect, which a helper reached
+from machine code cannot name; only a caller with the concrete types (the runner) can make
+those calls.
+
 ### 7.5 Inlining (design only unless time allows)
 
 A small monomorphic callee is translated into the caller's SSA at the call (its `arg n` are the
