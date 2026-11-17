@@ -92,6 +92,7 @@ var __sum = 0;
 var __fin = 0;
 var __at = -1;
 var __g = 0;
+var __eo = {};
 function __sumthis(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + this.x + this.y; } return t; }
 function __show(v) {
   if (typeof v === 'number') return Object.is(v, -0) ? '-0' : String(v);
@@ -160,7 +161,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "protos", "protos", "protos"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "protos", "protos", "protos", "equality"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -415,6 +416,14 @@ class Generator:
             return (f"class P {{}} class Q extends P {{}} class H {{ static [Symbol.hasInstance](v) {{ return v === 1; }} }} "
                     f"var C = {right}; var vs = [a, b, new P(), new Q(), {{}}, [1], 1, 's', null, undefined, __sumthis]; var c = 0; "
                     f"for (var i = 0; i < vs.length; i++) {{ if (vs[i] instanceof C) c = c + i + 1; if (vs[i] instanceof P) c = c * 2 + 1; }} "
+                    f"return c;")
+        if flavor == "equality":
+            # ===, !==, == and != between values of every kind (J2): sites that start on ints
+            # and meet objects, strings, null, undefined, NaN and -0, and == that coerces.
+            test = self.pick(["x === y", "x !== y", "x == y", "x != y", "x === 7", "x !== 0", "x == null", "x === a"])
+            return (f"var xs = [1, 2, a, b, {{}}, 's', null, undefined, NaN, -0, 7, '7', true, __eo]; "
+                    f"var ys = [1, 3, b, a, __eo, 's', undefined, null, NaN, 0, 7.0, 7, 1, __eo]; var c = 0; "
+                    f"for (var i = 0; i < xs.length; i++) {{ var x = xs[i]; var y = ys[i]; if ({test}) c = c + i + 1; }} "
                     f"return c;")
         raise ValueError(flavor)
 
