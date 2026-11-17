@@ -1,8 +1,9 @@
 //! Simplification and the ownership pass (docs/jit/ssa.md, "The ownership pass").
 //!
 //! `optimize` runs, to a fixed point: folding `unbox (box x)`, dropping counts on immediates,
-//! sharing one `arg n` per argument, removing trivial block parameters and unboxing parameters
-//! that only ever receive boxed integers or booleans; then the argument-web rule, which turns
+//! sharing one `arg n` per argument, removing trivial block parameters, unboxing parameters
+//! that only ever receive boxed numbers or booleans and replacing repeated instructions by the
+//! one that dominates them; then the argument-web rule, which turns
 //! counted copies of arguments into borrows when nothing returns them. Every rewrite keeps the
 //! verifier's rules; the tests verify after it.
 import silk.collections.list { List }
@@ -10,8 +11,8 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Edge, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount, isNumberOp, numberOpHasExit }
-import ssa_verify { readsA, readsB }
+import ssa { Function, Edge, Inst, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount, isNumberOp, numberOpHasExit }
+import ssa_verify { readsA, readsB, dominators }
 
 /// Replaces every use of `from` by `to`: operands, edge arguments, exit slots and roots.
 pub fn replaceAll(f: &mut Function, from: u32, to: u32) -> () {
@@ -365,6 +366,7 @@ pub effect fn simplify(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocat
     if run deadCode(&mut f) { going = true run f.compact() }
     if run unboxParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
     else if run unboxNumberParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
+    if run commonValues(&mut f) { going = true fixSlots(&mut f) run f.compact() }
   }
 }
 
@@ -585,4 +587,71 @@ effect fn unboxNumber(f: &mut Function, b: u32, g: u32, p: u32) -> () ! OutOfMem
 fn takesDouble(op: Op) -> bool {
   return op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64 || op == Op.NegF64
     || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.ToInt32 || op == Op.ExactI32
+}
+
+// ---- common values (docs/jit/ssa.md, "Common values") ----
+//
+// An instruction that repeats one which dominates it, with the same operation, operands and
+// constant, is replaced by it. That covers pure operations and guards alike: a guard's outcome
+// depends only on its operands (a tag, an overflow, a range), so once the dominating copy did
+// not exit the repeat cannot exit either. The repeated `unbox.i32` of an argument in a loop
+// condition is the case that matters: the loop no longer checks the tag each time round.
+
+/// Whether two instructions of `op` with the same operands always give the same result.
+/// Excludes what has an effect (counts, polls, terminators) and `box.f64`, whose result
+/// representation is the ABI's business.
+fn repeatable(op: Op) -> bool {
+  return op == Op.ConstI32 || op == Op.Imm || op == Op.Arg || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32
+    || op == Op.BoxBool || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.ConstF64
+    || (isNumberOp(op) && op != Op.BoxF64)
+}
+
+fn sameInst(f: &Function, x: Inst, y: Inst) -> bool {
+  if x.op != y.op || x.k != y.k { return false }
+  if readsA(x.op) && x.a != y.a { return false }
+  if readsB(x.op) && x.b != y.b { return false }
+  // ConstI32, Imm, Arg and ConstF64 are told apart by `k` alone.
+  return f.value(x.result).ty == f.value(y.result).ty
+}
+
+fn dominates(idom: &List<u32>, a: u32, b: u32) -> bool {
+  // Blocks are in reverse postorder, so a dominator has the smaller index.
+  let mut x = b
+  while x > a { x = idom.get(u32.toUsize(x)) }
+  return x == a
+}
+
+/// Replaces every repeated instruction by the one that dominates it, on a compacted function.
+/// Returns whether any went; the caller compacts.
+effect fn commonValues(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let idom = run dominators(&f.*)
+  // Kept candidates, in block order then instruction order; a dominating one comes first.
+  let mut kept = List<u32>.make()
+  let mut changed = false
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if repeatable(inst.op) && inst.result != NONE {
+        let mut found = NONE
+        let mut j: usize = 0
+        while j < kept.length() && found == NONE {
+          let earlier = f.inst(kept.get(j))
+          if sameInst(&f.*, earlier, inst) && dominates(&idom, earlier.block, b) { found = earlier.result }
+          j = j + 1
+        }
+        if found == NONE { run kept.append(i) }
+        else {
+          replaceAll(&mut f, inst.result, found)
+          let mut gone = inst gone.op = Op.Removed f.insts.set(u32.toUsize(i), gone)
+          changed = true
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  return changed
 }

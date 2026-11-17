@@ -226,7 +226,14 @@ argument-web rule, simplify again.
 - dead code: pure instructions (constants, `arg`, `imm`, boxes, comparisons) with no use go;
 - parameter unboxing: a `value` parameter whose every incoming argument is an `i32` (or bool) or
   a box of one becomes an `i32` (`bool`) parameter, so a counted loop carries its counters
-  unboxed.
+  unboxed;
+- common values: an instruction that repeats one dominating it (same operation, operands and
+  constant) is replaced by it. Guards are included: a guard's outcome depends only on its
+  operands, so once the dominating copy did not exit, the repeat cannot. The loop condition's
+  `unbox.i32` of an argument goes this way, as do the duplicate `f64 x` conversions the
+  translator makes for each branch edge. `box.f64` and everything with an effect (counts,
+  `poll`, terminators) are left alone. The search is quadratic in the candidates, which is fine
+  at the sizes the JIT compiles today.
 
 Guards are never removed by dead code: an unused `unbox.i32` still checks a type, and an unused
 `add.i32` still exits on overflow where the interpreter would make a Float64.
