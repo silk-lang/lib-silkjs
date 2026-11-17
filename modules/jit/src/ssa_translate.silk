@@ -85,9 +85,13 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_instanceof
 }
 
-/// Workstream H's calls: `call0`..`call3`, `call` and `call_method`.
+/// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
+/// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
+fn osrExit(opcode: u8) -> bool { return !supported(opcode) || callOpcode(opcode) }
+
+/// Workstream H's calls: `call0`..`call3`, `call`, `call_method` and `call_constructor`.
 pub fn callOpcode(opcode: u8) -> bool {
-  return (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method
+  return (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor
 }
 
 /// Workstream J's opcodes (`this`, properties, globals, scopes, elements) translated below.
@@ -219,15 +223,20 @@ fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
 /// at each leader, from the engine's pops and pushes. Fails on code outside the subset.
 struct Shape { leader: List<bool>, depth: List<i32>, start: List<bool> }
 
-effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
+effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator { return run shapeAt(input, 0, false) }
+
+/// shape walking from the instruction at `begin` (stack empty there). With `sideExits`, an
+/// opcode outside the subset ends its block (the translator exits there) instead of refusing.
+effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
   let length = input.code.length()
   let mut leader = List<bool>.make() run leader.appendRepeated(false, length + 1)
   let mut start = List<bool>.make() run start.appendRepeated(false, length + 1)
   let mut depth = List<i32>.make() run depth.appendRepeated(-1, length + 1)
   let mut work = List<usize>.make()
   let mut workDepth = List<i32>.make()
-  leader.set(0, true) depth.set(0, 0)
-  run work.append(0) run workDepth.append(0)
+  if begin >= length { fail refuse(usize.toU32(begin), 0, b"control falls off the end of the code") }
+  leader.set(begin, true) depth.set(begin, 0)
+  run work.append(begin) run workDepth.append(0)
   while work.length() > 0 {
     let mut pc = work.pop().unwrapOr(0)
     let mut d = workDepth.pop().unwrapOr(0)
@@ -238,13 +247,15 @@ effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &
       else {
         start.set(pc, true)
         let opcode = byteAt(input, pc)
-        if !supported(opcode) { fail refuse(usize.toU32(pc), opcode, b"opcode outside the subset") }
+        if !supported(opcode) && !sideExits { fail refuse(usize.toU32(pc), opcode, b"opcode outside the subset") }
+        // A side exit: the state before it is the block's, nothing after it is reached.
+        if sideExits && osrExit(opcode) { going = false continue }
         let info = op.opcodeInfo(opcode, true)
         let size = u8.toUsize(info.size)
         if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
         d = d - u8.toI32(info.pops) + u8.toI32(info.pushes)
         // A call's table entry counts only its fixed operands; the argument count is in the code.
-        if opcode == op.OP_call || opcode == op.OP_call_method { d = d - u16.toI32(u16At(input, pc + 1)) }
+        if opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor { d = d - u16.toI32(u16At(input, pc + 1)) }
         if opcode >= op.OP_call0 && opcode <= op.OP_call3 { d = d - u8.toI32(opcode - op.OP_call0) }
         if d < 0 { fail refuse(usize.toU32(pc), opcode, b"operand stack underflow") }
         if isReturn(opcode) { going = false }
@@ -302,6 +313,8 @@ struct Translator {
   stack: List<u32>,
   /// FunctionInput.doubleSites, copied.
   doubleSites: List<u32>,
+  /// On-stack replacement: argument n's number, guarded once at entry, or NONE (or empty).
+  argNumbers: List<u32>,
 }
 
 impl Translator {
@@ -369,6 +382,7 @@ impl Translator {
   }
   /// Argument `n`'s bits, borrowed from its cell.
   effect fn argument(self: &mut Self, n: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if u32.toUsize(n) < self.argNumbers.length() && self.argNumbers.get(u32.toUsize(n)) != NONE { return self.argNumbers.get(u32.toUsize(n)) }
     let v = run self.f.emit(self.current, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, u32.wrappingToI32(n), pc)
     self.f.setOwnership(v, Own.Borrowed, RootKind.Argument, n)
     return v
@@ -1033,21 +1047,28 @@ impl Translator {
     else { count = u16.toUsize(u16At(input, pc + 1)) }
     if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many call arguments") }
     let method = opcode == op.OP_call_method
+    // `new`: the function, then new.target in the receiver's place, then the arguments.
+    let construct = opcode == op.OP_call_constructor
     let mut depth = count + 1
-    if method { depth = depth + 1 }
+    if method || construct { depth = depth + 1 }
     if self.stack.length() < depth { fail refuse(at, opcode, b"call operands missing") }
-    let function = self.top(count + 1)
+    let mut function = self.top(count + 1)
+    if construct { function = self.top(count + 2) }
     if self.f.value(function).ty != Type.Value { fail refuse(at, opcode, b"calling an unboxed number") }
     // Boxes come before the call.arg run, which must stay contiguous.
     let mut receiver = NONE
-    if method { let given = self.top(count + 2) receiver = run self.boxed(given, at) } else { receiver = run self.imm(Imm.Undefined, at) }
+    if method { let given = self.top(count + 2) receiver = run self.boxed(given, at) }
+    else if construct { let given = self.top(count + 1) receiver = run self.boxed(given, at) }
+    else { receiver = run self.imm(Imm.Undefined, at) }
     let mut i: usize = 0
     while i < count {
       let argument = self.top(count - i)
       drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, argument, NONE, usize.toI32(i), at)
       i = i + 1
     }
-    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, usize.toI32(count), at)
+    let mut k = usize.toI32(count)
+    if construct { k = k | calls.CONSTRUCT }
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
     i = 0
     while i < depth { let v = self.pop() run self.release(v, at) i = i + 1 }
@@ -1292,7 +1313,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
   let shapeOf = run shape(input)
   let length = input.code.length()
   let mut t = Translator { f: Function.make(input.argumentCount, input.localCount), blockAt: List<u32>.make(), current: 0,
-    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites) }
+    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites), argNumbers: List<u32>.make() }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -1340,4 +1361,282 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
   }
   run t.f.compact()
   return move t.f
+}
+
+/// An exit at `pc` that is always taken (a guard on a constant that never holds), ending the
+/// block: how on-stack-replacement code leaves at an instruction outside the subset.
+effect fn sideExit(t: &mut Translator, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let u = run t.imm(Imm.Undefined, pc)
+  drop run t.f.emit(t.current, Op.Unbox, true, Type.I32, Own.Unboxed, u, NONE, 0, pc)
+  let last = t.f.lastInst() run t.exitHere(last, pc)
+  // Never reached; it ends the block with every owned value consumed.
+  run t.releaseAll(pc)
+  let r = run t.imm(Imm.Undefined, pc)
+  run t.f.terminate(t.current, Op.Return, r, NONE, pc)
+}
+
+/// On-stack replacement (docs/jit/osr.md): translates `input` for an entry at the loop header
+/// `header`, reached with an empty operand stack. The function takes `argumentCount +
+/// localCount` arguments: the frame's arguments, then its locals (local `i` is argument
+/// `argumentCount + i`). Only code reachable from the header is translated, and an
+/// instruction outside the subset becomes an exit to the interpreter instead of a refusal.
+pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+  let none = List<u8>.make()
+  let plain = run translateOsrWith(input, header, &none, &none)
+  // Locals the loop only ever makes numbers of enter as numbers: guarded once at entry, so
+  // the loop's own unboxing (ssa_ownership) keeps them in registers.
+  let speculation = run osrSpeculation(&plain, input.localCount, header, &input.doubleSites)
+  // Arguments the loop only unboxes are guarded once at entry too (loop-invariant guards).
+  let arguments = run osrArgumentSpeculation(&plain, input.argumentCount)
+  let mut any = false
+  let mut i: usize = 0
+  while i < speculation.length() { if speculation.get(i) != SPECULATE_NONE { any = true } i = i + 1 }
+  i = 0
+  while i < arguments.length() { if arguments.get(i) != SPECULATE_NONE { any = true } i = i + 1 }
+  if !any { return move plain }
+  return run translateOsrWith(input, header, &speculation, &arguments)
+}
+
+const SPECULATE_NONE: u8 = 0
+const SPECULATE_INT: u8 = 1
+const SPECULATE_NUMBER: u8 = 2
+
+/// For each local of `f` (a translateOsr artefact): SPECULATE_INT when every value entering
+/// its loop-header web from inside the loop is a boxed i32, SPECULATE_NUMBER when they are
+/// boxed i32 or f64 (or the header deoptimized before, `doubleSites`), else SPECULATE_NONE.
+effect fn osrSpeculation(f: &Function, localCount: u32, header: u32, doubleSites: &List<u32>) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.appendRepeated(SPECULATE_NONE, u32.toUsize(localCount))
+  if f.blockCount() == 0 { return move out }
+  let entry = f.blocks.get(0)
+  if entry.instCount == 0 { return move out }
+  let jump = f.inst(entry.firstInst + entry.instCount - 1)
+  if jump.edge == NONE { return move out }
+  let edge = f.edges.get(u32.toUsize(jump.edge))
+  let target = f.blocks.get(u32.toUsize(edge.target))
+  let mut widened = false
+  let mut k: usize = 0
+  while k < doubleSites.length() { if doubleSites.get(k) == header { widened = true } k = k + 1 }
+  let mut g: u32 = 0
+  while g < localCount && g < edge.argCount && g < target.paramCount {
+    let entering = f.edgeArg(edge, g)
+    // The web of header parameters this local's value flows around the loop in.
+    let mut members = List<u32>.make()
+    run members.append(f.paramAt(target, g))
+    let mut ints = false let mut doubles = false let mut other = false
+    let mut m: usize = 0
+    while m < members.length() {
+      let q = members.get(m)
+      let info = f.value(q)
+      let home = f.blocks.get(u32.toUsize(info.block))
+      let mut position: u32 = 0
+      while position < home.paramCount && f.paramAt(home, position) != q { position = position + 1 }
+      let mut e: usize = 0
+      while e < f.edges.length() {
+        let into = f.edges.get(e)
+        if into.target == info.block && position < into.argCount {
+          let a = f.edgeArg(into, position)
+          let ai = f.value(a)
+          if a == entering || listHas(&members, a) { }
+          else if ai.def == NONE && ai.ty == Type.Value { run members.append(a) }
+          else if ai.def != NONE && f.inst(ai.def).op == Op.BoxI32 { ints = true }
+          else if ai.def != NONE && f.inst(ai.def).op == Op.BoxF64 { doubles = true }
+          else { other = true }
+        }
+        e = e + 1
+      }
+      m = m + 1
+    }
+    if !other && (ints || doubles) {
+      if doubles || widened { out.set(u32.toUsize(g), SPECULATE_NUMBER) } else { out.set(u32.toUsize(g), SPECULATE_INT) }
+    }
+    g = g + 1
+  }
+  return move out
+}
+/// For each argument of `f` (a translateOsr artefact): SPECULATE_INT when every use of it is
+/// an i32 unbox, SPECULATE_NUMBER when they are i32 or f64 unboxes with at least one f64,
+/// else SPECULATE_NONE.
+effect fn osrArgumentSpeculation(f: &Function, argumentCount: u32) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  let mut ints = List<bool>.make() let mut doubles = List<bool>.make() let mut other = List<bool>.make()
+  run out.appendRepeated(SPECULATE_NONE, u32.toUsize(argumentCount))
+  run ints.appendRepeated(false, u32.toUsize(argumentCount))
+  run doubles.appendRepeated(false, u32.toUsize(argumentCount))
+  run other.appendRepeated(false, u32.toUsize(argumentCount))
+  // Which argument each value is, if it is an Arg.
+  let mut which = List<u32>.make()
+  run which.appendRepeated(NONE, f.values.length())
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Arg && inst.result != NONE && inst.k >= 0 && i32.wrappingToU32(inst.k) < argumentCount { which.set(u32.toUsize(inst.result), i32.wrappingToU32(inst.k)) }
+    i = i + 1
+  }
+  // get_arg makes an owned copy: a retain of the argument is the argument too.
+  let mut changed = true
+  while changed {
+    changed = false
+    i = 0
+    while i < f.insts.length() {
+      let inst = f.insts.get(i)
+      if inst.op == Op.Retain && inst.result != NONE && inst.a != NONE && u32.toUsize(inst.a) < which.length()
+        && which.get(u32.toUsize(inst.a)) != NONE && which.get(u32.toUsize(inst.result)) == NONE {
+        let n = which.get(u32.toUsize(inst.a))
+        which.set(u32.toUsize(inst.result), n) changed = true
+      }
+      i = i + 1
+    }
+  }
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Arg && inst.op != Op.Retain && inst.op != Op.Release {
+      if inst.a != NONE && u32.toUsize(inst.a) < which.length() && which.get(u32.toUsize(inst.a)) != NONE {
+        let n = u32.toUsize(which.get(u32.toUsize(inst.a)))
+        if inst.op == Op.Unbox && f.value(inst.result).ty == Type.I32 { ints.set(n, true) }
+        else if inst.op == Op.UnboxF64 { doubles.set(n, true) }
+        else { other.set(n, true) }
+      }
+      if inst.b != NONE && u32.toUsize(inst.b) < which.length() && which.get(u32.toUsize(inst.b)) != NONE { other.set(u32.toUsize(which.get(u32.toUsize(inst.b))), true) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() {
+    let a = f.edgeArgs.get(i)
+    if a != NONE && u32.toUsize(a) < which.length() && which.get(u32.toUsize(a)) != NONE { other.set(u32.toUsize(which.get(u32.toUsize(a))), true) }
+    i = i + 1
+  }
+  i = 0
+  while i < u32.toUsize(argumentCount) {
+    if !other.get(i) && doubles.get(i) { out.set(i, SPECULATE_NUMBER) }
+    else if !other.get(i) && ints.get(i) { out.set(i, SPECULATE_INT) }
+    i = i + 1
+  }
+  return move out
+}
+fn listHas(list: &List<u32>, v: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == v { return true } i = i + 1 }
+  return false
+}
+
+effect fn translateOsrWith(input: &FunctionInput, header: u32, speculation: &List<u8>, argumentSpeculation: &List<u8>) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+  if !input.normal { fail refuse(NONE, 0, b"generator or async function") }
+  if input.closureVars != 0 { fail refuse(NONE, 0, b"closure variables") }
+  if input.scopeSlots != 0 { fail refuse(NONE, 0, b"a function scope") }
+  if input.code.length() == 0 { fail refuse(NONE, 0, b"no code") }
+  if op.opcodeInfo(op.OP_fuse_prefix, true).size != 5 { fail refuse(NONE, op.OP_fuse_prefix, b"fusion prefix size changed") }
+  let begin = u32.toUsize(header)
+  let shapeOf = run shapeAt(input, begin, true)
+  let length = input.code.length()
+  let mut t = Translator { f: Function.make(input.argumentCount + input.localCount, input.localCount), blockAt: List<u32>.make(), current: 0,
+    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites), argNumbers: List<u32>.make() }
+  run t.blockAt.appendRepeated(NONE, length + 1)
+  let entry = run t.f.block()
+  let mut pc: usize = 0
+  while pc < length {
+    if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
+      let b = run t.f.block()
+      t.blockAt.set(pc, b)
+      let count = input.localCount + i32.wrappingToU32(shapeOf.depth.get(pc))
+      let mut i: u32 = 0
+      while i < count { drop run t.f.addParam(b, Type.Value, Own.Owned) i = i + 1 }
+    }
+    pc = pc + 1
+  }
+  // The entry: each local is an owner of the frame's value, as get_arg makes one.
+  t.current = entry
+  let mut i: u32 = 0
+  while i < input.localCount {
+    let a = run t.argument(input.argumentCount + i, header)
+    let r = run t.f.emit(t.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, header)
+    run t.locals.append(r)
+    i = i + 1
+  }
+  // Speculated locals: one guard each (an exit at the header with every local as it came),
+  // then the local is the boxed number, its frame value released.
+  i = 0
+  while i < input.localCount && u32.toUsize(i) < speculation.length() {
+    let kind = speculation.get(u32.toUsize(i))
+    if kind != SPECULATE_NONE {
+      let r = t.locals.get(u32.toUsize(i))
+      let mut unboxed = NONE
+      if kind == SPECULATE_INT { unboxed = run t.f.emit(t.current, Op.Unbox, true, Type.I32, Own.Unboxed, r, NONE, 0, header) }
+      else { unboxed = run t.f.emit(t.current, Op.UnboxF64, true, Type.F64, Own.Unboxed, r, NONE, 0, header) }
+      let guard = t.f.lastInst() run t.exitHere(guard, header)
+      drop run t.f.emit(t.current, Op.Release, false, Type.I32, Own.Unboxed, r, NONE, 0, header)
+      let number = run t.boxed(unboxed, header)
+      t.locals.set(u32.toUsize(i), number)
+    }
+    i = i + 1
+  }
+  if argumentSpeculation.length() > 0 {
+    run t.argNumbers.appendRepeated(NONE, u32.toUsize(input.argumentCount))
+    i = 0
+    while i < input.argumentCount && u32.toUsize(i) < argumentSpeculation.length() {
+      let kind = argumentSpeculation.get(u32.toUsize(i))
+      if kind != SPECULATE_NONE {
+        let a = run t.argument(i, header)
+        let mut unboxed = NONE
+        if kind == SPECULATE_INT { unboxed = run t.f.emit(t.current, Op.Unbox, true, Type.I32, Own.Unboxed, a, NONE, 0, header) }
+        else { unboxed = run t.f.emit(t.current, Op.UnboxF64, true, Type.F64, Own.Unboxed, a, NONE, 0, header) }
+        let guard = t.f.lastInst() run t.exitHere(guard, header)
+        let number = run t.boxed(unboxed, header)
+        t.argNumbers.set(u32.toUsize(i), number)
+      }
+      i = i + 1
+    }
+  }
+  let headerBlock = t.blockAt.get(begin)
+  let edge = run t.edgeTo(headerBlock, header)
+  run t.f.terminate(entry, Op.Jump, NONE, edge, header)
+  pc = 0
+  while pc < length {
+    if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
+      run t.enter(pc)
+      let mut at = pc
+      let mut previous = pc
+      let mut open = true
+      while open {
+        if at != pc && shapeOf.leader.get(at) {
+          run t.jumpTo(at, usize.toU32(previous))
+          open = false
+        } else if osrExit(byteAt(input, at)) {
+          run sideExit(&mut t, usize.toU32(at))
+          open = false
+        } else {
+          open = run t.instruction(input, at)
+          previous = at
+          at = at + sizeAt(input, at)
+        }
+      }
+    }
+    pc = pc + 1
+  }
+  run t.f.compact()
+  return move t.f
+}
+
+/// The targets of backward jumps in `input`, each once, in code order: where on-stack
+/// replacement can enter. Read by decoding the code linearly.
+pub effect fn loopHeaders(input: &FunctionInput) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let mut marked = List<bool>.make() run marked.appendRepeated(false, length + 1)
+  let mut pc: usize = 0
+  while pc < length {
+    let opcode = byteAt(input, pc)
+    let size = sizeAt(input, pc)
+    if size == 0 || pc + size > length { break }
+    if isBranch(opcode) || isGoto(opcode) {
+      let target = targetOf(input, pc)
+      if target >= 0 && target <= usize.toI64(pc) { marked.set(i64.toUsize(target), true) }
+    }
+    pc = pc + size
+  }
+  let mut headers = List<u32>.make()
+  pc = 0
+  while pc < length { if marked.get(pc) { run headers.append(usize.toU32(pc)) } pc = pc + 1 }
+  return move headers
 }

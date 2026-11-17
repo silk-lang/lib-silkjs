@@ -17,7 +17,8 @@ import silk.num.u64
 import silk.num.i64
 import silk.num.usize
 import silkjs.js_heap { HeapCell, HeapHeader }
-import silkjs.js_core_types { FunctionBytecode, CompiledEntry, HostHook, NativeFunctionId }
+import silkjs.js_compiled as compiled
+import silkjs.js_core_types { FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
 import silkjs.js_runtime as runtime
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
 import silkjs.cli_io as io
@@ -28,10 +29,16 @@ import x64_lower { Lowered, Refusal }
 import x64_lower as lower
 import jit_recompile { History }
 import jit_recompile as recompile
+import ssa_input { inputOf }
+import ssa_translate { loopHeaders, translateOsr, Refusal as TranslateRefusal }
+import ssa { Function }
 import jit_helpers { CompiledEnv }
 
 /// Functions one runtime can have compiled; the table never moves.
 pub const CAPACITY: usize = 4096
+/// u64 words of the runtime's activation stack (js_vm.runActivations): 2 MiB, room for about a
+/// thousand nested activations before calls take native frames.
+pub const ACTIVATION_WORDS: usize = 262144
 /// Address space reserved for machine code.
 const CODE_BYTES: usize = 67108864
 
@@ -63,13 +70,15 @@ pub struct Jit {
   pub options: Options,
   memory: Option<CodeMemory>,
   entries: List<CompiledEntry>,
+  /// Storage lent to the runtime for its activation stack (never grows, so never moves).
+  activations: List<u64>,
   /// One CompiledEnv, in storage that never moves (every entry's env points at it).
   pub env: List<CompiledEnv>,
   blocks: List<CodeBlock>,
   /// Countdown the stress configuration's guards share (CompiledEntry.data).
   stressCounter: i32,
   handler: HotHandler,
-  runtime: ?*mut HeapHeader,
+  pub runtime: ?*mut HeapHeader,
   pub reported: u64,
   pub compiledFunctions: u64,
   pub refused: u64,
@@ -87,17 +96,28 @@ pub struct Jit {
   /// Earlier compilations per function and their deopt sites (jit_recompile).
   history: History,
   /// Reports of functions compiled or refused before (recompilations attempted).
-  pub recompiled: u64
+  pub recompiled: u64,
+  /// Loop-header entries (docs/jit/osr.md): per linked function, the list its
+  /// CompiledEntry.osr points into (never appended to once linked).
+  osrLists: List<List<OsrEntry>>,
+  pub osrCompiled: u64,
+  pub osrRefused: u64,
+  /// Functions linked for on-stack replacement only (their normal entry was refused).
+  pub osrOnly: u64,
+  pub osrRuns: u64,
+  pub osrDeopts: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
     let entries = run List<CompiledEntry>.makeWithCapacity(CAPACITY)
+    let activations = run List<u64>.makeWithCapacity(ACTIVATION_WORDS)
     let mut env = run List<CompiledEnv>.makeWithCapacity(1)
     drop env.appendWithinCapacity(CompiledEnv.make())
-    return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, env: move env, blocks: List<CodeBlock>.make(),
+    return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, activations: move activations, env: move env, blocks: List<CodeBlock>.make(),
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
-      history: History.make(), recompiled: 0 }
+      history: History.make(), recompiled: 0,
+      osrLists: List<List<OsrEntry>>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -121,6 +141,11 @@ impl Jit {
     run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
     run line.appendSlice(b" recompiled ") run decimal(&mut line, self.recompiled)
     run line.appendSlice(b" direct-calls ") run decimal(&mut line, self.env.get(0).directCalls)
+    run line.appendSlice(b" osr-compiled ") run decimal(&mut line, self.osrCompiled)
+    run line.appendSlice(b" osr-refused ") run decimal(&mut line, self.osrRefused)
+    run line.appendSlice(b" osr-only ") run decimal(&mut line, self.osrOnly)
+    run line.appendSlice(b" osr-runs ") run decimal(&mut line, self.osrRuns)
+    run line.appendSlice(b" osr-deopts ") run decimal(&mut line, self.osrDeopts)
     run line.appendSlice(b" code-bytes ") run decimal(&mut line, self.codeBytes)
     run line.appendSlice(b" compile-ns ") run decimal(&mut line, self.compileNanoseconds)
     run line.append(10)
@@ -128,12 +153,13 @@ impl Jit {
   }
   /// Sums the compiled code table's counters into runs, deopts, polls and unlinked.
   pub fn collect(self: &mut Self) -> () {
-    self.runs = 0 self.deopts = 0 self.polls = 0 self.unlinked = 0
+    self.runs = 0 self.deopts = 0 self.polls = 0 self.unlinked = 0 self.osrRuns = 0 self.osrDeopts = 0
     let entries = self.entries.asSlice()
     let mut index: usize = 0
     while index < entries.length {
       let entry = &entries[index]
       self.runs = self.runs + entry.runs self.deopts = self.deopts + entry.deopts self.polls = self.polls + entry.polls
+      self.osrRuns = self.osrRuns + entry.osrRuns self.osrDeopts = self.osrDeopts + entry.osrDeopts
       if entry.deoptLimit != 0 && entry.deopts >= u32.toU64(entry.deoptLimit) { self.unlinked = self.unlinked + 1 }
       index = index + 1
     }
@@ -192,6 +218,8 @@ pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
   if jit.options.threshold != 0 { unsafe runtime.setHotEntryBudget(rt, jit.options.threshold) }
   let table = unsafe jit.entries.storage()
   unsafe runtime.setCompiledTable(rt, unsafe Intrinsic.pointerRequalify<?[*]mut CompiledEntry, ?*mut CompiledEntry>(table), usize.toU32(CAPACITY))
+  let stack = unsafe jit.activations.storage()
+  unsafe runtime.setActivationStack(rt, unsafe Intrinsic.pointerRequalify<?[*]mut u64, ?*mut u64>(stack), ACTIVATION_WORDS)
 }
 
 /// LibcServices.hotFunction through HotHandler: compile bytecode or refuse it.
@@ -225,6 +253,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   }
   let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, jit.options.calls, &plan.sites))
   drop function
+  let osr = run unsafe compileLoops(&mut jit, bytecode, &plan.sites)
   let result = match move lowered {
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
@@ -234,9 +263,11 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let mut code = match move result {
     Lowered.Code { value, .. } => move value
     Lowered.Refused { reason } => {
-      run jit.history.remember(&plan, recompile.noEntry())
       jit.refused = jit.refused + 1
       if jit.options.dump { run sayRefusal(&reason) }
+      let mut linked = recompile.noEntry()
+      if osr.length() > 0 { linked = run unsafe installOsrOnly(&mut jit, bytecode, move osr) }
+      run jit.history.remember(&plan, linked)
       return ()
     }
   }
@@ -246,6 +277,92 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   run jit.history.remember(&plan, usize.toU32(jit.entries.length() - 1))
   jit.compiledFunctions = jit.compiledFunctions + 1
   if jit.options.dump { run say(b"jit: compiled", b"") }
+  let last = jit.entries.length() - 1
+  run unsafe attachOsr(&mut jit, last, move osr)
+}
+
+/// Compiles and publishes an on-stack-replacement entry for each loop header of bytecode
+/// (docs/jit/osr.md), refusals counted and skipped.
+unsafe effect fn compileLoops(jit: &mut Jit, bytecode: *mut HeapHeader, doubleSites: &List<u32>) -> List<OsrEntry> ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  let mut entries = List<OsrEntry>.make()
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let input = run inputOf(&function)
+  let headers = run loopHeaders(&input)
+  let mut position: usize = 0
+  while position < headers.length() {
+    let header = headers.get(position)
+    position = position + 1
+    if jit.options.dump {
+      match move run Effect.result(translateOsr(&input, header)) {
+        Result<Function, TranslateRefusal | OutOfMemoryError>.Success { value } => { let mut out = List<u8>.make() run value.print(&mut out) io.stderr(out.asSlice()) }
+        Result<Function, TranslateRefusal | OutOfMemoryError>.Failure { .. } => ()
+      }
+    }
+    let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, doubleSites, header))
+    let result = match move lowered {
+      Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
+      Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 continue }
+    }
+    let mut code = match move result {
+      Lowered.Code { value, .. } => move value
+      Lowered.Refused { reason } => {
+        jit.osrRefused = jit.osrRefused + 1
+        if jit.options.dump { run say(b"jit: osr refused: ", reason.text()) }
+        continue
+      }
+    }
+    if jit.memory.isNone() { jit.memory = Option<CodeMemory>.some(run CodeMemory.reserve(CODE_BYTES)) }
+    let block = match &mut jit.memory {
+      Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code)
+      Option<CodeMemory>.None => { continue }
+    }
+    jit.codeBytes = jit.codeBytes + usize.toU64(code.bytes.length())
+    run entries.append(OsrEntry { pc: header, depth: 0, code: block.entry() })
+    run jit.blocks.append(move block)
+    jit.osrCompiled = jit.osrCompiled + 1
+    if jit.options.dump { run say(b"jit: osr compiled", b"") }
+  }
+  drop function
+  return move entries
+}
+/// Gives table entry index the loop-header entries in list.
+unsafe effect fn attachOsr(jit: &mut Jit, index: usize, list: List<OsrEntry>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if list.length() == 0 { return () }
+  let count = usize.toU32(list.length())
+  run jit.osrLists.append(move list)
+  let stored = jit.osrLists.length() - 1
+  let lists = jit.osrLists.asMutSlice()
+  let pointer = unsafe Intrinsic.pointerRequalify<?[*]mut OsrEntry, ?*const OsrEntry>(unsafe lists[stored].storage())
+  let entries = jit.entries.asMutSlice()
+  entries[index].osr = pointer
+  entries[index].osrCount = count
+}
+/// Links bytecode, whose normal entry was refused, for on-stack replacement only.
+/// Returns its table index (for jit_recompile, which reads its OSR deopt sites) or
+/// recompile.noEntry() when the table is full.
+unsafe effect fn installOsrOnly(jit: &mut Jit, bytecode: *mut HeapHeader, list: List<OsrEntry>) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  if jit.entries.length() >= CAPACITY { return recompile.noEntry() }
+  let index = jit.entries.length()
+  // The osr code reads the stress countdown through the entry's data word, as normal code does.
+  let mut stress: ?*mut u8 = Pointer.null<u8>()
+  if jit.options.stress != 0 {
+    jit.stressCounter = u32.wrappingToI32(jit.options.stress)
+    stress = unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(Pointer.fromMutRef<i32>(&mut jit.stressCounter))
+  }
+  let env = unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0]))
+  let added = jit.entries.appendWithinCapacity(blankEntry(Pointer.null<u8>(), stress, env, jit.options.deoptLimit, OSR_ONLY_CALL_WORDS))
+  if !added { return recompile.noEntry() }
+  run unsafe attachOsr(&mut jit, index, move list)
+  let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
+  unsafe runtime.linkOsr(attached, bytecode, usize.toU32(index))
+  jit.osrOnly = jit.osrOnly + 1
+  return usize.toU32(index)
+}
+fn blankEntry(code: ?*const u8, data: ?*mut u8, env: ?*mut u8, deoptLimit: u32, callWords: u32) -> CompiledEntry {
+  return CompiledEntry { code: code, data: data, env: env, deoptLimit: deoptLimit, frameCells: 0, leaf: 0, callWords: callWords, runs: 0, deopts: 0, polls: 0, deoptPcs: [0; 4], deoptPcCount: 0,
+    osr: Pointer.null<OsrEntry>(), osrCount: 0, osrRuns: 0, osrDeopts: 0, activationWords: 0, counter: Pointer.null<i32>(),
+    directArity: compiled.DIRECT_NOT_READY, directRealm: Pointer.null<HeapHeader>(), directCode: Pointer.null<u8>() }
 }
 
 /// Links code, lowered from bytecode by this or another runtime's compiler (it holds no
@@ -269,7 +386,7 @@ pub unsafe effect fn install(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mu
   }
   let index = jit.entries.length()
   let env = unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0]))
-  let added = jit.entries.appendWithinCapacity(CompiledEntry { code: entry, data: stress, env: env, deoptLimit: jit.options.deoptLimit, frameCells: 0, leaf: 0, callWords: callWords, runs: 0, deopts: 0, polls: 0, deoptPcs: [0; 4], deoptPcCount: 0 })
+  let added = jit.entries.appendWithinCapacity(blankEntry(entry, stress, env, jit.options.deoptLimit, callWords))
   if !added { return false }
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
   unsafe runtime.linkCompiled(attached, bytecode, usize.toU32(index))

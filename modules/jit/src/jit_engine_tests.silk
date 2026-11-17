@@ -23,6 +23,10 @@ import silkjs.js_realm { Realm, lendRealm }
 import silkjs.js_core_types { HostHook, NativeFunctionId, FunctionBytecode }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_runtime as runtime
+import silkjs.js_vm as vm
+import silkjs.cli_io as io
+import silk.num.u8
+import silk.num.u32
 import silkjs.js_gc as gc
 import silkjs.js_eval as eval
 import silkjs.js_intrinsic_install as intrinsics
@@ -93,10 +97,14 @@ unsafe effect fn exercise<'m>(engine: &mut Engine<'m, Compiling>, context: *mut 
   // A long loop: the back edge's poll falls due (the interrupt counter runs at most 10000 back
   // edges) before s overflows at i = 65536, so the interpreter takes over at the loop header and
   // makes the double. The overflow guard itself is run in x64_backend_tests.
+  // There the interpreter polls at its next back edge and enters the loop header's
+  // on-stack-replacement code (docs/jit/osr.md), which polls every 10000 back edges without
+  // leaving for good and deopts at the overflow.
   let wide = run unsafe evaluate(&mut engine, context, b"sum(70000)")
   run Testing.expect(isNumber(wide, sumOf(70000)), "a loop past the poll leaves at the loop header and the interpreter finishes it")
   engine.services.jit.collect()
-  run Testing.expect(engine.services.jit.deopts == 0 && engine.services.jit.polls == polled + 1, "that exit is one poll, not a deopt")
+  run Testing.expect(engine.services.jit.deopts == 0 && engine.services.jit.polls >= polled + 6, "the poll exits are not deopts")
+  run Testing.expect(engine.services.jit.osrRuns >= 6 && engine.services.jit.osrDeopts == 1, "the loop is re-entered after each poll; the overflow is its one deopt")
   // Not an int: the entry guard deopts before anything ran.
   let half = run unsafe evaluate(&mut engine, context, b"sum(3.5)")
   run Testing.expect(isInt(half, 6), "a double argument deopts at entry")
@@ -120,6 +128,48 @@ unsafe effect fn exercise<'m>(engine: &mut Engine<'m, Compiling>, context: *mut 
   let leaf = run unsafe evaluate(&mut engine, context, b"function add(a,b){return a+b};var u=0;for(var k=0;k<100;k++)u=add(u,k);u")
   engine.services.jit.collect()
   run Testing.expect(isInt(leaf, 4950) && engine.services.jit.compiledFunctions == 1, "a leaf function stays interpreted")
+  // On-stack replacement (docs/jit/osr.md). Called once, so never hot by entries: the back-edge
+  // poll reports it. The object read before the loop is outside the subset, so only the loop
+  // compiles (OSR only), and the object kept in a local across the loop comes back intact.
+  let before = engine.services.jit.osrRuns
+  let looped = run unsafe evaluate(&mut engine, context,
+    b"function once(n){let o={k:7};let s=o.k;for(let i=0;i<n;i++){s=s+3;if(s>9000)s=s-9000}return s+o.k};once(200000)")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(looped, 6014), "a loop entered by on-stack replacement returns the interpreter's answer")
+  run Testing.expect(engine.services.jit.osrOnly == 1 && engine.services.jit.osrRuns >= before + 15,
+    "the loop runs compiled from its first poll on, re-entered after every poll")
+  // In an inline frame (once called from another function's loop), and leaving at a side exit
+  // (the property write) on the last iteration.
+  let nested = run unsafe evaluate(&mut engine, context,
+    b"function inner(n,o){let s=0;for(let i=0;i<n;i++){s=s+1;if(i===n-1)o.last=s}return s};function outer(){let o={};let t=0;for(let k=0;k<3;k++)t=t+inner(30000,o);return t+o.last};outer()")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(nested, 120000), "on-stack replacement in an inline frame, with a side exit")
+  // An OSR-only loop whose int add overflows deopts at every poll; at the deopt limit the function
+  // is unlinked and reported again, and its next compilation (jit_recompile) widens that add.
+  let recompiles = engine.services.jit.recompiled
+  let deoptsBefore = engine.services.jit.osrDeopts
+  let grown = run unsafe evaluate(&mut engine, context,
+    b"function grow(n){let o={k:1};let s=o.k;for(let i=0;i<n;i++){s=s+100000}return s+o.k};grow(300000)")
+  engine.services.jit.collect()
+  run Testing.expect(isNumber(grown, 30000000002.0), "a recompiled OSR loop returns the interpreter's answer")
+  run Testing.expect(engine.services.jit.recompiled == recompiles + 1 && engine.services.jit.osrDeopts <= deoptsBefore + 10,
+    "OSR deopts feed the recompile path, and the widened loop stops deopting")
+  // A double from a non-int argument in an OSR-only loop, widened at recompilation.
+  let infinite = run unsafe evaluate(&mut engine, context,
+    b"function long0(a,n){var t=1;var o={x:1};for(var i=0;i<n;i++){t=t-a;if(t>100000||t<-100000)t=0;if(i===n-2)o=[t]}return t+o.length};long0(Infinity,250000)")
+  run Testing.expect(isInt(infinite, 1), "a loop widened to doubles after OSR deopts")
+  // An OSR-only function (the object literal keeps its normal entry out) called afterwards
+  // through the interpreter's linked call site, spread, apply and call: each call interprets
+  // it (OSR_ONLY_CALL_WORDS) and its long loops still enter the OSR code.
+  engine.services.jit.collect()
+  let onlyBefore = engine.services.jit.osrOnly
+  let runsBefore = engine.services.jit.osrRuns
+  let hop = run unsafe evaluate(&mut engine, context,
+    b"function hop(n){let o={k:2};let s=o.k;for(let i=0;i<n;i++){s=s+1}return s};var r=hop(30000);var t=0;for(var k=0;k<50;k++)t=t+hop(k);t=t+hop(...[25000])+hop.apply(null,[25000])+hop.call(null,3);r+t")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(hop, 81336), "an OSR-only function returns the interpreter's answers through every call path")
+  run Testing.expect(engine.services.jit.osrOnly == onlyBefore + 1 && engine.services.jit.osrRuns >= runsBefore + 4,
+    "it is linked once, and loops reached by spread and apply calls enter its OSR code")
   run Testing.expect(engine.services.failures == 0, "no compile failed")
 }
 test effect fn hotFunctionsRunCompiledCodeAndDeopt() -> ()
@@ -137,6 +187,46 @@ test effect fn hotFunctionsRunCompiledCodeAndDeopt() -> ()
   unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
   let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
   let checked = run Effect.result(unsafe exercise(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
+    Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+const BRANCHES: &[u8] = b"function br(x,y){var c=0;if(x<y)c=c+1;if(x<=y)c=c+2;if(x>y)c=c+4;if(x>=y)c=c+8;if(x==y)c=c+16;if(x!=y)c=c+32;if(!(x<y))c=c+64;if(!(x>=y))c=c+128;return c}function lp(x,y){var n=0;for(var d=x;d<y;d=d+1){n=n+1;if(n>5)break}var m=0;for(var e=y;!(e<=x);e=e-1){m=m+1;if(m>5)break}return n*8+m}var I=[1,2,2,1,1,1,-5,3,3,-5,0,0,-2147483648,2147483647,7,-7];var D=[1.5,2,NaN,1,1,NaN,NaN,NaN,0,-0,-0,0,Infinity,1,-Infinity,Infinity,Infinity,Infinity,0.5,0.5,-Infinity,NaN];function phase(P,rounds){var t=0;for(var r=0;r<rounds;r++)for(var p=0;p<P.length;p=p+2)t=(t*31+br(P[p],P[p+1])*7+lp(P[p],P[p+1]))%1000003;return t}"
+
+/// Every branch form on compares, first with int32 operands (fused compare and branch), then,
+/// recompiled, with doubles: NaN, -0 and the infinities. Checksums are node's.
+unsafe effect fn exerciseBranches<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
+  ! JsException | AssertionError<'static> ? &mut Allocator {
+  drop run unsafe evaluate(&mut engine, context, BRANCHES)
+  let ints = run unsafe evaluate(&mut engine, context, b"phase(I,40)")
+  run Testing.expect(isNumber(ints, 685411.0), "int32 compares branch as the interpreter does")
+  let doubles = run unsafe evaluate(&mut engine, context, b"phase(D,40)")
+  run Testing.expect(isNumber(doubles, 547601.0), "double compares branch false at NaN, and -0 equals 0")
+  let again = run unsafe evaluate(&mut engine, context, b"phase(I,5)")
+  run Testing.expect(isNumber(again, 552975.0), "ints again, after the double recompile")
+  run Testing.expect(engine.services.jit.compiledFunctions >= 2 && engine.services.jit.recompiled >= 1, "br and lp compiled, then recompiled for doubles")
+  run Testing.expect(engine.services.failures == 0, "no compile failed")
+}
+test effect fn branchesFollowTheInterpreterAtNaN() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut options = Options.make()
+  options.enabled = true options.threshold = 20
+  let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
+  unsafe jitRuntime.attach(&mut engine.services.jit, rt)
+  unsafe runtime.setHotFunctionHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: HANDLER }), opaque: Pointer.null<u8>() })
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exerciseBranches(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
   unsafe gc.releaseHeader(&mut engine, rt, context)
   run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
   match move checked {
@@ -414,7 +504,7 @@ test effect fn propertyReadsRunCompiled() -> ()
   }
 }
 
-const CALLS: &[u8] = b"function inc(x){return x+1}function each(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i);return s}function apply(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i,i);return s}function twice(o,n){let s=0;for(let i=0;i<n;i++)s=s+o.dbl(i);return s}function risky(x){if(x>50)throw new RangeError('big '+x);return x}function guarded(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i);return s}function scaled(f,n){let d=0.5;let s=0;for(let i=0;i<n;i++){d=d*1.5;s=s+f(i)}return s+d}"
+const CALLS: &[u8] = b"function inc(x){return x+1}function each(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i);return s}function apply(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i,i);return s}function twice(o,n){let s=0;for(let i=0;i<n;i++)s=s+o.dbl(i);return s}function risky(x){if(x>50)throw new RangeError('big '+x);return x}function guarded(f,n){let s=0;for(let i=0;i<n;i++)s=s+f(i);return s}function scaled(f,n){let d=0.5;let s=0;for(let i=0;i<n;i++){d=d*1.5;s=s+f(i)}return s+d}function rec(self,g,n){if(n<=0)return g(n);return self(self,g,n-1)+1}function p3(o,x){return o.q3(o,x)+1}function q3(o,x){return o.r3(o,x)+1}function r3(o,x){return o.leaf(x)+1}function deepr(self,n){if(n<=0)return 0;return self(self,n-1)+1}"
 
 unsafe effect fn exerciseCalls<'m>(engine: &mut Engine<'m, Compiling>, context: *mut HeapHeader) -> ()
   ! JsException | AssertionError<'static> ? &mut Allocator {
@@ -449,6 +539,71 @@ unsafe effect fn exerciseCalls<'m>(engine: &mut Engine<'m, Compiling>, context: 
   // Integers above and a double here are live across calls: they must survive the re-entry.
   let across = run unsafe evaluate(&mut engine, context, b"var q=1;for(var k=0;k<3000;k++)if(scaled(inc,4)!==12.53125)q=0;q")
   run Testing.expect(isInt(across, 1), "a double live across a call keeps its value")
+  // Compiled rec suspends at each recursive call. A string from the innermost call makes every
+  // activation deoptimize as it resumes, which unlinks rec while the outer ones are suspended.
+  let unlinkedBefore = engine.services.jit.unlinked
+  let deep = run unsafe evaluate(&mut engine, context, b"var z=0;for(var k=0;k<200;k++)z=z+rec(rec,inc,5);var y=rec(rec,function(){return 'x'},20);y==='x'+'1'.repeat(20)&&z===1200?1:0")
+  run Testing.expect(isInt(deep, 1), "frames suspended at a call finish after their code is unlinked")
+  engine.services.jit.collect()
+  run Testing.expect(engine.services.jit.unlinked > unlinkedBefore, "and rec was unlinked meanwhile")
+  // A callee that throws through several suspended frames, caught by the script.
+  let through = run unsafe evaluate(&mut engine, context, b"var w=0;try{rec(rec,function(){throw new RangeError('deep')},30)}catch(e){w=e.message==='deep'?1:2}w")
+  run Testing.expect(isInt(through, 1), "an exception unwinds through suspended compiled frames")
+  // Three levels of compiled code that makes calls, each an activation of the one above.
+  let chain = run unsafe evaluate(&mut engine, context, b"var o3={p3:p3,q3:q3,r3:r3,leaf:inc};var h=0;for(var k=0;k<300;k++)h=h+p3(o3,k);h")
+  run Testing.expect(isInt(chain, 46050), "a call chain three activations deep returns what the interpreter's does")
+  // The innermost deoptimizes (a string where it saw ints): the two above it finish compiled.
+  let deopted = run unsafe evaluate(&mut engine, context, b"p3(o3,'s')==='s1111'?1:0")
+  run Testing.expect(isInt(deopted, 1), "a deopt three activations deep finishes every level")
+  let thrown = run unsafe evaluate(&mut engine, context, b"var o4={p3:p3,q3:q3,r3:r3,leaf:function(x){throw new TypeError('at '+x)}};var m='';try{p3(o4,7)}catch(e){m=e.message+(e.stack.indexOf('r3')<e.stack.indexOf('q3')&&e.stack.indexOf('q3')<e.stack.indexOf('p3')?' ordered':'')}m==='at 7 ordered'?1:0")
+  run Testing.expect(isInt(thrown, 1), "a throw three activations deep unwinds all of them, and the backtrace names each in order")
+  // Recursion past the activation stack continues on native frames, up to the engine's
+  // stack limit, which throws the RangeError the interpreter would.
+  let warm = run unsafe evaluate(&mut engine, context, b"var v=0;for(var k=0;k<300;k++)v=v+deepr(deepr,10);v")
+  run Testing.expect(isInt(warm, 3000), "deepr compiles")
+  // The deepest recursion that returns (searched): past the activation stack's room.
+  let beyond = run unsafe evaluate(&mut engine, context, b"var lo=1,hi=100000;while(lo<hi){var mid=(lo+hi+1)>>1;var ok=true;try{deepr(deepr,mid)}catch(e){ok=e instanceof RangeError?false:(hi=-1e9)}if(ok)lo=mid;else hi=mid-1}hi<0?-1:lo")
+  run Testing.expect(match beyond { ValueBits.Int { value } => value > 1000 _ => false }, "recursion deeper than the activation stack returns")
+  let overflow = run unsafe evaluate(&mut engine, context, b"var f=0;try{deepr(deepr,10000000)}catch(e){f=e instanceof RangeError?1:2}f")
+  run Testing.expect(isInt(overflow, 1), "runaway compiled recursion throws RangeError")
+  let after = run unsafe evaluate(&mut engine, context, b"deepr(deepr,50)")
+  run Testing.expect(isInt(after, 50), "and the activation stack is whole again afterwards")
+  // The layout direct calls from machine code read (js_compiled.DIRECT_*), on inc, which
+  // compiled code has called directly.
+  let incValue = run unsafe evaluate(&mut engine, context, b"inc")
+  let layout = unsafe vm.directLayoutHolds(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(engine.services.jit.runtime), incValue)
+  if layout.field != 0 { drop run Effect.result(failLayout(layout.field, layout.actual)) run Testing.expect(false, "js_compiled.DIRECT_* constants match the layout") }
+  // A closure with captured variables, called directly: its cells reach the callee, and a
+  // write through another closure is seen.
+  let captured = run unsafe evaluate(&mut engine, context,
+    b"function mkc(z){return [function(x){return x+z},function(v){z=v}]}var cz=mkc(5);var cs=0;for(var k=0;k<300;k++){if(k===150)cz[1](6);cs=cs+each(cz[0],10)}cs")
+  run Testing.expect(isInt(captured, 150 * 95 + 150 * 105), "direct calls of a closure read its captured cells")
+  let czValue = run unsafe evaluate(&mut engine, context, b"cz[0]")
+  let capturedLayout = unsafe vm.directLayoutHolds(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(engine.services.jit.runtime), czValue)
+  if capturedLayout.field != 0 { drop run Effect.result(failLayout(capturedLayout.field, capturedLayout.actual)) run Testing.expect(false, "DIRECT_BOX_DATA matches the layout") }
+  // An OSR-only callee (the object literal keeps its normal entry out) called from compiled
+  // code, through a nested callee that makes calls (CALL_FAST, the activation stack): every
+  // call interprets it, and its long loop still enters the OSR code.
+  let onlyBefore = engine.services.jit.osrOnly
+  let osr = run unsafe evaluate(&mut engine, context,
+    b"function hop2(n){let o={k:2};let s=o.k;for(let i=0;i<n;i++){s=s+1}return s};function via(n){return hop2(n)+1};var ov={v:via};function outerHop(o,n){return o.v(n)+1};var w=hop2(30000);for(var k=0;k<300;k++)w=w+outerHop(ov,k%7);w+outerHop(ov,30000)")
+  engine.services.jit.collect()
+  run Testing.expect(isInt(osr, 62103), "an OSR-only callee returns the interpreter's answers from compiled callers")
+  run Testing.expect(engine.services.jit.osrOnly == onlyBefore + 1, "hop2 is OSR-only")
+  // `new` from compiled code leaves through the call exit: bytecode, object-returning, throwing
+  // and native constructors, and a TypeError for a non-constructor.
+  let built = run unsafe evaluate(&mut engine, context,
+    b"function P(x){this.x=x}function R(x){return {x:x*2}}function T(x){if(x>250)throw new RangeError('t'+x);this.x=x}function mk(C,n){let s=0;for(let i=0;i<n;i++)s=s+new C(i).x;return s}function mkA(n){let s=0;for(let i=0;i<n;i++)s=s+new Array(i).length;return s}var b=0;for(var k=0;k<30;k++)b=b+mk(P,10)+mk(R,10)+mkA(10);b")
+  run Testing.expect(isInt(built, 30 * (45 + 90 + 45)), "constructors called from compiled code")
+  let newThrew = run unsafe evaluate(&mut engine, context, b"var e='';try{mk(T,300)}catch(x){e=x.message}e==='t251'?1:0")
+  run Testing.expect(isInt(newThrew, 1), "a constructor's throw from compiled code")
+  let notConstructor = run unsafe evaluate(&mut engine, context, b"var n=0;try{mk(()=>1,2)}catch(x){n=x instanceof TypeError?1:2}n")
+  run Testing.expect(isInt(notConstructor, 1), "new of a non-constructor from compiled code")
+  // Generators and async functions are called like any callee (their own code is refused).
+  let generators = run unsafe evaluate(&mut engine, context, b"var g=0;for(var k=0;k<50;k++){var r=apply(function*(a){yield a},2);g=typeof r==='string'?g+1:g}g")
+  run Testing.expect(isInt(generators, 50), "a generator callee returns its generator object")
+  let asyncs = run unsafe evaluate(&mut engine, context, b"var q=0;for(var k=0;k<50;k++){var r=apply(async function(a){return a},2);q=typeof r==='string'?q+1:q}q")
+  run Testing.expect(isInt(asyncs, 50), "an async callee returns its promise")
   run Testing.expect(engine.services.failures == 0, "no compile failed")
 }
 test effect fn callsFromCompiledCode() -> ()
@@ -473,4 +628,21 @@ test effect fn callsFromCompiledCode() -> ()
     Result<(), JsException | AssertionError<'static>>.Success { value: _ } => ()
     Result<(), JsException | AssertionError<'static>>.Failure { error } => { fail move error }
   }
+}
+
+/// Fails naming a js_compiled.DIRECT_* mismatch: field (its place in js_vm.directLayoutHolds)
+/// and the offset this build has, printed on stderr.
+effect fn failLayout(field: u32, actual: i64) -> () ! AssertionError<'static> | OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(b"direct layout mismatch: field ")
+  run digits(&mut line, u32.toI64(field))
+  run line.append(32)
+  run digits(&mut line, actual)
+  run line.append(10)
+  io.stderr(line.asSlice())
+  run Testing.expect(false, "js_compiled.DIRECT_* constants match the layout")
+}
+effect fn digits(line: &mut List<u8>, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run digits(&mut line, value / 10) }
+  run line.append(i64.wrappingToU8(48 + value % 10))
 }
