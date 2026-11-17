@@ -102,6 +102,11 @@ pub struct Emitter {
   pub constants: List<Option<i32>>,
   /// The block being lowered: a jump to the next one falls through.
   current: u32,
+  /// The instruction being lowered, and the one a label is bound after (NONE: none): where
+  /// a get.elem that loaded its number itself skips its unbox (fusedUnbox).
+  cursor: u32,
+  skipAt: u32,
+  skipLabel: Label,
   /// `add.i32`/`sub.i32` done in place (result and first operand in one register): on
   /// overflow each jumps to its label here, where the operation is undone before the exit
   /// reads the operand.
@@ -138,12 +143,12 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let raw = inputs + INPUT_COUNT * 8 + inlined * INLINE_FRAME_WORDS * 8 + 8 + pushes * 8
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
   let mut assembler = Assembler.make()
+  let skipLabel = run assembler.label()
   let mut emitter = Emitter { a: move assembler, blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places,
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(),
-
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel,
     inlineFrames: u32.wrappingToI32(inputs + INPUT_COUNT * 8), inlineClosures: List<u32>.make(), frameOf: 0 }
   run emitter.inlineClosures.appendRepeated(NONE, u32.toUsize(inlined))
   let mut n: usize = 0
@@ -185,7 +190,9 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
     emitter.a.bind(emitter.blockLabels.get(u32.toUsize(b)))
     let mut i: u32 = 0
     while i < block.instCount {
+      emitter.cursor = block.firstInst + i
       run emitter.instruction(&function, function.inst(block.firstInst + i))
+      if emitter.skipAt == block.firstInst + i { emitter.a.bind(emitter.skipLabel) emitter.skipAt = NONE }
       i = i + 1
     }
     b = b + 1
@@ -658,6 +665,24 @@ impl Emitter {
         if op == Op.PutElem { index = i32.wrappingToU32(inst.k) }
         run self.elementSlot(inst.a, index, typed)
         if op == Op.GetElem {
+          if borrowed && self.fusedUnbox(&function, inst) {
+            // The next instruction unboxes this element and nothing else reads it: an Int
+            // goes from the array to the number's place, and the unbox is skipped. Anything
+            // else is copied to its slot as usual, for the unbox to refuse.
+            let unbox = function.inst(self.cursor + 1)
+            let general = run self.a.label()
+            let layout = self.settings.layout
+            run self.loadTag(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)))
+            run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+            run self.a.jcc(Cond.NotEqual, general)
+            let out = self.at(unbox.result)
+            if out.kind == GPR { run self.a.load(Width.W32, out.gpr, Mem.at(Reg.R11, 8)) }
+            else { run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, 8)) run self.a.store(Width.W64, slotOf(unbox.result), Reg.Rax) }
+            self.skipLabel = run self.a.label()
+            self.skipAt = self.cursor + 1
+            run self.a.jmp(self.skipLabel)
+            self.a.bind(general)
+          }
           run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
           run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
           run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
@@ -967,6 +992,19 @@ impl Emitter {
     }
     return false
   }
+  /// Whether `read` (a get.elem) is followed in its block by the unbox of its result, the
+  /// only reader of that result but for the unbox's own exit.
+  fn fusedUnbox(self: &Self, function: &Function, read: Inst) -> bool {
+    let block = function.blocks.get(u32.toUsize(read.block))
+    if self.cursor + 1 >= block.firstInst + block.instCount { return false }
+    let unbox = function.inst(self.cursor + 1)
+    if unbox.op != Op.Unbox || unbox.a != read.result || unbox.result == NONE || unbox.exit == NONE { return false }
+    let exit = function.exit(unbox.exit)
+    let mut readers: u32 = 1
+    let mut s: u32 = 0
+    while s < function.slotCount(exit) { if function.slot(exit, s).value == read.result { readers = readers + 1 } s = s + 1 }
+    return self.uses.get(u32.toUsize(read.result)) == readers
+  }
   effect fn countUses(self: &mut Self, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
     let count = u32.toUsize(function.valueCount())
     run self.uses.appendRepeated(0, count)
@@ -1227,12 +1265,20 @@ impl Emitter {
     run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
     run self.a.jcc(Cond.NotEqual, miss)
     run self.a.load(Width.W64, Reg.R11, payloadOf(value))
-    run self.a.loadZero16(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectClass)))
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(fields.arrayClass))
-    run self.a.jcc(Cond.NotEqual, miss)
-    run self.a.loadZero8(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)))
-    run self.a.testImm(Width.W32, Reg.R8, u32.wrappingToI32(fields.fastArray))
-    run self.a.jcc(Cond.Equal, miss)
+    if fields.objectClass == fields.objectFlags + 2 && fields.arrayClass < 65536 && fields.fastArray < 256 {
+      // The flags byte and the 16-bit class share one 32-bit word: one test for both.
+      run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)))
+      run self.a.aluImm(Alu.And, Width.W32, Reg.R8, u32.wrappingToI32(u32.bitOr(0xffff0000, fields.fastArray)))
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(u32.bitOr(u32.shiftLeft(fields.arrayClass, 16), fields.fastArray)))
+      run self.a.jcc(Cond.NotEqual, miss)
+    } else {
+      run self.a.loadZero16(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectClass)))
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(fields.arrayClass))
+      run self.a.jcc(Cond.NotEqual, miss)
+      run self.a.loadZero8(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)))
+      run self.a.testImm(Width.W32, Reg.R8, u32.wrappingToI32(fields.fastArray))
+      run self.a.jcc(Cond.Equal, miss)
+    }
     let place = self.at(index)
     run getI32(&mut self.a, Reg.R8, place)
     run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)))

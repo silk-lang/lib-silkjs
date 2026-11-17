@@ -14,6 +14,7 @@ breaks a rule turns into a refused function, not into wrong code.
 | --- | --- | --- |
 | Reads without counts | `ssa_opt_borrow.silk` | `--jit-no-borrow` |
 | Hoisting | `ssa_opt_hoist.silk` | `--jit-no-hoist` |
+| Exits name the unboxed number | `ssa_opt_unboxed.silk` | `--jit-no-unboxed` |
 
 ## Reads without counts
 
@@ -90,6 +91,15 @@ earlier code of the function deoptimized at (`jit_recompile` sites) is not hoist
 the guard stays in the loop, the next deopt names the instruction, and the compilation
 after that widens it.
 
+## Exits name the unboxed number
+
+After `u = unbox.i32 v` passed, `v` is an Int and `u` is its number. An exit later in the
+block that writes `v` to the interpreter's frame writes `int u` instead: the same value. `v`
+then has no reader past its unbox, which is what lets the backend load an element's number
+straight from the array (below). Only a borrowed `v` (an owned one is moved by the exit, and
+the ownership rules count that), and only exits one instruction uses: an exit shared with an
+instruction in front of the unbox (the front block of a hoist) runs before `u` exists.
+
 ## In the backend
 
 - **`add.i32` and `sub.i32` in place.** When the result takes the first operand's register
@@ -97,6 +107,13 @@ after that widens it.
   the operand, so the overflow jump goes to a short piece after the blocks that undoes the
   operation and then jumps to the exit.
 - An Array's length is a number: its inline read took a count it never needed.
+- **One test for an Array.** The flags byte and the 16-bit class of an object share a
+  32-bit word, so "class Array and fast" is one masked compare, where it was two loads and
+  two compares.
+- **`get.elem` followed by its unbox.** When the element's only reader is the `unbox.i32`
+  next to it (and that unbox's own exit), an Int goes from the array to the number's
+  register and the unbox is skipped; anything else is copied to its frame slot as before
+  and the unbox refuses it. No exit changes.
 
 ## What it is checked with
 
@@ -127,19 +144,22 @@ include their warm-up.
 
 | Kernel | Before | After | Without hoisting | Without borrowing | V8 | After / V8 |
 | --- | --- | --- | --- | --- | --- | --- |
-| array-sum (`s + a[i]` over 1000 ints) | 78.2 | 35.2 | 52.2 | 69.2 | 13.1 | 2.7 |
+| array-sum (`s + a[i]` over 1000 ints) | 78.2 | 29.3 | 46.2 | 67.2 | 13.1 | 2.2 |
 | sum-long (counted loop, one branch) | 15.4 | 11.4 | 11.4 | 11.4 | 16.5 | 0.7 |
 | nested (`s + i * j`, two loops) | 26.6 | 24.6 | 24.6 | 24.6 | 13.1 | 1.9 |
 | doubles (`s * 0.999 + i * 0.25`) | 20.4 | 18.3 | 18.3 | 18.3 | 17.3 | 1.1 |
-| typed-array (Float64Array multiply-add) | 373.7 | 178.0 | 297.7 | 373.7 | 16.3 | 10.9 |
+| typed-array (Float64Array multiply-add) | 373.7 | 182.0 | 301.8 | 377.7 | 16.3 | 11.2 |
 
 ## What is left
 
-- **array-sum, 35 against 13.** Each `a[i]` still tests the tag, the class and the fast
-  flag of `a`, compares the index with the count, copies the element to a frame slot and
-  tests its tag again. Splitting `get.elem` into a hoistable `check.array`, a bounds check
-  and a typed load needs a value type for the element storage; the bounds check then goes
-  when the loop's bound is the hoisted length.
+- **array-sum, 29 against 13.** Each `a[i]` still tests the tag of `a`, its class and fast
+  flag (seven instructions), compares the index with the count (three) and jumps over the
+  code for the other kinds of object (one). A `check.array` guard in front of the loop and
+  an element read that trusts it need the element kind each site saw (the doubles stream
+  is adding it to js_feedback): without it a loop over a typed array would deoptimize at
+  its entry. The bounds check then goes when the loop's bound is the hoisted length.
+  The masked Array test costs a typed array access one instruction more than before (the
+  typed arm runs after it); the element kind decides the order too.
 - **typed-array, 178 against 16.** Every element crosses a frame slot as a boxed double, and each access
   tests the class and the count again. The same
   split, with the element kind from feedback (js_feedback records no element sites yet),

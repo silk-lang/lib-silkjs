@@ -42,7 +42,7 @@ are compared with.
   jit-calls-stress                              jit-stress with --jit-calls
   jit-inline-stress                             jit-calls with stressed guards after a warm-up, so
                                                 inlined bodies (docs/jit/inlining.md) leave mid-way
-  jit-no-hoist, jit-no-borrow                   jit-calls-eager without one code quality pass
+  jit-no-hoist, jit-no-borrow, jit-no-unboxed   jit-calls-eager without one code quality pass
                                                 (docs/jit/code-quality.md), to pin a mismatch on it
 
 Adding a configuration: for a one-off run pass `--config NAME=TEMPLATE` (repeatable; the name is
@@ -87,6 +87,7 @@ BUILTIN = {
     "jit-inline-stress": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stress=5 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-no-hoist": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-hoist --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-no-borrow": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-borrow --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-no-unboxed": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-unboxed --jit-threshold=20 --jit-stats={stats} {file}",
 }
 REFERENCES = {"node"}
 
