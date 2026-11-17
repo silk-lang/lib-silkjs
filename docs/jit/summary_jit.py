@@ -8,10 +8,12 @@ print("%-11s %8s %8s %8s" % ("engine", "best", "median", "worst"))
 for e in engines:
     cols = [sorted(row[e]) for row in table.values() if row.get(e)]
     print("%-11s %8.0f %8.0f %8.0f" % (e, g([c[-1] for c in cols]), g([c[len(c)//2] for c in cols]), g([c[0] for c in cols])))
-# per-benchmark silkjs-jit / silkjs ratio of medians
-r = []
-for name, row in table.items():
-    a, b = sorted(row["silkjs"]), sorted(row["silkjs-jit"])
-    r.append(b[1] / a[1])
-    print("  %-16s jit/plain median %.3f  plain [%g..%g] jit [%g..%g]" % (name, b[1]/a[1], a[0], a[-1], b[0], b[-1]))
-print("geomean jit/plain of medians %.3f" % g(r))
+# per-benchmark ratio of medians to silkjs for each JIT column
+for column in [e for e in engines if e.startswith("silkjs-jit")]:
+    r = []
+    print(column)
+    for name, row in table.items():
+        a, b = sorted(row["silkjs"]), sorted(row[column])
+        r.append(b[len(b)//2] / a[len(a)//2])
+        print("  %-16s %s/plain median %.3f  plain [%g..%g] %s [%g..%g]" % (name, column, r[-1], a[0], a[-1], column, b[0], b[-1]))
+    print("geomean %s/plain of medians %.3f" % (column, g(r)))

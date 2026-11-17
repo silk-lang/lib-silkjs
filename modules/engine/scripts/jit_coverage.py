@@ -76,9 +76,9 @@ def parse_stats(text):
     return {}
 
 
-def counters(shell, path, cwd, timeout):
+def counters(shell, path, cwd, timeout, extra=()):
     env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
-    done = subprocess.run([shell, "--jit", "--jit-dump", "--jit-stats", path], capture_output=True, text=True,
+    done = subprocess.run([shell, "--jit", "--jit-dump", "--jit-stats", *extra, path], capture_output=True, text=True,
                           timeout=timeout, env=env, cwd=cwd)
     refused = collections.Counter(line[len("jit: refused: "):] for line in done.stderr.splitlines()
                                   if line.startswith("jit: refused: "))
@@ -86,11 +86,11 @@ def counters(shell, path, cwd, timeout):
     return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "errors": errors}
 
 
-def compiled_fraction(shell, path, cwd, timeout):
+def compiled_fraction(shell, path, cwd, timeout, extra=()):
     with tempfile.NamedTemporaryFile(suffix=".callgrind") as out:
         env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
         done = subprocess.run(["valgrind", "--tool=callgrind", "--smc-check=all-non-file", "--callgrind-out-file=" + out.name,
-                               shell, "--jit", "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+                               shell, "--jit", "--jit-stats", *extra, path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if done.returncode != 0 or " done" not in done.stdout:
             return {"exit": done.returncode, "error": (done.stdout + done.stderr)[-600:]}
         total, unknown = per_object(out.name)
@@ -140,6 +140,7 @@ def main():
     parser.add_argument("--instructions", action="store_true", help="also run fixed iterations under callgrind")
     parser.add_argument("--kernels", action="store_true", help="also measure bench/kernels")
     parser.add_argument("--json", default="")
+    parser.add_argument("--flags", default="", help="extra shell flags, space-separated, such as --jit-calls")
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()
     found, missing = jit_kernels.commands(args.work)
@@ -181,9 +182,9 @@ def main():
                 f.write(score_text)
             with open(fixed_path, "w", encoding="utf-8") as f:
                 f.write(fixed_text)
-            entry = {"counters": counters(shell, score_path, cwd, args.timeout)}
+            entry = {"counters": counters(shell, score_path, cwd, args.timeout, args.flags.split())}
             if args.instructions:
-                entry["callgrind"] = compiled_fraction(shell, fixed_path, cwd, args.timeout)
+                entry["callgrind"] = compiled_fraction(shell, fixed_path, cwd, args.timeout, args.flags.split())
             results[label] = entry
             s = entry["counters"]["stats"]
             line = "%-22s exit %d hot %s compiled %s refused %s runs %s deopts %s polls %s unlinked %s" % (
