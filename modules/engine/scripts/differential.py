@@ -358,8 +358,15 @@ class Generator:
                 f"t = __clamp(t + {self.pick(['{get x() { throw new TypeError(\'g\'); }}', '{get x() { return j; }}', '{x: j}'])}.x);",
             ])
             when = self.pick(["j === (b & 7)", "(t & 15) === 3", "j === 2 && a === b", f"({self.using(['t', 'j'])}) === 1"])
-            shape = self.pick(["catch", "catch", "finally", "nested", "return", "jumps", "rethrow"])
+            shape = self.pick(["catch", "catch", "finally", "nested", "return", "jumps", "rethrow", "header", "header"])
             head = f"var t = {self.pick(['0', 'b', '1'])}; "
+            if shape == "header":
+                # A long loop inside the try region on the first calls (__long): its header
+                # has the marker under it, so on-stack replacement enters with it.
+                inner, close = self.pick([("", ""), ("try { ", "} finally { __fin = (__fin + 1) | 0; } ")])
+                return (f"var n = __long < 3 ? 12000 : {n}; __long = __long + 1; " + head +
+                        f"try {{ {inner}for (var j = 0; j < n; j++) {{ t = (t + (j & 7)) | 0; if (j === n - 1 - (b & 3) && {self.pick(['true', 'a === b', '(t & 1) === 0'])}) {self.pick([f'throw {thrown};', 'return [t, j];', 'break;'])} }} "
+                        f"{close}}} catch (e) {{ t = __clamp(__err(e) + t); }} return t;")
             if shape == "catch":
                 return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
                         f"catch (e) {{ t = __clamp(__err(e) + j); }} }} return t;")
