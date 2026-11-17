@@ -18,25 +18,29 @@ poll branch of each back-edge arm (ten arms in `js_vm.silk`: `if_false`, `if_tru
 8-bit forms, `goto`, `goto8`, `goto16`, `if_nullish8`, `if_not_nullish8`, the fused loop
 prefix) is one call to `backEdgePoll` (`js_vm.silk`, out of line), which runs
 `interrupts.handle`, reports a hand-off to the observed loop, and otherwise calls
-`js_compiled_osr.atPoll` with the frame written back. The observed loop never reaches
-`atPoll`. Measured: adding the `atPoll` call inside each arm cost richards +0.35 percent
+`js_vm.osrAtPoll` (which asks `js_compiled_osr.target`) with the frame written back. The observed loop never reaches
+it. Measured: adding that call inside each arm cost richards +0.35 percent
 instructions, all of it in the dispatch loop's own code (register pressure), none on the poll
 path; with the whole slow path behind one out-of-line call the eight benchmarks are 1.000x.
 
-`atPoll` looks at the running frame, base or inline (`current` in `executeLoop`):
+`target` looks at the running frame, base or inline (`current` in `executeLoop`):
 
 1. **Loop hotness.** No code linked (`FunctionBytecode.compiled == 0`): `js_hotness.loopPoll`
    reports the function at once, the way an exhausted entry budget does (parked in
-   `hotPending`, budget `u32.MAX`, polls forced, delivered at the next poll). A poll that lands
-   on a back edge of a frame means that frame has been looping; one is enough evidence, the
-   compile is cheap, and a function already reported (budget at or above 2^31), or with no
-   handler set, or while another function waits, is skipped. A refused function is not
-   reported again (its budget stays parked), unless K's recompile rule resets it.
-2. **On-stack replacement.** Code linked: if the entry has OSR code for the frame's pc and
-   operand stack depth, run it on the live frame (below). After a poll exit, reset the
-   counter, run `interrupts.handle` with the frame whole again, and enter again. So a long
-   loop stays compiled across polls (step a of the brief) and the handler (debugger,
-   hot-function delivery, compile and link) never sees a half-written frame.
+   `hotPending`, budget `u32.MAX`, polls forced, delivered at the next poll), with the header pc
+   in `CompiledTable.loopPc` (`js_runtime.hotLoopPc`; `u32.MAX` for a report from entries). A
+   poll that lands on a back edge of a frame means that frame has been looping; one is enough
+   evidence. A function already reported (budget at or above 2^31), or with no handler set, or
+   while another function waits, is skipped. A refused function is not reported again (its
+   budget stays parked), unless K's recompile rule resets it.
+2. **A header with no entry yet.** Code linked, but no `OsrEntry` for the frame's pc (at depth
+   0): the function is reported again with that pc, and the embedder adds an entry for that
+   header alone, compiled or refused (null code, so polls there stop asking).
+3. **On-stack replacement.** The entry has OSR code for the frame's pc and operand stack depth:
+   run it on the live frame (below). After a poll exit, reset the counter, run
+   `interrupts.handle` with the frame whole again, and enter again. So a long loop stays
+   compiled across polls (step a of the brief) and the handler (debugger, hot-function
+   delivery, compile and link) never sees a half-written frame.
 
 A normal compiled entry that leaves through a poll exit (from `callInternal`) resumes in the
 interpreter at the loop header with the counter at 0, so the interpreter polls at its next back
@@ -53,8 +57,14 @@ unchanged compiled-entry ABI:
   argument word (Int and Bool unboxed, anything else named by its position, kind 6). The entry
   block makes each local an owner of the frame's value with a `retain` of that argument, exactly
   as `get_arg` does, so the ownership pass, verifier and backend need nothing new.
-- **Only code reachable from the header** is translated (`shapeAt` walks from the header with an
-  empty stack), so code before the loop never matters.
+- **Only the loop** is translated: the code reachable from the header (`shapeAt` walks from the
+  header with an empty stack) inside the outermost loop around it (`loopRegion`: the ranges
+  [target, jump] of backward jumps that overlap the header's, merged). Code before and after
+  that loop never matters; a jump out of it is an exit, which the engine counts as the loop
+  finishing, not a deopt (`OsrEntry.start`/`end`). Covering the outermost loop keeps a short
+  inner loop compiled across its outer iterations. Before this, the artefact ran to the end of
+  the function, and a 41 KB emscripten function in zlib translated most of itself once per
+  header (85 artefacts, 23.9 MB, 2.4 s of compiling).
 - **Side exits.** An opcode outside the subset does not refuse the artefact: the block ends
   with an exit there that is always taken (`sideExit`: an `unbox.i32` of `undefined`). Cold
   paths in or after a loop (a property write on the last iteration, the code after the loop)
@@ -62,12 +72,16 @@ unchanged compiled-entry ABI:
 - **Headers** are the targets of backward jumps (`loopHeaders`, a linear decode). Only depth 0 is
   compiled; the engine checks the frame's depth before entering.
 
-`jit_runtime.compileHot` compiles the loop headers of every function it is handed, next to the
-normal entry. `CompiledEntry` gains `osr`/`osrCount` (an embedder array of `OsrEntry { pc,
-depth, code }`, never moved while linked) and `osrRuns`/`osrDeopts`. A function whose normal
-entry is refused but has OSR code is linked with `js_runtime.linkOsr`: the entry's `code` is
-null, `js_compiled.enter` returns at once for it, and inline calls are not redirected (no
-`frameCells` swap), so its calls keep interpreting and only its loops run compiled.
+`jit_runtime.compileHot` compiles OSR code only for the header in the report, next to the
+normal entry; a function reported from entries gets none until a poll lands in one of its
+loops (step 2 above, `addHeader`). Per table entry, at most `OSR_HEADERS` (8) headers compile and
+at most `OSR_BUDGET_NS` (50 ms) is spent on them; a loop over `OSR_LOOP_BYTES` (16 KB) of bytecode
+is refused. `CompiledEntry` has `osr`/`osrCount` (an embedder array of `OsrEntry { pc, depth,
+code, callWords, start, end }` plus counters the engine writes; the embedder replaces the array
+to add a header, keeping the old one allocated) and `osrRuns`/`osrDeopts`. A function whose
+normal entry is refused but has OSR code is linked with `js_runtime.linkOsr`: the entry's
+`code` is null, `js_compiled.enter` returns at once for it, and inline calls are not redirected
+(no `frameCells` swap), so its calls keep interpreting and only its loops run compiled.
 
 ## Entering and leaving a live frame (`js_compiled_osr`)
 
@@ -83,8 +97,13 @@ Unlike a normal entry, the frame's locals hold owned values while the code runs.
   The frame's locals still hold their entry values, which that return releases. Base frames and
   inline frames (`finishInline`) need nothing of their own, and construct frames keep their
   return rule.
-- **Deopt limit.** OSR deopts are counted apart: at `deoptLimit` the entry's `osrCount` is set to 0
-  (OSR off for that function); the normal entry stays linked.
+- **Deopts.** OSR deopts (exits inside the loop) are counted apart from the normal entry's.
+  An OSR-only function is unlinked at `deoptLimit` and reported again, so jit_recompile widens
+  the sites it deoptimized at (new information; it refuses a function that deopts again where it
+  was widened). A linked function's OSR code is not recompiled: after its nth deopt the header's
+  next 2^n - 1 polls interpret (`OsrEntry.wait`), after 6 it is never entered again, and at
+  `deoptLimit` deopts over all its headers no poll enters any. `--jit-dump` prints the opcode
+  each OSR entry last deoptimized at, at exit (`jit: osr deoptimized at:`).
 
 ## Ahead of time
 
