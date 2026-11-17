@@ -10,7 +10,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Edge, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount }
+import ssa { Function, Edge, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount, isNumberOp, numberOpHasExit }
 import ssa_verify { readsA, readsB }
 
 /// Replaces every use of `from` by `to`: operands, edge arguments, exit slots and roots.
@@ -109,6 +109,16 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
       let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
     } else if inst.op == Op.UnboxBool && defOp(&f.*, inst.a) == Op.BoxBool {
       let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.UnboxF64 && defOp(&f.*, inst.a) == Op.BoxF64 {
+      let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.UnboxF64 && defOp(&f.*, inst.a) == Op.BoxI32 {
+      // An Int converts exactly: no guard left.
+      let mut converted = inst converted.op = Op.ToF64 converted.a = defOperand(&f.*, inst.a) converted.exit = NONE
+      f.insts.set(i, converted) changed = true
+    } else if inst.op == Op.Unbox && defOp(&f.*, inst.a) == Op.BoxF64 {
+      // Still a guard: the double must be an int32 exactly.
+      let mut exact = inst exact.op = Op.ExactI32 exact.a = defOperand(&f.*, inst.a)
+      f.insts.set(i, exact) changed = true
     } else if inst.op == Op.Retain && f.value(inst.a).own == Own.Imm {
       replaceAll(&mut f, inst.result, inst.a) removeInst(&mut f, i) changed = true
     } else if inst.op == Op.Release && !isOwned(&f.*, inst.a) {
@@ -121,6 +131,7 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
 
 fn pure(op: Op) -> bool {
   return op == Op.BoxI32 || op == Op.BoxBool || op == Op.ConstI32 || op == Op.Imm || op == Op.Arg || op == Op.Cmp
+    || (isNumberOp(op) && !numberOpHasExit(op)) || op == Op.ConstF64
 }
 
 /// Removes pure instructions whose result nothing uses. Returns whether any went.
@@ -329,9 +340,10 @@ fn fixSlots(f: &mut Function) -> () {
     let mut slot = f.slots.get(i)
     // A boxed i32 or bool is written from its unboxed operand.
     let o = defOp(&f.*, slot.value)
-    if o == Op.BoxI32 || o == Op.BoxBool { slot.value = defOperand(&f.*, slot.value) }
+    if o == Op.BoxI32 || o == Op.BoxBool || o == Op.BoxF64 { slot.value = defOperand(&f.*, slot.value) }
     let info = f.value(slot.value)
     if info.ty == Type.I32 { slot.mode = SlotMode.Int slot.root = NONE }
+    else if info.ty == Type.F64 { slot.mode = SlotMode.F64 slot.root = NONE }
     else if info.ty == Type.Bool { slot.mode = SlotMode.Bool slot.root = NONE }
     else if info.own == Own.Owned { slot.mode = SlotMode.Move slot.root = NONE }
     else if info.own == Own.Imm { slot.mode = SlotMode.Imm slot.root = NONE }
@@ -352,6 +364,7 @@ pub effect fn simplify(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocat
     fixSlots(&mut f)
     if run deadCode(&mut f) { going = true run f.compact() }
     if run unboxParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
+    else if run unboxNumberParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
   }
 }
 
@@ -466,4 +479,110 @@ pub effect fn borrowArguments(f: &mut Function) -> bool ! OutOfMemoryError ? &mu
 pub effect fn optimize(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
   run simplify(&mut f)
   if run borrowArguments(&mut f) { run f.compact() run simplify(&mut f) }
+}
+
+// ---- numbers (docs/jit/doubles.md) ----
+
+/// Unboxes one `value` parameter whose incoming arguments are all `box.f64` or `box.i32` (at
+/// least one `box.f64`) or the parameter itself: it becomes an `f64` parameter, the `box.i32`
+/// arguments arrive converted. Returns whether one was unboxed.
+effect fn unboxNumberParam(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut b: u32 = 1
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut g: u32 = 0
+    while g < block.paramCount {
+      let p = f.paramAt(block, g)
+      if f.value(p).ty == Type.Value {
+        let args = run incoming(&f.*, b, g)
+        let mut numbers = true let mut doubles = false
+        let mut k: usize = 0
+        while k < args.length() {
+          let a = args.get(k)
+          if a != p {
+            let o = defOp(&f.*, a)
+            if o == Op.BoxF64 { doubles = true } else if o != Op.BoxI32 { numbers = false }
+          }
+          k = k + 1
+        }
+        if numbers && doubles { run unboxNumber(&mut f, b, g, p) return true }
+      }
+      g = g + 1
+    }
+    b = b + 1
+  }
+  return false
+}
+
+effect fn unboxNumber(f: &mut Function, b: u32, g: u32, p: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    if edge.target == b {
+      let a = f.edgeArg(edge, g)
+      if a != p {
+        let x = defOperand(&f.*, a)
+        if defOp(&f.*, a) == Op.BoxF64 { f.setEdgeArg(edge.firstArg + g, x) }
+        else {
+          let at = terminatorIndex(&f.*, sourceBlock(&f.*, usize.toU32(e)))
+          let converted = run f.insertBefore(at, Op.ToF64, true, Type.F64, Own.Unboxed, x, NONE, 0)
+          f.setEdgeArg(edge.firstArg + g, converted)
+        }
+      }
+    }
+    e = e + 1
+  }
+  f.setType(p, Type.F64)
+  f.setOwnership(p, Own.Unboxed, RootKind.None, NONE)
+  let mut i: usize = 0
+  let count = f.insts.length()
+  while i < count {
+    let inst = f.insts.get(i)
+    if readsA(inst.op) && inst.a == p {
+      if inst.op == Op.UnboxF64 { replaceAll(&mut f, inst.result, p) removeInst(&mut f, i) }
+      else if inst.op == Op.Unbox { let mut exact = inst exact.op = Op.ExactI32 f.insts.set(i, exact) }
+      else if inst.op == Op.Release { removeInst(&mut f, i) }
+      else if inst.op == Op.Retain {
+        let mut changed = inst changed.op = Op.BoxF64 f.insts.set(i, changed)
+        f.setOwnership(inst.result, Own.Imm, RootKind.None, NONE)
+      }
+      else if inst.op != Op.BoxF64 && !takesDouble(inst.op) {
+        let boxed = run f.insertBefore(usize.toU32(i), Op.BoxF64, true, Type.Value, Own.Imm, p, NONE, 0)
+        let mut user = f.insts.get(i) user.a = boxed f.insts.set(i, user)
+      }
+    }
+    if readsB(inst.op) && inst.b == p && !takesDouble(inst.op) {
+      let boxed = run f.insertBefore(usize.toU32(i), Op.BoxF64, true, Type.Value, Own.Imm, p, NONE, 0)
+      let mut user = f.insts.get(i) user.b = boxed f.insts.set(i, user)
+    }
+    i = i + 1
+  }
+  e = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    let target = f.blocks.get(u32.toUsize(edge.target))
+    let mut k: u32 = 0
+    while k < edge.argCount {
+      if f.edgeArg(edge, k) == p && f.paramAt(target, k) != p {
+        let at = terminatorIndex(&f.*, sourceBlock(&f.*, usize.toU32(e)))
+        let boxed = run f.insertBefore(at, Op.BoxF64, true, Type.Value, Own.Imm, p, NONE, 0)
+        f.setEdgeArg(edge.firstArg + k, boxed)
+      }
+      k = k + 1
+    }
+    e = e + 1
+  }
+  i = 0
+  while i < f.slots.length() {
+    let mut slot = f.slots.get(i)
+    if slot.value == p { slot.mode = SlotMode.F64 slot.root = NONE f.slots.set(i, slot) }
+    i = i + 1
+  }
+}
+
+/// Whether `op` reads doubles (an earlier rewrite of this parameter's unbox made it read the
+/// parameter itself).
+fn takesDouble(op: Op) -> bool {
+  return op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64 || op == Op.NegF64
+    || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.ToInt32 || op == Op.ExactI32
 }

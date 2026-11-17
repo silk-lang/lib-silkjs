@@ -1,0 +1,220 @@
+// Runs x64_backend's code for hand-built SSA functions with doubles and the int32 operators
+// (docs/jit/doubles.md), without the engine: results, NaN and -0 semantics, and each guard's exit.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.testing.testing { AssertionError, Testing }
+import asm_x64 { Code, LinkError, UnboundLabelError }
+import code_memory { CodeBlock, CodeMemory, MemoryError }
+import ssa { Function, Op, Type, Own, RootKind, Cmp, NONE }
+import ssa
+import x64_backend { Lowering, Settings }
+import x64_backend as backend
+
+const INT: u64 = 4294967296
+const BOOL: u64 = 17179869184
+const PC: u32 = 3
+
+/// A function of one argument that unboxes it as an i32 (guarded) into the returned value.
+struct Builder { f: Function, x: u32 }
+impl Builder {
+  effect fn make() -> Builder ! OutOfMemoryError ? &mut Allocator {
+    let mut f = Function.make(1, 0)
+    drop run f.block()
+    let n = run f.emit(0, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, 0, PC)
+    f.setOwnership(n, Own.Borrowed, RootKind.Argument, 0)
+    let x = run f.emit(0, Op.Unbox, true, Type.I32, Own.Unboxed, n, NONE, 0, PC)
+    let at = f.lastInst() drop run f.exitFor(at, PC, 0)
+    return Builder { f: move f, x: x }
+  }
+  effect fn double(self: &mut Self, value: f64) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.f.numbers.append(f64.toBits(value))
+    let index = usize.toI32(self.f.numbers.length() - 1)
+    return run self.f.emit(0, Op.ConstF64, true, Type.F64, Own.Unboxed, NONE, NONE, index, PC)
+  }
+  effect fn int(self: &mut Self, value: i32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    return run self.f.emit(0, Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, value, PC)
+  }
+  /// An operation with a result of type `ty`; guards get an exit at PC with no slots.
+  effect fn op(self: &mut Self, operation: Op, ty: Type, a: u32, b: u32, k: i32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let r = run self.f.emit(0, operation, true, ty, Own.Unboxed, a, b, k, PC)
+    if ssa.numberOpHasExit(operation) { let at = self.f.lastInst() drop run self.f.exitFor(at, PC, 0) }
+    return r
+  }
+  /// Returns `v` (an i32 or bool), lowers and publishes.
+  effect fn finish(self: Self, v: u32, memory: &mut CodeMemory) -> CodeBlock ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError ? &mut Allocator {
+    let mut f = move self.f
+    let mut boxOp = Op.BoxI32
+    if f.value(v).ty == Type.Bool { boxOp = Op.BoxBool }
+    let boxed = run f.emit(0, boxOp, true, Type.Value, Own.Imm, v, NONE, 0, PC)
+    run f.terminate(0, Op.Return, boxed, NONE, PC)
+    run f.compact()
+    let mut code = match move run backend.lower(&f, Settings { stress: 0 }) {
+      Lowering.Code { value } => move value
+      Lowering.Unsupported { .. } => { return Intrinsic.trap("the function must lower") }
+    }
+    return run publish(&mut memory, &mut code)
+  }
+}
+
+effect fn publish(memory: &mut CodeMemory, code: &mut Code) -> CodeBlock ! MemoryError | LinkError {
+  let mut writer = run memory.allocate(code.bytes.length())
+  let none: [usize; 1] = [0]
+  run code.link(writer.address(), Slice.view<usize>(&none, 0, 0))
+  run writer.append(code.bytes.asSlice())
+  return run writer.finish()
+}
+/// Runs block on the Int argument; the exit code, the result word in out.
+unsafe fn invoke(block: &CodeBlock, argument: i32, out: &mut u64) -> u32 {
+  let address = block.entry()
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(Pointer.fromRef(&address))
+  let function = unsafe Pointer.read<extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(slot)
+  let words: [u64; 1] = [INT | u32.toU64(i32.wrappingToU32(argument))]
+  let mut state: [u64; 4] = [0; 4]
+  let mut counter: i32 = 10000
+  let exit = unsafe function(Pointer.fromRef<u64>(&words[0]), Pointer.fromMutRef<u64>(&mut state[0]), Pointer.fromMutRef<i32>(&mut counter), Pointer.null<u8>())
+  out.* = state[0]
+  return exit
+}
+fn returnsInt(block: &CodeBlock, argument: i32, expected: i32) -> bool {
+  let mut word: u64 = 0
+  return unsafe invoke(&block, argument, &mut word) == 0 && word == (INT | u32.toU64(i32.wrappingToU32(expected)))
+}
+fn returnsBool(block: &CodeBlock, argument: i32, expected: bool) -> bool {
+  let mut word: u64 = 0
+  let bit: u64 = if expected { 1 } else { 0 }
+  return unsafe invoke(&block, argument, &mut word) == 0 && word == (BOOL | bit)
+}
+fn deopts(block: &CodeBlock, argument: i32) -> bool {
+  let mut word: u64 = 0
+  return unsafe invoke(&block, argument, &mut word) == 1 && word == u32.toU64(PC)
+}
+
+test effect fn doubleArithmeticRuns() -> () ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut memory = run CodeMemory.reserve(1048576)
+  // toint32((x * 0.5 + 0.25) / 2)
+  let mut b = run Builder.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let half = run b.double(0.5) |> Effect.provideMut<Allocator>(&mut allocator)
+  let quarter = run b.double(0.25) |> Effect.provideMut<Allocator>(&mut allocator)
+  let two = run b.double(2.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let bx = b.x
+  let x = run b.op(Op.ToF64, Type.F64, bx, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let m = run b.op(Op.MulF64, Type.F64, x, half, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let s = run b.op(Op.AddF64, Type.F64, m, quarter, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let d = run b.op(Op.DivF64, Type.F64, s, two, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let r = run b.op(Op.ToInt32, Type.I32, d, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let block = run b.finish(r, &mut memory) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&block, 10, 2) && returnsInt(&block, -3, 0) && returnsInt(&block, -11, -2), "mul, add, div and truncation")
+  // toint32(sqrt(x)) and toint32(-abs(x) * 2^31 * 4): NaN leaves, a wrap past 2^32 does not.
+  let mut c = run Builder.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let cx = c.x
+  let y = run c.op(Op.ToF64, Type.F64, cx, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = run c.op(Op.SqrtF64, Type.F64, y, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let t = run c.op(Op.ToInt32, Type.I32, root, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let roots = run c.finish(t, &mut memory) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&roots, 17, 4) && deopts(&roots, -1), "sqrt, and NaN has no truncation")
+  let mut e = run Builder.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let big = run e.double(8589934592.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ex = e.x
+  let z = run e.op(Op.ToF64, Type.F64, ex, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let magnitude = run e.op(Op.AbsF64, Type.F64, z, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let negative = run e.op(Op.NegF64, Type.F64, magnitude, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let wide = run e.op(Op.AddF64, Type.F64, negative, big, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let w = run e.op(Op.ToInt32, Type.I32, wide, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let wraps = run e.finish(w, &mut memory) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&wraps, 5, -5) && returnsInt(&wraps, -7, -7), "ToInt32 wraps modulo 2^32; abs and neg")
+  // int.f64(x * 0.5): exact halves pass, a fraction and -0 leave.
+  let mut g = run Builder.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let minusHalf = run g.double(-0.5) |> Effect.provideMut<Allocator>(&mut allocator)
+  let gx = g.x
+  let v = run g.op(Op.ToF64, Type.F64, gx, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = run g.op(Op.MulF64, Type.F64, v, minusHalf, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let exact = run g.op(Op.ExactI32, Type.I32, h, NONE, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let exacts = run g.finish(exact, &mut memory) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&exacts, 4, -2) && returnsInt(&exacts, -6, 3) && deopts(&exacts, 3) && deopts(&exacts, 0), "exact int32: fraction and -0 leave")
+}
+
+/// cmp.f64 k of x / d and 1.0, where d is x - 1 (so x = 1 gives 1 / 0 = Infinity and x = 0 gives 0 / -1 = -0)
+/// and NaN comes from 0 * Infinity at x = 1 ... built per comparison.
+effect fn comparison(memory: &mut CodeMemory, k: Cmp, nanAtZero: bool) -> CodeBlock ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError ? &mut Allocator {
+  let mut b = run Builder.make()
+  let one = run b.double(1.0)
+  let bx = b.x
+  let x = run b.op(Op.ToF64, Type.F64, bx, NONE, 0)
+  let mut left = x
+  if nanAtZero { left = run b.op(Op.DivF64, Type.F64, x, x, 0) }
+  let c = run b.op(Op.CmpF64, Type.Bool, left, one, u8.toI32(Cmp.value(k)))
+  return run b.finish(c, &mut memory)
+}
+
+test effect fn doubleComparisonsFollowNaNRules() -> () ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut memory = run CodeMemory.reserve(1048576)
+  let lt = run comparison(&mut memory, Cmp.Lt, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let le = run comparison(&mut memory, Cmp.Le, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let gt = run comparison(&mut memory, Cmp.Gt, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ge = run comparison(&mut memory, Cmp.Ge, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let eq = run comparison(&mut memory, Cmp.Eq, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ne = run comparison(&mut memory, Cmp.Ne, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsBool(&lt, 0, true) && returnsBool(&lt, 1, false) && returnsBool(&lt, 2, false), "lt")
+  run Testing.expect(returnsBool(&le, 0, true) && returnsBool(&le, 1, true) && returnsBool(&le, 2, false), "le")
+  run Testing.expect(returnsBool(&gt, 0, false) && returnsBool(&gt, 1, false) && returnsBool(&gt, 2, true), "gt")
+  run Testing.expect(returnsBool(&ge, 0, false) && returnsBool(&ge, 1, true) && returnsBool(&ge, 2, true), "ge")
+  run Testing.expect(returnsBool(&eq, 1, true) && returnsBool(&eq, 2, false), "eq")
+  run Testing.expect(returnsBool(&ne, 1, false) && returnsBool(&ne, 2, true), "ne")
+  // x / x at x = 0 is NaN: every comparison false but ne; at x = 1 it is 1.
+  let nlt = run comparison(&mut memory, Cmp.Lt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let nle = run comparison(&mut memory, Cmp.Le, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ngt = run comparison(&mut memory, Cmp.Gt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let nge = run comparison(&mut memory, Cmp.Ge, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let neq = run comparison(&mut memory, Cmp.Eq, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let nne = run comparison(&mut memory, Cmp.Ne, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsBool(&nlt, 0, false) && returnsBool(&nle, 0, false) && returnsBool(&ngt, 0, false)
+    && returnsBool(&nge, 0, false) && returnsBool(&neq, 0, false) && returnsBool(&nne, 0, true), "NaN compares unordered")
+  run Testing.expect(returnsBool(&nle, 1, true) && returnsBool(&neq, 1, true), "x / x is 1 elsewhere")
+}
+
+effect fn binary(memory: &mut CodeMemory, operation: Op, k: i32) -> CodeBlock ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError ? &mut Allocator {
+  let mut b = run Builder.make()
+  let c = run b.int(k)
+  let bx = b.x
+  let r = run b.op(operation, Type.I32, bx, c, 0)
+  return run b.finish(r, &mut memory)
+}
+effect fn unary(memory: &mut CodeMemory, operation: Op) -> CodeBlock ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError ? &mut Allocator {
+  let mut b = run Builder.make()
+  let bx = b.x
+  let r = run b.op(operation, Type.I32, bx, NONE, 0)
+  return run b.finish(r, &mut memory)
+}
+
+test effect fn intOperatorsRunAndGuard() -> () ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut memory = run CodeMemory.reserve(1048576)
+  let and = run binary(&mut memory, Op.BitAnd, 12) |> Effect.provideMut<Allocator>(&mut allocator)
+  let or = run binary(&mut memory, Op.BitOr, 12) |> Effect.provideMut<Allocator>(&mut allocator)
+  let xor = run binary(&mut memory, Op.BitXor, 12) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&and, 10, 8) && returnsInt(&or, 10, 14) && returnsInt(&xor, 10, 6) && returnsInt(&and, -1, 12), "and, or, xor")
+  let shl = run binary(&mut memory, Op.Shl, 33) |> Effect.provideMut<Allocator>(&mut allocator)
+  let sar = run binary(&mut memory, Op.Sar, 2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let shr = run binary(&mut memory, Op.Shr, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let shr0 = run binary(&mut memory, Op.Shr, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&shl, 3, 6) && returnsInt(&shl, 1073741824, -2147483648), "shl takes its count modulo 32")
+  run Testing.expect(returnsInt(&sar, -9, -3) && returnsInt(&shr, -2, 2147483647) && returnsInt(&shr0, 5, 5) && deopts(&shr0, -1), "sar and shr; >>> 0 of a negative is no int32")
+  let mod = run binary(&mut memory, Op.Mod, 7) |> Effect.provideMut<Allocator>(&mut allocator)
+  let modZero = run binary(&mut memory, Op.Mod, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let modNegative = run binary(&mut memory, Op.Mod, -1) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&mod, 23, 2) && returnsInt(&mod, -23, -2) && deopts(&mod, -14) && returnsInt(&mod, 14, 0), "% keeps the dividend's sign; -0 leaves")
+  run Testing.expect(deopts(&modZero, 5) && deopts(&modNegative, -2147483648), "% by zero or a negative divisor leaves")
+  let neg = run unary(&mut memory, Op.Neg) |> Effect.provideMut<Allocator>(&mut allocator)
+  let not = run unary(&mut memory, Op.BitNot) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsInt(&neg, 5, -5) && deopts(&neg, 0) && deopts(&neg, -2147483648) && returnsInt(&not, 5, -6), "neg guards -0 and overflow; not")
+}
