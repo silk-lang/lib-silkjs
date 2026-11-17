@@ -107,6 +107,14 @@ pub enum Op {
   /// `get.length a`: guard, a string's or an Array's length (get_length), owned; exits on
   /// anything else.
   GetLength,
+  /// `truthy a`: ToBoolean of boxed `a` (a condition on a site that deoptimized at unbox.bool),
+  /// through a helper call; no exit.
+  Truthy,
+  /// `tag.is a, k`: whether boxed `a` is undefined (k bit 0) or null (k bit 1); no exit.
+  TagIs,
+  /// `typeof a`: the atom typeof answers for boxed `a` (a helper call), as an i32; exits for a
+  /// proxy.
+  TypeofAtom,
   // ---- calls (workstream H)
   /// `call.arg a, k`: operand `a` is argument `k` of the `call` that follows (CallArgs come
   /// right before their call, in order). Borrows `a` for the call; consumes nothing.
@@ -244,6 +252,30 @@ pub struct Function {
   /// The bits of the doubles `const.f64` names, by index.
   pub numbers: List<u64>,
   nextOrder: u32,
+  /// Instructions and exit slots the rewriting passes have walked so far (compact, and the
+  /// ownership pass's sweeps): compile cost in units that do not depend on the machine, for
+  /// the test that keeps it linear (ssa_tests.compileWorkStaysLinear).
+  pub work: u64,
+}
+
+/// Copies each exit's slots from the old table (`from`, at oldFirst[exit]) to their place in
+/// the new one, renumbering their values (Function.compact).
+fn copySlots(from: &[Slot], to: &mut [Slot], numbers: &[u32], exits: &List<Exit>, oldFirst: &List<u32>, localCount: u32) -> () {
+  let mut x: usize = 0
+  while x < exits.length() {
+    let exit = exits.get(x)
+    let source = u32.toUsize(oldFirst.get(x))
+    let target = u32.toUsize(exit.firstSlot)
+    let count = u32.toUsize(localCount + exit.stackDepth)
+    let mut s: usize = 0
+    while s < count {
+      let mut slot = from[source + s]
+      slot.value = numbers[u32.toUsize(slot.value)]
+      to[target + s] = slot
+      s = s + 1
+    }
+    x = x + 1
+  }
 }
 
 pub fn ownOf(ty: Type) -> Own { if ty == Type.Value { return Own.Owned } return Own.Unboxed }
@@ -266,7 +298,7 @@ impl Function {
     return Function { argumentCount: argumentCount, localCount: localCount, blocks: List<Block>.make(),
       params: List<u32>.make(), insts: List<Inst>.make(), values: List<ValueInfo>.make(),
       edges: List<Edge>.make(), edgeArgs: List<u32>.make(), exits: List<Exit>.make(),
-      slots: List<Slot>.make(), numbers: List<u64>.make(), nextOrder: 0 }
+      slots: List<Slot>.make(), numbers: List<u64>.make(), nextOrder: 0, work: 0 }
   }
 
   pub fn valueCount(self: &Self) -> u32 { return usize.toU32(self.values.length()) }
@@ -312,6 +344,13 @@ impl Function {
   /// Adds a parameter to `block`, after the ones it has.
   pub effect fn addParam(self: &mut Self, block: u32, ty: Type, own: Own) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let v = run self.newValue(ty, own, block, NONE)
+    // Before compact, a block's range is kept while its parameters arrive together (the
+    // translator adds each block's at once); paramsOf reads it.
+    let mut info = self.blocks.get(u32.toUsize(block))
+    if info.paramCount == 0 { info.firstParam = usize.toU32(self.params.length()) }
+    if info.firstParam != NONE && info.firstParam + info.paramCount == usize.toU32(self.params.length()) { info.paramCount = info.paramCount + 1 }
+    else { info.firstParam = NONE info.paramCount = info.paramCount + 1 }
+    self.blocks.set(u32.toUsize(block), info)
     run self.params.append(v)
     return v
   }
@@ -319,6 +358,12 @@ impl Function {
   /// The parameters of `block` in order, for a function that is not compacted yet.
   pub effect fn paramsOf(self: &Self, block: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
     let mut out = List<u32>.make()
+    let info = self.blocks.get(u32.toUsize(block))
+    if info.firstParam != NONE {
+      let mut g: u32 = 0
+      while g < info.paramCount { run out.append(self.params.get(u32.toUsize(info.firstParam + g))) g = g + 1 }
+      return move out
+    }
     let mut i: usize = 0
     while i < self.params.length() {
       let v = self.params.get(i)
@@ -396,6 +441,7 @@ impl Function {
   /// Puts the blocks in reverse postorder from block 0, drops unreachable blocks and removed
   /// instructions, and renumbers blocks, values and exits densely in that order.
   pub effect fn compact(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.work = self.work + usize.toU64(self.insts.length() + self.slots.length())
     let blockCount = self.blocks.length()
     // The terminator of each block, to walk its successors.
     let mut term = List<u32>.make()
@@ -473,21 +519,41 @@ impl Function {
     let mut newParams = List<u32>.make()
     let mut newBlocks = List<Block>.make()
     let mut newInsts = List<Inst>.make()
+    // Parameters grouped by new block, in creation order: paramStart[r] .. paramStart[r + 1]
+    // of grouped. One pass, where scanning them per block was quadratic.
+    let mut paramStart = List<u32>.make()
+    run paramStart.appendRepeated(0, order.length() + 1)
+    let mut q: usize = 0
+    while q < self.params.length() {
+      let r = rank.get(u32.toUsize(self.values.get(u32.toUsize(self.params.get(q))).block))
+      if r != NONE { let at = u32.toUsize(r) + 1 let c = paramStart.get(at) + 1 paramStart.set(at, c) }
+      q = q + 1
+    }
+    bi = 0
+    while bi < order.length() { let c = paramStart.get(bi + 1) + paramStart.get(bi) paramStart.set(bi + 1, c) bi = bi + 1 }
+    let mut fill = List<u32>.make()
+    run fill.appendSlice(paramStart.asSlice())
+    let mut grouped = List<u32>.make()
+    run grouped.appendRepeated(NONE, u32.toUsize(paramStart.get(order.length())))
+    q = 0
+    while q < self.params.length() {
+      let v = self.params.get(q)
+      let r = rank.get(u32.toUsize(self.values.get(u32.toUsize(v)).block))
+      if r != NONE { let at = u32.toUsize(r) let slot = fill.get(at) grouped.set(u32.toUsize(slot), v) fill.set(at, slot + 1) }
+      q = q + 1
+    }
     bi = 0
     while bi < order.length() {
-      let old = order.get(bi)
       let firstParam = usize.toU32(newParams.length())
-      let mut q: usize = 0
-      while q < self.params.length() {
-        let v = self.params.get(q)
+      let mut g = paramStart.get(bi)
+      while g < paramStart.get(bi + 1) {
+        let v = grouped.get(u32.toUsize(g))
         let info = self.values.get(u32.toUsize(v))
-        if info.block == old {
-          renumber.set(u32.toUsize(v), usize.toU32(newValues.length()))
-          run newParams.append(usize.toU32(newValues.length()))
-          let mut moved = info moved.block = usize.toU32(bi)
-          run newValues.append(moved)
-        }
-        q = q + 1
+        renumber.set(u32.toUsize(v), usize.toU32(newValues.length()))
+        run newParams.append(usize.toU32(newValues.length()))
+        let mut moved = info moved.block = usize.toU32(bi)
+        run newValues.append(moved)
+        g = g + 1
       }
       let firstInst = usize.toU32(newInsts.length())
       let list = &buckets.asSlice()[bi]
@@ -517,6 +583,9 @@ impl Function {
     let mut newArgs = List<u32>.make()
     let mut newExits = List<Exit>.make()
     let mut newSlots = List<Slot>.make()
+    // Each new exit's first slot in the old table, and the slots counted so far.
+    let mut oldFirst = List<u32>.make()
+    let mut slotTotal: u32 = 0
     i = 0
     while i < newInsts.length() {
       let mut inst = newInsts.get(i)
@@ -538,21 +607,18 @@ impl Function {
       }
       if inst.exit != NONE {
         let exit = self.exits.get(u32.toUsize(inst.exit))
-        let count = self.localCount + exit.stackDepth
-        let firstSlot = usize.toU32(newSlots.length())
-        let mut s: u32 = 0
-        while s < count {
-          let mut slot = self.slots.get(u32.toUsize(exit.firstSlot + s))
-          slot.value = renumber.get(u32.toUsize(slot.value))
-          run newSlots.append(slot)
-          s = s + 1
-        }
         inst.exit = usize.toU32(newExits.length())
-        run newExits.append(Exit { pc: exit.pc, stackDepth: exit.stackDepth, firstSlot: firstSlot })
+        run oldFirst.append(exit.firstSlot)
+        run newExits.append(Exit { pc: exit.pc, stackDepth: exit.stackDepth, firstSlot: slotTotal })
+        slotTotal = slotTotal + self.localCount + exit.stackDepth
       }
       newInsts.set(i, inst)
       i = i + 1
     }
+    // The exit slots, by far the largest table (every exit names every local): sized once
+    // and copied through slices.
+    run newSlots.appendRepeated(Slot { value: NONE, mode: SlotMode.Imm, root: NONE }, u32.toUsize(slotTotal))
+    copySlots(self.slots.asSlice(), newSlots.asMutSlice(), renumber.asSlice(), &newExits, &oldFirst, self.localCount)
     // Value roots name values too.
     let mut v: usize = 0
     while v < newValues.length() {
@@ -679,6 +745,9 @@ impl Function {
     else if op == Op.GetElem { run text(&mut out, b"get.elem ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) }
     else if op == Op.PutElem { run text(&mut out, b"put.elem ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run operand(&mut out, i32.wrappingToU32(inst.k)) }
     else if op == Op.GetLength { run text(&mut out, b"get.length ") run operand(&mut out, inst.a) }
+    else if op == Op.Truthy { run text(&mut out, b"truthy ") run operand(&mut out, inst.a) }
+    else if op == Op.TagIs { run text(&mut out, b"tag.is ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.TypeofAtom { run text(&mut out, b"typeof ") run operand(&mut out, inst.a) }
     else if op == Op.GetScope { run text(&mut out, b"get.scope ") run signed(&mut out, inst.k) }
     else if op == Op.PutScope { run text(&mut out, b"put.scope ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
     else if op == Op.GetVar { run text(&mut out, b"get.var ") run signed(&mut out, inst.k) }

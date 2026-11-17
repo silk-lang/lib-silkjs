@@ -38,6 +38,7 @@ import silkjs.js_compiled_objects { FieldLayout }
 import silkjs.js_compiled_objects as objects
 import ssa_liveness as liveness
 import ssa_calls as calls
+import x64_exits as exits
 
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
@@ -95,7 +96,7 @@ pub struct Emitter {
   immediateUses: List<u32>,
   defs: List<u32>,
   /// Per value: its constant when a `const.i32` defines it.
-  constants: List<Option<i32>>,
+  pub constants: List<Option<i32>>,
   /// The block being lowered: a jump to the next one falls through.
   current: u32,
 }
@@ -164,11 +165,7 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
     b = b + 1
   }
   // Exit stubs: the interpreter state at each exit's bytecode boundary.
-  x = 0
-  while x < function.exits.length() {
-    run emitter.exitStub(&function, usize.toU32(x))
-    x = x + 1
-  }
+  run exits.emit(&mut emitter, &function)
   return Lowering.Code { value: run emitter.a.finish() }
 }
 
@@ -198,7 +195,7 @@ fn supported(function: &Function) -> Option<&'static [u8]> {
 }
 
 impl Emitter {
-  fn saves(self: &Self, index: usize) -> bool { return u32.bitAnd(u32.shiftRight(self.places.savedMask, usize.toU32(index)), 1) != 0 }
+  pub fn saves(self: &Self, index: usize) -> bool { return u32.bitAnd(u32.shiftRight(self.places.savedMask, usize.toU32(index)), 1) != 0 }
   /// Where value v lives.
   fn at(self: &Self, v: u32) -> Place { return self.places.place(v, slotOf(v)) }
   effect fn instruction(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -245,6 +242,36 @@ impl Emitter {
       run self.a.loadZero8(Reg.Rax, payloadOf(inst.a))
       run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 1)
       let place101 = self.at(inst.result) run putI32(&mut self.a, place101, Reg.Rax)
+      return ()
+    }
+    if op == Op.TagIs {
+      let layout = self.settings.layout
+      run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES + layout.tagOffset)))
+      run self.a.movImm32(Reg.R9, 0)
+      run self.a.movImm32(Reg.R10, 0)
+      if (inst.k & 1) != 0 { run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined())) run self.a.setcc(Cond.Equal, Reg.R9) }
+      if (inst.k & 2) != 0 { run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null())) run self.a.setcc(Cond.Equal, Reg.R10) }
+      run self.a.alu(Alu.Or, Width.W32, Reg.R9, Reg.R10)
+      let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.R9)
+      return ()
+    }
+    if op == Op.TypeofAtom {
+      run self.stressGuard(inst.exit)
+      // typeof(env, frame, value) -> atom, 0 for a proxy.
+      let frame = self.input(INPUT_FRAME)
+      run self.a.load(Width.W64, Reg.Rsi, frame)
+      run self.a.lea(Width.W64, Reg.Rdx, slotOf(inst.a))
+      run self.callHelper(helpers.TYPEOF)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
+      return ()
+    }
+    if op == Op.Truthy {
+      // truthy(env, value) -> 0 or 1.
+      run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+      run self.callHelper(helpers.TRUTHY)
+      let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
       return ()
     }
     if op == Op.BoxI32 || op == Op.BoxBool {
@@ -375,7 +402,12 @@ impl Emitter {
         if place.kind == GPR { run self.a.test(Width.W32, place.gpr, place.gpr) }
         else { run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a)) run self.a.test(Width.W32, Reg.Rax, Reg.Rax) }
       }
-      // An edge without moves is a conditional jump straight to its block.
+      // An edge without moves is a conditional jump straight to its block; when the true edge
+      // falls through to the next block, jump on the false one instead.
+      if !self.moves(&function, inst.edge) && !self.moves(&function, inst.edge + 1) && function.edge(inst.edge).target == self.current + 1 {
+        run self.a.jcc(untaken, self.blockLabels.get(u32.toUsize(function.edge(inst.edge + 1).target)))
+        return ()
+      }
       if !self.moves(&function, inst.edge) {
         run self.a.jcc(taken, self.blockLabels.get(u32.toUsize(function.edge(inst.edge).target)))
         run self.edge(&function, inst.edge + 1)
@@ -762,7 +794,17 @@ impl Emitter {
     i = 0
     while i < function.edgeArgs.length() { self.read(function.edgeArgs.get(i)) i = i + 1 }
     i = 0
-    while i < function.slots.length() { self.read(function.slots.get(i).value) i = i + 1 }
+    while i < function.slots.length() {
+      let v = function.slots.get(i).value
+      self.read(v)
+      // An exit writes a constant from its immediate (valueInto), so it needs no register.
+      if v != NONE && v < function.valueCount() && self.constant(&function, v) {
+        let at = u32.toUsize(v)
+        let before = self.immediateUses.get(at)
+        self.immediateUses.set(at, before + 1)
+      }
+      i = i + 1
+    }
   }
   fn read(self: &mut Self, v: u32) -> () {
     if v == NONE || u32.toUsize(v) >= self.uses.length() { return () }
@@ -770,8 +812,7 @@ impl Emitter {
     self.uses.set(u32.toUsize(v), before + 1)
   }
   fn constant(self: &Self, function: &Function, v: u32) -> bool {
-    let def = self.defs.get(u32.toUsize(v))
-    return def != NONE && function.inst(def).op == Op.ConstI32
+    return self.constants.get(u32.toUsize(v)).isSome()
   }
   fn onlyImmediate(self: &Self, v: u32) -> bool {
     return self.uses.get(u32.toUsize(v)) == self.immediateUses.get(u32.toUsize(v))
@@ -901,7 +942,10 @@ impl Emitter {
   effect fn valueInto(self: &mut Self, function: &Function, v: u32, mode: SlotMode, base: Reg, offset: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let info = function.value(v)
     if info.ty == Type.I32 || info.ty == Type.Bool {
-      let place12 = self.at(v) run getI32(&mut self.a, Reg.Rax, place12)
+      match self.constants.get(u32.toUsize(v)) {
+        Option<i32>.Some { value } => { run self.a.movImm32(Reg.Rax, i32.wrappingToU32(value)) }
+        Option<i32>.None => { let place12 = self.at(v) run getI32(&mut self.a, Reg.Rax, place12) }
+      }
       run self.boxInto(info.ty == Type.Bool, Reg.Rax, base, offset)
       return ()
     }
@@ -1221,7 +1265,7 @@ impl Emitter {
     run self.a.ret()
   }
   /// Frees the frame and pops the saved registers (the prologue in reverse). Keeps RAX.
-  effect fn unwind(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn unwind(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.frame != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, self.frame) }
     let mut r = gprCount()
     while r > 0 { r = r - 1 if self.saves(r) { run self.a.pop(gprAt(r)) } }

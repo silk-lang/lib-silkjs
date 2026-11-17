@@ -18,6 +18,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
+import silkjs.js_atom_data as atoms
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
 import ssa_calls as calls
 import ssa
@@ -41,6 +42,9 @@ pub struct FunctionInput {
   /// Bytecode offsets of arithmetic and comparison sites to compile as numbers (f64) rather
   /// than int32: sites that deoptimized in an earlier compilation of the same code.
   pub doubleSites: List<u32>,
+  /// Some local is captured by a closure (VarDef.isCaptured): a callee could read or write
+  /// its frame cell, so on-stack-replacement code that holds it must not make calls.
+  pub capturedLocals: bool,
 }
 
 /// Constant kinds of `NumberConstant`.
@@ -63,7 +67,7 @@ pub fn supported(opcode: u8) -> bool {
   return opcode == op.OP_push_i32 || opcode == op.OP_push_i8 || opcode == op.OP_push_i16
     || opcode == op.OP_push_0 || opcode == op.OP_push_1 || opcode == op.OP_undefined || opcode == op.OP_null
     || opcode == op.OP_push_true || opcode == op.OP_push_false
-    || opcode == op.OP_drop || opcode == op.OP_dup || opcode == op.OP_nip || opcode == op.OP_swap
+    || opcode == op.OP_drop || opcode == op.OP_dup || opcode == op.OP_nip || opcode == op.OP_swap || shuffleOf(opcode).length != 0
     || opcode == op.OP_get_loc || opcode == op.OP_put_loc || opcode == op.OP_set_loc
     || opcode == op.OP_get_loc8 || opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8
     || (opcode >= op.OP_get_loc0 && opcode <= op.OP_put_loc3)
@@ -80,7 +84,7 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
-    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode)
+    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode)
     || exceptionOpcode(opcode)
 }
 
@@ -93,7 +97,21 @@ fn isThrow(opcode: u8) -> bool { return opcode == op.OP_throw || opcode == op.OP
 
 /// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
 /// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
-fn osrExit(opcode: u8) -> bool { return !supported(opcode) || callOpcode(opcode) }
+fn osrExit(opcode: u8, calls: bool) -> bool { return !supported(opcode) || (!calls && callOpcode(opcode)) }
+/// Whether OSR code for input may make calls: asked for, no captured local, and no
+/// arguments object or direct eval that could alias the frame's cells.
+fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
+  if !allowCalls || input.capturedLocals { return false }
+  let mut pc: usize = 0
+  while pc < input.code.length() {
+    let opcode = byteAt(input, pc)
+    if opcode == op.OP_special_object || opcode == op.OP_eval || opcode == op.OP_apply_eval { return false }
+    let size = sizeAt(input, pc)
+    if size == 0 { return false }
+    pc = pc + size
+  }
+  return true
+}
 
 /// Workstream H's calls: `call0`..`call3`, `call`, `call_method` and `call_constructor`.
 pub fn callOpcode(opcode: u8) -> bool {
@@ -111,7 +129,8 @@ pub fn objectOpcode(opcode: u8) -> bool {
     || opcode == op.OP_put_scope0_check || opcode == op.OP_set_scope0
     || opcode == op.OP_get_var_ref || opcode == op.OP_get_var_ref_check || opcode == op.OP_put_var_ref
     || opcode == op.OP_put_var_ref_check || opcode == op.OP_set_var_ref
-    || opcode == op.OP_get_array_el || opcode == op.OP_put_array_el || opcode == op.OP_get_length
+    || opcode == op.OP_get_array_el || opcode == op.OP_get_array_el2 || opcode == op.OP_get_array_el3
+    || opcode == op.OP_put_array_el || opcode == op.OP_get_length
     || opcode == op.OP_get_loc_length8 || opcode == op.OP_get_arg_length8 || opcode == op.OP_get_loc_el8
     || opcode == op.OP_get_arg_el8 || opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8
 }
@@ -128,11 +147,60 @@ pub fn numberOpcode(opcode: u8) -> bool {
     || opcode == op.OP_push_const8 || opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8
 }
 /// `if_true_keep8`/`if_false_keep8`: a branch whose taken edge keeps the tested value.
-fn keepBranch(opcode: u8) -> bool { return opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 }
+fn keepBranch(opcode: u8) -> bool { return opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 || opcode == op.OP_if_not_nullish_keep8 }
+/// The undefined/null tests and typeof tests (no exit but typeof's proxy), and the branches
+/// on them.
+fn testOpcode(opcode: u8) -> bool {
+  return opcode == op.OP_is_undefined || opcode == op.OP_is_null || opcode == op.OP_is_undefined_or_null
+    || opcode == op.OP_typeof_is_undefined || opcode == op.OP_typeof_is_function || opcode == op.OP_typeof_is
+    || nullMask(opcode) != 0
+}
+/// The stack shuffles (js_vm_values.step): the window's size in operands, then for each
+/// result operand, bottom to top, the window position (bottom 0) it copies, all as ASCII
+/// digits. A position used twice is retained once more; one never used is released. Empty
+/// for any other opcode. dup3, perm5, swap2, rot4l and rot5l are absent: final code writes
+/// them behind OP_extended (js_opcode_data.movedToExtended), and their bytes mean other opcodes.
+pub fn shuffleOf(opcode: u8) -> &'static [u8] {
+  if opcode == op.OP_nip1 { return b"312" }
+  if opcode == op.OP_dup1 { return b"2001" }
+  if opcode == op.OP_dup2 { return b"20101" }
+  if opcode == op.OP_insert2 { return b"2101" }
+  if opcode == op.OP_insert3 { return b"32012" }
+  if opcode == op.OP_insert4 { return b"430123" }
+  if opcode == op.OP_perm3 { return b"3102" }
+  if opcode == op.OP_perm4 { return b"42013" }
+  if opcode == op.OP_rot3l { return b"3120" }
+  if opcode == op.OP_rot3r { return b"3201" }
+  return b""
+}
+/// tag.is's mask (1 undefined, 2 null) for a test or a branch on one; 0 for anything else.
+fn nullMask(opcode: u8) -> i32 {
+  if opcode == op.OP_is_undefined { return 1 }
+  if opcode == op.OP_is_null || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8 { return 2 }
+  if opcode == op.OP_is_undefined_or_null || opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8
+    || opcode == op.OP_if_not_nullish_keep8 { return 3 }
+  return 0
+}
+/// typeof_is's operand as the type name's atom (js_bytecode.typeofIsAtom).
+fn typeofIsAtom(index: u8) -> u32 {
+  if index == 0 { return atoms.JS_ATOM_string }
+  if index == 1 { return atoms.JS_ATOM_number }
+  if index == 2 { return atoms.JS_ATOM_object }
+  if index == 3 { return atoms.JS_ATOM_boolean }
+  if index == 4 { return atoms.JS_ATOM_symbol }
+  if index == 5 { return atoms.JS_ATOM_bigint }
+  if index == 6 { return atoms.JS_ATOM_undefined }
+  if index == 7 { return atoms.JS_ATOM_function }
+  return atoms.JS_ATOM_unknown
+}
+/// The branches on a nullish or null test: a padding byte, then the displacement.
+fn nullBranch(opcode: u8) -> bool {
+  return opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8
+}
 
 fn isBranch(opcode: u8) -> bool {
   return opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
-    || keepBranch(opcode)
+    || keepBranch(opcode) || nullBranch(opcode)
 }
 /// The double operation of an int32 one (`add`, `sub`, `mul`).
 fn doubleOf(operation: Op) -> Op {
@@ -163,7 +231,11 @@ fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
   let mut displacement: i32 = 0
   if opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_goto { displacement = i32At(input, pc + 1) }
   else if opcode == op.OP_goto16 { displacement = i16At(input, pc + 1) }
-  else if keepBranch(opcode) {
+  else if opcode == op.OP_if_not_nullish_keep8 {
+    // dup, if_not_nullish8, drop: its displacement is the fourth byte and counts from itself.
+    return usize.toI64(pc + 3) + i32.toI64(i8At(input, pc + 3))
+  }
+  else if keepBranch(opcode) || nullBranch(opcode) {
     // dup, if_*8, drop in one: the displacement counts from its own byte, the second.
     return usize.toI64(pc + 2) + i32.toI64(i8At(input, pc + 2))
   }
@@ -183,11 +255,12 @@ fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
 struct Shape { leader: List<bool>, depth: List<i32>, start: List<bool>, catchTop: List<i32>, catchLevel: List<i32>,
   catchParent: List<i32>, returns: List<u32> }
 
-effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator { return run shapeAt(input, 0, false) }
+effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator { return run shapeAt(input, 0, false, true, 0, u32.MAX) }
 
 /// shape walking from the instruction at `begin` (stack empty there). With `sideExits`, an
-/// opcode outside the subset ends its block (the translator exits there) instead of refusing.
-effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
+/// opcode outside the subset, or an instruction outside [low, high], ends its block (the
+/// translator exits there) instead of refusing.
+effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: bool, low: u32, high: u32) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
   let length = input.code.length()
   let mut leader = List<bool>.make() run leader.appendRepeated(false, length + 1)
   let mut start = List<bool>.make() run start.appendRepeated(false, length + 1)
@@ -216,7 +289,7 @@ effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool) -> Shape
         let opcode = byteAt(input, pc)
         if !supported(opcode) && !sideExits { fail refuse(usize.toU32(pc), opcode, b"opcode outside the subset") }
         // A side exit: the state before it is the block's, nothing after it is reached.
-        if sideExits && osrExit(opcode) { going = false continue }
+        if sideExits && (osrExit(opcode, calls) || outside(pc, low, high)) { going = false continue }
         let info = op.opcodeInfo(opcode, true)
         let size = u8.toUsize(info.size)
         if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
@@ -324,6 +397,8 @@ struct Translator {
   /// parameters (by value) are proven initialized.
   tdz: Tdz,
   initialized: List<bool>,
+  /// On-stack replacement: argument n's number, guarded once at entry, or NONE (or empty).
+  argNumbers: List<u32>,
 }
 
 /// Lexical locals that may be uninitialized (still in their TDZ) on entry to each leader, from a
@@ -357,7 +432,7 @@ effect fn tdzMerge(tdz: &mut Tdz, seen: &mut List<bool>, work: &mut List<usize>,
 
 /// The Tdz of `input`, whose shape is `shapeOf`, entered at `begin` (an OSR entry: every lexical
 /// local may be uninitialized there).
-effect fn tdzOf(input: &FunctionInput, shapeOf: &Shape, begin: usize, sideExits: bool) -> Tdz ! OutOfMemoryError ? &mut Allocator {
+effect fn tdzOf(input: &FunctionInput, shapeOf: &Shape, begin: usize, sideExits: bool, calls: bool, low: u32, high: u32) -> Tdz ! OutOfMemoryError ? &mut Allocator {
   let length = input.code.length()
   let locals = u32.toUsize(input.localCount)
   let mut tdz = Tdz { tracked: false, locals: locals, slot: List<u32>.make(), maybe: List<bool>.make() }
@@ -391,7 +466,7 @@ effect fn tdzOf(input: &FunctionInput, shapeOf: &Shape, begin: usize, sideExits:
     let mut going = true
     while going && at < length {
       let opcode = byteAt(input, at)
-      if sideExits && osrExit(opcode) { going = false continue }
+      if sideExits && (osrExit(opcode, calls) || outside(at, low, high)) { going = false continue }
       let size = sizeAt(input, at)
       let local = tdzLocal(input, at, opcode)
       if local < locals { current.set(local, opcode == op.OP_set_loc_uninitialized) }
@@ -488,6 +563,7 @@ impl Translator {
   }
   /// Argument `n`'s bits, borrowed from its cell.
   effect fn argument(self: &mut Self, n: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if u32.toUsize(n) < self.argNumbers.length() && self.argNumbers.get(u32.toUsize(n)) != NONE { return self.argNumbers.get(u32.toUsize(n)) }
     let v = run self.f.emit(self.current, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, u32.wrappingToI32(n), pc)
     self.f.setOwnership(v, Own.Borrowed, RootKind.Argument, n)
     return v
@@ -643,9 +719,35 @@ impl Translator {
       let magnitude = run self.f.emit(self.current, Op.AbsF64, true, Type.F64, Own.Unboxed, v, NONE, 0, pc)
       return run self.f.emit(self.current, Op.CmpF64, true, Type.Bool, Own.Unboxed, magnitude, zero, u8.toI32(Cmp.value(Cmp.Gt)), pc)
     }
+    // A site that deoptimized here before saw something other than a boolean: ToBoolean.
+    if self.widened(pc) { return run self.f.emit(self.current, Op.Truthy, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc) }
     let c = run self.f.emit(self.current, Op.UnboxBool, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
     return c
+  }
+  /// The condition a branch tests: undefined/null for the nullish branches, else ToBoolean.
+  effect fn branchTest(self: &mut Self, opcode: u8, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let mask = nullMask(opcode)
+    if mask != 0 { return run self.nullTest(v, mask, pc) }
+    return run self.condition(v, pc)
+  }
+  /// Whether v is undefined (mask bit 0) or null (bit 1): false for an unboxed number or bool.
+  effect fn nullTest(self: &mut Self, v: u32, mask: i32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if self.f.value(v).ty != Type.Value { return run self.constBool(false, pc) }
+    return run self.f.emit(self.current, Op.TagIs, true, Type.Bool, Own.Unboxed, v, NONE, mask, pc)
+  }
+  effect fn constBool(self: &mut Self, value: bool, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let zero = run self.constant(0, pc)
+    let mut k: i32 = 0
+    if value { k = 1 }
+    let x = run self.constant(k, pc)
+    return run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, x, zero, u8.toI32(Cmp.value(Cmp.Ne)), pc)
+  }
+  /// Whether the instruction at pc deoptimized in an earlier compilation.
+  fn widened(self: &Self, pc: u32) -> bool {
+    let mut i: usize = 0
+    while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { return true } i = i + 1 }
+    return false
   }
 
   // ---- numbers and the remaining operators (docs/jit/doubles.md) ----
@@ -860,6 +962,26 @@ impl Translator {
     if opcode == op.OP_dup { let t = self.top(1) let v = run self.share(t, at) run self.push(v) return true }
     if opcode == op.OP_nip { let b = self.pop() let a = self.pop() run self.push(b) run self.release(a, at) return true }
     if opcode == op.OP_swap { let b = self.pop() let a = self.pop() run self.push(b) run self.push(a) return true }
+    let shuffle = shuffleOf(opcode)
+    if shuffle.length != 0 {
+      let n = u8.toUsize(shuffle[0] - 48)
+      let mut window = List<u32>.make()
+      let mut used = List<bool>.make()
+      let mut i: usize = 0
+      while i < n { run window.append(self.top(n - i)) run used.append(false) i = i + 1 }
+      i = 0
+      while i < n { drop self.pop() i = i + 1 }
+      i = 1
+      while i < shuffle.length {
+        let from = u8.toUsize(shuffle[i] - 48)
+        let v = window.get(from)
+        if used.get(from) { let copy = run self.share(v, at) run self.push(copy) } else { used.set(from, true) run self.push(v) }
+        i = i + 1
+      }
+      i = 0
+      while i < n { if !used.get(i) { run self.release(window.get(i), at) } i = i + 1 }
+      return true
+    }
 
     // Locals and arguments.
     let mut index: usize = usize.MAX
@@ -1024,7 +1146,7 @@ impl Translator {
       // Taken keeps the tested value on the stack; the fall-through drops it, in a block of
       // its own that receives the whole state and releases the value.
       let v = self.top(1)
-      let c = run self.condition(v, at)
+      let c = run self.branchTest(opcode, v, at)
       let taken = run self.destination(i64.toUsize(targetOf(input, pc)), at)
       let dropBlock = run self.f.block()
       let mut i: usize = 0
@@ -1048,14 +1170,14 @@ impl Translator {
     }
     if isBranch(opcode) {
       let v = self.top(1)
-      let c = run self.condition(v, at)
+      let c = run self.branchTest(opcode, v, at)
       drop self.pop() run self.release(v, at)
       let target = i64.toUsize(targetOf(input, pc))
       let fall = pc + size
       let taken = run self.destination(target, at)
       let next = run self.destination(fall, at)
       let mut whenTrue = taken let mut whenFalse = next
-      if opcode == op.OP_if_false || opcode == op.OP_if_false8 { whenTrue = next whenFalse = taken }
+      if opcode == op.OP_if_false || opcode == op.OP_if_false8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_not_null8 { whenTrue = next whenFalse = taken }
       let edge = run self.edgeTo(whenTrue, at)
       drop run self.edgeTo(whenFalse, at)
       run self.f.terminate(self.current, Op.Branch, c, edge, at)
@@ -1108,6 +1230,28 @@ impl Translator {
       // the engine does not count an exit at a throw as a deopt (js_compiled.coldExit).
       run sideExit(&mut self, at)
       return false
+    }
+    if testOpcode(opcode) {
+      let v = self.top(1)
+      let mut r = NONE
+      if nullMask(opcode) != 0 { r = run self.nullTest(v, nullMask(opcode), at) }
+      else {
+        let mut wanted = atoms.JS_ATOM_function
+        if opcode == op.OP_typeof_is_undefined { wanted = atoms.JS_ATOM_undefined }
+        else if opcode == op.OP_typeof_is { wanted = typeofIsAtom(byteAt(input, pc + 1)) }
+        let ty = self.f.value(v).ty
+        if ty == Type.I32 || ty == Type.F64 { r = run self.constBool(wanted == atoms.JS_ATOM_number, at) }
+        else if ty == Type.Bool { r = run self.constBool(wanted == atoms.JS_ATOM_boolean, at) }
+        else {
+          let t = run self.f.emit(self.current, Op.TypeofAtom, true, Type.I32, Own.Unboxed, v, NONE, 0, at)
+          let last = self.f.lastInst() run self.exitHere(last, at)
+          let k = run self.constant(u32.wrappingToI32(wanted), at)
+          r = run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, t, k, u8.toI32(Cmp.value(Cmp.Eq)), at)
+        }
+      }
+      drop self.pop() run self.release(v, at)
+      run self.push(r)
+      return true
     }
     if objectOpcode(opcode) { return run self.object(input, pc) }
     if callOpcode(opcode) { return run self.call(input, pc) }
@@ -1307,6 +1451,16 @@ impl Translator {
       run self.push(r)
       return true
     }
+    // get_array_el2 keeps the object below the element (a[i] op= ...), get_array_el3 the
+    // object and the key (a[i]++).
+    if opcode == op.OP_get_array_el2 || opcode == op.OP_get_array_el3 {
+      let i = self.top(1)
+      let o = self.top(2)
+      let r = run self.getElem(o, i, at, opcode)
+      if opcode == op.OP_get_array_el2 { drop self.pop() run self.release(i, at) }
+      run self.push(r)
+      return true
+    }
     if opcode == op.OP_get_loc_el8 || opcode == op.OP_get_arg_el8 || opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8 {
       let o = run self.slotValue(opcode == op.OP_get_arg_el8 || opcode == op.OP_get_arg_el_arg8, u8.toUsize(byteAt(input, pc + 1)), at, opcode)
       let i = run self.slotValue(opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8, u8.toUsize(byteAt(input, pc + 2)), at, opcode)
@@ -1444,7 +1598,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, 0, false), initialized: List<bool>.make() }
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make() }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -1511,20 +1665,166 @@ effect fn sideExit(t: &mut Translator, pc: u32) -> () ! OutOfMemoryError ? &mut 
 /// localCount` arguments: the frame's arguments, then its locals (local `i` is argument
 /// `argumentCount + i`). Only code reachable from the header is translated, and an
 /// instruction outside the subset becomes an exit to the interpreter instead of a refusal.
-pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+pub effect fn translateOsr(input: &FunctionInput, header: u32, allowCalls: bool) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+  let calls = osrMayCall(input, allowCalls)
+  let none = List<u8>.make()
+  let plain = run translateOsrWith(input, header, calls, &none, &none)
+  // Locals the loop only ever makes numbers of enter as numbers: guarded once at entry, so
+  // the loop's own unboxing (ssa_ownership) keeps them in registers.
+  let speculation = run osrSpeculation(&plain, input.localCount, header, &input.doubleSites)
+  // Arguments the loop only unboxes are guarded once at entry too (loop-invariant guards).
+  let arguments = run osrArgumentSpeculation(&plain, input.argumentCount)
+  let mut any = false
+  let mut i: usize = 0
+  while i < speculation.length() { if speculation.get(i) != SPECULATE_NONE { any = true } i = i + 1 }
+  i = 0
+  while i < arguments.length() { if arguments.get(i) != SPECULATE_NONE { any = true } i = i + 1 }
+  if !any { return move plain }
+  return run translateOsrWith(input, header, calls, &speculation, &arguments)
+}
+
+const SPECULATE_NONE: u8 = 0
+const SPECULATE_INT: u8 = 1
+const SPECULATE_NUMBER: u8 = 2
+
+/// For each local of `f` (a translateOsr artefact): SPECULATE_INT when every value entering
+/// its loop-header web from inside the loop is a boxed i32, SPECULATE_NUMBER when they are
+/// boxed i32 or f64 (or the header deoptimized before, `doubleSites`), else SPECULATE_NONE.
+effect fn osrSpeculation(f: &Function, localCount: u32, header: u32, doubleSites: &List<u32>) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.appendRepeated(SPECULATE_NONE, u32.toUsize(localCount))
+  if f.blockCount() == 0 { return move out }
+  let entry = f.blocks.get(0)
+  if entry.instCount == 0 { return move out }
+  let jump = f.inst(entry.firstInst + entry.instCount - 1)
+  if jump.edge == NONE { return move out }
+  let edge = f.edges.get(u32.toUsize(jump.edge))
+  let target = f.blocks.get(u32.toUsize(edge.target))
+  let mut widened = false
+  let mut k: usize = 0
+  while k < doubleSites.length() { if doubleSites.get(k) == header { widened = true } k = k + 1 }
+  let mut g: u32 = 0
+  while g < localCount && g < edge.argCount && g < target.paramCount {
+    let entering = f.edgeArg(edge, g)
+    // The web of header parameters this local's value flows around the loop in.
+    let mut members = List<u32>.make()
+    run members.append(f.paramAt(target, g))
+    let mut ints = false let mut doubles = false let mut other = false
+    let mut m: usize = 0
+    while m < members.length() {
+      let q = members.get(m)
+      let info = f.value(q)
+      let home = f.blocks.get(u32.toUsize(info.block))
+      let mut position: u32 = 0
+      while position < home.paramCount && f.paramAt(home, position) != q { position = position + 1 }
+      let mut e: usize = 0
+      while e < f.edges.length() {
+        let into = f.edges.get(e)
+        if into.target == info.block && position < into.argCount {
+          let a = f.edgeArg(into, position)
+          let ai = f.value(a)
+          if a == entering || listHas(&members, a) { }
+          else if ai.def == NONE && ai.ty == Type.Value { run members.append(a) }
+          else if ai.def != NONE && f.inst(ai.def).op == Op.BoxI32 { ints = true }
+          else if ai.def != NONE && f.inst(ai.def).op == Op.BoxF64 { doubles = true }
+          else { other = true }
+        }
+        e = e + 1
+      }
+      m = m + 1
+    }
+    if !other && (ints || doubles) {
+      if doubles || widened { out.set(u32.toUsize(g), SPECULATE_NUMBER) } else { out.set(u32.toUsize(g), SPECULATE_INT) }
+    }
+    g = g + 1
+  }
+  return move out
+}
+/// For each argument of `f` (a translateOsr artefact): SPECULATE_INT when every use of it is
+/// an i32 unbox, SPECULATE_NUMBER when they are i32 or f64 unboxes with at least one f64,
+/// else SPECULATE_NONE.
+effect fn osrArgumentSpeculation(f: &Function, argumentCount: u32) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  let mut ints = List<bool>.make() let mut doubles = List<bool>.make() let mut other = List<bool>.make()
+  run out.appendRepeated(SPECULATE_NONE, u32.toUsize(argumentCount))
+  run ints.appendRepeated(false, u32.toUsize(argumentCount))
+  run doubles.appendRepeated(false, u32.toUsize(argumentCount))
+  run other.appendRepeated(false, u32.toUsize(argumentCount))
+  // Which argument each value is, if it is an Arg.
+  let mut which = List<u32>.make()
+  run which.appendRepeated(NONE, f.values.length())
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Arg && inst.result != NONE && inst.k >= 0 && i32.wrappingToU32(inst.k) < argumentCount { which.set(u32.toUsize(inst.result), i32.wrappingToU32(inst.k)) }
+    i = i + 1
+  }
+  // get_arg makes an owned copy: a retain of the argument is the argument too.
+  let mut changed = true
+  while changed {
+    changed = false
+    i = 0
+    while i < f.insts.length() {
+      let inst = f.insts.get(i)
+      if inst.op == Op.Retain && inst.result != NONE && inst.a != NONE && u32.toUsize(inst.a) < which.length()
+        && which.get(u32.toUsize(inst.a)) != NONE && which.get(u32.toUsize(inst.result)) == NONE {
+        let n = which.get(u32.toUsize(inst.a))
+        which.set(u32.toUsize(inst.result), n) changed = true
+      }
+      i = i + 1
+    }
+  }
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Arg && inst.op != Op.Retain && inst.op != Op.Release {
+      if inst.a != NONE && u32.toUsize(inst.a) < which.length() && which.get(u32.toUsize(inst.a)) != NONE {
+        let n = u32.toUsize(which.get(u32.toUsize(inst.a)))
+        if inst.op == Op.Unbox && f.value(inst.result).ty == Type.I32 { ints.set(n, true) }
+        else if inst.op == Op.UnboxF64 { doubles.set(n, true) }
+        else { other.set(n, true) }
+      }
+      if inst.b != NONE && u32.toUsize(inst.b) < which.length() && which.get(u32.toUsize(inst.b)) != NONE { other.set(u32.toUsize(which.get(u32.toUsize(inst.b))), true) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() {
+    let a = f.edgeArgs.get(i)
+    if a != NONE && u32.toUsize(a) < which.length() && which.get(u32.toUsize(a)) != NONE { other.set(u32.toUsize(which.get(u32.toUsize(a))), true) }
+    i = i + 1
+  }
+  i = 0
+  while i < u32.toUsize(argumentCount) {
+    if !other.get(i) && doubles.get(i) { out.set(i, SPECULATE_NUMBER) }
+    else if !other.get(i) && ints.get(i) { out.set(i, SPECULATE_INT) }
+    i = i + 1
+  }
+  return move out
+}
+fn listHas(list: &List<u32>, v: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == v { return true } i = i + 1 }
+  return false
+}
+
+effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, speculation: &List<u8>, argumentSpeculation: &List<u8>) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
   if !input.normal { fail refuse(NONE, 0, b"generator or async function") }
   if input.closureVars != 0 { fail refuse(NONE, 0, b"closure variables") }
   if input.scopeSlots != 0 { fail refuse(NONE, 0, b"a function scope") }
   if input.code.length() == 0 { fail refuse(NONE, 0, b"no code") }
   if op.opcodeInfo(op.OP_fuse_prefix, true).size != 5 { fail refuse(NONE, op.OP_fuse_prefix, b"fusion prefix size changed") }
   let begin = u32.toUsize(header)
-  let shapeOf = run shapeAt(input, begin, true)
+  let region = run loopRegion(input, header)
+  let shapeOf = run shapeAt(input, begin, true, calls, region.start, region.end)
+  let back = run loopsBack(input, begin, calls, &region)
+  if !back { fail refuse(header, byteAt(input, begin), b"every path around the loop leaves through an exit") }
   let length = input.code.length()
   let mut t = Translator { f: Function.make(input.argumentCount + input.localCount, input.localCount), blockAt: List<u32>.make(), current: 0,
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, begin, true), initialized: List<bool>.make() }
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make() }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
@@ -1547,6 +1847,40 @@ pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Ref
     run t.locals.append(r)
     i = i + 1
   }
+  // Speculated locals: one guard each (an exit at the header with every local as it came),
+  // then the local is the boxed number, its frame value released.
+  i = 0
+  while i < input.localCount && u32.toUsize(i) < speculation.length() {
+    let kind = speculation.get(u32.toUsize(i))
+    if kind != SPECULATE_NONE {
+      let r = t.locals.get(u32.toUsize(i))
+      let mut unboxed = NONE
+      if kind == SPECULATE_INT { unboxed = run t.f.emit(t.current, Op.Unbox, true, Type.I32, Own.Unboxed, r, NONE, 0, header) }
+      else { unboxed = run t.f.emit(t.current, Op.UnboxF64, true, Type.F64, Own.Unboxed, r, NONE, 0, header) }
+      let guard = t.f.lastInst() run t.exitHere(guard, header)
+      drop run t.f.emit(t.current, Op.Release, false, Type.I32, Own.Unboxed, r, NONE, 0, header)
+      let number = run t.boxed(unboxed, header)
+      t.locals.set(u32.toUsize(i), number)
+    }
+    i = i + 1
+  }
+  if argumentSpeculation.length() > 0 {
+    run t.argNumbers.appendRepeated(NONE, u32.toUsize(input.argumentCount))
+    i = 0
+    while i < input.argumentCount && u32.toUsize(i) < argumentSpeculation.length() {
+      let kind = argumentSpeculation.get(u32.toUsize(i))
+      if kind != SPECULATE_NONE {
+        let a = run t.argument(i, header)
+        let mut unboxed = NONE
+        if kind == SPECULATE_INT { unboxed = run t.f.emit(t.current, Op.Unbox, true, Type.I32, Own.Unboxed, a, NONE, 0, header) }
+        else { unboxed = run t.f.emit(t.current, Op.UnboxF64, true, Type.F64, Own.Unboxed, a, NONE, 0, header) }
+        let guard = t.f.lastInst() run t.exitHere(guard, header)
+        let number = run t.boxed(unboxed, header)
+        t.argNumbers.set(u32.toUsize(i), number)
+      }
+      i = i + 1
+    }
+  }
   let headerBlock = t.blockAt.get(begin)
   let edge = run t.edgeTo(headerBlock, header)
   run t.f.terminate(entry, Op.Jump, NONE, edge, header)
@@ -1561,7 +1895,7 @@ pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Ref
         if at != pc && shapeOf.leader.get(at) {
           run t.jumpTo(at, usize.toU32(previous))
           open = false
-        } else if osrExit(byteAt(input, at)) {
+        } else if osrExit(byteAt(input, at), calls) || outside(at, region.start, region.end) {
           run sideExit(&mut t, usize.toU32(at))
           open = false
         } else {
@@ -1575,6 +1909,81 @@ pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Ref
   }
   run t.f.compact()
   return move t.f
+}
+
+/// Whether some path from the loop header `begin` comes back to it without an exit (an opcode
+/// osrExit names, or leaving the region): OSR code with none would deopt on every entry.
+effect fn loopsBack(input: &FunctionInput, begin: usize, calls: bool, region: &LoopRegion) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let mut seen = List<bool>.make() run seen.appendRepeated(false, length + 1)
+  let mut work = List<usize>.make()
+  run work.append(begin)
+  while work.length() > 0 {
+    let mut pc = work.pop().unwrapOr(0)
+    let mut going = true
+    while going {
+      if pc >= length || seen.get(pc) || outside(pc, region.start, region.end) { going = false continue }
+      seen.set(pc, true)
+      let opcode = byteAt(input, pc)
+      let size = sizeAt(input, pc)
+      if osrExit(opcode, calls) || isReturn(opcode) || size == 0 { going = false continue }
+      if isBranch(opcode) || isGoto(opcode) {
+        let target = targetOf(input, pc)
+        if target == usize.toI64(begin) { return true }
+        if target >= 0 { run work.append(i64.toUsize(target)) }
+        if isBranch(opcode) { run work.append(pc + size) }
+        going = false
+      } else {
+        pc = pc + size
+        if pc == begin { return true }
+      }
+    }
+  }
+  return false
+}
+
+fn outside(pc: usize, low: u32, high: u32) -> bool { return pc < u32.toUsize(low) || pc > u32.toUsize(high) }
+
+/// The bytecode range of a loop: from its header to its last back edge, inclusive.
+pub struct LoopRegion { pub start: u32, pub end: u32 }
+
+/// The outermost loop around `header`: the ranges [target, jump] of backward jumps that
+/// overlap header's, merged until none overlaps more. On-stack-replacement code covers only
+/// this range, so a huge function's code after the loop is not translated for each header,
+/// and an exit outside it is the loop finishing (OsrEntry.start, end).
+pub effect fn loopRegion(input: &FunctionInput, header: u32) -> LoopRegion ! OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let mut targets = List<u32>.make()
+  let mut jumps = List<u32>.make()
+  let mut pc: usize = 0
+  while pc < length {
+    let opcode = byteAt(input, pc)
+    let size = sizeAt(input, pc)
+    if size == 0 || pc + size > length { break }
+    if isBranch(opcode) || isGoto(opcode) {
+      let target = targetOf(input, pc)
+      if target >= 0 && target <= usize.toI64(pc) { run targets.append(usize.toU32(i64.toUsize(target))) run jumps.append(usize.toU32(pc)) }
+    }
+    pc = pc + size
+  }
+  let mut start = header
+  let mut end = header
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut i: usize = 0
+    while i < targets.length() {
+      let low = targets.get(i)
+      let high = jumps.get(i)
+      if low <= end && high >= start && (low < start || high > end) {
+        if low < start { start = low }
+        if high > end { end = high }
+        changed = true
+      }
+      i = i + 1
+    }
+  }
+  return LoopRegion { start: start, end: end }
 }
 
 /// The targets of backward jumps in `input`, each once, in code order: where on-stack

@@ -5,14 +5,14 @@
 //! arguments then its locals as its arguments. A poll exit is handled here and the code entered
 //! again, so a long loop stays compiled; a return exit lets the interpreter execute the
 //! return instruction, so inline frames need nothing of their own.
-import silk.mem.allocator { Allocator }
 import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
 import silk.num.i32
+import silk.num.u8
 import silk.num.u16
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import runtime_memory { AllocationObserver }
 import js_heap { HeapCell }
 import js_value { ValueBits }
 import js_core_types { FunctionBytecode, ContextState, RuntimeState, CompiledEntry, OsrEntry }
@@ -21,111 +21,169 @@ import js_gc { HeapHooks }
 import js_gc as gc
 import js_interrupt_host { InterruptHooks }
 import js_interrupts as interrupts
-import js_exceptions { JsException }
-import js_realm { lendRealm }
 import js_hotness as hotness
 import js_opcode_data as op
-import js_compiled { EXIT_RETURNED, EXIT_DEOPT, EXIT_POLL, CompiledFrame, CompiledCode, stateWords, result, recordDeoptPc, rearmHotness, coldExit }
+import js_compiled { EXIT_RETURNED, EXIT_DEOPT, EXIT_POLL, EXIT_THROW, EXIT_CALL, CALL_RESUME, CALL_CALLEE_EXIT, CompiledFrame, CompiledCode, stateWords, result, recordDeoptPc, rearmHotness, coldExit }
 
 fn trap() -> never { return Intrinsic.trap("compiled code table invariant violated") }
 
-/// Called by the plain dispatch loop after an interrupt poll on a backward jump, with
-/// machine (the running frame, base or inline) written back. A frame of a function with no
-/// linked code reports it hot (js_hotness.loopPoll); one whose entry has code for machine's
-/// pc and stack depth runs it, re-entering after each poll exit, and leaves machine at the
-/// bytecode boundary where the code stopped.
-@inlineNever
-pub unsafe effect fn atPoll<H: HeapHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine) -> ()
-  ! JsException ? &mut Allocator {
-  while true {
-    let anchor = ()
-    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
-    if state.observeInstructions { return () }
-    let tableEntries = state.compiled.entries
-    let tableCount = state.compiled.count
-    drop state
-    let index = (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)).compiled
-    if index == 0 { unsafe hotness.loopPoll(machine.bytecode) return () }
-    if index > tableCount { trap() }
-    let table = unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(tableEntries)
-    let entrySlot = unsafe Pointer.atMut<CompiledEntry>(unsafe Pointer.assumeManyMut<CompiledEntry>(table), u32.toUsize(index - 1))
-    let code = unsafe codeAt(entrySlot, usize.toU32(machine.pc()), usize.toU32(machine.sp()))
-    if Pointer.isNull<u8>(code) { return () }
-    let exit = run unsafe enterAt(&mut hooks, &mut machine, entrySlot, unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(code))
-    if exit != EXIT_POLL { return () }
-    // The code left the counter at zero; reset it as interrupts.dueAt does before handling.
-    let mut contextAnchor = () let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, machine.context)
-    context.interruptCounter = interrupts.JS_INTERRUPT_COUNTER_INIT
-    drop context
-    // The frame is whole again: the handler may run the debugger or compile and link.
-    run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context))
+/// What a back-edge poll found for the running frame (js_vm.osrAtPoll): the entry, the osr
+/// entry and the code for its pc and stack depth (null: none), and the sizes of the buffers
+/// the caller allocates for a run: inputs ValueBits, state words, call block words (at least 1).
+pub struct OsrTarget { pub entrySlot: ?*mut CompiledEntry, pub osrSlot: ?*mut OsrEntry, pub code: ?*const u8, pub inputs: usize, pub stateWords: usize, pub blockWords: usize }
+impl Copy for OsrTarget {}
+
+/// Deopts after which an osr entry is never entered again.
+const ENTRY_DEOPTS: u32 = 6
+
+/// The OSR target of machine (the running frame, base or inline, written back), or one with
+/// null code. A frame of a function with no linked code reports it hot, and so does one of a
+/// linked function at a header it has no osr entry for (js_hotness.loopPoll); an entry that
+/// deoptimized lets polls pass first (OsrEntry.wait).
+pub unsafe fn target(machine: &Machine) -> OsrTarget {
+  let none = OsrTarget { entrySlot: Pointer.null<CompiledEntry>(), osrSlot: Pointer.null<OsrEntry>(), code: Pointer.null<u8>(), inputs: 0, stateWords: 0, blockWords: 1 }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  if state.observeInstructions { return none }
+  let tableEntries = state.compiled.entries
+  let tableCount = state.compiled.count
+  drop state
+  let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  let index = bytecode.compiled
+  let inputs = u16.toUsize(bytecode.argumentCount) + u16.toUsize(bytecode.variableCount)
+  let words = stateWords(u16.toUsize(bytecode.variableCount), u16.toUsize(bytecode.stackSize))
+  drop bytecode
+  let pc = usize.toU32(machine.pc())
+  let depth = usize.toU32(machine.sp())
+  if index == 0 { unsafe hotness.loopPoll(machine.bytecode, pc, false) return none }
+  if index > tableCount { trap() }
+  let table = unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(tableEntries)
+  let entrySlot = unsafe Pointer.atMut<CompiledEntry>(unsafe Pointer.assumeManyMut<CompiledEntry>(table), u32.toUsize(index - 1))
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
+  let off = entry.deoptLimit != 0 && entry.osrDeopts >= u32.toU64(entry.deoptLimit)
+  drop entry
+  if off { return none }
+  let osrSlot = unsafe osrAt(entrySlot, pc, depth)
+  if Pointer.isNull<OsrEntry>(osrSlot) {
+    if depth == 0 { unsafe hotness.loopPoll(machine.bytecode, pc, true) }
+    return none
   }
+  let slot = unsafe Intrinsic.pointerRequalify<?*mut OsrEntry, *mut OsrEntry>(osrSlot)
+  let mut found = unsafe Pointer.read<OsrEntry>(slot)
+  if Pointer.isNull<u8>(found.code) { return none }
+  if found.wait > 0 {
+    found.wait = found.wait - 1
+    unsafe Pointer.write<OsrEntry>(slot, found)
+    return none
+  }
+  let mut blockWords: usize = 1
+  if u32.toUsize(found.callWords) > blockWords { blockWords = u32.toUsize(found.callWords) }
+  return OsrTarget { entrySlot: unsafe Intrinsic.pointerRequalify<*mut CompiledEntry, ?*mut CompiledEntry>(entrySlot), osrSlot: osrSlot, code: found.code,
+    inputs: inputs, stateWords: words, blockWords: blockWords }
 }
 
-/// The osr code of entry for pc and depth, or null.
-unsafe fn codeAt(entrySlot: *mut CompiledEntry, pc: u32, depth: u32) -> ?*const u8 {
+/// The osr entry of entry for pc and depth, or null.
+unsafe fn osrAt(entrySlot: *mut CompiledEntry, pc: u32, depth: u32) -> ?*mut OsrEntry {
   let mut anchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut anchor, entrySlot)
   let count = entry.osrCount
   let list = entry.osr
   drop entry
-  if count == 0 { return Pointer.null<u8>() }
-  let entries = unsafe Pointer.assumeMany<OsrEntry>(unsafe Intrinsic.pointerRequalify<?*const OsrEntry, *const OsrEntry>(list))
+  if count == 0 { return Pointer.null<OsrEntry>() }
+  let entries = unsafe Pointer.assumeManyMut<OsrEntry>(unsafe Intrinsic.pointerRequalify<?*mut OsrEntry, *mut OsrEntry>(list))
   let mut position: u32 = 0
   while position < count {
-    let candidate = unsafe Pointer.read<OsrEntry>(unsafe Pointer.at<OsrEntry>(entries, u32.toUsize(position)))
-    if candidate.pc == pc && candidate.depth == depth { return candidate.code }
+    let at = unsafe Pointer.atMut<OsrEntry>(entries, u32.toUsize(position))
+    let candidate = unsafe Pointer.read<OsrEntry>(at)
+    if candidate.pc == pc && candidate.depth == depth { return unsafe Intrinsic.pointerRequalify<*mut OsrEntry, ?*mut OsrEntry>(at) }
     position = position + 1
   }
-  return Pointer.null<u8>()
+  return Pointer.null<OsrEntry>()
 }
 
-/// Runs code for machine and applies its exit. Returns the exit code.
-@inlineNever
-unsafe effect fn enterAt<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, entrySlot: *mut CompiledEntry, code: *const u8) -> u32 ? &mut Allocator {
-  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
-  let data = entry.data
-  let env = entry.env
-  drop entry
+/// Starts target's code on machine: the inputs are the frame's arguments then its locals,
+/// as borrowed bit copies; the call block's resume and callee-exit words start at 0.
+/// Returns the exit; at EXIT_CALL the caller makes the call in block and calls `again`.
+pub unsafe fn start(machine: &Machine, target: &OsrTarget, inputs: *mut ValueBits, state: *mut u64, block: *mut u64) -> u32 {
   let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
   let parameters = u16.toUsize(bytecode.argumentCount)
   let locals = u16.toUsize(bytecode.variableCount)
-  let stackSize = u16.toUsize(bytecode.stackSize)
   drop bytecode
-  // The code's arguments: the frame's arguments, then its locals, as borrowed bit copies.
-  let inputs = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(
-    unsafe Intrinsic.stackAllocate<ValueBits>(parameters + locals)))
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(inputs)
   let mut position: usize = 0
   while position < parameters {
-    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(inputs, position), unsafe Pointer.read<ValueBits>(unsafe machine.argumentCell(position)))
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, position), unsafe Pointer.read<ValueBits>(unsafe machine.argumentCell(position)))
     position = position + 1
   }
   position = 0
   while position < locals {
-    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(inputs, parameters + position), unsafe Pointer.read<ValueBits>(unsafe machine.localCell(position)))
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, parameters + position), unsafe Pointer.read<ValueBits>(unsafe machine.localCell(position)))
     position = position + 1
   }
-  let exitState = unsafe Intrinsic.pointerRequalify<[*]mut u64, *mut u64>(unsafe Intrinsic.stackAllocate<u64>(stateWords(locals, stackSize)))
+  let words = unsafe Pointer.assumeManyMut<u64>(block)
+  unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(words, CALL_RESUME), 0)
+  if target.blockWords > CALL_CALLEE_EXIT { unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(words, CALL_CALLEE_EXIT), 0) }
+  return unsafe again(&machine, &target, inputs, state, block)
+}
+
+/// Runs target's code again after start: from the call the block names when its resume word
+/// is set (js_vm.compiledCall ORed how the call went into it).
+pub unsafe fn again(machine: &Machine, target: &OsrTarget, inputs: *mut ValueBits, state: *mut u64, block: *mut u64) -> u32 {
+  let entrySlot = unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(target.entrySlot)
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
+  let data = entry.data
+  let env = entry.env
+  drop entry
   let mut contextAnchor = () let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, machine.context)
   let counter = Pointer.fromMutRef<i32>(&mut context.interruptCounter)
   drop context
-  let frame = CompiledFrame.of(&machine)
+  let mut frame = CompiledFrame.of(&machine)
+  if target.blockWords > 1 { frame.calls = unsafe Intrinsic.pointerRequalify<*mut u64, ?*mut u64>(block) }
+  let code = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(target.code)
   let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const CompiledCode>(Pointer.fromRef<*const u8>(&code))
   let machineCode = unsafe Pointer.read<CompiledCode>(slot)
-  let arguments = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(unsafe Pointer.atMut<ValueBits>(inputs, 0))
-  let exit = unsafe machineCode(arguments, exitState, counter, data, env, Pointer.fromRef<CompiledFrame>(&frame))
-  let words = unsafe Pointer.assumeManyMut<u64>(exitState)
+  let arguments = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(inputs)
+  let exit = unsafe machineCode(arguments, state, counter, data, env, Pointer.fromRef<CompiledFrame>(&frame))
+  if exit > EXIT_CALL { trap() }
+  return exit
+}
+
+/// Counts and applies a final exit (not EXIT_CALL) of target's code to machine: a return
+/// leaves the result for the interpreter's return instruction; a deopt, poll or throw exit
+/// writes the frame state (a throw's pc is the call's, for the caller to raise there).
+pub unsafe fn finish<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, target: &OsrTarget, exit: u32, state: *mut u64) -> () {
+  let entrySlot = unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(target.entrySlot)
+  let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
+  let locals = u16.toUsize(bytecode.variableCount)
+  let stackSize = u16.toUsize(bytecode.stackSize)
+  drop bytecode
+  let words = unsafe Pointer.assumeManyMut<u64>(state)
   let mut tallyAnchor = () let tally = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut tallyAnchor, entrySlot)
   tally.osrRuns = tally.osrRuns + 1
   let osrOnly = Pointer.isNull<u8>(tally.code)
   let mut unlink = false
   if exit == EXIT_POLL { tally.polls = tally.polls + 1 }
   else if exit == EXIT_DEOPT && !unsafe coldExit(&machine.*, u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 0)))) {
-    tally.osrDeopts = tally.osrDeopts + 1
-    // An OSR-only entry's deopt sites are the embedder's input for compiling it again.
-    if osrOnly { recordDeoptPc(&mut tally, u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 0)))) }
-    // A loop that keeps failing a guard: stop entering it. A normal entry stays linked; an
-    // OSR-only function is unlinked and reported again (js_compiled.rearmHotness).
-    if tally.deoptLimit != 0 && tally.osrDeopts >= u32.toU64(tally.deoptLimit) { tally.osrCount = 0 unlink = osrOnly }
+    let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 0)))
+    let slot = unsafe Intrinsic.pointerRequalify<?*mut OsrEntry, *mut OsrEntry>(target.osrSlot)
+    let mut osrEntry = unsafe Pointer.read<OsrEntry>(slot)
+    // An exit outside the loop is the loop finishing: the interpreter runs on from there.
+    if pc >= u32.toUsize(osrEntry.start) && pc <= u32.toUsize(osrEntry.end) {
+      tally.osrDeopts = tally.osrDeopts + 1
+      osrEntry.deopts = osrEntry.deopts + 1
+      osrEntry.deoptOpcode = u8.toU32(unsafe machine.byteAt(pc)) + 1
+      // A linked function's loop is not recompiled for its OSR deopts: back off, then stop. An
+      // OSR-only one is, at the deopt limit, with the sites it deoptimized at widened.
+      if !osrOnly {
+        if osrEntry.deopts >= ENTRY_DEOPTS { osrEntry.wait = u32.MAX }
+        else { osrEntry.wait = u32.shiftLeft(1, osrEntry.deopts) - 1 }
+      }
+      unsafe Pointer.write<OsrEntry>(slot, osrEntry)
+      // An OSR-only entry's deopt sites are the embedder's input for compiling it again.
+      if osrOnly { recordDeoptPc(&mut tally, pc) }
+      // A loop that keeps failing a guard: stop entering it. A normal entry stays linked; an
+      // OSR-only function is unlinked and reported again (js_compiled.rearmHotness).
+      if tally.deoptLimit != 0 && tally.osrDeopts >= u32.toU64(tally.deoptLimit) { unlink = osrOnly }
+    }
   }
   drop tally
   if unlink {
@@ -135,18 +193,23 @@ unsafe effect fn enterAt<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, ent
     unsafe rearmHotness(machine.runtime, machine.bytecode)
   }
   if exit == EXIT_RETURNED {
-    let value = unsafe result(exitState)
+    let value = unsafe result(state)
     let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 2)))
     let opcode = unsafe machine.byteAt(pc)
     if opcode == op.OP_return { unsafe machine.push(value) }
     else if opcode == op.OP_return_undef { unsafe gc.release(&mut hooks, machine.runtime, value) }
     else { trap() }
     unsafe machine.setPc(pc)
-    return exit
+    return ()
   }
-  if exit != EXIT_DEOPT && exit != EXIT_POLL { trap() }
+  if exit != EXIT_DEOPT && exit != EXIT_POLL && exit != EXIT_THROW { trap() }
   unsafe restoreLive(&mut hooks, &mut machine, words, locals, stackSize)
-  return exit
+}
+
+/// After a poll exit: the code left the counter at zero; reset it as interrupts.dueAt does.
+pub unsafe fn resetCounter(machine: &Machine) -> () {
+  let mut contextAnchor = () let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, machine.context)
+  context.interruptCounter = interrupts.JS_INTERRUPT_COUNTER_INIT
 }
 
 /// Applies an exit state to a live frame whose operand stack is empty: each slot's value owns
