@@ -33,7 +33,10 @@ import x64_regalloc { Allocation, Place, GPR, XMM, getI32, putI32, aluWith, getF
 import x64_regalloc as regalloc
 import jit_helpers as helpers
 import silkjs.js_compiled as compiled
+import silkjs.js_compiled_objects { FieldLayout }
+import silkjs.js_compiled_objects as objects
 import ssa_liveness as liveness
+import ssa_calls as calls
 
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
@@ -45,6 +48,10 @@ const EXIT_THROW: u32 = 3
 const EXIT_CALL: u32 = 4
 /// js_compiled.CompiledFrame.calls's offset (its seventh pointer).
 const FRAME_CALLS: i32 = 48
+/// CompiledFrame.code's offset (its eighth pointer).
+const FRAME_CODE: i32 = 56
+/// CompiledFrame.runtime's offset (its fourth pointer).
+const FRAME_RUNTIME: i32 = 24
 /// More values than this would make the frame larger than is sensible for a first tier.
 const MAX_VALUES: u32 = 65536
 
@@ -79,6 +86,8 @@ pub struct Emitter {
   pub settings: Settings,
   /// Where each value lives (x64_regalloc).
   pub places: Allocation,
+  /// Where an object keeps its shape and slots (inline field access).
+  fields: FieldLayout,
   /// Per value: its reads (operands, edge arguments, exit slots; an over-count only costs
   /// speed), the reads that take it as an immediate, and the instruction defining it or NONE.
   uses: List<u32>,
@@ -114,7 +123,7 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places,
-    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0 }
+    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout() }
   run emitter.countUses(&function)
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
@@ -289,10 +298,18 @@ impl Emitter {
       return ()
     }
     if op == Op.Release {
-      // Only a heap reference has a count to drop; the engine's deferred release does it.
+      // Only a heap reference has a count to drop. A count above one drops here; the last
+      // goes to the engine's deferred release.
       let skip = run self.a.label()
+      let last = run self.a.label()
       run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
       run self.heapTest(Reg.Rax, skip)
+      run self.a.load(Width.W64, Reg.R9, payloadOf(inst.a))
+      run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R9, 0), 1)
+      run self.a.jcc(Cond.LessOrEqual, last)
+      run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R9, 0), 1)
+      run self.a.jmp(skip)
+      self.a.bind(last)
       run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
       run self.callHelper(helpers.RELEASE)
       self.a.bind(skip)
@@ -402,19 +419,90 @@ impl Emitter {
     }
     if op == Op.GetField {
       run self.stressGuard(inst.exit)
+      let slow = run self.a.label()
+      let done = run self.a.label()
+      // A borrowed result (ssa_ownership.borrowFields) takes no count.
+      let borrowed = function.value(inst.result).own == Own.Borrowed
+      if inst.k == 0 || inst.k == 1 {
+        // Inline: the slot the site's key (k 0) or its site cache entry (k 1) names.
+        if inst.k == 0 { run self.fieldSlot(inst.a, inst.pc, slow) } else { run self.cachedFieldSlot(inst.a, inst.pc, slow) }
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        if !borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
+        run self.a.jmp(done)
+      }
+      self.a.bind(slow)
       // get_field(env, frame, site, object, out) -> 1 when out holds the owned value.
       let frame = self.input(INPUT_FRAME)
       run self.a.load(Width.W64, Reg.Rsi, frame)
-      run self.a.movImm32(Reg.Rdx, u32.bitOr(inst.pc, u32.shiftLeft(i32.wrappingToU32(inst.k), 31)))
+      let mut site = u32.bitOr(inst.pc, u32.shiftLeft(i32.wrappingToU32(inst.k), 31))
+      if borrowed { site = u32.bitOr(site, 0x40000000) }
+      run self.a.movImm32(Reg.Rdx, site)
       run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a))
       run self.a.lea(Width.W64, Reg.R8, slotOf(inst.result))
       run self.callHelper(helpers.GET_FIELD)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      self.a.bind(done)
       return ()
     }
     if op == Op.GetElem || op == Op.PutElem || op == Op.GetLength {
       run self.stressGuard(inst.exit)
+      let done = run self.a.label()
+      if op == Op.GetLength {
+        // Inline: an Array keeps its length in slot 0.
+        let layout = self.settings.layout
+        let fields = self.fields
+        let slow = run self.a.label()
+        run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES + layout.tagOffset)))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+        run self.a.jcc(Cond.NotEqual, slow)
+        run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+        run self.a.loadZero16(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectClass)))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(fields.arrayClass))
+        run self.a.jcc(Cond.NotEqual, slow)
+        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectSlots)))
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        run self.retainBits(Reg.Rax, Reg.R9)
+        run self.a.jmp(done)
+        self.a.bind(slow)
+      }
+      if op == Op.GetElem || op == Op.PutElem {
+        let slow = run self.a.label()
+        let mut index = inst.b
+        if op == Op.PutElem { index = i32.wrappingToU32(inst.k) }
+        run self.elementSlot(inst.a, index, slow)
+        if op == Op.GetElem {
+          run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+          run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
+          run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+          run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+          run self.retainBits(Reg.Rax, Reg.R9)
+        } else {
+          // Only a non-heap value over a non-heap one: FastArrayData.store's plain and
+          // clearHead stay true, and no count changes.
+          let oldPlain = run self.a.label()
+          let newPlain = run self.a.label()
+          run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+          run self.heapTest(Reg.Rax, oldPlain)
+          run self.a.jmp(slow)
+          self.a.bind(oldPlain)
+          run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+          run self.heapTest(Reg.Rax, newPlain)
+          run self.a.jmp(slow)
+          self.a.bind(newPlain)
+          run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+          run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+          run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
+        }
+        run self.a.jmp(done)
+        self.a.bind(slow)
+      }
       // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
       // get_length(env, object, out) -> 1 when done.
       run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
@@ -432,14 +520,16 @@ impl Emitter {
       }
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      self.a.bind(done)
       return ()
     }
     if op == Op.GetScope || op == Op.PutScope {
       run self.stressGuard(inst.exit)
       // get_scope(env, frame, site, out) / put_scope(env, frame, site, value) -> 1 when done;
-      // site = slot | checked << 31.
+      // site = slot | checked << 31 | captured << 30.
       let frame = self.input(INPUT_FRAME)
-      let site = u32.bitOr(i32.wrappingToU32(inst.k) & 0xffff, u32.shiftLeft(u32.shiftRight(i32.wrappingToU32(inst.k), 16) & 1, 31))
+      let k = i32.wrappingToU32(inst.k)
+      let site = u32.bitOr(u32.bitOr(k & 0xffff, u32.shiftLeft(u32.shiftRight(k, 16) & 1, 31)), u32.shiftLeft(u32.shiftRight(k, 17) & 1, 30))
       run self.a.load(Width.W64, Reg.Rsi, frame)
       run self.a.movImm32(Reg.Rdx, site)
       if op == Op.GetScope { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result)) run self.callHelper(helpers.GET_SCOPE) }
@@ -474,6 +564,25 @@ impl Emitter {
     }
     if op == Op.PutField {
       run self.stressGuard(inst.exit)
+      let slow = run self.a.label()
+      let done = run self.a.label()
+      // Inline (writeOwnField): the old value's count drops unless it is the last one.
+      let kept = run self.a.label()
+      run self.fieldSlot(inst.a, inst.pc, slow)
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+      run self.heapTest(Reg.Rax, kept)
+      run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
+      run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R9, 0), 1)
+      run self.a.jcc(Cond.LessOrEqual, slow)
+      run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R9, 0), 1)
+      self.a.bind(kept)
+      run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+      run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
+      run self.retainBits(Reg.Rax, Reg.R9)
+      run self.a.jmp(done)
+      self.a.bind(slow)
       // put_field(env, frame, pc, object, value) -> 1 when stored (the object retained value).
       let frame = self.input(INPUT_FRAME)
       run self.a.load(Width.W64, Reg.Rsi, frame)
@@ -483,6 +592,7 @@ impl Emitter {
       run self.callHelper(helpers.PUT_FIELD)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      self.a.bind(done)
       return ()
     }
     if op == Op.CallArg {
@@ -505,20 +615,23 @@ impl Emitter {
       run self.a.store(Width.W64, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SITE), 8)), Reg.Rax)
       // A linked callee that makes no calls runs at once (helper CALL_FAST); values live
       // across the call are in their slots (x64_regalloc), so only the inputs need reloading.
+      // A constructor call (`new`) always leaves: the engine builds the receiver.
       let generic = run self.a.label()
       let done = run self.a.label()
-      let atF = self.input(INPUT_FRAME) run self.a.load(Width.W64, Reg.Rsi, atF)
-      run self.a.mov(Width.W64, Reg.Rdx, Reg.R11)
-      run self.callHelper(helpers.CALL_FAST)
-      run self.callBlock(Reg.R11)
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.NotEqual, generic)
-      let fastResult = u32.wrappingMultiply(usize.toU32(compiled.CALL_RESULT), 8)
-      run self.a.load(Width.W64, Reg.Rax, word(Reg.R11, fastResult))
-      run self.a.load(Width.W64, Reg.R9, word(Reg.R11, fastResult + 8))
-      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
-      run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
-      run self.a.jmp(done)
+      if (inst.k & calls.CONSTRUCT) == 0 {
+        let atF = self.input(INPUT_FRAME) run self.a.load(Width.W64, Reg.Rsi, atF)
+        run self.a.mov(Width.W64, Reg.Rdx, Reg.R11)
+        run self.callHelper(helpers.CALL_FAST)
+        run self.callBlock(Reg.R11)
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.NotEqual, generic)
+        let fastResult = u32.wrappingMultiply(usize.toU32(compiled.CALL_RESULT), 8)
+        run self.a.load(Width.W64, Reg.Rax, word(Reg.R11, fastResult))
+        run self.a.load(Width.W64, Reg.R9, word(Reg.R11, fastResult + 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        run self.a.jmp(done)
+      }
       // Otherwise leave with EXIT_CALL: the resume point and the saved values go to the block.
       self.a.bind(generic)
       run self.a.movImm32(Reg.Rax, u32.shiftLeft(point + 1, 2))
@@ -802,6 +915,114 @@ impl Emitter {
     run self.heapTest(tagWord, skip)
     run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(payload, 0), 1)
     self.a.bind(skip)
+  }
+  /// R11 = the address of the slot that the inline key of the field site at pc names in
+  /// the object in value's slot, or a jump to miss: value is not an object, or the key's
+  /// shape version (key >> 16, slot index in the low 16 bits, at code + pc + 5 as
+  /// js_vm_property_ops.fieldKeyAt reads it) is not its shape's. Clobbers RAX, R8 to R11.
+  effect fn fieldSlot(self: &mut Self, value: u32, pc: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    let fields = self.fields
+    run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(value * SLOT_BYTES + layout.tagOffset)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.load(Width.W64, Reg.R11, payloadOf(value))
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, u32.wrappingToI32(fields.shapeVersion)))
+    let frame = self.input(INPUT_FRAME)
+    run self.a.load(Width.W64, Reg.R10, frame)
+    run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R10, FRAME_CODE))
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R10, u32.wrappingToI32(pc + 5)))
+    run self.a.mov(Width.W64, Reg.R8, Reg.R9)
+    run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R8, 16)
+    run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.Rax)
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.aluImm(Alu.And, Width.W32, Reg.R9, 65535)
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
+    run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectSlots)))
+    run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
+  }
+  /// R11 = the address of element `index` (an i32 value) of the fast Array in value's slot,
+  /// or a jump to miss: not a fast Array, or the index is negative or past its elements.
+  /// Clobbers R8 and R11.
+  effect fn elementSlot(self: &mut Self, value: u32, index: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    let fields = self.fields
+    run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(value * SLOT_BYTES + layout.tagOffset)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.load(Width.W64, Reg.R11, payloadOf(value))
+    run self.a.loadZero16(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectClass)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(fields.arrayClass))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.loadZero8(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)))
+    run self.a.testImm(Width.W32, Reg.R8, u32.wrappingToI32(fields.fastArray))
+    run self.a.jcc(Cond.Equal, miss)
+    let place = self.at(index)
+    run getI32(&mut self.a, Reg.R8, place)
+    run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)))
+    run self.a.jcc(Cond.AboveOrEqual, miss)
+    run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.elements)))
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R8, 4)
+    run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R8)
+  }
+  /// fieldSlot by the site cache entry (js_vm_property_ops.readFieldCachedAt): an own entry of
+  /// the object's shape version, or a prototype entry for it while RuntimeState.shapeEpoch is
+  /// the entry's (then the slot is in the entry's holder). An exotic object misses.
+  effect fn cachedFieldSlot(self: &mut Self, value: u32, pc: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    let fields = self.fields
+    let entries = u32.wrappingToI32(fields.fieldCache)
+    let proto = run self.a.label()
+    let found = run self.a.label()
+    run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(value * SLOT_BYTES + layout.tagOffset)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.load(Width.W64, Reg.R11, payloadOf(value))
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, u32.wrappingToI32(fields.shapeVersion)))
+    // R9 = the site (the operand's address), R8 = its entry less the cache's offset.
+    let frame = self.input(INPUT_FRAME)
+    run self.a.load(Width.W64, Reg.R10, frame)
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R10, FRAME_CODE))
+    run self.a.lea(Width.W64, Reg.R9, Mem.at(Reg.R9, u32.wrappingToI32(pc + 1)))
+    run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R10, FRAME_RUNTIME))
+    run self.a.mov(Width.W64, Reg.R8, Reg.R9)
+    run self.a.aluImm(Alu.And, Width.W32, Reg.R8, 4095)
+    run self.a.imulImm(Width.W64, Reg.R8, Reg.R8, u32.wrappingToI32(fields.entryStride))
+    run self.a.alu(Alu.Add, Width.W64, Reg.R8, Reg.R10)
+    run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R9, Mem.at(Reg.R8, entries + u32.wrappingToI32(fields.entrySite)))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, entries + u32.wrappingToI32(fields.entryKey)))
+    run self.a.mov(Width.W64, Reg.R10, Reg.R9)
+    run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R9, 16)
+    run self.a.alu(Alu.Cmp, Width.W64, Reg.R9, Reg.Rax)
+    run self.a.jcc(Cond.NotEqual, proto)
+    run self.a.aluImm(Alu.And, Width.W32, Reg.R10, 65535)
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R10, 4)
+    run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectSlots)))
+    run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R10)
+    run self.a.jmp(found)
+    self.a.bind(proto)
+    run self.a.loadZero8(Reg.R10, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)))
+    run self.a.testImm(Width.W32, Reg.R10, u32.wrappingToI32(fields.exotic))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.movImm64(Reg.R10, fields.protoKey)
+    run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R10)
+    run self.a.alu(Alu.Cmp, Width.W64, Reg.R9, Reg.Rax)
+    run self.a.jcc(Cond.NotEqual, miss)
+    let again = self.input(INPUT_FRAME)
+    run self.a.load(Width.W64, Reg.R10, again)
+    run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R10, FRAME_RUNTIME))
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, entries + u32.wrappingToI32(fields.entryEpoch)))
+    run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R9, Mem.at(Reg.R10, u32.wrappingToI32(fields.shapeEpoch)))
+    run self.a.jcc(Cond.NotEqual, miss)
+    run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R8, entries + u32.wrappingToI32(fields.entryHolder)))
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, entries + u32.wrappingToI32(fields.entryHolderIndex)))
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
+    run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectSlots)))
+    run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
+    self.a.bind(found)
   }
   /// Jumps to notHeap unless the ValueBits whose first word is in tagWord is a heap
   /// reference. Clobbers R10.
