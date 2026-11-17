@@ -118,6 +118,12 @@ function __clamp(v) {
   if (v !== null && typeof v === 'object') return 'o';
   return v;
 }
+function* __gen(arr) { for (var i = 0; i < arr.length; i++) yield arr[i]; }
+function __iter(arr, b) {
+  var i = 0;
+  return { next: function () { i++; if (i === 11000 + (b & 7)) throw new RangeError('next'); return { value: arr[i - 1], done: i > arr.length }; },
+    return: function () { __fin = (__fin + 1) | 0; return {}; }, [Symbol.iterator]: function () { return this; } };
+}
 function __P(x, y) { this.x = x; this.y = y; this.n = 0; }
 __P.prototype.getx = function () { return this.x; };
 __P.prototype.sum = function (k) { return this.x * k + this.y; };
@@ -174,7 +180,7 @@ FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
             "calls", "calls", "fields", "elements", "globals", "method", "literals", "operators", "classes", "tests", "shuffles", "instanceof",
             "protos", "protos", "protos", "tries", "tries", "tdz", "frames", "frames",
-            "lazyargs", "lazyargs", "equality"]
+            "lazyargs", "lazyargs", "equality", "iteration", "iteration", "iteration"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -188,6 +194,7 @@ AREAS = {
     "typed arrays": (r"\bvar ta = new ", r"\bvar ta = new \w+\(", "var ta = new Float64Array("),  # wrong element kind
     "number loops": (r"\bvar d = ", r"\bd = d \+ ", "d = d - "),  # a double add becomes a subtract
     "int operators": (r"\bvar u = ", r"\bvar u = a \| 0;", "var u = (a | 0) ^ 1;"),  # the first operand is off by one bit
+    "iteration": (r"\bfor \(var v of ", r"\bj\+\+; \}", "j = j + 2; }"),  # a step is counted twice
 }
 
 
@@ -516,6 +523,26 @@ class Generator:
                 f"try {{ s = __clamp(s + {k}th(i & 3, a)); }} catch (e) {{ s = __clamp(s + __err(e).length); }}",
             ])
             return f"var s = 0; for (var i = 0; i < {self.pick([2, 5, 12])}; i++) {{ {step} }} return s;"
+        if flavor == "iteration":
+            # for-of and for-in (stream Q), long enough on the first calls (__long) for on-stack
+            # replacement: a fast Array stepped by index in compiled code while the body pushes,
+            # pops, empties it or writes a hole or a double; other iterables, an iterator whose next
+            # throws, a return called by break; for-in keys deleted and added while it runs.
+            n = "__long < 3 ? 12000 : " + str(self.pick([3, 9]))
+            source = self.pick(["arr", "arr", "arr", "new Set(arr)", "new Map(arr.map(function (v, k) { return [k, v]; }))",
+                                "String(arr.length).repeat(4)", "__gen(arr)", "__iter(arr, b)"])
+            step = self.pick(["t = (t + (typeof v === 'number' ? v : 1)) | 0;", "t = (t ^ (Array.isArray(v) ? v[1] : v)) | 0;",
+                              "t = __clamp(t + (+v || 0));"])
+            mutate = self.pick(["", "", "if (t === 7) arr.push(a);", "if ((t & 1023) === 5) arr.pop();",
+                                "if (j === 300) arr.length = 0;", "if (j === 200) arr[j + 1] = 0.5;", "if (j === 90) delete arr[j + 2];",
+                                "if (j === 400) break;", "if (j === (b & 15)) continue;"])
+            head = (f"var n = {n}; __long = __long + 1; var arr = []; for (var k = 0; k < n; k++) arr.push(k & {self.pick([7, 255])}); "
+                    f"var t = 0; var j = 0; ")
+            if self.random.random() < 0.25:
+                return (head + "var o = Object.create({p: 1}); for (var k = 0; k < (n & 1023); k++) o['k' + k] = k; "
+                        f"for (var key in o) {{ t = (t + key.length) | 0; {self.pick(['', 'if (key === \'k3\') delete o.k5;', 'if (key === \'k2\') o.extra = 1;'])} }} return t;")
+            return (head + f"try {{ for (var v of {source}) {{ {step} {mutate} j++; }} }} catch (e) {{ t = __clamp(t + __err(e)); }} "
+                    f"return [t, j, arr.length];")
         if flavor == "tests":
             # Nullish, undefined and typeof tests (J2) on values of every type, as branch
             # conditions and as values; `??` keeps its operand on one edge only.
