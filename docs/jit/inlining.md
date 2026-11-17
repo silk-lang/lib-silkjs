@@ -28,8 +28,8 @@ In both cases:
 
 - the function is a plain function (`FunctionKind.Normal`) of the caller's realm, with no
   closure variables and no scope of its own, at most 96 bytes of code;
-- its code is made of the opcodes `ssa_translate.inlinable` lists and runs straight to one
-  `return`. The list is its own, not "everything the translator supports": an opcode a later
+- its code is made of the opcodes `ssa_translate.inlinable` lists and has no loop (forward
+  branches only, at most eight blocks past the first). The list is its own, not "everything the translator supports": an opcode a later
   change adds to the subset (one whose handler reads a table of the function by pc, say) is
   not inlinable until it is put there;
 - the body of a plain call does not read `this` (what it is depends on the callee's mode).
@@ -74,6 +74,18 @@ undefined). The differences from translating a function's own code:
   released first;
 - a call inside the body is inlined in turn or fails the attempt.
 
+A body without branches stays in the caller's block and its value may stay unboxed. A body
+with branches gets a block for each of its leaders and one where its returns meet. Each of
+those blocks takes as parameters, before the body's own locals and operands, the locals
+and operands of every frame around the body (`Translator.held`: the function's own state
+before the outermost inlined call first, then each body's around this one), so the
+translator's rule that a block's state is its parameters holds across the body. The
+arguments and the receiver are places in that list. A `return` jumps to the meeting block
+with the frames around and its value; after the body the caller's locals and operands are
+read back from the list. Each block starts with `inline.frame` again for every body it is
+inside, naming the closure as the value it is in that block (the backend takes the closure
+of the frame it builds from the last `inline.frame` it lowered for that target).
+
 `Inst.frame` tells the backend whose `CompiledFrame` an instruction reads: field sites,
 variables, scopes and atoms of an inlined body belong to the callee's code, closure and
 scope. `inline.frame` reserves that frame on the native stack (nine words per target) and
@@ -100,8 +112,8 @@ would change again. So:
   operation's own guard comes before its own effect, so a body may end in one store.
 
 A failed attempt is rolled back (`Function.mark` and `rollback`: the instruction, value,
-exit and slot lists are truncated; an inlined body makes no block) and the site is
-translated as an ordinary call.
+exit, slot, block, parameter and edge lists are truncated) and the site is translated as
+an ordinary call.
 
 Counts: a body owns values the interpreter frame will not receive (its retained copies of
 arguments, the results of its reads). An exit lists them after the frame's slots
@@ -119,8 +131,7 @@ another function.
 
 ## 4. What is not done yet
 
-- Callees with branches (the body becomes blocks; the continuation takes the result as a
-  parameter).
+- Callees with loops.
 - A guard after an effect: an exit that names two frames, so the interpreter resumes inside
   the callee.
 - Natives and constructors as targets.
