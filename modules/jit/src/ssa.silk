@@ -28,9 +28,10 @@ pub enum Type { I32, Bool, Value, F64 }
 /// its root is) or `Imm` (no heap reference, needs no count).
 pub enum Own { Unboxed, Owned, Borrowed, Imm }
 
-/// What a borrowed value borrows from: an argument cell (`root` is its index) or an owned value
-/// (`root` is its value index).
-pub enum RootKind { None, Argument, Value }
+/// What a borrowed value borrows from: an argument cell (`root` is its index), an owned value
+/// (`root` is its value index) or a variable binding (no `root`; ssa_opt_borrow keeps calls
+/// and stores away from the borrow).
+pub enum RootKind { None, Argument, Value, Binding }
 
 /// The operation of an instruction. See docs/jit/ssa.md for each one's meaning.
 pub enum Op {
@@ -73,6 +74,9 @@ pub enum Op {
   This,
   /// `check.tag a, k`: guard, exits unless `a`'s engine tag (ValueBits.tag) is `k`.
   CheckTag,
+  /// `tag.in a, k`: whether value `a`'s engine tag is one of the bits of `k` (bit tag + 9);
+  /// a bool, no guard.
+  TagIn,
   /// `get.field a`: guard, the named property the instruction at `pc` reads from object `a`
   /// (an owned value), through the interpreter's own site cache; exits on any miss.
   GetField,
@@ -152,8 +156,8 @@ pub enum Op {
   AbsF64,
   /// `floor.f64 a`: Math.floor, no guard (NaN, infinities and -0 stay themselves).
   FloorF64,
-  /// `toint32 a`: ToInt32 of the double `a`; guard, exits when the truncation leaves the
-  /// int64 range (NaN, infinities, huge values), which the interpreter answers instead.
+  /// `toint32 a`: ToInt32 of the double `a`, no guard (NaN and the infinities give 0, huge
+  /// values wrap modulo 2^32).
   ToInt32,
   /// `int.f64 a`: the double `a` as an i32 when it is one exactly (not -0); guard otherwise.
   ExactI32,
@@ -207,6 +211,10 @@ pub struct ValueInfo {
   pub block: u32,
   /// The defining instruction, or NONE for a block parameter.
   pub def: u32,
+  /// A block parameter's place among its block's parameters when the translator made it:
+  /// the interpreter state slot (locals, then the operand stack) it stands for, which stays
+  /// true when passes remove other parameters. NONE for an instruction's result.
+  pub state: u32,
 }
 impl Copy for ValueInfo {}
 
@@ -363,6 +371,19 @@ impl Function {
   pub fn setInst(self: &mut Self, index: u32, inst: Inst) -> () { self.insts.set(u32.toUsize(index), inst) }
   pub fn setSlot(self: &mut Self, index: u32, slot: Slot) -> () { self.slots.set(u32.toUsize(index), slot) }
   pub fn setEdgeArg(self: &mut Self, index: u32, v: u32) -> () { self.edgeArgs.set(u32.toUsize(index), v) }
+  /// Points edge `index` at `target`, with no arguments (ssa_opt_hoist splits an edge).
+  pub fn retarget(self: &mut Self, index: u32, target: u32) -> () {
+    let mut edge = self.edges.get(u32.toUsize(index))
+    edge.target = target edge.argCount = 0
+    self.edges.set(u32.toUsize(index), edge)
+  }
+  /// Moves instruction `index` to `block`, at `order` among its instructions; `compact` puts
+  /// it there.
+  pub fn moveInst(self: &mut Self, index: u32, block: u32, order: u32) -> () {
+    let mut inst = self.insts.get(u32.toUsize(index))
+    inst.block = block inst.order = order
+    self.insts.set(u32.toUsize(index), inst)
+  }
 
   // ---- building ----
 
@@ -373,13 +394,16 @@ impl Function {
   }
 
   effect fn newValue(self: &mut Self, ty: Type, own: Own, block: u32, def: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
-    run self.values.append(ValueInfo { ty: ty, own: own, rootKind: RootKind.None, root: NONE, block: block, def: def })
+    run self.values.append(ValueInfo { ty: ty, own: own, rootKind: RootKind.None, root: NONE, block: block, def: def, state: NONE })
     return usize.toU32(self.values.length() - 1)
   }
 
   /// Adds a parameter to `block`, after the ones it has.
   pub effect fn addParam(self: &mut Self, block: u32, ty: Type, own: Own) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let v = run self.newValue(ty, own, block, NONE)
+    let mut made = self.values.get(u32.toUsize(v))
+    made.state = self.blocks.get(u32.toUsize(block)).paramCount
+    self.values.set(u32.toUsize(v), made)
     // Before compact, a block's range is kept while its parameters arrive together (the
     // translator adds each block's at once); paramsOf reads it.
     let mut info = self.blocks.get(u32.toUsize(block))
@@ -515,9 +539,9 @@ impl Function {
     // Iterative depth-first search for the postorder.
     let mut state = List<u8>.make()
     run state.appendRepeated(0, blockCount)
-    let mut post = List<u32>.make()
-    let mut stack = List<u32>.make()
-    let mut next = List<u32>.make()
+    let mut post = run List<u32>.makeWithCapacity(blockCount)
+    let mut stack = run List<u32>.makeWithCapacity(blockCount)
+    let mut next = run List<u32>.makeWithCapacity(blockCount)
     if blockCount > 0 { run stack.append(0) run next.append(0) state.set(0, 1) }
     while stack.length() > 0 {
       let top = stack.length() - 1
@@ -541,32 +565,50 @@ impl Function {
     // rank[old block] = new index, or NONE when unreachable.
     let mut rank = List<u32>.make()
     run rank.appendRepeated(NONE, blockCount)
-    let mut order = List<u32>.make()
+    let mut order = run List<u32>.makeWithCapacity(blockCount)
     let mut p = post.length()
     while p > 0 { p = p - 1 rank.set(u32.toUsize(post.get(p)), usize.toU32(order.length())) run order.append(post.get(p)) }
 
-    // Instructions grouped by new block, then by order within it.
-    let mut buckets = List<List<u32>>.make()
-    let mut bi: usize = 0
-    while bi < order.length() { run buckets.append(List<u32>.make()) bi = bi + 1 }
+    // Instructions grouped by new block (a counting sort into one list: `sorted` from
+    // `first[b]` to `first[b + 1]`), then by order within it.
+    let mut first = List<u32>.make()
+    run first.appendRepeated(0, order.length() + 1)
     i = 0
     while i < self.insts.length() {
       let inst = self.insts.get(i)
       let r = rank.get(u32.toUsize(inst.block))
-      if r != NONE && inst.op != Op.Removed { run buckets.asMutSlice()[u32.toUsize(r)].append(usize.toU32(i)) }
+      if r != NONE && inst.op != Op.Removed { let had = first.get(u32.toUsize(r) + 1) first.set(u32.toUsize(r) + 1, had + 1) }
+      i = i + 1
+    }
+    let mut bi: usize = 0
+    while bi < order.length() { let sum = first.get(bi + 1) + first.get(bi) first.set(bi + 1, sum) bi = bi + 1 }
+    let mut cursor = List<u32>.make()
+    run cursor.appendSlice(first.asSlice())
+    let mut sorted = List<u32>.make()
+    run sorted.appendRepeated(0, u32.toUsize(first.get(order.length())))
+    i = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      let r = rank.get(u32.toUsize(inst.block))
+      if r != NONE && inst.op != Op.Removed {
+        let at = cursor.get(u32.toUsize(r))
+        sorted.set(u32.toUsize(at), usize.toU32(i))
+        cursor.set(u32.toUsize(r), at + 1)
+      }
       i = i + 1
     }
     bi = 0
-    while bi < buckets.length() {
-      let list = &mut buckets.asMutSlice()[bi]
+    while bi < order.length() {
       // Insertion sort by order: blocks are short and nearly sorted.
-      let mut x: usize = 1
-      while x < list.length() {
-        let item = list.get(x)
+      let low = u32.toUsize(first.get(bi))
+      let high = u32.toUsize(first.get(bi + 1))
+      let mut x: usize = low + 1
+      while x < high {
+        let item = sorted.get(x)
         let key = self.insts.get(u32.toUsize(item)).order
         let mut y = x
-        while y > 0 && self.insts.get(u32.toUsize(list.get(y - 1))).order > key { let prev = list.get(y - 1) list.set(y, prev) y = y - 1 }
-        list.set(y, item)
+        while y > low && self.insts.get(u32.toUsize(sorted.get(y - 1))).order > key { let prev = sorted.get(y - 1) sorted.set(y, prev) y = y - 1 }
+        sorted.set(y, item)
         x = x + 1
       }
       bi = bi + 1
@@ -575,10 +617,10 @@ impl Function {
     // New value numbers: each block's parameters (in creation order), then its results.
     let mut renumber = List<u32>.make()
     run renumber.appendRepeated(NONE, self.values.length())
-    let mut newValues = List<ValueInfo>.make()
-    let mut newParams = List<u32>.make()
-    let mut newBlocks = List<Block>.make()
-    let mut newInsts = List<Inst>.make()
+    let mut newValues = run List<ValueInfo>.makeWithCapacity(self.values.length())
+    let mut newParams = run List<u32>.makeWithCapacity(self.params.length())
+    let mut newBlocks = run List<Block>.makeWithCapacity(blockCount)
+    let mut newInsts = run List<Inst>.makeWithCapacity(self.insts.length())
     // Parameters grouped by new block, in creation order: paramStart[r] .. paramStart[r + 1]
     // of grouped. One pass, where scanning them per block was quadratic.
     let mut paramStart = List<u32>.make()
@@ -616,13 +658,14 @@ impl Function {
         g = g + 1
       }
       let firstInst = usize.toU32(newInsts.length())
-      let list = &buckets.asSlice()[bi]
-      let mut x: usize = 0
-      while x < list.length() {
-        let mut inst = self.insts.get(u32.toUsize(list.get(x)))
+      let low = u32.toUsize(first.get(bi))
+      let high = u32.toUsize(first.get(bi + 1))
+      let mut x: usize = low
+      while x < high {
+        let mut inst = self.insts.get(u32.toUsize(sorted.get(x)))
         inst.block = usize.toU32(bi)
         // From 2, so insertBefore can still place an instruction before the first.
-        inst.order = usize.toU32(x) * 2 + 2
+        inst.order = usize.toU32(x - low) * 2 + 2
         if inst.result != NONE {
           let mut info = self.values.get(u32.toUsize(inst.result))
           info.block = usize.toU32(bi) info.def = usize.toU32(newInsts.length())
@@ -639,12 +682,12 @@ impl Function {
     }
 
     // Edges and exits in the order the new instructions use them; operands renumbered.
-    let mut newEdges = List<Edge>.make()
-    let mut newArgs = List<u32>.make()
-    let mut newExits = List<Exit>.make()
+    let mut newEdges = run List<Edge>.makeWithCapacity(self.edges.length())
+    let mut newArgs = run List<u32>.makeWithCapacity(self.edgeArgs.length())
+    let mut newExits = run List<Exit>.makeWithCapacity(self.exits.length())
     let mut newSlots = List<Slot>.make()
     // Each new exit's first slot in the old table, and the slots counted so far.
-    let mut oldFirst = List<u32>.make()
+    let mut oldFirst = run List<u32>.makeWithCapacity(self.exits.length())
     let mut slotTotal: u32 = 0
     i = 0
     while i < newInsts.length() {
@@ -759,6 +802,7 @@ impl Function {
       run text(&mut out, b"borrowed(")
       if info.rootKind == RootKind.Argument { run text(&mut out, b"arg ") run number(&mut out, info.root) }
       else if info.rootKind == RootKind.Value { run text(&mut out, b"v") run number(&mut out, info.root) }
+      else if info.rootKind == RootKind.Binding { run text(&mut out, b"binding") }
       else { run text(&mut out, b"?") }
       run text(&mut out, b")")
     } else { run text(&mut out, b"unboxed?") }
@@ -808,6 +852,7 @@ impl Function {
     else if op == Op.Return { run text(&mut out, b"return ") run operand(&mut out, inst.a) }
     else if op == Op.This { run text(&mut out, b"this") }
     else if op == Op.CheckTag { run text(&mut out, b"check.tag ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.TagIn { run text(&mut out, b"tag.in ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
     else if op == Op.GetField { run text(&mut out, b"get.field ") run operand(&mut out, inst.a) }
     else if op == Op.GetElem { run text(&mut out, b"get.elem ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) }
     else if op == Op.PutElem { run text(&mut out, b"put.elem ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run operand(&mut out, i32.wrappingToU32(inst.k)) }
@@ -930,5 +975,5 @@ pub fn numberOpReadsB(op: Op) -> bool {
 }
 /// Whether a K operation is a guard (carries an exit).
 pub fn numberOpHasExit(op: Op) -> bool {
-  return op == Op.UnboxF64 || op == Op.ToInt32 || op == Op.ExactI32 || op == Op.Shr || op == Op.Mod || op == Op.Neg
+  return op == Op.UnboxF64 || op == Op.ExactI32 || op == Op.Shr || op == Op.Mod || op == Op.Neg
 }

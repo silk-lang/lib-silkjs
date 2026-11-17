@@ -25,6 +25,7 @@ import silkjs.js_opcode_data as op
 import silkjs.js_atom_data as atoms
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, NONE }
 import ssa_calls as calls
+import silkjs.js_compiled as compiled
 import ssa
 
 /// What the translator reads about a function: plain numbers and the code bytes, nothing that
@@ -550,6 +551,8 @@ struct Translator {
   /// parameters (by value) are proven initialized.
   tdz: Tdz,
   initialized: List<bool>,
+  /// Whether a widened store may leave through a call exit (not in OSR code, which makes no calls).
+  exits: bool,
   // ---- inlining (docs/jit/inlining.md): the state of the inlined body being translated.
   /// How many inlined bodies deep the translator is; 0 in the function's own code.
   depth: u32,
@@ -924,9 +927,17 @@ impl Translator {
     let a = self.top(2) let b = self.top(1)
     if equality(opcode) && self.wideEquality && (self.f.value(a).ty == Type.Value || self.f.value(b).ty == Type.Value) {
       // A site that deoptimized: equality of any two values through the interpreter's
-      // identity tests, exiting only where the operator would coerce.
+      // identity tests. Outside OSR, == goes through a call that runs any coercion in place.
       let strict = opcode == op.OP_strict_eq || opcode == op.OP_strict_neq
-      let r = run self.equals(a, b, strict, opcode == op.OP_neq || opcode == op.OP_strict_neq, pc)
+      let negate = opcode == op.OP_neq || opcode == op.OP_strict_neq
+      let mut r = NONE
+      if !strict && self.exits {
+        let x = run self.boxed(a, pc) let y = run self.boxed(b, pc)
+        let mut how = 0
+        if negate { how = 1 }
+        r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, x, y, calls.kAt(0, compiled.SITE_EQUAL) | i32.shiftLeft(how, 16), pc)
+        let last = self.f.lastInst() run self.exitHere(last, pc)
+      } else { r = run self.equals(a, b, strict, negate, pc) }
       drop self.pop() drop self.pop()
       run self.release(a, pc) run self.release(b, pc)
       run self.push(r)
@@ -1004,12 +1015,6 @@ impl Translator {
     let x = run self.constant(k, pc)
     return run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, x, zero, u8.toI32(Cmp.value(Cmp.Ne)), pc)
   }
-  /// Whether the instruction at pc deoptimized in an earlier compilation.
-  fn widened(self: &Self, pc: u32) -> bool {
-    let mut i: usize = 0
-    while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { return true } i = i + 1 }
-    return false
-  }
 
   // ---- numbers and the remaining operators (docs/jit/doubles.md) ----
 
@@ -1017,6 +1022,11 @@ impl Translator {
   /// one already, or the site deoptimized as int32 in an earlier compilation.
   fn numberSite(self: &Self, pc: u32, a: u32, b: u32) -> bool {
     if self.f.value(a).ty == Type.F64 || self.f.value(b).ty == Type.F64 { return true }
+    return self.widened(pc)
+  }
+  /// Whether the instruction at `pc` deoptimized in an earlier compilation (a double site for
+  /// arithmetic; a generic one for equality, stores and calls).
+  fn widened(self: &Self, pc: u32) -> bool {
     let mut i: usize = 0
     while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { return true } i = i + 1 }
     return false
@@ -1032,8 +1042,8 @@ impl Translator {
     let last = self.f.lastInst() run self.exitHere(last, pc)
     return r
   }
-  /// `v` as ToInt32 would make it, for a bitwise operator: an i32 as it is, a double truncated
-  /// (guarded), a boxed value guarded as an Int (as a number on a double site). NONE for a bool.
+  /// `v` as ToInt32 would make it, for a bitwise operator: an i32 as it is, a double through
+  /// ToInt32, a boxed value guarded as an Int (as a number on a double site). NONE for a bool.
   effect fn int32(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let ty = self.f.value(v).ty
     if ty == Type.I32 { return v }
@@ -1043,9 +1053,7 @@ impl Translator {
       if !self.numberSite(pc, v, v) { return run self.int(v, pc) }
       x = run self.number(v, pc)
     }
-    let r = run self.f.emit(self.current, Op.ToInt32, true, Type.I32, Own.Unboxed, x, NONE, 0, pc)
-    let last = self.f.lastInst() run self.exitHere(last, pc)
-    return r
+    return run self.f.emit(self.current, Op.ToInt32, true, Type.I32, Own.Unboxed, x, NONE, 0, pc)
   }
   effect fn doubleConstant(self: &mut Self, value: f64, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let bits = f64.toBits(value)
@@ -1621,7 +1629,10 @@ impl Translator {
       drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, argument, NONE, usize.toI32(i), at)
       i = i + 1
     }
-    let mut k = usize.toI32(count)
+    // A call that deoptimized before (a callee only the interpreter called) calls anyway.
+    let mut kind = compiled.SITE_CALL
+    if self.widened(at) { kind = compiled.SITE_CALL_ALWAYS }
+    let mut k = calls.kAt(usize.toU32(count), kind)
     if construct { k = k | calls.CONSTRUCT }
     let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
@@ -1869,6 +1880,13 @@ impl Translator {
   /// The named property store of the instruction at `pc` of `value` into `object`.
   effect fn putField(self: &mut Self, object: u32, value: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let bits = run self.boxed(value, pc)
+    if self.exits && self.widened(pc) {
+      // It deoptimized before (an add, a setter): a call exit runs what the helper cannot.
+      let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, object, bits, calls.kAt(0, compiled.SITE_PUT_FIELD), pc)
+      let last = self.f.lastInst() run self.exitHere(last, pc)
+      run self.release(r, pc)
+      return ()
+    }
     drop run self.f.emit(self.current, Op.PutField, false, Type.I32, Own.Unboxed, object, bits, 0, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
   }
@@ -2105,7 +2123,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", exits: true, wideEquality: wideEquality(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -2334,7 +2352,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", exits: false, wideEquality: wideEquality(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
