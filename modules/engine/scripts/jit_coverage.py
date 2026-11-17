@@ -76,21 +76,27 @@ def parse_stats(text):
     return {}
 
 
+EXTRA = []  # --calls: ["--jit-calls"]
+
+
 def counters(shell, path, cwd, timeout):
     env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
-    done = subprocess.run([shell, "--jit", "--jit-dump", "--jit-stats", path], capture_output=True, text=True,
+    done = subprocess.run([shell, "--jit", *EXTRA, "--jit-dump", "--jit-stats", path], capture_output=True, text=True,
                           timeout=timeout, env=env, cwd=cwd)
     refused = collections.Counter(line[len("jit: refused: "):] for line in done.stderr.splitlines()
                                   if line.startswith("jit: refused: "))
+    deopted = collections.Counter(line[len("jit: deoptimized at: "):] for line in done.stderr.splitlines()
+                                  if line.startswith("jit: deoptimized at: "))
     errors = [line for line in done.stdout.splitlines() if "ERROR" in line]
-    return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "errors": errors}
+    return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "deopted": dict(deopted),
+            "errors": errors}
 
 
 def compiled_fraction(shell, path, cwd, timeout):
     with tempfile.NamedTemporaryFile(suffix=".callgrind") as out:
         env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
         done = subprocess.run(["valgrind", "--tool=callgrind", "--smc-check=all-non-file", "--callgrind-out-file=" + out.name,
-                               shell, "--jit", "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+                               shell, "--jit", *EXTRA, "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if done.returncode != 0 or " done" not in done.stdout:
             return {"exit": done.returncode, "error": (done.stdout + done.stderr)[-600:]}
         total, unknown = per_object(out.name)
@@ -139,9 +145,11 @@ def main():
     parser.add_argument("--work", default=os.environ.get("SILKJS_BENCH_WORK") or os.path.join(ROOT, "build", "bench"))
     parser.add_argument("--instructions", action="store_true", help="also run fixed iterations under callgrind")
     parser.add_argument("--kernels", action="store_true", help="also measure bench/kernels")
+    parser.add_argument("--calls", action="store_true", help="run the JIT with --jit-calls")
     parser.add_argument("--json", default="")
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()
+    if args.calls: EXTRA.append("--jit-calls")
     found, missing = jit_kernels.commands(args.work)
     if "silkjs-jit" not in found:
         sys.exit("silkjs-jit: " + missing["silkjs-jit"])
@@ -202,6 +210,13 @@ def main():
     print("\nrefusal reasons over all benchmarks (hot functions refused):")
     for reason, count in total.most_common(12):
         print("  %5d  %s" % (count, reason))
+    sites = collections.Counter()
+    for entry in results.values():
+        sites.update(entry["counters"].get("deopted", {}))
+    if sites:
+        print("\ndeoptimization sites over all benchmarks (sites of recompiled functions, by opcode):")
+        for name, count in sites.most_common(12):
+            print("  %5d  %s" % (count, name))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"shell": shell, "results": results}, f, indent=1)
