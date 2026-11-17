@@ -172,7 +172,8 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
             "calls", "calls", "fields", "elements", "globals", "method", "literals", "operators", "classes", "tests", "shuffles", "instanceof",
-            "protos", "protos", "protos", "tries", "tries", "tdz", "frames", "frames"]
+            "protos", "protos", "protos", "tries", "tries", "tdz", "frames", "frames",
+            "lazyargs", "lazyargs"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -501,6 +502,19 @@ class Generator:
                 "try { var u = [...(i === (b & 3) ? null : w)]; s = __clamp(s + u.length); } catch (e) { s = __clamp(s + __err(e).length); }",
             ])
             return (f"var s = 0; var w = [a, 1, 2]; for (var i = 0; i < {n}; i++) {{ {step} }} return s;")
+        if flavor == "lazyargs":
+            # Lazy arguments objects (stream P): f.apply(this, arguments) with no, fewer and more
+            # arguments than f's formals, arguments.length and arguments[i], an index past the
+            # arguments, a method that is not apply and a throw through an apply (helpers below).
+            k = f"__A{self.functions}"
+            step = self.pick([
+                f"s = __clamp(s + {k}ap());", f"s = __clamp(s + {k}ap(a));", f"s = __clamp(s + {k}ap(i, b));",
+                f"s = __clamp(s + {k}ap(a, i, b));", f"s = __clamp(s + {k}ln(i) + {k}ln(a, b, i));",
+                f"s = __clamp(s + {k}el(a, i, 1) + {k}el());", f"s = __clamp(s + ({k}at(a, b, i) === i ? 1 : 2) + ({k}at(a) === undefined ? 3 : 4));",
+                f"s = __clamp(s + {k}nm(i, a));",
+                f"try {{ s = __clamp(s + {k}th(i & 3, a)); }} catch (e) {{ s = __clamp(s + __err(e).length); }}",
+            ])
+            return f"var s = 0; for (var i = 0; i < {self.pick([2, 5, 12])}; i++) {{ {step} }} return s;"
         if flavor == "tests":
             # Nullish, undefined and typeof tests (J2) on values of every type, as branch
             # conditions and as values; `??` keeps its operand on one edge only.
@@ -549,6 +563,19 @@ class Generator:
                        f"return {{ B: B, D: D, E: E, Nt: Nt, nt: function () {{ return new.target === undefined ? 1 : 0; }}, "
                        f"rest: function (a, ...r) {{ var t = 0; for (var j = 0; j < r.length; j++) t = __clamp(t + r[j]); return __clamp(t + r.length); }}, "
                        f"read: function (o) {{ return o[key]; }} }}; }})();")
+            return f"{helpers} function {name}(a, b) {{ {body} }}"
+        if flavor == "lazyargs":
+            # Top-level functions: a closure's would take closure variables.
+            k = f"__A{self.functions - 1}"
+            helpers = (f"function {k}t(x, y) {{ return __clamp((x === undefined ? 7 : x) + (y === undefined ? 11 : y)); }} "
+                       f"function {k}r(x) {{ if (x === 2) throw new RangeError('l' + arguments.length); return __clamp(x); }} "
+                       f"var {k}o = {{ m: function (x, a) {{ return a.length + x; }} }}; "
+                       f"function {k}ap() {{ return {k}t.apply(this, arguments); }} "
+                       f"function {k}ln(x) {{ return arguments.length + (x === undefined ? 0 : 1); }} "
+                       f"function {k}el() {{ var t = 0; for (var j = 0; j < arguments.length; j++) t = __clamp(t + arguments[j]); return t; }} "
+                       f"function {k}at() {{ return arguments[2]; }} "
+                       f"function {k}nm() {{ return {k}o.m(1, arguments); }} "
+                       f"function {k}th() {{ return {k}r.apply(this, arguments); }}")
             return f"{helpers} function {name}(a, b) {{ {body} }}"
         if flavor == "classes":
             klass = (f"var __K{self.functions - 1} = class {{ #p; constructor(v) {{ this.#p = __clamp(v); }} get() {{ return this.#p; }} "

@@ -362,6 +362,61 @@ fn i16At(input: &FunctionInput, at: usize) -> i32 { return i16.toI32(u16.wrappin
 
 /// The size of the instruction at `pc`, from the engine's table.
 fn sizeAt(input: &FunctionInput, pc: usize) -> usize { return u8.toUsize(op.opcodeInfo(byteAt(input, pc), true).size) }
+/// OP_special_object's kind for a lazy arguments object (js_bytecode.SPECIAL_LAZY_ARGUMENTS).
+const SPECIAL_LAZY_ARGUMENTS: u8 = 7
+/// The one local the code copies its lazy arguments object in `slot` to, or usize.MAX
+/// (js_bytecode.lazyArgumentsAlias checked there is at most one, before any branch).
+fn lazyArgumentsCopy(input: &FunctionInput, slot: usize) -> usize {
+  let length = input.code.length()
+  let mut pc: usize = 0
+  while pc < length {
+    let next = pc + sizeAt(input, pc)
+    if next <= pc || next >= length { return usize.MAX }
+    if localRead(input, pc) == slot {
+      let target = localStore(input, next)
+      if target != usize.MAX && target != slot { return target }
+    }
+    pc = next
+  }
+  return usize.MAX
+}
+/// The local a get_loc or set_loc at `pc` reads (set_loc leaves the value), or usize.MAX.
+fn localRead(input: &FunctionInput, pc: usize) -> usize {
+  let opcode = byteAt(input, pc)
+  if opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3 { return u8.toUsize(opcode - op.OP_get_loc0) }
+  if opcode == op.OP_get_loc8 || opcode == op.OP_set_loc8 { return u8.toUsize(byteAt(input, pc + 1)) }
+  if opcode == op.OP_get_loc || opcode == op.OP_set_loc { return u16.toUsize(u16At(input, pc + 1)) }
+  return usize.MAX
+}
+/// The local a put_loc or set_loc at `pc` stores to, or usize.MAX.
+fn localStore(input: &FunctionInput, pc: usize) -> usize {
+  let opcode = byteAt(input, pc)
+  if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { return u8.toUsize(opcode - op.OP_put_loc0) }
+  if opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8 { return u8.toUsize(byteAt(input, pc + 1)) }
+  if opcode == op.OP_put_loc || opcode == op.OP_set_loc { return u16.toUsize(u16At(input, pc + 1)) }
+  return usize.MAX
+}
+/// The local the code's lazy arguments object (special_object SPECIAL_LAZY_ARGUMENTS, the
+/// store right after it) lives in, or usize.MAX (js_vm_factories.lazyArgumentsSlot).
+fn lazyArgumentsLocal(input: &FunctionInput) -> usize {
+  let length = input.code.length()
+  let mut pc: usize = 0
+  while pc + 1 < length {
+    let opcode = byteAt(input, pc)
+    let next = pc + sizeAt(input, pc)
+    if opcode == op.OP_special_object && byteAt(input, pc + 1) == SPECIAL_LAZY_ARGUMENTS {
+      if next + 3 > length { return usize.MAX }
+      let store = byteAt(input, next)
+      if store >= op.OP_put_loc0 && store <= op.OP_put_loc3 { return u8.toUsize(store - op.OP_put_loc0) }
+      if store == op.OP_put_loc8 || store == op.OP_set_loc8 { return u8.toUsize(byteAt(input, next + 1)) }
+      if store == op.OP_put_loc || store == op.OP_set_loc { return u16.toUsize(u16At(input, next + 1)) }
+      return usize.MAX
+    }
+    if next <= pc { return usize.MAX }
+    pc = next
+  }
+  return usize.MAX
+}
 
 /// The target of the branch or goto at `pc`: displacements count from the first operand byte
 /// (`Machine.jump`).
@@ -624,6 +679,11 @@ struct Translator {
   /// The pc of a set_name that the closure created just before it already ran: js_vm's
   /// fclosure folds a following set_name into the creation (factories.allocate).
   namedClosure: usize,
+  /// The local a lazy arguments object lives in (js_bytecode.lazyArgumentsSite) and its one
+  /// copy, or usize.MAX: their reads push the stand-in (Uninitialized) the interpreter keeps
+  /// there, and its uses go to the engine (lazyUse, calls.LAZY_ARGUMENTS).
+  lazySlot: usize,
+  lazyAlias: usize,
   argNumbers: List<u32>,
 }
 
@@ -933,6 +993,31 @@ impl Translator {
     let have = self.initialized.length()
     if have <= at { run self.initialized.appendRepeated(false, at + 1 - have) }
     self.initialized.set(at, true)
+  }
+  /// Whether local `index` of the function's own frame is its lazy arguments object or the copy.
+  fn lazyLocal(self: &Self, index: usize) -> bool {
+    return self.depth == 0 && self.lazySlot != usize.MAX && (index == self.lazySlot || index == self.lazyAlias)
+  }
+  /// Whether `v` is a lazy arguments object's stand-in (a read of lazyLocal). The engine's
+  /// grammar (js_bytecode.lazyArgumentsSite) puts one only under its use, in the same block.
+  fn standIn(self: &Self, v: u32) -> bool {
+    if self.depth != 0 || self.lazySlot == usize.MAX { return false }
+    let info = self.f.value(v)
+    if info.def == NONE { return false }
+    let def = self.f.inst(info.def)
+    return def.op == Op.Imm && def.k == u8.toI32(Imm.value(Imm.Uninitialized))
+  }
+  /// Whether `opcode` reads the length or an element of a stand-in: a generic exit, which the
+  /// engine answers from the frame's own arguments, or leaves (CALL_DEOPT) when the
+  /// interpreter would build the object (js_vm.compiledOp).
+  fn lazyUse(self: &Self, opcode: u8) -> bool {
+    if opcode == op.OP_get_length { return self.stack.length() >= 1 && self.standIn(self.top(1)) }
+    if opcode == op.OP_get_array_el { return self.stack.length() >= 2 && self.standIn(self.top(2)) }
+    return false
+  }
+  /// Whether a call is `f.apply(x, arguments)` on a stand-in (calls.LAZY_ARGUMENTS).
+  fn lazyApply(self: &Self, method: bool, count: usize) -> bool {
+    return method && count == 2 && self.stack.length() >= 4 && self.standIn(self.top(1))
   }
   /// Whether `v` holds an Uninitialized marker: 0 no, 1 yes, -1 not known.
   fn uninitializedState(self: &Self, v: u32) -> i32 {
@@ -1267,6 +1352,10 @@ impl Translator {
       return true
     }
 
+    // A lazy arguments object's stand-in (js_vm_factories.lazyArgumentsSlot).
+    if opcode == op.OP_special_object && byteAt(input, pc + 1) == SPECIAL_LAZY_ARGUMENTS && self.depth == 0 {
+      let u = run self.imm(Imm.Uninitialized, at) run self.push(u) return true
+    }
     // Locals and arguments.
     let mut index: usize = usize.MAX
     if opcode == op.OP_get_loc || opcode == op.OP_put_loc || opcode == op.OP_set_loc || opcode == op.OP_get_arg
@@ -1289,6 +1378,9 @@ impl Translator {
       run self.push(r) return true
     }
     if opcode == op.OP_get_loc || opcode == op.OP_get_loc8 || (opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3) {
+      // The lazy arguments local holds its stand-in for the whole run: compiled code never
+      // builds the object (its uses that would leave to the interpreter).
+      if self.lazyLocal(index) { let u = run self.imm(Imm.Uninitialized, at) run self.push(u) return true }
       let l = self.locals.get(index) let v = run self.share(l, at) run self.push(v) return true
     }
     if opcode == op.OP_put_loc || opcode == op.OP_put_loc8 || (opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3) {
@@ -1544,6 +1636,10 @@ impl Translator {
       run self.push(r)
       return true
     }
+    if self.lazyUse(opcode) { return run self.generic(input, pc) }
+    if (opcode == op.OP_get_loc_length8 || opcode == op.OP_get_loc_el8) && self.lazyLocal(u8.toUsize(byteAt(input, pc + 1))) {
+      fail refuse(at, opcode, b"a fused read of a lazy arguments object")
+    }
     if objectOpcode(opcode) { return run self.object(input, pc) }
     if callOpcode(opcode) { return run self.call(input, pc) }
     if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
@@ -1685,6 +1781,7 @@ impl Translator {
     let mut k = usize.toI32(count)
     if construct { k = k | calls.CONSTRUCT }
     if self.depth == 0 && self.widened(at) { k = k | calls.ALWAYS }
+    if self.lazyApply(method, count) { k = k | calls.LAZY_ARGUMENTS }
     let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
     i = 0
@@ -1739,6 +1836,8 @@ impl Translator {
   /// the function its site last called, guarded by that function's identity, when it can:
   /// true, with the operands replaced by the result. False with nothing changed otherwise.
   effect fn inlined(self: &mut Self, input: &FunctionInput, function: u32, receiver: u32, method: bool, count: usize, pc: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+    // The engine applies f to the frame's own arguments (calls.LAZY_ARGUMENTS).
+    if self.lazyApply(method, count) { return false }
     // receiver is the boxed operand; the body reads the operand itself.
     if method && receiver == NONE { return false }
     let t = self.inlineTarget(input, function, pc)
@@ -2165,9 +2264,11 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"" }
+  t.lazySlot = lazyArgumentsLocal(input)
+  if t.lazySlot != usize.MAX { t.lazyAlias = lazyArgumentsCopy(input, t.lazySlot) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -2235,6 +2336,8 @@ effect fn sideExit(t: &mut Translator, pc: u32) -> () ! OutOfMemoryError ? &mut 
 /// `argumentCount + i`). Only code reachable from the header is translated, and an
 /// instruction outside the subset becomes an exit to the interpreter instead of a refusal.
 pub effect fn translateOsr(input: &FunctionInput, header: u32, allowCalls: bool) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+  // Its stand-in's uses run on the frame's arguments through the call block (lazyUse).
+  if lazyArgumentsLocal(input) != usize.MAX { fail refuse(header, op.OP_special_object, b"a lazy arguments object in on-stack-replacement code") }
   let calls = osrMayCall(input, allowCalls)
   let none = List<u8>.make()
   let plain = run translateOsrWith(input, header, calls, &none, &none)
@@ -2394,7 +2497,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"" }
   run t.blockAt.appendRepeated(NONE, length + 1)
