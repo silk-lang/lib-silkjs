@@ -4,7 +4,7 @@
 Each kernel is fixed work with one feature (integer loop, calls, method calls, doubles, arrays,
 typed arrays). One `kernel()` call is timed inside the process, so startup is excluded and
 compilation and warmup are included. Rounds are processes, interleaved across engines. Every
-engine must return the same checksum. silkjs-jit also runs with --jit-stats, whose counters are
+engine must return the same checksum. silkjs-jit (and silkjs-jit-calls, with --jit-calls) also runs with --jit-stats, whose counters are
 printed beside its time so a non-result can be explained.
 
     python3 scripts/jit_kernels.py                       # every installed engine, 5 rounds
@@ -192,8 +192,8 @@ def main():
         distinct = set(results[kernel].values())
         if len(distinct) > 1:
             failures.append("%s: checksums differ: %s" % (kernel, results[kernel]))
-        for column, line in stats[kernel].items():
-            print("%-16s %-12s %s" % (column, kernel, line))
+        for column, line in sorted(stats[kernel].items()):
+            print("%s %-12s %s" % (column, kernel, line))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"rounds": args.rounds, "commands": {c: found[c] for c in columns}, "omitted": {c: missing[c] for c in chosen if c in missing},

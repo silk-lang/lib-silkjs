@@ -17,8 +17,10 @@
 //! helper calls compiled code makes, and the prologue saves those it uses. Doubles take xmm2 to
 //! xmm15. rax, rcx, rdx, rsi, rdi, r8 to r11 and xmm0, xmm1 stay with the lowering (scratch, and
 //! the ABI's state, counter and stress words). A `value` (16 bytes) always lives in its slot.
-//! When a pool runs out, the interval that ends furthest away is spilled to its slot. A value
-//! live across a call (an exit and a re-entry) is never given a register.
+//! When a pool runs out, the interval read least often is spilled to its slot: each read counts
+//! 8 to the power of its block's loop depth (exit slots, read only on the way out, count
+//! nothing), and between equal weights the one that ends furthest away goes. A value live
+//! across a call (an exit and a re-entry) is never given a register.
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.ownership { Copy }
@@ -27,7 +29,8 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import asm_x64 { Alu, Assembler, Mem, PackedOp, Reg, ScalarOp, Width, Xmm }
-import ssa { Function, Op, Type, NONE, edgeCount }
+import ssa { Function, Op, Type, NONE, edgeCount, readsK }
+import silk.num.i32
 import ssa_verify { readsA, readsB }
 
 pub const SPILL: u8 = 0
@@ -190,6 +193,7 @@ pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut All
       let at = position(i)
       if readsA(inst.op) && inst.a != NONE { live.put(work, inst.a, true) extend(&mut ends, inst.a, at) }
       if readsB(inst.op) && inst.b != NONE { live.put(work, inst.b, true) extend(&mut ends, inst.b, at) }
+      if readsK(inst.op) { let third = i32.wrappingToU32(inst.k) live.put(work, third, true) extend(&mut ends, third, at) }
       if inst.exit != NONE {
         let exit = f.exit(inst.exit)
         let mut s: u32 = 0
@@ -234,14 +238,14 @@ pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut All
   }
   // A call is an exit and a re-entry (docs/jit/compiled-entry.md 7.3): no register survives
   // it, so a value live across one, or read by its exit, stays in its slot. A helper call
-  // (release, get.field) keeps the callee-saved integer pool but not xmm2 to xmm15.
+  // (callsOut) keeps the callee-saved integer pool but not xmm2 to xmm15.
   let mut across = List<bool>.make()
   run across.appendRepeated(false, u32.toUsize(values))
   let mut c: usize = 0
   while c < f.insts.length() {
     let op = f.insts.get(c).op
     let exits = op == Op.Call
-    if exits || op == Op.Release || op == Op.GetField {
+    if exits || callsOut(op) {
       let at = position(usize.toU32(c))
       v = 0
       while v < values {
@@ -253,15 +257,91 @@ pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut All
     }
     c = c + 1
   }
-  return run scan(&f, move starts, move ends, &across)
+  let weights = run weigh(&f)
+  return run scan(&f, move starts, move ends, &across, &weights)
 }
 
-effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<bool>) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+/// How hot each value's reads are: a read in block b counts 8^depth(b), at most 8^6. Loops are
+/// back edges s -> h with h <= s, their bodies the blocks h..s in reverse postorder.
+effect fn weigh(f: &Function) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let count = f.blockCount()
+  let mut depth = List<u32>.make()
+  run depth.appendRepeated(0, u32.toUsize(count))
+  let mut s: u32 = 0
+  while s < count {
+    let term = f.terminator(f.blocks.get(u32.toUsize(s)))
+    if term.edge != NONE {
+      let mut e: u32 = 0
+      while e < edgeCount(term.op) {
+        let h = f.edge(term.edge + e).target
+        if h <= s {
+          let mut b = h
+          while b <= s { let d = depth.get(u32.toUsize(b)) depth.set(u32.toUsize(b), d + 1) b = b + 1 }
+        }
+        e = e + 1
+      }
+    }
+    s = s + 1
+  }
+  let mut weights = List<u64>.make()
+  run weights.appendRepeated(0, u32.toUsize(f.valueCount()))
+  let mut b: u32 = 0
+  while b < count {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut d = depth.get(u32.toUsize(b))
+    if d > 6 { d = 6 }
+    let heat = u64.shiftLeft(1, u32.toU64(3 * d))
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if readsA(inst.op) && inst.a != NONE { addWeight(&mut weights, inst.a, heat) }
+      if readsB(inst.op) && inst.b != NONE { addWeight(&mut weights, inst.b, heat) }
+      if inst.edge != NONE {
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let edge = f.edge(inst.edge + e)
+          let mut g: u32 = 0
+          while g < edge.argCount { addWeight(&mut weights, f.edgeArg(edge, g), heat) g = g + 1 }
+          e = e + 1
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  return move weights
+}
+fn addWeight(weights: &mut List<u64>, v: u32, heat: u64) -> () {
+  let before = weights.get(u32.toUsize(v))
+  weights.set(u32.toUsize(v), before + heat)
+}
+
+fn poolKind(double: bool) -> u8 { if double { return XMM } return GPR }
+
+effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<bool>, weights: &List<u64>) -> Allocation ! OutOfMemoryError ? &mut Allocator {
   let values = f.valueCount()
   let mut kinds = List<u8>.make()
   run kinds.appendRepeated(SPILL, u32.toUsize(values))
   let mut registers = List<u8>.make()
   run registers.appendRepeated(0, u32.toUsize(values))
+  // Hints: an edge argument and the parameter it becomes would rather share a register, so
+  // the edge moves nothing (a loop's back edge most of all).
+  let mut hints = List<u32>.make()
+  run hints.appendRepeated(NONE, u32.toUsize(values))
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    let target = f.blocks.get(u32.toUsize(edge.target))
+    let mut g: u32 = 0
+    while g < edge.argCount {
+      let arg = f.edgeArg(edge, g)
+      let into = f.paramAt(target, g)
+      if hints.get(u32.toUsize(arg)) == NONE { hints.set(u32.toUsize(arg), into) }
+      if hints.get(u32.toUsize(into)) == NONE { hints.set(u32.toUsize(into), arg) }
+      g = g + 1
+    }
+    e = e + 1
+  }
   // Candidates by start, then value.
   let mut order = List<u64>.make()
   let mut v: u32 = 0
@@ -294,14 +374,23 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<b
       if owners.get(r) == NONE && free == usize.MAX { free = r }
       r = r + 1
     }
+    // The hinted value's register, when it is already placed in this pool and free now.
+    let hint = hints.get(u32.toUsize(v))
+    if free != usize.MAX && hint != NONE && kinds.get(u32.toUsize(hint)) == poolKind(double) {
+      let wanted = first + u8.toUsize(registers.get(u32.toUsize(hint)))
+      if owners.get(wanted) == NONE { free = wanted }
+    }
     if free == usize.MAX {
-      // Spill whichever of v and the holders ends last.
+      // Spill whichever of v and the holders is read least, then ends last.
       let mut furthest = usize.MAX
       let mut furthestEnd = ends.get(u32.toUsize(v))
+      let mut lightest = weights.get(u32.toUsize(v))
       r = first
       while r < last {
-        let end = ends.get(u32.toUsize(owners.get(r)))
-        if end > furthestEnd { furthest = r furthestEnd = end }
+        let owner = owners.get(r)
+        let end = ends.get(u32.toUsize(owner))
+        let weight = weights.get(u32.toUsize(owner))
+        if weight < lightest || (weight == lightest && end > furthestEnd) { furthest = r furthestEnd = end lightest = weight }
         r = r + 1
       }
       if furthest != usize.MAX {
@@ -361,4 +450,12 @@ pub effect fn putBits(a: &mut Assembler, p: Place, src: Reg) -> () ! OutOfMemory
 pub effect fn scalarWith(a: &mut Assembler, op: ScalarOp, dst: Xmm, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
   if p.kind == XMM { run a.scalar(op, dst, p.xmm) return () }
   run a.scalarLoad(op, dst, p.mem)
+}
+
+/// Whether lowering `op` calls a helper (x64_backend callHelper), which may change rax, rcx,
+/// rdx, rsi, rdi, r8 to r11 and every xmm register.
+pub fn callsOut(op: Op) -> bool {
+  return op == Op.Release || op == Op.GetField || op == Op.PutField || op == Op.AtomValue || op == Op.GetVar
+    || op == Op.PutVar || op == Op.GetScope || op == Op.PutScope || op == Op.GetElem || op == Op.PutElem
+    || op == Op.GetLength
 }
