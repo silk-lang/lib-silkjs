@@ -128,7 +128,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
            "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "tries", "tries", "tdz",
-           "literals", "operators", "classes"]
+           "literals", "operators", "classes", "frames", "frames"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -450,6 +450,26 @@ class Generator:
             return (f"var k = new __K{self.functions}(a); var s = 0; for (var i = 0; i < {self.pick([1, 4])}; i++) {{ "
                     f"s = s + __clamp(k.add(i)); }} return [__clamp(k.get()), s, __K{self.functions}.has(k) ? 1 : 0, "
                     f"__K{self.functions}.has({{}}) ? 1 : 0, k['m' + (b & 1)]()];")
+        if flavor == "frames":
+            # Instructions that read the frame (stream P, generic exits): closures that capture
+            # nothing or the arguments, rest parameters, new.target, a derived constructor
+            # (check_ctor, init_ctor or super), spreads into arrays and calls, and an element
+            # read keyed by a captured variable; spreads of throwing iterables are caught.
+            n = self.pick([2, 5])
+            k = f"__F{self.functions}"
+            step = self.pick([
+                "var f = function (x) { return x + 1; }; s = __clamp(s + f(i));",
+                "var g = function () { return b; }; s = __clamp(s + g());",
+                f"s = __clamp(s + {k}.rest(a, i, b));",
+                f"s = __clamp(s + {k}.nt() + (new {k}.Nt()).v);",
+                f"var d = new {k}.D(i + (b & 7)); s = __clamp(s + d.x + d.y);",
+                f"var e = new {k}.E(i, a); s = __clamp(s + e.x);",
+                "var t = [i, ...w, b]; s = __clamp(s + t.length + t[1]);",
+                "s = __clamp(s + Math.max(...w, i));",
+                f"s = __clamp(s + {k}.read({{x: i, k: a}}));",
+                "try { var u = [...(i === (b & 3) ? null : w)]; s = __clamp(s + u.length); } catch (e) { s = __clamp(s + __err(e).length); }",
+            ])
+            return (f"var s = 0; var w = [a, 1, 2]; for (var i = 0; i < {n}; i++) {{ {step} }} return s;")
         raise ValueError(flavor)
 
     def function(self) -> str:
@@ -461,6 +481,17 @@ class Generator:
             body = f"if (a === __at) throw {self.thrown()}; " + body
             self.guarded.append(name)
         self.functions += 1
+        if flavor == "frames":
+            k = f"__F{self.functions - 1}"
+            key = self.pick(["'x'", "'k'"])
+            helpers = (f"var {k} = (function () {{ var key = {key}; "
+                       f"class B {{ constructor(x) {{ if (x === 13) throw new RangeError('d' + x); this.x = __clamp(x); }} }} "
+                       f"class D extends B {{ constructor(x) {{ super(x); this.y = 1; }} }} class E extends B {{}} "
+                       f"function Nt() {{ this.v = new.target === Nt ? 2 : 3; }} "
+                       f"return {{ B: B, D: D, E: E, Nt: Nt, nt: function () {{ return new.target === undefined ? 1 : 0; }}, "
+                       f"rest: function (a, ...r) {{ var t = 0; for (var j = 0; j < r.length; j++) t = __clamp(t + r[j]); return __clamp(t + r.length); }}, "
+                       f"read: function (o) {{ return o[key]; }} }}; }})();")
+            return f"{helpers} function {name}(a, b) {{ {body} }}"
         if flavor == "classes":
             klass = (f"var __K{self.functions - 1} = class {{ #p; constructor(v) {{ this.#p = __clamp(v); }} get() {{ return this.#p; }} "
                      f"add(x) {{ this.#p = __clamp(this.#p + x); return this.#p; }} static has(o) {{ return #p in o; }} "
