@@ -44,7 +44,9 @@ One `Site` (`js_feedback.silk:61`) per instruction of a recorded function whose 
 | `KIND_CALL` | `call_constructor`, `call`, `tail_call`, `call_method`, `tail_call_method`, `call0`..`call3` | up to two distinct targets, then megamorphic; a target is a bytecode function (by its `FunctionBytecode`), a native (by `NativeFunctionId` and magic) or other |
 | `KIND_PROPERTY` | `get_field`, `get_field2`, `put_field`, `get_length`, `get_loc_field8`, `get_arg_field8`, `put_loc_field_loc8`, `put_loc_field_arg8` | receiver class, up to four distinct receiver shapes (`ShapeData.version`), then megamorphic |
 
-Element access, `instanceof`, branches and constructors' results are not recorded yet (see open
+| `KIND_BRANCH` | `if_false`, `if_true`, `if_false8`, `if_true8`, `if_true_keep8`, `if_false_keep8`, `lnot` | class of the value tested, `SEEN_NOT_BOOL` when it was not a boolean, count (added for compile-cost.md, "Recording before the first compilation") |
+
+Element access, `instanceof`, branch directions and constructors' results are not recorded yet (see open
 questions). Overflow is computed from the int32 operands before the instruction runs
 (`overflows`, `:151`), so it needs no hook after the instruction.
 
