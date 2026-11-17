@@ -274,7 +274,8 @@ class Generator:
             # Named reads and stores in a counted loop, the J subset: same-shape stores to
             # existing fields compile, reads of the arguments' fields deopt on a miss.
             literal = self.pick(["{x: 1, y: 2}", "{y: 2, x: 1}", "{x: a, y: b}"])
-            update = self.pick(["o.x + i", "o.x - o.y", "o.y * 2 - i", "t + o.x"])
+            # No update feeds o.x back into itself through t: a string would double each round.
+            update = self.pick(["o.x + i", "o.x - o.y", "o.y * 2 - i", "i - o.y"])
             return (f"var o = {literal}; var t = 0; var n = b; if (n > {self.pick([5, 20])}) n = {self.pick([3, 20])}; "
                     f"for (var i = 0; i < n; i++) {{ o.x = {update}; o.y = o.x - o.y; t = t + {self.pick(['a.x', 'b.y', 'o.x', 'a.y'])}; }} "
                     f"return [o.x, o.y, t];")
