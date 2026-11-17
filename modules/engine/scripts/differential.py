@@ -85,6 +85,7 @@ PRELUDE = """\
 var __out = typeof print === 'function' ? print : console.log;
 var __sum = 0;
 var __fin = 0;
+var __long = 0;
 var __at = -1;
 var __g = 0;
 function __sumthis(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + this.x + this.y; } return t; }
@@ -126,7 +127,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method", "tries", "tries"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tries", "tries", "tdz"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -376,6 +377,17 @@ class Generator:
                         f"finally {{ __fin = (__fin + 1) | 0; t = __clamp(t + j); {self.pick(['', 'if (j === 4) return t;'])} }} }} return t;")
             return (head + f"try {{ for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
                     f"catch (e) {{ t = __clamp(t + 1); throw e; }} }} }} catch (e) {{ return [t, __err(e)]; }} return t;")
+        if flavor == "tdz":
+            # Lexical slots in a loop long enough for on-stack replacement on its first calls
+            # (__long): one read before its initialization at an iteration that depends on the
+            # arguments (a ReferenceError, or never), one initialized before the loop, one made
+            # per iteration and captured by a closure.
+            when = self.pick(["j === n - 1 - (b & 7)", "j === 11000 && a === b", "j < 0", "j > 10000 && (t & 4095) === 77"])
+            return (f"var n = __long < 3 ? 12000 : {self.pick([3, 8])}; __long = __long + 1; var t = 0; var h = null; "
+                    f"let early = {self.pick(['a', '3', 'b'])}; "
+                    f"for (var j = 0; j < n; j++) {{ if ({when}) t = __clamp(t + late); else t = (t + (j & 7)) | 0; "
+                    f"{self.pick(['', 't = __clamp(t + early);', 'let c = j & 3; h = function () { return c; }; t = (t + h()) | 0;'])} }} "
+                    f"let late = {self.pick(['a', '1'])}; return [t, h ? h() : 0];")
         raise ValueError(flavor)
 
     def function(self) -> str:
