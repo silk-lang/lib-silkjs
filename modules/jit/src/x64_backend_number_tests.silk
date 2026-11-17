@@ -17,9 +17,11 @@ import ssa { Function, Op, Type, Own, RootKind, Cmp, NONE }
 import ssa
 import x64_backend { Lowering, Settings }
 import x64_backend as backend
+import silk.core.option { Option }
+import silkjs.js_value { ValueBits }
+import value_layout { ValueLayout }
+import value_layout as layouts
 
-const INT: u64 = 4294967296
-const BOOL: u64 = 17179869184
 const PC: u32 = 3
 
 /// A function of one argument that unboxes it as an i32 (guarded) into the returned value.
@@ -31,6 +33,16 @@ impl Builder {
     let n = run f.emit(0, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, 0, PC)
     f.setOwnership(n, Own.Borrowed, RootKind.Argument, 0)
     let x = run f.emit(0, Op.Unbox, true, Type.I32, Own.Unboxed, n, NONE, 0, PC)
+    let at = f.lastInst() drop run f.exitFor(at, PC, 0)
+    return Builder { f: move f, x: x }
+  }
+  /// Like make, but the argument is unboxed as a double (guarded: a number).
+  effect fn makeDouble() -> Builder ! OutOfMemoryError ? &mut Allocator {
+    let mut f = Function.make(1, 0)
+    drop run f.block()
+    let n = run f.emit(0, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, 0, PC)
+    f.setOwnership(n, Own.Borrowed, RootKind.Argument, 0)
+    let x = run f.emit(0, Op.UnboxF64, true, Type.F64, Own.Unboxed, n, NONE, 0, PC)
     let at = f.lastInst() drop run f.exitFor(at, PC, 0)
     return Builder { f: move f, x: x }
   }
@@ -48,15 +60,16 @@ impl Builder {
     if ssa.numberOpHasExit(operation) { let at = self.f.lastInst() drop run self.f.exitFor(at, PC, 0) }
     return r
   }
-  /// Returns `v` (an i32 or bool), lowers and publishes.
+  /// Returns `v` (an i32, bool or f64), lowers and publishes.
   effect fn finish(self: Self, v: u32, memory: &mut CodeMemory) -> CodeBlock ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError ? &mut Allocator {
     let mut f = move self.f
     let mut boxOp = Op.BoxI32
     if f.value(v).ty == Type.Bool { boxOp = Op.BoxBool }
+    if f.value(v).ty == Type.F64 { boxOp = Op.BoxF64 }
     let boxed = run f.emit(0, boxOp, true, Type.Value, Own.Imm, v, NONE, 0, PC)
     run f.terminate(0, Op.Return, boxed, NONE, PC)
     run f.compact()
-    let mut code = match move run backend.lower(&f, Settings { stress: 0 }) {
+    let mut code = match move run backend.lower(&f, Settings { stress: 0, layout: layout() }) {
       Lowering.Code { value } => move value
       Lowering.Unsupported { .. } => { return Intrinsic.trap("the function must lower") }
     }
@@ -71,30 +84,66 @@ effect fn publish(memory: &mut CodeMemory, code: &mut Code) -> CodeBlock ! Memor
   run writer.append(code.bytes.asSlice())
   return run writer.finish()
 }
-/// Runs block on the Int argument; the exit code, the result word in out.
-unsafe fn invoke(block: &CodeBlock, argument: i32, out: &mut u64) -> u32 {
+fn layout() -> ValueLayout {
+  return match layouts.probe() { Option<ValueLayout>.Some { value } => value Option<ValueLayout>.None => Intrinsic.trap("ValueBits layout not understood") }
+}
+/// Runs block on argument; the exit code, and the state's first ValueBits (the result) in out,
+/// its first word (an exit's pc) in pc.
+unsafe fn enter(block: &CodeBlock, argument: ValueBits, out: &mut ValueBits, pc: &mut u64) -> u32 {
   let address = block.entry()
-  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(Pointer.fromRef(&address))
-  let function = unsafe Pointer.read<extern "C" fn(*const u64, *mut u64, *mut i32, ?*mut u8) -> u32>(slot)
-  let words: [u64; 1] = [INT | u32.toU64(i32.wrappingToU32(argument))]
-  let mut state: [u64; 4] = [0; 4]
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const extern "C" fn(*const ValueBits, *mut u64, *mut i32, ?*mut u8, ?*mut u8, ?*const u8) -> u32>(Pointer.fromRef(&address))
+  let function = unsafe Pointer.read<extern "C" fn(*const ValueBits, *mut u64, *mut i32, ?*mut u8, ?*mut u8, ?*const u8) -> u32>(slot)
+  let cells: [ValueBits; 1] = [argument]
+  let mut state: [u64; 8] = [0; 8]
   let mut counter: i32 = 10000
-  let exit = unsafe function(Pointer.fromRef<u64>(&words[0]), Pointer.fromMutRef<u64>(&mut state[0]), Pointer.fromMutRef<i32>(&mut counter), Pointer.null<u8>())
-  out.* = state[0]
+  let exit = unsafe function(Pointer.fromRef<ValueBits>(&cells[0]), Pointer.fromMutRef<u64>(&mut state[0]), Pointer.fromMutRef<i32>(&mut counter),
+    Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>())
+  pc.* = state[0]
+  out.* = unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*const u64, *const ValueBits>(Pointer.fromRef<u64>(&state[0])))
   return exit
 }
+unsafe fn invoke(block: &CodeBlock, argument: i32, out: &mut ValueBits, pc: &mut u64) -> u32 {
+  return unsafe enter(&block, ValueBits.Int { value: argument }, &mut out, &mut pc)
+}
 fn returnsInt(block: &CodeBlock, argument: i32, expected: i32) -> bool {
-  let mut word: u64 = 0
-  return unsafe invoke(&block, argument, &mut word) == 0 && word == (INT | u32.toU64(i32.wrappingToU32(expected)))
+  let mut bits = ValueBits.Undefined let mut pc: u64 = 0
+  if unsafe invoke(&block, argument, &mut bits, &mut pc) != 0 { return false }
+  return match bits { ValueBits.Int { value } => value == expected _ => false }
 }
 fn returnsBool(block: &CodeBlock, argument: i32, expected: bool) -> bool {
-  let mut word: u64 = 0
-  let bit: u64 = if expected { 1 } else { 0 }
-  return unsafe invoke(&block, argument, &mut word) == 0 && word == (BOOL | bit)
+  let mut bits = ValueBits.Undefined let mut pc: u64 = 0
+  if unsafe invoke(&block, argument, &mut bits, &mut pc) != 0 { return false }
+  return match bits { ValueBits.Bool { value } => value == expected _ => false }
+}
+/// Whether block returns the Float64 with exactly the bits of expected for argument.
+fn returnsDouble(block: &CodeBlock, argument: ValueBits, expected: f64) -> bool {
+  let mut bits = ValueBits.Undefined let mut pc: u64 = 0
+  if unsafe enter(&block, argument, &mut bits, &mut pc) != 0 { return false }
+  return match bits { ValueBits.Float64 { value } => f64.toBits(value) == f64.toBits(expected) _ => false }
 }
 fn deopts(block: &CodeBlock, argument: i32) -> bool {
-  let mut word: u64 = 0
-  return unsafe invoke(&block, argument, &mut word) == 1 && word == u32.toU64(PC)
+  let mut bits = ValueBits.Undefined let mut pc: u64 = 0
+  return unsafe invoke(&block, argument, &mut bits, &mut pc) == 1 && pc == u32.toU64(PC)
+}
+fn deoptsOn(block: &CodeBlock, argument: ValueBits) -> bool {
+  let mut bits = ValueBits.Undefined let mut pc: u64 = 0
+  return unsafe enter(&block, argument, &mut bits, &mut pc) == 1 && pc == u32.toU64(PC)
+}
+
+test effect fn doublesBoxAndUnbox() -> () ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut memory = run CodeMemory.reserve(1048576)
+  // x * 0.5 for an argument unboxed as a number, returned as a Float64.
+  let mut b = run Builder.makeDouble() |> Effect.provideMut<Allocator>(&mut allocator)
+  let half = run b.double(0.5) |> Effect.provideMut<Allocator>(&mut allocator)
+  let bx = b.x
+  let m = run b.op(Op.MulF64, Type.F64, bx, half, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let block = run b.finish(m, &mut memory) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(returnsDouble(&block, ValueBits.Float64 { value: 5.0 }, 2.5), "a Float64 argument unboxes")
+  run Testing.expect(returnsDouble(&block, ValueBits.Int { value: -7 }, -3.5), "an Int argument converts, sign and all")
+  run Testing.expect(returnsDouble(&block, ValueBits.Int { value: 4 }, 2.0), "an integral result stays a Float64")
+  run Testing.expect(returnsDouble(&block, ValueBits.Float64 { value: -0.0 }, -0.0), "-0 keeps its sign through box and unbox")
+  run Testing.expect(deoptsOn(&block, ValueBits.Undefined) && deoptsOn(&block, ValueBits.Bool { value: true }), "anything but a number leaves")
 }
 
 test effect fn doubleArithmeticRuns() -> () ! OutOfMemoryError | UnboundLabelError | MemoryError | LinkError | AssertionError<'static> {
