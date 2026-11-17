@@ -1,5 +1,7 @@
 # SilkJS JIT handoff
 
+Historical recovery snapshot. A [17 November completeness audit](README.md) found a newer coordination handoff and recovered the full original HTML plan plus the detailed task briefs. Use that index to find the latest status and the original design; the implementation state below remains the 16 November snapshot.
+
 Verified 2026-11-16. Recovery branch: `t3/jit-compiler-plan` at `86c3e4db`.
 Workspace: `/home/user/.t3/worktrees/silkjs/t3-d319cd44`.
 
@@ -95,7 +97,7 @@ The historical phase durations were estimates, not delivery commitments. Define 
 
 ## AOT context and historical artifacts
 
-The original HTML plan at `/tmp/silkjs-jit-plan/silkjs-jit-plan.html` no longer exists on this VM. The design above was recovered from conversation and the saved notes at `/home/user/.claude/projects/-home-user-silkjs/memory/`.
+The original `/tmp/silkjs-jit-plan/silkjs-jit-plan.html` file was absent at recovery. On 17 November its complete creation diff was found in session history and restored as [the original HTML plan](archive/2026-11-12-plan.html). The summary above had been recovered from conversation and the saved notes at `/home/user/.claude/projects/-home-user-silkjs/memory/`.
 
 Earlier Bun research cited [Bun PR 45631](https://github.com/oven-sh/bun/pull/45631), [WebKit PR 757](https://github.com/oven-sh/WebKit/pull/757), and [Bun AOT documentation](https://bun.com/docs/compiler/aot). Those sources and historical numerical claims were **not revalidated during this recovery**. The useful design hypotheses are immutable file-backed code, runtime data-side references, generic entry fallback, and opt-in closed-world assumptions. Preserve ordinary JS semantics by default. Do not assume static TypeScript annotations are sound runtime facts.
 
