@@ -716,6 +716,12 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let site = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_SITE))
   let pc = u64.toUsize(site & 0xffffffff)
   let count = compiled.siteCount(site)
+  let kind = compiled.siteKind(site)
+  if kind == compiled.SITE_PUT_FIELD || kind == compiled.SITE_EQUAL {
+    unsafe machine.setPc(pc + 1)
+    unsafe machine.publishPc()
+    return run unsafe compiledStep(&mut hooks, machine.runtime, machine.context, machine.bytecode, block, pc)
+  }
   let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
   let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
   match Pointer.nonNullMut<Activation>(unsafe pushedCallee(block)) {
@@ -739,8 +745,8 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   // So does a bytecode callee js_hotness already reported that has no code (refused, or
   // waiting to compile): the interpreter's inline call costs less than a base frame, and
   // enough of these deopts unlink a caller whose calls stay interpreted. One not yet hot is
-  // called here, which counts its entry.
-  if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION
+  // called here, which counts its entry. A site that deoptimized here before calls anyway.
+  if kind != compiled.SITE_CALL_ALWAYS && function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION
     && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT)) == 0
     && unsafe reportedWithoutCode(machine.runtime, (unsafe activation.calleeOf(function)).bytecode) {
     return compiled.CALL_DEOPT
@@ -780,6 +786,41 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
     }
     FailedJs { .. } => { return compiled.CALL_THREW }
   }
+}
+/// The instruction compiled code left to run generically at a site it widened (the call
+/// block at block, compiled.SITE_PUT_FIELD or SITE_EQUAL): the put_field (or eq or neq) at
+/// pc of bytecode on the area's two values, both borrowed. compiled.CALL_RETURNED (Undefined,
+/// or the Bool, in the block) or CALL_THREW with the exception pending.
+@inlineNever
+unsafe effect fn compiledStep<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  runtime: *mut HeapHeader, context: *mut HeapHeader, bytecode: *mut HeapHeader, block: *mut u64, pc: usize) -> u64 ? &mut Allocator {
+  let words = unsafe Pointer.assumeManyMut<u64>(block)
+  let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
+  let object = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
+  let value = unsafe (unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 1))).retained()
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let opcode = unsafe Pointer.read<u8>(unsafe code.code.pointerAt(pc))
+  let atom = unsafe properties.fieldAtomAt(unsafe code.code.pointerAt(pc + 1))
+  drop code
+  if opcode == op.OP_eq || opcode == op.OP_neq {
+    let left = unsafe object.retained()
+    let compared = run Intrinsic.catchFailure<JsException>(unsafe properties.equalGeneric(&mut hooks, context, left, value, opcode == op.OP_neq), failedJs)
+    match move compared {
+      ValueBits answer => {
+        unsafe Pointer.write<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_RESULT)), answer)
+        return compiled.CALL_RETURNED
+      }
+      FailedJs { .. } => { return compiled.CALL_THREW }
+    }
+  }
+  let stored = run Intrinsic.catchFailure<JsException>(unsafe properties.putFieldGeneric(&mut hooks, runtime, context, object, atom, value), failedJs)
+  match move stored {
+    FailedJs { .. } => { return compiled.CALL_THREW }
+    _ => ()
+  }
+  unsafe Pointer.write<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_RESULT)), ValueBits.Undefined)
+  return compiled.CALL_RETURNED
 }
 /// Whether bytecode has no machine code although js_hotness reported it (its count was set
 /// past the runtime's budget then).
@@ -1213,11 +1254,19 @@ unsafe effect fn activationCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
   let words = unsafe Pointer.assumeManyMut<u64>(block)
   let site = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_SITE))
   let count = compiled.siteCount(site)
+  let kind = compiled.siteKind(site)
+  if kind == compiled.SITE_PUT_FIELD || kind == compiled.SITE_EQUAL {
+    let bytecode = running.frame.bytecode
+    unsafe noteCall(&mut running, site)
+    drop running
+    unsafe publishActivations(runtime, entry)
+    return run unsafe compiledStep(&mut hooks, runtime, context, bytecode, block, u64.toUsize(site & 0xffffffff))
+  }
   let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
   let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
   if let ValueBits.FunctionBytecode { .. } = function { return compiled.CALL_DEOPT }
   let calleeExit = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT))
-  if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION && calleeExit == 0
+  if kind != compiled.SITE_CALL_ALWAYS && function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION && calleeExit == 0
     && unsafe reportedWithoutCode(runtime, (unsafe activation.calleeOf(function)).bytecode) {
     return compiled.CALL_DEOPT
   }
