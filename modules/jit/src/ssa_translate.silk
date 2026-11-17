@@ -42,6 +42,9 @@ pub struct FunctionInput {
   /// Bytecode offsets of arithmetic and comparison sites to compile as numbers (f64) rather
   /// than int32: sites that deoptimized in an earlier compilation of the same code.
   pub doubleSites: List<u32>,
+  /// Some local is captured by a closure (VarDef.isCaptured): a callee could read or write
+  /// its frame cell, so on-stack-replacement code that holds it must not make calls.
+  pub capturedLocals: bool,
 }
 
 /// Constant kinds of `NumberConstant`.
@@ -86,7 +89,21 @@ pub fn supported(opcode: u8) -> bool {
 
 /// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
 /// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
-fn osrExit(opcode: u8) -> bool { return !supported(opcode) || callOpcode(opcode) }
+fn osrExit(opcode: u8, calls: bool) -> bool { return !supported(opcode) || (!calls && callOpcode(opcode)) }
+/// Whether OSR code for input may make calls: asked for, no captured local, and no
+/// arguments object or direct eval that could alias the frame's cells.
+fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
+  if !allowCalls || input.capturedLocals { return false }
+  let mut pc: usize = 0
+  while pc < input.code.length() {
+    let opcode = byteAt(input, pc)
+    if opcode == op.OP_special_object || opcode == op.OP_eval || opcode == op.OP_apply_eval { return false }
+    let size = sizeAt(input, pc)
+    if size == 0 { return false }
+    pc = pc + size
+  }
+  return true
+}
 
 /// Workstream H's calls: `call0`..`call3`, `call`, `call_method` and `call_constructor`.
 pub fn callOpcode(opcode: u8) -> bool {
@@ -222,11 +239,12 @@ fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
 /// at each leader, from the engine's pops and pushes. Fails on code outside the subset.
 struct Shape { leader: List<bool>, depth: List<i32>, start: List<bool> }
 
-effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator { return run shapeAt(input, 0, false) }
+effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator { return run shapeAt(input, 0, false, true, 0, u32.MAX) }
 
 /// shape walking from the instruction at `begin` (stack empty there). With `sideExits`, an
-/// opcode outside the subset ends its block (the translator exits there) instead of refusing.
-effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
+/// opcode outside the subset, or an instruction outside [low, high], ends its block (the
+/// translator exits there) instead of refusing.
+effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: bool, low: u32, high: u32) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
   let length = input.code.length()
   let mut leader = List<bool>.make() run leader.appendRepeated(false, length + 1)
   let mut start = List<bool>.make() run start.appendRepeated(false, length + 1)
@@ -248,7 +266,7 @@ effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool) -> Shape
         let opcode = byteAt(input, pc)
         if !supported(opcode) && !sideExits { fail refuse(usize.toU32(pc), opcode, b"opcode outside the subset") }
         // A side exit: the state before it is the block's, nothing after it is reached.
-        if sideExits && osrExit(opcode) { going = false continue }
+        if sideExits && (osrExit(opcode, calls) || outside(pc, low, high)) { going = false continue }
         let info = op.opcodeInfo(opcode, true)
         let size = u8.toUsize(info.size)
         if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
@@ -1366,9 +1384,10 @@ effect fn sideExit(t: &mut Translator, pc: u32) -> () ! OutOfMemoryError ? &mut 
 /// localCount` arguments: the frame's arguments, then its locals (local `i` is argument
 /// `argumentCount + i`). Only code reachable from the header is translated, and an
 /// instruction outside the subset becomes an exit to the interpreter instead of a refusal.
-pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+pub effect fn translateOsr(input: &FunctionInput, header: u32, allowCalls: bool) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+  let calls = osrMayCall(input, allowCalls)
   let none = List<u8>.make()
-  let plain = run translateOsrWith(input, header, &none, &none)
+  let plain = run translateOsrWith(input, header, calls, &none, &none)
   // Locals the loop only ever makes numbers of enter as numbers: guarded once at entry, so
   // the loop's own unboxing (ssa_ownership) keeps them in registers.
   let speculation = run osrSpeculation(&plain, input.localCount, header, &input.doubleSites)
@@ -1380,7 +1399,7 @@ pub effect fn translateOsr(input: &FunctionInput, header: u32) -> Function ! Ref
   i = 0
   while i < arguments.length() { if arguments.get(i) != SPECULATE_NONE { any = true } i = i + 1 }
   if !any { return move plain }
-  return run translateOsrWith(input, header, &speculation, &arguments)
+  return run translateOsrWith(input, header, calls, &speculation, &arguments)
 }
 
 const SPECULATE_NONE: u8 = 0
@@ -1508,14 +1527,17 @@ fn listHas(list: &List<u32>, v: u32) -> bool {
   return false
 }
 
-effect fn translateOsrWith(input: &FunctionInput, header: u32, speculation: &List<u8>, argumentSpeculation: &List<u8>) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
+effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, speculation: &List<u8>, argumentSpeculation: &List<u8>) -> Function ! Refusal | OutOfMemoryError ? &mut Allocator {
   if !input.normal { fail refuse(NONE, 0, b"generator or async function") }
   if input.closureVars != 0 { fail refuse(NONE, 0, b"closure variables") }
   if input.scopeSlots != 0 { fail refuse(NONE, 0, b"a function scope") }
   if input.code.length() == 0 { fail refuse(NONE, 0, b"no code") }
   if op.opcodeInfo(op.OP_fuse_prefix, true).size != 5 { fail refuse(NONE, op.OP_fuse_prefix, b"fusion prefix size changed") }
   let begin = u32.toUsize(header)
-  let shapeOf = run shapeAt(input, begin, true)
+  let region = run loopRegion(input, header)
+  let shapeOf = run shapeAt(input, begin, true, calls, region.start, region.end)
+  let back = run loopsBack(input, begin, calls, &region)
+  if !back { fail refuse(header, byteAt(input, begin), b"every path around the loop leaves through an exit") }
   let length = input.code.length()
   let mut t = Translator { f: Function.make(input.argumentCount + input.localCount, input.localCount), blockAt: List<u32>.make(), current: 0,
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites), argNumbers: List<u32>.make() }
@@ -1589,7 +1611,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, speculation: &Lis
         if at != pc && shapeOf.leader.get(at) {
           run t.jumpTo(at, usize.toU32(previous))
           open = false
-        } else if osrExit(byteAt(input, at)) {
+        } else if osrExit(byteAt(input, at), calls) || outside(at, region.start, region.end) {
           run sideExit(&mut t, usize.toU32(at))
           open = false
         } else {
@@ -1603,6 +1625,81 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, speculation: &Lis
   }
   run t.f.compact()
   return move t.f
+}
+
+/// Whether some path from the loop header `begin` comes back to it without an exit (an opcode
+/// osrExit names, or leaving the region): OSR code with none would deopt on every entry.
+effect fn loopsBack(input: &FunctionInput, begin: usize, calls: bool, region: &LoopRegion) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let mut seen = List<bool>.make() run seen.appendRepeated(false, length + 1)
+  let mut work = List<usize>.make()
+  run work.append(begin)
+  while work.length() > 0 {
+    let mut pc = work.pop().unwrapOr(0)
+    let mut going = true
+    while going {
+      if pc >= length || seen.get(pc) || outside(pc, region.start, region.end) { going = false continue }
+      seen.set(pc, true)
+      let opcode = byteAt(input, pc)
+      let size = sizeAt(input, pc)
+      if osrExit(opcode, calls) || isReturn(opcode) || size == 0 { going = false continue }
+      if isBranch(opcode) || isGoto(opcode) {
+        let target = targetOf(input, pc)
+        if target == usize.toI64(begin) { return true }
+        if target >= 0 { run work.append(i64.toUsize(target)) }
+        if isBranch(opcode) { run work.append(pc + size) }
+        going = false
+      } else {
+        pc = pc + size
+        if pc == begin { return true }
+      }
+    }
+  }
+  return false
+}
+
+fn outside(pc: usize, low: u32, high: u32) -> bool { return pc < u32.toUsize(low) || pc > u32.toUsize(high) }
+
+/// The bytecode range of a loop: from its header to its last back edge, inclusive.
+pub struct LoopRegion { pub start: u32, pub end: u32 }
+
+/// The outermost loop around `header`: the ranges [target, jump] of backward jumps that
+/// overlap header's, merged until none overlaps more. On-stack-replacement code covers only
+/// this range, so a huge function's code after the loop is not translated for each header,
+/// and an exit outside it is the loop finishing (OsrEntry.start, end).
+pub effect fn loopRegion(input: &FunctionInput, header: u32) -> LoopRegion ! OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let mut targets = List<u32>.make()
+  let mut jumps = List<u32>.make()
+  let mut pc: usize = 0
+  while pc < length {
+    let opcode = byteAt(input, pc)
+    let size = sizeAt(input, pc)
+    if size == 0 || pc + size > length { break }
+    if isBranch(opcode) || isGoto(opcode) {
+      let target = targetOf(input, pc)
+      if target >= 0 && target <= usize.toI64(pc) { run targets.append(usize.toU32(i64.toUsize(target))) run jumps.append(usize.toU32(pc)) }
+    }
+    pc = pc + size
+  }
+  let mut start = header
+  let mut end = header
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut i: usize = 0
+    while i < targets.length() {
+      let low = targets.get(i)
+      let high = jumps.get(i)
+      if low <= end && high >= start && (low < start || high > end) {
+        if low < start { start = low }
+        if high > end { end = high }
+        changed = true
+      }
+      i = i + 1
+    }
+  }
+  return LoopRegion { start: start, end: end }
 }
 
 /// The targets of backward jumps in `input`, each once, in code order: where on-stack
