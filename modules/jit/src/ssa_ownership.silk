@@ -757,8 +757,30 @@ pub effect fn optimize(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocat
 /// (nothing else in compiled code frees a cell: releases there are deferred), borrows the
 /// value from the object instead of counting it: the read takes no count and the release
 /// goes. The object (or its own root) must not be released first. Requires compacted blocks.
+/// Linear in the function: each value's first release and last read are found once.
 effect fn borrowFields(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let mut uses = run Uses.of(&f.*)
+  let count = f.values.length()
+  let mut firstRelease = List<u32>.make() let mut lastRead = List<u32>.make() let mut firstRead = List<u32>.make() let mut escapes = List<bool>.make()
+  let mut v: usize = 0
+  while v < count { run firstRelease.append(NONE) run lastRead.append(0) run firstRead.append(NONE) run escapes.append(false) v = v + 1 }
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    let at = usize.toU32(i)
+    if readsA(inst.op) { noteRead(&mut firstRead, &mut lastRead, inst.a, at) }
+    if readsB(inst.op) { noteRead(&mut firstRead, &mut lastRead, inst.b, at) }
+    if readsK(inst.op) { noteRead(&mut firstRead, &mut lastRead, i32.wrappingToU32(inst.k), at) }
+    if inst.op == Op.Release && inst.a != NONE && firstRelease.get(u32.toUsize(inst.a)) == NONE { firstRelease.set(u32.toUsize(inst.a), at) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { let e = f.edgeArgs.get(i) if u32.toUsize(e) < count { escapes.set(u32.toUsize(e), true) } i = i + 1 }
+  i = 0
+  while i < count {
+    let info = f.values.get(i)
+    if info.own == Own.Borrowed && info.rootKind == RootKind.Value && u32.toUsize(info.root) < count { escapes.set(u32.toUsize(info.root), true) }
+    i = i + 1
+  }
   let mut changed = false
   let mut b: u32 = 0
   while b < f.blockCount() {
@@ -771,23 +793,24 @@ effect fn borrowFields(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Alloc
         let object = f.value(read.a)
         let mut kind = RootKind.Value
         let mut root = read.a
-        let mut ok = true
+        let r = read.result
+        let release = firstRelease.get(u32.toUsize(r))
+        let mut ok = release != NONE && release > at && release < end && !escapes.get(u32.toUsize(r)) && lastRead.get(u32.toUsize(r)) <= release
+          && (firstRead.get(u32.toUsize(r)) == NONE || firstRead.get(u32.toUsize(r)) > at)
         if object.own == Own.Borrowed && (object.rootKind == RootKind.Argument || object.rootKind == RootKind.Value) { kind = object.rootKind root = object.root }
         else if object.own != Own.Owned { ok = false }
-        let r = read.result
-        let mut release = NONE
+        // The window up to the release: no call or block end, no release of the root.
         let mut j = at + 1
-        while ok && j < end {
+        while ok && j < release {
           let inst = f.inst(j)
-          if inst.op == Op.Release && inst.a == r { release = j break }
           if inst.op == Op.Call || inst.op == Op.Return || inst.op == Op.Jump || inst.op == Op.Branch { ok = false }
           if inst.op == Op.Release && kind == RootKind.Value && inst.a == root { ok = false }
           j = j + 1
         }
-        if ok && release != NONE && uses.onlyWithin(r, at, release) {
+        if ok {
           f.setOwnership(r, Own.Borrowed, kind, root)
-          if kind == RootKind.Value { uses.rooted.set(u32.toUsize(root), true) }
           removeInst(&mut f, u32.toUsize(release))
+          if kind == RootKind.Value && u32.toUsize(root) < count { escapes.set(u32.toUsize(root), true) }
           changed = true
         }
       }
@@ -798,50 +821,11 @@ effect fn borrowFields(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Alloc
   if changed { run fixSlots(&mut f) }
   return changed
 }
-
-/// Where each value is read, for borrowFields: the first and last reading instruction, whether
-/// an edge passes it and whether a borrow names it as its root. Gathered once; rewrites that
-/// remove reads leave it conservative.
-struct Uses { first: List<u32>, last: List<u32>, edge: List<bool>, rooted: List<bool> }
-impl Uses {
-  effect fn of(f: &Function) -> Uses ! OutOfMemoryError ? &mut Allocator {
-    let n = f.values.length()
-    let mut uses = Uses { first: List<u32>.make(), last: List<u32>.make(), edge: List<bool>.make(), rooted: List<bool>.make() }
-    run uses.first.appendRepeated(NONE, n) run uses.last.appendRepeated(0, n)
-    run uses.edge.appendRepeated(false, n) run uses.rooted.appendRepeated(false, n)
-    let mut i: usize = 0
-    while i < f.insts.length() {
-      let inst = f.insts.get(i)
-      let at = usize.toU32(i)
-      if readsA(inst.op) { uses.read(inst.a, at) }
-      if readsB(inst.op) { uses.read(inst.b, at) }
-      if readsK(inst.op) { uses.read(i32.wrappingToU32(inst.k), at) }
-      i = i + 1
-    }
-    i = 0
-    while i < f.edgeArgs.length() { let a = f.edgeArgs.get(i) if u32.toUsize(a) < n { uses.edge.set(u32.toUsize(a), true) } i = i + 1 }
-    i = 0
-    while i < n {
-      let info = f.values.get(i)
-      if info.own == Own.Borrowed && info.rootKind == RootKind.Value && u32.toUsize(info.root) < n { uses.rooted.set(u32.toUsize(info.root), true) }
-      i = i + 1
-    }
-    return move uses
-  }
-  fn read(self: &mut Self, v: u32, at: u32) -> () {
-    if u32.toUsize(v) >= self.first.length() { return () }
-    let k = u32.toUsize(v)
-    if self.first.get(k) == NONE { self.first.set(k, at) }
-    self.last.set(k, at)
-  }
-  /// Whether v is read only by instructions first < i <= last (exit slots aside), by no edge
-  /// and as no borrow's root.
-  fn onlyWithin(self: &Self, v: u32, first: u32, last: u32) -> bool {
-    let k = u32.toUsize(v)
-    if self.edge.get(k) || self.rooted.get(k) { return false }
-    if self.first.get(k) == NONE { return true }
-    return self.first.get(k) > first && self.last.get(k) <= last
-  }
+/// Records that instruction at reads value v (first and last reads per value).
+fn noteRead(first: &mut List<u32>, last: &mut List<u32>, v: u32, at: u32) -> () {
+  if u32.toUsize(v) >= last.length() { return () }
+  if first.get(u32.toUsize(v)) == NONE { first.set(u32.toUsize(v), at) }
+  last.set(u32.toUsize(v), at)
 }
 
 /// Moves every `const.f64` outside the entry block into it, before its terminator, so a loop
