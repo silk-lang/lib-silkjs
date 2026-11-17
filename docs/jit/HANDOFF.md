@@ -56,8 +56,45 @@ configuration.
 | 3. Differential harness | Done for the interpreter: widened generator, per-area self-test, `silk task differential`, a step in `silk task check` |
 | 4. Engine seam | Mapped in [tier-seam.md](tier-seam.md); per-function hotness counting with an embedder slot is in the engine. Hook design beyond that is open |
 | 5. Machine-code foundations | x86-64 encoder and executable memory done for Linux x86-64 |
-| 6. Feedback and ownership-aware SSA | Not started |
+| 6. Feedback and ownership-aware SSA | Feedback recorder ([feedback.md](feedback.md)) and SSA form with a bytecode translator ([ssa.md](ssa.md)) merged; the first compiled function with deoptimization is in progress in a separate session |
 | 7. Optimizations | Not started |
+
+## The plan as recovered (milestone definitions)
+
+Copied unchanged on 2026-11-16 from the earlier handoff on `t3/jit-compiler-plan` (`95a03c95`),
+which the first version of this file had shortened to milestone names. This is the fullest
+surviving statement of the plan: the original HTML plan was lost with its machine. Where the
+work done so far falls short of these definitions it is listed after them.
+
+The initial four-tier plan and immediate tracing-GC replacement were superseded in discussion. The subsequent direction was interpreter plus one SSA compiler with quick and full optimization modes, subject to measured warmup needs. Deopt to interpreter frames at bytecode boundaries; make ownership reconstruction part of the deopt design. The user did not mandate a permanent tier count or memory model.
+
+1. **Finish foundational validation.** Correct overstated package docs; review the two saved commits; test memory permissions/lifetimes and the observed-dispatch option. Complete a bounded workspace check and relevant engine/runtime checks, recording commands and results. Integrate only validated changes.
+2. **Establish a scorecard.** Extend existing benchmark tooling for configurable SilkJS, Node, d8, and JSC commands. Record versions, host, source revision, binary provenance, repetitions, throughput, warmup, startup, per-process peak RSS, binary size, and an explicitly labeled pause proxy. Missing engines are explicit omissions. Keep benchmark runs isolated from builds. A worst-iteration ratio is not a measured GC pause or p99 latency.
+3. **Finish the differential harness.** Deterministic seeded programs; plain versus observed interpreter configurations; optional external reference engines; normalized output and exit classification; timeouts, reproducible failures, minimization, and explicit unsupported-case reporting. Generate stable hot calls followed by changed types/shapes/call targets. Add future JIT/deopt configurations through the same interface.
+4. **Implement the engine seam.** Define hotness and native-entry hooks with zero/verified-minimal interpreter-only cost. Cover normal calls, leaf paths, constructors, loops, exceptions, and invalidation; do not serialize process-local pointers. Prove frame and ownership contracts before compiled JavaScript entry.
+5. **Finish machine-code foundations.** Typed x64 operands and labels, relocation records, ABI handling, encoding comparisons against a real assembler, executable tests, and platform-gated extension points. One constant byte string is not an assembler.
+6. **Add feedback and ownership-aware SSA.** Begin with call/type feedback; specify safepoints, guards, deoptimization state, native helper effects, and roots. Keep compiler inputs serializable for background compilation/AOT. Build a narrow end-to-end compiled function before broad optimization passes.
+7. **Broaden optimizations from measurements.** Inlining, unboxed arithmetic, load/check elimination, register allocation, OSR, and allocation/RC optimizations. Evaluate background compilation, persisted profiles/code, cross-module optimization, and regexp compilation with correctness and performance gates.
+
+The historical phase durations were estimates, not delivery commitments. Define progress through tests and measured gates.
+
+### AOT context and historical artifacts
+
+The original HTML plan at `/tmp/silkjs-jit-plan/silkjs-jit-plan.html` no longer exists on this VM. The design above was recovered from conversation and the saved notes at `/home/user/.claude/projects/-home-user-silkjs/memory/`.
+
+Earlier Bun research cited [Bun PR 45631](https://github.com/oven-sh/bun/pull/45631), [WebKit PR 757](https://github.com/oven-sh/WebKit/pull/757), and [Bun AOT documentation](https://bun.com/docs/compiler/aot). Those sources and historical numerical claims were **not revalidated during this recovery**. The useful design hypotheses are immutable file-backed code, runtime data-side references, generic entry fallback, and opt-in closed-world assumptions. Preserve ordinary JS semantics by default. Do not assume static TypeScript annotations are sound runtime facts.
+
+### Where the work so far falls short of these definitions
+
+- Milestone 2: `d8` is not a column (V8 is measured through Node 24, with and without
+  `--jitless`), and there is no pause proxy of any kind in the scorecard.
+- Milestone 4: only hotness counting exists. It does not cover leaf paths, loops (back edges)
+  or generator resumption, and there is no native-entry hook, no frame or ownership contract
+  for compiled entry yet (in progress in milestone 6's sessions).
+- Ahead-of-time compilation: nothing is implemented. What exists is the rule and two places
+  that follow it: the encoder emits relocation records instead of addresses, and the hotness
+  counter is not serialized with bytecode. No persisted code or profile format, no
+  closed-world mode, and no plan for when AOT work starts has been written.
 
 ## What is on this branch
 
@@ -235,9 +272,77 @@ this, shrink the field, or fix that cache is undecided.
 `js_interrupts.handle` it fails with "an inline frame's function is reported once" (the lead
 reran both the passing and the broken case).
 
+## Feedback (milestone 6, part 1)
+
+[feedback.md](feedback.md): inventory of what the interpreter already records, the design, costs
+and what the benchmarks record. `modules/engine/src/js_feedback.silk` records, per bytecode site
+of a function the embedder starts recording for (from the hot report): operand classes and
+int32 overflow for arithmetic and comparisons, up to two call targets, up to four receiver
+shapes. It records only in the observed dispatch loop (recording switches
+`observeInstructions` on); the plain loop has no new code. Read API: `start`, `stop`,
+`snapshot` (plain data). Hidden CLI switches `--debug-feedback`, `--debug-feedback-stats`.
+
+Measured: with no handler, `v8bench.py --instructions` is 1.000x on all eight (worker, and
+rerun by the lead against the hotness-hook binary). While recording, the worker measured a
+one-time cost of 70 to 185 M instructions per run, about 82 percent of it from functions that
+are not being recorded but run in the observed loop meanwhile (not rerun by the lead). Site
+fractions over the seven benchmarks that report functions (worker's measurement):
+arithmetic/compare int32-only 55 percent, with a double 37; calls monomorphic 94; property
+sites with one shape 87. navier-stokes reports no function at all: its time is in loops of
+functions entered rarely, the on-stack-replacement case.
+
+Open: budget (20,000 observed instructions) and window are guesses; element access,
+`instanceof` and branch counts are not recorded; no serializer; always-on recording was judged
+too costly and not prototyped.
+
+## SSA form (milestone 6, part 2)
+
+[ssa.md](ssa.md): the design and the backend interface. In `modules/jit/src`: `ssa.silk` (blocks
+with parameters, deoptimization exits that name the bytecode offset and the value and
+ownership of every local and operand slot), `ssa_translate.silk` (bytecode to SSA for integer
+arithmetic, comparisons, branches, loops, return; everything else is refused with a reason),
+`ssa_verify.silk` (every owned value consumed exactly once on every path, exits included),
+`ssa_ownership.silk` (removes the interpreter's redundant retain and release). The only engine
+change is exporting `js_opcode_data` from `modules/engine/silk.toml`.
+
+Run by the lead: `silk test --manifest-path modules/jit/silk.toml --no-cache` exit 0, 47 passed
+(was 28). The opt-in census (`cd modules/jit && mkdir -p build && touch build/ssa-census &&
+silk test --file src/ssa_census_tests.silk --optimization debug`) exit 0: of 429 finished
+functions after one run of each v8 benchmark the translator accepts 28, the verifier rejects
+none. First refusals, largest first (worker's count): `push_this` 190, `get_var` 80, function
+scopes and scope reads 52.
+
+## Ahead-of-time compilation: what is known
+
+Julia's direction (2026-11-16): start AOT only if it is cheap, meaning the same compiler run at
+a different time; otherwise keep it possible. The SSA side passes its check: the same function
+translated in two runtime instances gives byte-identical translator input and IR
+(`independentOfTheRuntimeInstance`). That holds because the subset has no atom, constant,
+closure or realm operand. As it grows these need re-resolving at load time: atom numbers in
+the code bytes are per runtime, constants and function constants need table indices, shape
+versions are runtime ids. The machine-code side (link compiled code at another address in a
+second runtime and run it, deoptimization included) is being checked with the first compiled
+function. No file format or cache exists.
+
+## Engine restructuring is allowed
+
+Julia (2026-11-16): the engine and its bytecode compiler are unreleased; that they must keep
+working without a JIT is no reason to avoid changing them, including large restructures, when
+integration is better for it. Restructures the workers proposed and did not do:
+
+- compiler-assigned feedback slot numbers per site (also names sites for deoptimization);
+- choosing the dispatch loop per frame, so recording one function does not run everything in
+  the observed loop;
+- moving the inline field key out of the bytecode into a per-function slot vector, which makes
+  the code bytes pure and serializable (to be measured against today's inline hit);
+- atom operands as indices into a per-function atom list, so code bytes do not depend on the
+  runtime;
+- fixed-layout captured-variable slots (about 12 percent of translator refusals);
+- redesigning the address-keyed call cache (tier-seam.md, open question 7).
+
 ## How the work was split
 
-On 2026-11-16 three worker sessions ran in parallel, each on its own machine, and a lead session
+On 2026-11-16 worker sessions ran in parallel (three, then four more), each on its own machine, and a lead session
 reran each one's key commands before merging into `claude/sweet-ptolemy-f5t7na`. The lead is the
 only one that edits this file. The briefs are in the Silk UI project's shared files under
 `jit/briefs/`, the workers' reports under `jit/reports/`; neither is needed to continue.
@@ -247,6 +352,10 @@ only one that edits this file. The briefs are in the Silk UI project's shared fi
 | A. Scorecard | `claude/project-thread-0jp1hn` (`f9ca0ee`) | yes |
 | B. Tier seam and hotness hook | `claude/project-thread-br37a3` (`b9afce9`) | yes |
 | C. Differential harness widening | `claude/project-thread-sisu3y` (`b4fbe1b`) | yes |
+| F. Call and type feedback | `claude/project-thread-kuzo60` (`5569a15`) | yes |
+| G. SSA form and translator | `claude/project-thread-38jcx9` (`1fe07af`) | yes |
+| D. Call cache behind the earley-boyer cost | running | no |
+| E. Compiled entry, deoptimization, first compiled function | `claude/project-thread-do7odg`, running | no |
 
 ## Next steps
 
