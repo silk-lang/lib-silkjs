@@ -364,6 +364,36 @@ the engine's call path is generic over its hooks and allocator effect, which a h
 from machine code cannot name; only a caller with the concrete types (the runner) can make
 those calls.
 
+### 7.7 Calls from machine code
+
+As built (behind `--jit-calls`). Before CALL_FAST, an ordinary call site (not `new`) checks in
+machine code whether it can call the callee's code itself: the callee is a bytecode closure
+(object tag, class), its bytecode has a `compiled` index within the runtime's table,
+instructions are not observed, and the entry's `directArity` is at most the site's argument
+count. The code then builds the callee's `CompiledFrame` in the call block (`CALL_FRAME`, 9
+words), counts the run and calls the entry's code through the runtime's entry table. A return
+leaves the owned result at `CALL_STATE`; an exit stores `exit | index << 32` in
+`CALL_CALLEE_EXIT` and takes the call exit, which `compiledCall` finishes as in 7.4.
+
+- **Nothing is baked in.** The guard is the callee's own index and the code address is loaded
+  from its entry, so a site whose callee changes, or code that is relinked, still takes the right
+  path, and AOT code needs only the offsets.
+- **Offsets.** The object, closure, bytecode, runtime and entry offsets the code reads are the
+  `DIRECT_*` constants in js_compiled. `js_vm.directLayoutHolds` checks every one against the
+  engine's own accessors, and a JIT test runs it on a plain and a capturing closure, so a layout
+  change fails a test instead of the code.
+- **Readiness.** `directArity` stays `DIRECT_NOT_READY` until the first CALL_FAST call of a leaf
+  callee caches its realm, code, counter and arity, and only when its exit state fits
+  `CALL_STATE`. Code that makes calls never gets it, so those calls keep CALL_FAST (7.6).
+- **Interpreted callers.** An interpreted call to code that makes calls (`callInline`, through
+  `linkedCall` with `handOff`) starts an activation and runs it on the native stack; a run that
+  leaves is parked in `CompiledTable.handedOff` and that `callInline` continues it before
+  anything else. Getter and setter calls keep the base-frame path.
+
+Measured (callgrind): calls kernel 336 instructions per call interpreted, 227 compiled; method
+kernel 496 per iteration interpreted, 318 compiled; deltablue `--jit-calls` 1.739x plain,
+richards 1.031x (the rest is mostly the 17 functions the JIT refuses).
+
 ### 7.5 Inlining (design only unless time allows)
 
 A small monomorphic callee is translated into the caller's SSA at the call (its `arg n` are the
