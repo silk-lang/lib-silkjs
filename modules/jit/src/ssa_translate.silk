@@ -19,6 +19,7 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
+import ssa_calls as calls
 import ssa
 
 /// What the translator reads about a function: plain numbers and the code bytes, nothing that
@@ -79,7 +80,12 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
-    || objectOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode)
+    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode)
+}
+
+/// Workstream H's calls: `call0`..`call3`, `call` and `call_method`.
+pub fn callOpcode(opcode: u8) -> bool {
+  return (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method
 }
 
 /// Workstream J's opcodes (`this`, properties, globals, scopes, elements) translated below.
@@ -179,6 +185,9 @@ effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &
         let size = u8.toUsize(info.size)
         if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
         d = d - u8.toI32(info.pops) + u8.toI32(info.pushes)
+        // A call's table entry counts only its fixed operands; the argument count is in the code.
+        if opcode == op.OP_call || opcode == op.OP_call_method { d = d - u16.toI32(u16At(input, pc + 1)) }
+        if opcode >= op.OP_call0 && opcode <= op.OP_call3 { d = d - u8.toI32(opcode - op.OP_call0) }
         if d < 0 { fail refuse(usize.toU32(pc), opcode, b"operand stack underflow") }
         if isReturn(opcode) { going = false }
         else if isBranch(opcode) || isGoto(opcode) {
@@ -866,9 +875,44 @@ impl Translator {
       run self.f.terminate(self.current, Op.Return, u, NONE, at)
       return false
     }
-    if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
     if objectOpcode(opcode) { return run self.object(input, pc) }
+    if callOpcode(opcode) { return run self.call(input, pc) }
+    if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
     fail refuse(at, opcode, b"opcode outside the subset")
+  }
+
+  // ---- calls (workstream H) ----
+
+  /// A call through the engine's call entry: the callee, its receiver (undefined unless a
+  /// method call) and arguments stay on the stack for the throw exit, then become the result.
+  effect fn call(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let opcode = byteAt(input, pc)
+    let at = usize.toU32(pc)
+    let mut count: usize = 0
+    if opcode >= op.OP_call0 && opcode <= op.OP_call3 { count = u8.toUsize(opcode - op.OP_call0) }
+    else { count = u16.toUsize(u16At(input, pc + 1)) }
+    if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many call arguments") }
+    let method = opcode == op.OP_call_method
+    let mut depth = count + 1
+    if method { depth = depth + 1 }
+    if self.stack.length() < depth { fail refuse(at, opcode, b"call operands missing") }
+    let function = self.top(count + 1)
+    if self.f.value(function).ty != Type.Value { fail refuse(at, opcode, b"calling an unboxed number") }
+    // Boxes come before the call.arg run, which must stay contiguous.
+    let mut receiver = NONE
+    if method { let given = self.top(count + 2) receiver = run self.boxed(given, at) } else { receiver = run self.imm(Imm.Undefined, at) }
+    let mut i: usize = 0
+    while i < count {
+      let argument = self.top(count - i)
+      drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, argument, NONE, usize.toI32(i), at)
+      i = i + 1
+    }
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, usize.toI32(count), at)
+    let last = self.f.lastInst() run self.exitHere(last, at)
+    i = 0
+    while i < depth { let v = self.pop() run self.release(v, at) i = i + 1 }
+    run self.push(r)
+    return true
   }
 
   // ---- objects (workstream J) ----
