@@ -19,6 +19,7 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
+import ssa_calls as calls
 import ssa
 
 /// What the translator reads about a function: plain numbers and the code bytes, nothing that
@@ -79,8 +80,22 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
-    || numberOpcode(opcode) || keepBranch(opcode)
+    || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode)
 }
+
+/// Workstream H's calls: `call0`..`call3`, `call` and `call_method`.
+pub fn callOpcode(opcode: u8) -> bool {
+  return (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method
+}
+
+/// Workstream J's opcodes (`this`, properties, globals, scopes, elements) translated below.
+pub fn objectOpcode(opcode: u8) -> bool {
+  return opcode == op.OP_push_this || opcode == op.OP_get_field || opcode == op.OP_get_field2
+    || opcode == op.OP_get_loc_field8 || opcode == op.OP_get_arg_field8
+}
+/// GetField's `k`: which engine read serves the site.
+pub const FIELD_KEYED: i32 = 0
+pub const FIELD_CACHED: i32 = 1
 
 /// The opcodes the number and operator part translates (docs/jit/doubles.md).
 pub fn numberOpcode(opcode: u8) -> bool {
@@ -162,6 +177,9 @@ effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &
         let size = u8.toUsize(info.size)
         if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
         d = d - u8.toI32(info.pops) + u8.toI32(info.pushes)
+        // A call's table entry counts only its fixed operands; the argument count is in the code.
+        if opcode == op.OP_call || opcode == op.OP_call_method { d = d - u16.toI32(u16At(input, pc + 1)) }
+        if opcode >= op.OP_call0 && opcode <= op.OP_call3 { d = d - u8.toI32(opcode - op.OP_call0) }
         if d < 0 { fail refuse(usize.toU32(pc), opcode, b"operand stack underflow") }
         if isReturn(opcode) { going = false }
         else if isBranch(opcode) || isGoto(opcode) {
@@ -849,7 +867,100 @@ impl Translator {
       run self.f.terminate(self.current, Op.Return, u, NONE, at)
       return false
     }
+    if objectOpcode(opcode) { return run self.object(input, pc) }
+    if callOpcode(opcode) { return run self.call(input, pc) }
     if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
+    fail refuse(at, opcode, b"opcode outside the subset")
+  }
+
+  // ---- calls (workstream H) ----
+
+  /// A call through the engine's call entry: the callee, its receiver (undefined unless a
+  /// method call) and arguments stay on the stack for the throw exit, then become the result.
+  effect fn call(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let opcode = byteAt(input, pc)
+    let at = usize.toU32(pc)
+    let mut count: usize = 0
+    if opcode >= op.OP_call0 && opcode <= op.OP_call3 { count = u8.toUsize(opcode - op.OP_call0) }
+    else { count = u16.toUsize(u16At(input, pc + 1)) }
+    if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many call arguments") }
+    let method = opcode == op.OP_call_method
+    let mut depth = count + 1
+    if method { depth = depth + 1 }
+    if self.stack.length() < depth { fail refuse(at, opcode, b"call operands missing") }
+    let function = self.top(count + 1)
+    if self.f.value(function).ty != Type.Value { fail refuse(at, opcode, b"calling an unboxed number") }
+    // Boxes come before the call.arg run, which must stay contiguous.
+    let mut receiver = NONE
+    if method { let given = self.top(count + 2) receiver = run self.boxed(given, at) } else { receiver = run self.imm(Imm.Undefined, at) }
+    let mut i: usize = 0
+    while i < count {
+      let argument = self.top(count - i)
+      drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, argument, NONE, usize.toI32(i), at)
+      i = i + 1
+    }
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, usize.toI32(count), at)
+    let last = self.f.lastInst() run self.exitHere(last, at)
+    i = 0
+    while i < depth { let v = self.pop() run self.release(v, at) i = i + 1 }
+    run self.push(r)
+    return true
+  }
+
+  // ---- objects (workstream J) ----
+
+  /// A guard that `v` has engine tag `tag`, exiting at `pc` with the current state.
+  effect fn checkTag(self: &mut Self, v: u32, tag: i32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.f.emit(self.current, Op.CheckTag, false, Type.I32, Own.Unboxed, v, NONE, tag, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+  }
+  /// The named property the instruction at `pc` reads from `object`, owned.
+  effect fn getField(self: &mut Self, object: u32, how: i32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let r = run self.f.emit(self.current, Op.GetField, true, Type.Value, Own.Owned, object, NONE, how, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    return r
+  }
+  effect fn object(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let opcode = byteAt(input, pc)
+    let at = usize.toU32(pc)
+    if opcode == op.OP_push_this {
+      // Only an object receiver: anything else needs the interpreter's mode checks.
+      let t = run self.f.emit(self.current, Op.This, true, Type.Value, Own.Borrowed, NONE, NONE, 0, at)
+      let receiver = self.f.argumentCount
+      self.f.setOwnership(t, Own.Borrowed, RootKind.Argument, receiver)
+      run self.checkTag(t, -1, at)
+      let r = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, t, NONE, 0, at)
+      run self.push(r) return true
+    }
+    if opcode == op.OP_get_field {
+      let o = self.top(1)
+      if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
+      let r = run self.getField(o, FIELD_KEYED, at)
+      drop self.pop() run self.release(o, at) run self.push(r)
+      return true
+    }
+    if opcode == op.OP_get_field2 {
+      let o = self.top(1)
+      if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
+      let r = run self.getField(o, FIELD_CACHED, at)
+      run self.push(r)
+      return true
+    }
+    if opcode == op.OP_get_loc_field8 || opcode == op.OP_get_arg_field8 {
+      let index = u8.toUsize(byteAt(input, pc + 13))
+      let mut o = NONE
+      if opcode == op.OP_get_loc_field8 {
+        if index >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
+        o = self.locals.get(index)
+      } else {
+        if index >= u32.toUsize(self.f.argumentCount) { fail refuse(at, opcode, b"argument index out of range") }
+        o = run self.argument(usize.toU32(index), at)
+      }
+      if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
+      let r = run self.getField(o, FIELD_KEYED, at)
+      run self.push(r)
+      return true
+    }
     fail refuse(at, opcode, b"opcode outside the subset")
   }
 }
