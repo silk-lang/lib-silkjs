@@ -50,7 +50,7 @@ pub unsafe fn target(machine: &Machine) -> OsrTarget {
   drop state
   let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
   let index = bytecode.compiled
-  let inputs = u16.toUsize(bytecode.argumentCount) + u16.toUsize(bytecode.variableCount)
+  let inputs = u16.toUsize(bytecode.argumentCount) + u16.toUsize(bytecode.variableCount) + machine.sp()
   let words = stateWords(u16.toUsize(bytecode.variableCount), u16.toUsize(bytecode.stackSize))
   drop bytecode
   let pc = usize.toU32(machine.pc())
@@ -67,7 +67,9 @@ pub unsafe fn target(machine: &Machine) -> OsrTarget {
   if Pointer.isNull<OsrEntry>(osrSlot) {
     // A header inside try regions holds only their catch markers: ask once (a refused or
     // differently based entry for pc answers it).
-    if depth == 0 || (unsafe markersOnly(&machine, depth) && !unsafe knownHeader(entrySlot, pc)) { unsafe hotness.loopPoll(machine.bytecode, pc, true) }
+    // A header under operands asks once: its entry, refused or for another layout
+    // (ssa_translate.osrMarkers), answers later polls.
+    if depth == 0 || !unsafe knownHeader(entrySlot, pc) { unsafe hotness.loopPoll(machine.bytecode, pc, true) }
     return none
   }
   let slot = unsafe Intrinsic.pointerRequalify<?*mut OsrEntry, *mut OsrEntry>(osrSlot)
@@ -82,16 +84,6 @@ pub unsafe fn target(machine: &Machine) -> OsrTarget {
   if u32.toUsize(found.callWords) > blockWords { blockWords = u32.toUsize(found.callWords) }
   return OsrTarget { entrySlot: unsafe Intrinsic.pointerRequalify<*mut CompiledEntry, ?*mut CompiledEntry>(entrySlot), osrSlot: osrSlot, code: found.code,
     inputs: inputs, stateWords: words, blockWords: blockWords, depth: u32.toUsize(depth) }
-}
-
-/// Whether the depth operands under machine's pc are all catch markers (try regions).
-unsafe fn markersOnly(machine: &Machine, depth: u32) -> bool {
-  let mut position: usize = 1
-  while position <= u32.toUsize(depth) {
-    match unsafe machine.top(position) { ValueBits.CatchOffset { offset } => { if offset == 0 { return false } } _ => { return false } }
-    position = position + 1
-  }
-  return true
 }
 
 /// Whether entry has an osr entry for pc at any depth.
@@ -128,9 +120,9 @@ unsafe fn osrAt(entrySlot: *mut CompiledEntry, pc: u32, depth: u32) -> ?*mut Osr
   return Pointer.null<OsrEntry>()
 }
 
-/// Starts target's code on machine: the inputs are the frame's arguments then its locals,
-/// as borrowed bit copies (the target.depth catch markers under the header are constants of
-/// the code); the call block's resume and callee-exit words start at 0.
+/// Starts target's code on machine: the inputs are the frame's arguments, its locals, then its
+/// target.depth operands from the bottom, as borrowed bit copies (the code uses the values
+/// among them; markers are its constants); the call block's resume and callee-exit words start at 0.
 /// Returns the exit; at EXIT_CALL the caller makes the call in block and calls `again`.
 pub unsafe fn start(machine: &Machine, target: &OsrTarget, inputs: *mut ValueBits, state: *mut u64, block: *mut u64) -> u32 {
   let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
@@ -146,6 +138,11 @@ pub unsafe fn start(machine: &Machine, target: &OsrTarget, inputs: *mut ValueBit
   position = 0
   while position < locals {
     unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, parameters + position), unsafe Pointer.read<ValueBits>(unsafe machine.localCell(position)))
+    position = position + 1
+  }
+  position = 0
+  while position < target.depth {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, parameters + locals + position), unsafe machine.top(target.depth - position))
     position = position + 1
   }
   let words = unsafe Pointer.assumeManyMut<u64>(block)
@@ -195,8 +192,9 @@ pub unsafe fn finish<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, target:
     let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 0)))
     let slot = unsafe Intrinsic.pointerRequalify<?*mut OsrEntry, *mut OsrEntry>(target.osrSlot)
     let mut osrEntry = unsafe Pointer.read<OsrEntry>(slot)
-    // An exit outside the loop is the loop finishing: the interpreter runs on from there.
-    if pc >= u32.toUsize(osrEntry.start) && pc <= u32.toUsize(osrEntry.end) {
+    // An exit outside the loop is the loop finishing: the interpreter runs on from there. So
+    // is a stand-in for-of record's step the code does not take (js_vm_control.forOfNext).
+    if pc >= u32.toUsize(osrEntry.start) && pc <= u32.toUsize(osrEntry.end) && !unsafe standInStep(&machine.*, words, locals, pc) {
       tally.osrDeopts = tally.osrDeopts + 1
       osrEntry.deopts = osrEntry.deopts + 1
       osrEntry.deoptOpcode = u8.toU32(unsafe machine.byteAt(pc)) + 1
@@ -221,6 +219,9 @@ pub unsafe fn finish<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, target:
     drop owner
     unsafe rearmHotness(machine.runtime, machine.bytecode)
   }
+  // The state holds the whole operand stack, the entry's included: the frame's goes.
+  let mut position: usize = 0
+  while position < target.depth { let entered = unsafe machine.pop() unsafe gc.release(&mut hooks, machine.runtime, entered) position = position + 1 }
   if exit == EXIT_RETURNED {
     let value = unsafe result(state)
     let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 2)))
@@ -232,10 +233,19 @@ pub unsafe fn finish<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, target:
     return ()
   }
   if exit != EXIT_DEOPT && exit != EXIT_POLL && exit != EXIT_THROW { trap() }
-  // The state holds the whole operand stack, the entry's markers included.
-  let mut position: usize = 0
-  while position < target.depth { let marker = unsafe machine.pop() unsafe gc.release(&mut hooks, machine.runtime, marker) position = position + 1 }
   unsafe restoreLive(&mut hooks, &mut machine, words, locals, stackSize)
+}
+
+/// Whether a deopt exit at pc is a for_of_next whose iterator record is a stand-in (its method
+/// slot an Int, js_iterators.forOfStart): the code steps only fast Array elements, and the
+/// interpreter does the rest (the end, a hole, a changed array) as it would.
+unsafe fn standInStep(machine: &Machine, words: [*]mut u64, locals: usize, pc: usize) -> bool {
+  if unsafe machine.byteAt(pc) != op.OP_for_of_next { return false }
+  let depth = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, 1)))
+  let offset = u8.toUsize(unsafe machine.byteAt(pc + 1))
+  if depth < 3 + offset { return false }
+  let values = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, 2)))
+  return match unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, locals + depth - 2 - offset)) { ValueBits.Int { .. } => true _ => false }
 }
 
 /// After a poll exit: the code left the counter at zero; reset it as interrupts.dueAt does.

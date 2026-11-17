@@ -79,6 +79,8 @@ BUILTIN = {
     "jit": "{jit} --jit --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-stress": "{jit} --jit --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-calls": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-eager": "{jit} --jit --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-calls-eager": "{jit} --jit --jit-calls --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-calls-stress": "{jit} --jit --jit-calls --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-inline-stress": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stress=5 --jit-deopt-limit=0 --jit-stats={stats} {file}",
 }
@@ -116,6 +118,12 @@ function __clamp(v) {
   if (v !== null && typeof v === 'object') return 'o';
   return v;
 }
+function* __gen(arr) { for (var i = 0; i < arr.length; i++) yield arr[i]; }
+function __iter(arr, b) {
+  var i = 0;
+  return { next: function () { i++; if (i === 11000 + (b & 7)) throw new RangeError('next'); return { value: arr[i - 1], done: i > arr.length }; },
+    return: function () { __fin = (__fin + 1) | 0; return {}; }, [Symbol.iterator]: function () { return this; } };
+}
 function __P(x, y) { this.x = x; this.y = y; this.n = 0; }
 __P.prototype.getx = function () { return this.x; };
 __P.prototype.sum = function (k) { return this.x * k + this.y; };
@@ -130,6 +138,11 @@ __P.prototype.glob = function () { return __g; };
 __P.prototype.rec = function (k) { return k < 1 ? this.x : this.rec(k - 1) + 1; };
 __P.prototype.boom = function (k) { if (k > 4) throw new RangeError('b'); return k; };
 __P.prototype.len = function (o) { return o.length; };
+__P.prototype.clamp = function (v) { if (v < this.x) return this.x; if (v > this.y) return this.y; return v; };
+__P.prototype.far = function (u, v) { var r = u; if (u < v) { r = v; } return r - this.x; };
+__P.prototype.orx = function (u) { return u || this.x; };
+__P.prototype.mid = function (u) { return this.clamp(u) + this.far(u, 2); };
+__P.prototype.mark = function (u) { if (u > 2) { this.n = u; } return this.n; };
 Object.defineProperty(__P.prototype, 'acc', {get: function () { return this.x + 1; }, set: function (v) { this.n = v; }, configurable: true});
 function __Q(x) { this.x = x; this.y = 's'; this.n = 0; }
 __Q.prototype.getx = function () { return this.y; };
@@ -145,6 +158,11 @@ __Q.prototype.glob = function () { return this; };
 __Q.prototype.rec = function (k) { return k; };
 __Q.prototype.boom = function (k) { return 'q'; };
 __Q.prototype.len = function (o) { return 0; };
+__Q.prototype.clamp = function (v) { return v; };
+__Q.prototype.far = function (u, v) { return u ? v : this.x; };
+__Q.prototype.orx = function (u) { return this.y; };
+__Q.prototype.mid = function (u) { return this.orx(u); };
+__Q.prototype.mark = function (u) { return 0; };
 function __phase(name) { __out(name + ' ' + __sum + ' ' + __fin); }
 """
 # Why the prelude is shaped like this:
@@ -161,7 +179,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
            "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "tries", "tries", "tdz",
-           "protos", "protos", "protos", "equality"]
+           "protos", "protos", "protos", "equality", "iteration", "iteration", "iteration"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -175,6 +193,7 @@ AREAS = {
     "typed arrays": (r"\bvar ta = new ", r"\bvar ta = new \w+\(", "var ta = new Float64Array("),  # wrong element kind
     "number loops": (r"\bvar d = ", r"\bd = d \+ ", "d = d - "),  # a double add becomes a subtract
     "int operators": (r"\bvar u = ", r"\bvar u = a \| 0;", "var u = (a | 0) ^ 1;"),  # the first operand is off by one bit
+    "iteration": (r"\bfor \(var v of ", r"\bj\+\+; \}", "j = j + 2; }"),  # a step is counted twice
 }
 
 
@@ -321,12 +340,14 @@ class Generator:
             # Calls of prototype methods from a loop (docs/jit/inlining.md): small ones a JIT may
             # inline (a getter, arithmetic on the receiver and arguments, a predicate, one store,
             # nested calls, recursion, missing and extra arguments, a global read), ones it may
-            # not (a store before a guard, a branch, a throw), an accessor pair and a constructor.
+            # not (a store before a guard, a throw), ones with branches (early returns, a local set
+            # on one path, a kept test, a store on one path), an accessor pair and a constructor.
             # The receiver's class and the methods themselves change in later phases.
             call = self.pick(["a.getx()", "a.sum(i)", "a.sum(b)", "a.less(b)", "a.two(i)", "a.self().x", "a.bump(i)",
                               "a.pick(i, b)", "a.pick(i)", "a.last(i)", "a.last(i, b, a)", "a.glob()", "a.rec(i & 3)",
                               "a.boom(i)", "a.sum(a.getx())", "a.sum.call(a, i)", "a.acc", "(a.setn(i), a.n)",
-                              "(a.acc = i, a.n)", "new __P(i, b).sum(i)", "a.len(b)", "a.two(a.two(i))", "a.self().self().getx()"])
+                              "(a.acc = i, a.n)", "new __P(i, b).sum(i)", "a.len(b)", "a.two(a.two(i))", "a.self().self().getx()",
+                              "a.clamp(i)", "a.clamp(b)", "a.far(i, b)", "a.orx(i)", "a.mid(i)", "a.mark(i)", "a.clamp(a.far(i, 3))"])
             return (f"var t = {self.pick(['0', 'b', '1'])}; for (var i = 0; i < {self.pick([2, 3, 6])}; i++) "
                     f"{{ t = {self.pick(['t + ' + call, '(t ^ ' + call + ')', '__clamp(t * 2 + ' + call + ')'])}; }} return t;")
         if flavor == "intbranch":
@@ -441,6 +462,26 @@ class Generator:
                     f"for (var j = 0; j < n; j++) {{ if ({when}) t = __clamp(t + late); else t = (t + (j & 7)) | 0; "
                     f"{self.pick(['', 't = __clamp(t + early);', 'let c = j & 3; h = function () { return c; }; t = (t + h()) | 0;'])} }} "
                     f"let late = {self.pick(['a', '1'])}; return [t, h ? h() : 0];")
+        if flavor == "iteration":
+            # for-of and for-in (stream Q), long enough on the first calls (__long) for on-stack
+            # replacement: a fast Array stepped by index in compiled code while the body pushes,
+            # pops, empties it or writes a hole or a double; other iterables, an iterator whose next
+            # throws, a return called by break; for-in keys deleted and added while it runs.
+            n = "__long < 3 ? 12000 : " + str(self.pick([3, 9]))
+            source = self.pick(["arr", "arr", "arr", "new Set(arr)", "new Map(arr.map(function (v, k) { return [k, v]; }))",
+                                "String(arr.length).repeat(4)", "__gen(arr)", "__iter(arr, b)"])
+            step = self.pick(["t = (t + (typeof v === 'number' ? v : 1)) | 0;", "t = (t ^ (Array.isArray(v) ? v[1] : v)) | 0;",
+                              "t = __clamp(t + (+v || 0));"])
+            mutate = self.pick(["", "", "if (t === 7) arr.push(a);", "if ((t & 1023) === 5) arr.pop();",
+                                "if (j === 300) arr.length = 0;", "if (j === 200) arr[j + 1] = 0.5;", "if (j === 90) delete arr[j + 2];",
+                                "if (j === 400) break;", "if (j === (b & 15)) continue;"])
+            head = (f"var n = {n}; __long = __long + 1; var arr = []; for (var k = 0; k < n; k++) arr.push(k & {self.pick([7, 255])}); "
+                    f"var t = 0; var j = 0; ")
+            if self.random.random() < 0.25:
+                return (head + "var o = Object.create({p: 1}); for (var k = 0; k < (n & 1023); k++) o['k' + k] = k; "
+                        f"for (var key in o) {{ t = (t + key.length) | 0; {self.pick(['', 'if (key === \'k3\') delete o.k5;', 'if (key === \'k2\') o.extra = 1;'])} }} return t;")
+            return (head + f"try {{ for (var v of {source}) {{ {step} {mutate} j++; }} }} catch (e) {{ t = __clamp(t + __err(e)); }} "
+                    f"return [t, j, arr.length];")
         if flavor == "tests":
             # Nullish, undefined and typeof tests (J2) on values of every type, as branch
             # conditions and as values; `??` keeps its operand on one edge only.
@@ -617,6 +658,7 @@ class Generator:
             "__P.prototype.getx = function () { return 'new'; };",
             "delete __P.prototype.getx;",
             "__P.prototype.sum = Math.max;",
+            "__P.prototype.clamp = function (v) { return v > 3 ? 'c' : v; }; __P.prototype.orx = __Q.prototype.orx;",
             "__P.prototype.self = function () { return {x: 's', getx: Math.abs}; };",
             "Object.setPrototypeOf(__P.prototype, __Q.prototype); delete __P.prototype.sum; delete __P.prototype.two;",
             "__g = 'g'; __P.prototype.setn = function (v) { this.n = v + 1; };",
