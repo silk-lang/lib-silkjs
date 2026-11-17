@@ -1,0 +1,469 @@
+//! Simplification and the ownership pass (docs/jit/ssa.md, "The ownership pass").
+//!
+//! `optimize` runs, to a fixed point: folding `unbox (box x)`, dropping counts on immediates,
+//! sharing one `arg n` per argument, removing trivial block parameters and unboxing parameters
+//! that only ever receive boxed integers or booleans; then the argument-web rule, which turns
+//! counted copies of arguments into borrows when nothing returns them. Every rewrite keeps the
+//! verifier's rules; the tests verify after it.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import ssa { Function, Edge, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount }
+import ssa_verify { readsA, readsB }
+
+/// Replaces every use of `from` by `to`: operands, edge arguments, exit slots and roots.
+pub fn replaceAll(f: &mut Function, from: u32, to: u32) -> () {
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let mut inst = f.insts.get(i)
+    let mut touched = false
+    if readsA(inst.op) && inst.a == from { inst.a = to touched = true }
+    if readsB(inst.op) && inst.b == from { inst.b = to touched = true }
+    if touched { f.insts.set(i, inst) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { if f.edgeArgs.get(i) == from { f.edgeArgs.set(i, to) } i = i + 1 }
+  i = 0
+  while i < f.slots.length() {
+    let mut slot = f.slots.get(i)
+    if slot.value == from { slot.value = to f.slots.set(i, slot) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.values.length() {
+    let mut info = f.values.get(i)
+    if info.rootKind == RootKind.Value && info.root == from { info.root = to f.values.set(i, info) }
+    i = i + 1
+  }
+}
+
+fn removeInst(f: &mut Function, index: usize) -> () {
+  let mut inst = f.insts.get(index)
+  inst.op = Op.Removed
+  f.insts.set(index, inst)
+}
+
+fn defOp(f: &Function, v: u32) -> Op {
+  let def = f.value(v).def
+  if def == NONE { return Op.Removed }
+  return f.inst(def).op
+}
+fn defOperand(f: &Function, v: u32) -> u32 { return f.inst(f.value(v).def).a }
+fn isOwned(f: &Function, v: u32) -> bool { let info = f.value(v) return info.ty == Type.Value && info.own == Own.Owned }
+
+/// The incoming arguments of parameter `g` of compacted block `b`.
+effect fn incoming(f: &Function, b: u32, g: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u32>.make()
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    if edge.target == b { run out.append(f.edgeArg(edge, g)) }
+    e = e + 1
+  }
+  return move out
+}
+
+/// The instruction index of block `b`'s terminator, in a compacted function.
+fn terminatorIndex(f: &Function, b: u32) -> u32 { let block = f.blocks.get(u32.toUsize(b)) return block.firstInst + block.instCount - 1 }
+
+/// One round of local folds. Returns whether anything changed.
+effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = false
+  // One `arg n` per argument, at the entry.
+  let mut canonical = List<u32>.make()
+  run canonical.appendRepeated(NONE, u32.toUsize(f.argumentCount))
+  let mut i: usize = 0
+  let count = f.insts.length()
+  while i < count {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Arg {
+      let k = i32.toUsize(inst.k)
+      if inst.block == 0 && canonical.get(k) == NONE { canonical.set(k, inst.result) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < count {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Arg && canonical.get(i32.toUsize(inst.k)) != inst.result {
+      let k = i32.toUsize(inst.k)
+      if canonical.get(k) == NONE {
+        let at = terminatorIndex(&f.*, 0)
+        let v = run f.insertBefore(at, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, inst.k)
+        f.setOwnership(v, Own.Borrowed, RootKind.Argument, i32.wrappingToU32(inst.k))
+        canonical.set(k, v)
+      }
+      replaceAll(&mut f, inst.result, canonical.get(k))
+      removeInst(&mut f, i)
+      changed = true
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Unbox && defOp(&f.*, inst.a) == Op.BoxI32 {
+      let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.UnboxBool && defOp(&f.*, inst.a) == Op.BoxBool {
+      let x = defOperand(&f.*, inst.a) replaceAll(&mut f, inst.result, x) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.Retain && f.value(inst.a).own == Own.Imm {
+      replaceAll(&mut f, inst.result, inst.a) removeInst(&mut f, i) changed = true
+    } else if inst.op == Op.Release && !isOwned(&f.*, inst.a) {
+      removeInst(&mut f, i) changed = true
+    }
+    i = i + 1
+  }
+  return changed
+}
+
+fn pure(op: Op) -> bool {
+  return op == Op.BoxI32 || op == Op.BoxBool || op == Op.ConstI32 || op == Op.Imm || op == Op.Arg || op == Op.Cmp
+}
+
+/// Removes pure instructions whose result nothing uses. Returns whether any went.
+effect fn deadCode(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut used = List<bool>.make()
+  run used.appendRepeated(false, f.values.length())
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Removed {
+      if readsA(inst.op) { used.set(u32.toUsize(inst.a), true) }
+      if readsB(inst.op) { used.set(u32.toUsize(inst.b), true) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { used.set(u32.toUsize(f.edgeArgs.get(i)), true) i = i + 1 }
+  i = 0
+  while i < f.slots.length() { used.set(u32.toUsize(f.slots.get(i).value), true) i = i + 1 }
+  i = 0
+  while i < f.values.length() {
+    let info = f.values.get(i)
+    if info.rootKind == RootKind.Value { used.set(u32.toUsize(info.root), true) }
+    i = i + 1
+  }
+  let mut changed = false
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if pure(inst.op) && !used.get(u32.toUsize(inst.result)) { removeInst(&mut f, i) changed = true }
+    i = i + 1
+  }
+  return changed
+}
+
+/// Removes block parameters whose every incoming argument is one other value (or the
+/// parameter itself). Returns whether any went.
+effect fn trivialParams(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut dead = List<bool>.make()
+  run dead.appendRepeated(false, f.values.length())
+  let mut changed = false
+  let mut b: u32 = 1
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut g: u32 = 0
+    while g < block.paramCount {
+      let p = f.paramAt(block, g)
+      let args = run incoming(&f.*, b, g)
+      let mut unique = NONE
+      let mut trivial = true
+      let mut k: usize = 0
+      while k < args.length() {
+        let a = args.get(k)
+        if a != p { if unique == NONE { unique = a } else if unique != a { trivial = false } }
+        k = k + 1
+      }
+      if trivial && unique != NONE {
+        replaceAll(&mut f, p, unique)
+        dead.set(u32.toUsize(p), true)
+        changed = true
+      }
+      g = g + 1
+    }
+    b = b + 1
+  }
+  if changed { run dropParams(&mut f, &dead) }
+  return changed
+}
+
+/// Drops the parameters marked dead and their edge arguments. Leaves the function to compact.
+effect fn dropParams(f: &mut Function, dead: &List<bool>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut args = List<u32>.make()
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    let target = f.blocks.get(u32.toUsize(edge.target))
+    let first = usize.toU32(args.length())
+    let mut g: u32 = 0
+    while g < edge.argCount {
+      if !dead.get(u32.toUsize(f.paramAt(target, g))) { run args.append(f.edgeArg(edge, g)) }
+      g = g + 1
+    }
+    f.edges.set(e, Edge { target: edge.target, firstArg: first, argCount: usize.toU32(args.length()) - first })
+    e = e + 1
+  }
+  let mut params = List<u32>.make()
+  let mut q: usize = 0
+  while q < f.params.length() { let p = f.params.get(q) if !dead.get(u32.toUsize(p)) { run params.append(p) } q = q + 1 }
+  // Block ranges are stale until compact, which regroups parameters by their value's block.
+  f.edgeArgs = move args
+  f.params = move params
+}
+
+/// Unboxes one parameter whose incoming arguments are all `box.i32` (or all `box.bool`) or the
+/// parameter itself. Returns whether one was unboxed.
+effect fn unboxParam(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut b: u32 = 1
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut g: u32 = 0
+    while g < block.paramCount {
+      let p = f.paramAt(block, g)
+      if f.value(p).ty == Type.Value {
+        let args = run incoming(&f.*, b, g)
+        let mut ints = true let mut bools = true let mut any = false
+        let mut k: usize = 0
+        while k < args.length() {
+          let a = args.get(k)
+          if a != p {
+            any = true
+            let o = defOp(&f.*, a)
+            if o != Op.BoxI32 { ints = false }
+            if o != Op.BoxBool { bools = false }
+          }
+          k = k + 1
+        }
+        if any && (ints || bools) {
+          let mut ty = Type.Bool
+          let mut boxOp = Op.BoxBool
+          let mut unboxOp = Op.UnboxBool
+          let mut mode = SlotMode.Bool
+          if ints { ty = Type.I32 boxOp = Op.BoxI32 unboxOp = Op.Unbox mode = SlotMode.Int }
+          run unbox(&mut f, b, g, p, ty, boxOp, unboxOp, mode)
+          return true
+        }
+      }
+      g = g + 1
+    }
+    b = b + 1
+  }
+  return false
+}
+
+effect fn unbox(f: &mut Function, b: u32, g: u32, p: u32, ty: Type, boxOp: Op, unboxOp: Op, mode: SlotMode) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Incoming boxes give their unboxed operand instead.
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    if edge.target == b {
+      let a = f.edgeArg(edge, g)
+      if a != p { let x = defOperand(&f.*, a) f.setEdgeArg(edge.firstArg + g, x) }
+    }
+    e = e + 1
+  }
+  f.setType(p, ty)
+  f.setOwnership(p, Own.Unboxed, RootKind.None, NONE)
+  // Users that wanted it boxed.
+  let mut i: usize = 0
+  let count = f.insts.length()
+  while i < count {
+    let inst = f.insts.get(i)
+    if readsA(inst.op) && inst.a == p {
+      if inst.op == unboxOp { replaceAll(&mut f, inst.result, p) removeInst(&mut f, i) }
+      else if inst.op == Op.Release { removeInst(&mut f, i) }
+      else if inst.op == Op.Retain {
+        let mut changed = inst changed.op = boxOp f.insts.set(i, changed)
+        f.setOwnership(inst.result, Own.Imm, RootKind.None, NONE)
+      }
+      else if inst.op != Op.BoxI32 && inst.op != Op.BoxBool && inst.op != Op.Add && inst.op != Op.Sub && inst.op != Op.Mul && inst.op != Op.Cmp && inst.op != Op.Branch {
+        let boxed = run f.insertBefore(usize.toU32(i), boxOp, true, Type.Value, Own.Imm, p, NONE, 0)
+        let mut user = f.insts.get(i) user.a = boxed f.insts.set(i, user)
+      }
+    }
+    i = i + 1
+  }
+  // Edge arguments into other parameters still want a boxed value.
+  e = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    let target = f.blocks.get(u32.toUsize(edge.target))
+    let mut k: u32 = 0
+    while k < edge.argCount {
+      if f.edgeArg(edge, k) == p && f.paramAt(target, k) != p {
+        let source = sourceBlock(&f.*, usize.toU32(e))
+        let at = terminatorIndex(&f.*, source)
+        let boxed = run f.insertBefore(at, boxOp, true, Type.Value, Own.Imm, p, NONE, 0)
+        f.setEdgeArg(edge.firstArg + k, boxed)
+      }
+      k = k + 1
+    }
+    e = e + 1
+  }
+  // Exits write it unboxed.
+  i = 0
+  while i < f.slots.length() {
+    let mut slot = f.slots.get(i)
+    if slot.value == p { slot.mode = mode slot.root = NONE f.slots.set(i, slot) }
+    i = i + 1
+  }
+}
+
+fn sourceBlock(f: &Function, e: u32) -> u32 {
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let term = f.inst(terminatorIndex(&f.*, b))
+    if term.edge != NONE && e >= term.edge && e < term.edge + edgeCount(term.op) { return b }
+    b = b + 1
+  }
+  return NONE
+}
+
+/// Gives every exit slot the mode its value's type and ownership call for.
+fn fixSlots(f: &mut Function) -> () {
+  let mut i: usize = 0
+  while i < f.slots.length() {
+    let mut slot = f.slots.get(i)
+    // A boxed i32 or bool is written from its unboxed operand.
+    let o = defOp(&f.*, slot.value)
+    if o == Op.BoxI32 || o == Op.BoxBool { slot.value = defOperand(&f.*, slot.value) }
+    let info = f.value(slot.value)
+    if info.ty == Type.I32 { slot.mode = SlotMode.Int slot.root = NONE }
+    else if info.ty == Type.Bool { slot.mode = SlotMode.Bool slot.root = NONE }
+    else if info.own == Own.Owned { slot.mode = SlotMode.Move slot.root = NONE }
+    else if info.own == Own.Imm { slot.mode = SlotMode.Imm slot.root = NONE }
+    else { slot.mode = SlotMode.Dup if info.rootKind == RootKind.Argument { slot.root = info.root } else { slot.root = NONE } }
+    f.slots.set(i, slot)
+    i = i + 1
+  }
+}
+
+/// Local folds, trivial parameters and parameter unboxing, compacting after each round, until
+/// none applies.
+pub effect fn simplify(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut going = true
+  while going {
+    going = false
+    if run fold(&mut f) { going = true fixSlots(&mut f) run f.compact() }
+    if run trivialParams(&mut f) { going = true run f.compact() }
+    fixSlots(&mut f)
+    if run deadCode(&mut f) { going = true run f.compact() }
+    if run unboxParam(&mut f) { going = true fixSlots(&mut f) run f.compact() }
+  }
+}
+
+fn find(parent: &mut List<u32>, v: u32) -> u32 {
+  let mut x = v
+  while parent.get(u32.toUsize(x)) != x { x = parent.get(u32.toUsize(x)) }
+  // Path halving is not needed at these sizes; compress fully once.
+  let mut y = v
+  while parent.get(u32.toUsize(y)) != x { let next = parent.get(u32.toUsize(y)) parent.set(u32.toUsize(y), x) y = next }
+  return x
+}
+
+/// The argument-web rule. Returns whether any web became borrows.
+pub effect fn borrowArguments(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let n = f.values.length()
+  let mut parent = List<u32>.make()
+  let mut v: usize = 0
+  while v < n { run parent.append(usize.toU32(v)) v = v + 1 }
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let term = f.inst(terminatorIndex(&f.*, b))
+    let mut e: u32 = 0
+    while e < edgeCount(term.op) {
+      let edge = f.edge(term.edge + e)
+      let target = f.blocks.get(u32.toUsize(edge.target))
+      let mut g: u32 = 0
+      while g < edge.argCount {
+        let a = f.edgeArg(edge, g) let p = f.paramAt(target, g)
+        if f.value(a).ty == Type.Value && f.value(p).ty == Type.Value {
+          let x = find(&mut parent, a) let y = find(&mut parent, p)
+          if x != y { parent.set(u32.toUsize(x), y) }
+        }
+        g = g + 1
+      }
+      e = e + 1
+    }
+    b = b + 1
+  }
+  // Per web: valid, has a retain, and its one argument root (NONE unknown, NONE - 1 mixed).
+  let mixed = NONE - 1
+  let mut valid = List<bool>.make() run valid.appendRepeated(true, n)
+  let mut retains = List<bool>.make() run retains.appendRepeated(false, n)
+  let mut root = List<u32>.make() run root.appendRepeated(NONE, n)
+  v = 0
+  while v < n {
+    let info = f.values.get(v)
+    if info.ty == Type.Value {
+      let w = u32.toUsize(find(&mut parent, usize.toU32(v)))
+      let mut r = NONE
+      if info.def != NONE {
+        let def = f.inst(info.def)
+        if def.op == Op.Retain {
+          let source = f.value(def.a)
+          if source.own == Own.Borrowed && source.rootKind == RootKind.Argument { r = source.root retains.set(w, true) }
+          else if source.own != Own.Imm { valid.set(w, false) }
+        } else if info.own == Own.Borrowed {
+          if info.rootKind == RootKind.Argument { r = info.root } else { valid.set(w, false) }
+        } else if info.own != Own.Imm { valid.set(w, false) }
+      } else if info.own == Own.Borrowed {
+        if info.rootKind == RootKind.Argument { r = info.root } else { valid.set(w, false) }
+      }
+      if r != NONE {
+        let known = root.get(w)
+        if known == NONE { root.set(w, r) } else if known != r { root.set(w, mixed) }
+      }
+    }
+    v = v + 1
+  }
+  // A returned member keeps its count.
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Return && f.value(inst.a).ty == Type.Value { let w = u32.toUsize(find(&mut parent, inst.a)) valid.set(w, false) }
+    i = i + 1
+  }
+  let mut changed = false
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Retain {
+      let w = u32.toUsize(find(&mut parent, inst.result))
+      if valid.get(w) && retains.get(w) && root.get(w) != mixed && root.get(w) != NONE {
+        replaceAll(&mut f, inst.result, inst.a) removeInst(&mut f, i) changed = true
+      }
+    }
+    i = i + 1
+  }
+  v = 0
+  while v < n {
+    let info = f.values.get(v)
+    if info.ty == Type.Value && info.def == NONE && info.own == Own.Owned {
+      let w = u32.toUsize(find(&mut parent, usize.toU32(v)))
+      if valid.get(w) && retains.get(w) && root.get(w) != mixed && root.get(w) != NONE {
+        f.setOwnership(usize.toU32(v), Own.Borrowed, RootKind.Argument, root.get(w)) changed = true
+      }
+    }
+    v = v + 1
+  }
+  if !changed { return false }
+  // Releases of what became borrows go; exit slots follow their values.
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Release && !isOwned(&f.*, inst.a) { removeInst(&mut f, i) }
+    i = i + 1
+  }
+  fixSlots(&mut f)
+  return true
+}
+
+/// The whole pipeline after translation: simplify, borrow arguments, simplify again.
+pub effect fn optimize(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  run simplify(&mut f)
+  if run borrowArguments(&mut f) { run f.compact() run simplify(&mut f) }
+}

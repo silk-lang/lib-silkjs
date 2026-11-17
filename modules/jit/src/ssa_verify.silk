@@ -1,0 +1,367 @@
+//! The verifier of the SSA form (docs/jit/ssa.md, "The verifier"). It reads a compacted
+//! function and fails with the first rule it finds broken.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import ssa { Function, Inst, Edge, Exit, Type, Own, RootKind, Op, SlotMode, NONE, isTerminator, edgeCount }
+
+/// A broken rule: where (block, instruction index or NONE, value or NONE) and which.
+pub struct VerifyError { pub block: u32, pub inst: u32, pub value: u32, pub reason: &'static [u8] }
+
+fn broken(block: u32, inst: u32, value: u32, reason: &'static [u8]) -> VerifyError {
+  return VerifyError { block: block, inst: inst, value: value, reason: reason }
+}
+
+/// Whether `op` reads operand `a` / `b` as a value.
+pub fn readsA(op: Op) -> bool {
+  return op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool || op == Op.Add || op == Op.Sub
+    || op == Op.Mul || op == Op.Cmp || op == Op.Retain || op == Op.Release || op == Op.Branch || op == Op.Return
+}
+pub fn readsB(op: Op) -> bool { return op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp }
+/// Whether `op` must, and alone may, carry a deoptimization exit.
+pub fn hasExit(op: Op) -> bool { return op == Op.Unbox || op == Op.UnboxBool || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Poll }
+
+fn isOwned(f: &Function, v: u32) -> bool { let info = f.value(v) return info.ty == Type.Value && info.own == Own.Owned }
+
+/// The immediate dominators of a compacted function (blocks in reverse postorder).
+effect fn dominators(f: &Function) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let count = f.blockCount()
+  let mut idom = List<u32>.make()
+  run idom.appendRepeated(NONE, u32.toUsize(count))
+  if count == 0 { return move idom }
+  idom.set(0, 0)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut b: u32 = 1
+    while b < count {
+      let mut chosen = NONE
+      // Every edge into b.
+      let mut e: usize = 0
+      while e < f.edges.length() {
+        let edge = f.edges.get(e)
+        if edge.target == b {
+          let pred = sourceOf(f, usize.toU32(e))
+          if idom.get(u32.toUsize(pred)) != NONE {
+            if chosen == NONE { chosen = pred } else { chosen = intersect(&idom, chosen, pred) }
+          }
+        }
+        e = e + 1
+      }
+      if chosen != idom.get(u32.toUsize(b)) { idom.set(u32.toUsize(b), chosen) changed = true }
+      b = b + 1
+    }
+  }
+  return move idom
+}
+
+fn intersect(idom: &List<u32>, a: u32, b: u32) -> u32 {
+  let mut x = a let mut y = b
+  while x != y {
+    while x > y { x = idom.get(u32.toUsize(x)) }
+    while y > x { y = idom.get(u32.toUsize(y)) }
+  }
+  return x
+}
+
+/// The block whose terminator owns edge `e`.
+pub fn sourceOf(f: &Function, e: u32) -> u32 {
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let term = f.terminator(block)
+    if term.edge != NONE && e >= term.edge && e < term.edge + edgeCount(term.op) { return b }
+    b = b + 1
+  }
+  return NONE
+}
+
+fn dominates(idom: &List<u32>, a: u32, b: u32) -> bool {
+  let mut x = b
+  while true {
+    if x == a { return true }
+    if x == 0 || x == NONE { return false }
+    x = idom.get(u32.toUsize(x))
+  }
+  return false
+}
+
+/// Checks that `v` is defined where the instruction at `index` in block `b` can use it.
+fn defined(f: &Function, idom: &List<u32>, v: u32, b: u32, index: u32) -> bool {
+  if v >= f.valueCount() { return false }
+  let info = f.value(v)
+  if info.block == b { return info.def == NONE || info.def < index }
+  return dominates(idom, info.block, b)
+}
+
+/// Verifies `f`. It must be compacted.
+pub effect fn verify(f: &Function) -> () ! VerifyError | OutOfMemoryError ? &mut Allocator {
+  run structure(f)
+  let idom = run dominators(f)
+  run uses(f, &idom)
+  run ownership(f)
+}
+
+effect fn structure(f: &Function) -> () ! VerifyError {
+  // Definitions: each parameter belongs to its block; each result to its instruction.
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    if block.instCount == 0 { fail broken(b, NONE, NONE, b"a block without a terminator") }
+    let mut p: u32 = 0
+    while p < block.paramCount {
+      let v = f.paramAt(block, p)
+      let info = f.value(v)
+      if info.block != b || info.def != NONE { fail broken(b, NONE, v, b"a parameter defined twice or elsewhere") }
+      p = p + 1
+    }
+    let mut i: u32 = 0
+    while i < block.instCount {
+      let index = block.firstInst + i
+      let inst = f.inst(index)
+      if inst.block != b { fail broken(b, index, NONE, b"an instruction outside its block's range") }
+      let last = i + 1 == block.instCount
+      if isTerminator(inst.op) != last { fail broken(b, index, NONE, b"the terminator is not the last instruction") }
+      if inst.op == Op.Removed { fail broken(b, index, NONE, b"a removed instruction") }
+      if inst.result != NONE {
+        let info = f.value(inst.result)
+        if info.def != index || info.block != b { fail broken(b, index, inst.result, b"a result defined twice or elsewhere") }
+      }
+      if hasExit(inst.op) != (inst.exit != NONE) { fail broken(b, index, NONE, b"an exit on an instruction that cannot leave, or a guard without one") }
+      run types(f, b, index, inst)
+      if inst.exit != NONE { run exitTypes(f, b, index, f.exit(inst.exit)) }
+      if inst.edge != NONE {
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) { run edgeTypes(f, b, index, f.edge(inst.edge + e)) e = e + 1 }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+}
+
+fn resultIs(f: &Function, inst: Inst, ty: Type, own: Own) -> bool {
+  if inst.result == NONE { return false }
+  let info = f.value(inst.result)
+  return info.ty == ty && info.own == own
+}
+fn typeOf(f: &Function, v: u32) -> Type { return f.value(v).ty }
+
+effect fn types(f: &Function, b: u32, index: u32, inst: Inst) -> () ! VerifyError {
+  let op = inst.op
+  let n = f.valueCount()
+  if readsA(op) && inst.a >= n { fail broken(b, index, inst.a, b"an operand that is not a value") }
+  if readsB(op) && inst.b >= n { fail broken(b, index, inst.b, b"an operand that is not a value") }
+  let mut ok = true
+  if op == Op.Arg {
+    ok = resultIs(f, inst, Type.Value, Own.Borrowed) && inst.k >= 0 && u32.toI64(f.argumentCount) > i32.toI64(inst.k)
+    if ok { let info = f.value(inst.result) ok = info.rootKind == RootKind.Argument && i32.toI64(inst.k) == u32.toI64(info.root) }
+  }
+  else if op == Op.ConstI32 { ok = resultIs(f, inst, Type.I32, Own.Unboxed) }
+  else if op == Op.Imm { ok = resultIs(f, inst, Type.Value, Own.Imm) && inst.k >= 0 && inst.k <= 4 }
+  else if op == Op.Unbox { ok = typeOf(f, inst.a) == Type.Value && resultIs(f, inst, Type.I32, Own.Unboxed) }
+  else if op == Op.UnboxBool { ok = typeOf(f, inst.a) == Type.Value && resultIs(f, inst, Type.Bool, Own.Unboxed) }
+  else if op == Op.BoxI32 { ok = typeOf(f, inst.a) == Type.I32 && resultIs(f, inst, Type.Value, Own.Imm) }
+  else if op == Op.BoxBool { ok = typeOf(f, inst.a) == Type.Bool && resultIs(f, inst, Type.Value, Own.Imm) }
+  else if op == Op.Add || op == Op.Sub || op == Op.Mul { ok = typeOf(f, inst.a) == Type.I32 && typeOf(f, inst.b) == Type.I32 && resultIs(f, inst, Type.I32, Own.Unboxed) }
+  else if op == Op.Cmp { ok = typeOf(f, inst.a) == Type.I32 && typeOf(f, inst.b) == Type.I32 && resultIs(f, inst, Type.Bool, Own.Unboxed) && inst.k >= 0 && inst.k <= 5 }
+  else if op == Op.Retain { ok = typeOf(f, inst.a) == Type.Value && resultIs(f, inst, Type.Value, Own.Owned) }
+  else if op == Op.Release { ok = isOwned(f, inst.a) && inst.result == NONE }
+  else if op == Op.Poll || op == Op.Jump { ok = inst.result == NONE }
+  else if op == Op.Branch { ok = typeOf(f, inst.a) == Type.Bool && inst.result == NONE }
+  else if op == Op.Return {
+    let info = f.value(inst.a)
+    ok = info.ty == Type.Value && (info.own == Own.Owned || info.own == Own.Imm) && inst.result == NONE
+  }
+  if !ok { fail broken(b, index, inst.result, b"operand or result types do not fit the instruction") }
+  if (op == Op.Jump || op == Op.Branch) != (inst.edge != NONE) { fail broken(b, index, NONE, b"a terminator without its edges") }
+  if inst.edge != NONE && inst.edge + edgeCount(op) > usize.toU32(f.edges.length()) { fail broken(b, index, NONE, b"an edge index out of range") }
+}
+
+effect fn edgeTypes(f: &Function, b: u32, index: u32, edge: Edge) -> () ! VerifyError {
+  if edge.target >= f.blockCount() { fail broken(b, index, NONE, b"an edge to no block") }
+  let target = f.blocks.get(u32.toUsize(edge.target))
+  if edge.argCount != target.paramCount { fail broken(b, index, NONE, b"edge arguments do not match the target's parameters") }
+  let mut g: u32 = 0
+  while g < edge.argCount {
+    let arg = f.edgeArg(edge, g)
+    if arg >= f.valueCount() { fail broken(b, index, arg, b"an edge argument that is not a value") }
+    let a = f.value(arg)
+    let p = f.value(f.paramAt(target, g))
+    if a.ty != p.ty { fail broken(b, index, arg, b"an edge argument of the wrong type") }
+    if a.ty == Type.Value {
+      let fits = a.own == Own.Imm || a.own == p.own
+      if !fits { fail broken(b, index, arg, b"an edge argument whose ownership the parameter cannot take") }
+    }
+    g = g + 1
+  }
+}
+
+effect fn exitTypes(f: &Function, b: u32, index: u32, exit: Exit) -> () ! VerifyError {
+  if exit.firstSlot + f.localCount + exit.stackDepth > usize.toU32(f.slots.length()) { fail broken(b, index, NONE, b"an exit's slots out of range") }
+  let mut s: u32 = 0
+  while s < f.localCount + exit.stackDepth {
+    let slot = f.slot(exit, s)
+    if slot.value >= f.valueCount() { fail broken(b, index, slot.value, b"an exit slot that is not a value") }
+    let info = f.value(slot.value)
+    let mut ok = false
+    if slot.mode == SlotMode.Int { ok = info.ty == Type.I32 }
+    else if slot.mode == SlotMode.Bool { ok = info.ty == Type.Bool }
+    else if slot.mode == SlotMode.Imm { ok = info.ty == Type.Value && info.own == Own.Imm }
+    else if slot.mode == SlotMode.Move { ok = info.ty == Type.Value && info.own == Own.Owned }
+    else { ok = info.ty == Type.Value && info.own == Own.Borrowed && (info.rootKind != RootKind.Argument || slot.root == info.root) }
+    if !ok { fail broken(b, index, slot.value, b"an exit slot's mode does not fit its value") }
+    if slot.mode != SlotMode.Dup && slot.root != NONE { fail broken(b, index, slot.value, b"a root on a slot that is not dup") }
+    s = s + 1
+  }
+}
+
+/// Every operand, edge argument and exit slot is defined where it is used.
+effect fn uses(f: &Function, idom: &List<u32>) -> () ! VerifyError {
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut i: u32 = 0
+    while i < block.instCount {
+      let index = block.firstInst + i
+      let inst = f.inst(index)
+      if readsA(inst.op) && !defined(f, idom, inst.a, b, index) { fail broken(b, index, inst.a, b"an operand used where its definition does not dominate") }
+      if readsB(inst.op) && !defined(f, idom, inst.b, b, index) { fail broken(b, index, inst.b, b"an operand used where its definition does not dominate") }
+      if inst.edge != NONE {
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let edge = f.edge(inst.edge + e)
+          let mut g: u32 = 0
+          while g < edge.argCount {
+            let arg = f.edgeArg(edge, g)
+            if !defined(f, idom, arg, b, index) { fail broken(b, index, arg, b"an edge argument whose definition does not dominate") }
+            g = g + 1
+          }
+          e = e + 1
+        }
+      }
+      if inst.exit != NONE {
+        let exit = f.exit(inst.exit)
+        let mut s: u32 = 0
+        while s < f.localCount + exit.stackDepth {
+          let v = f.slot(exit, s).value
+          if !defined(f, idom, v, b, index) { fail broken(b, index, v, b"an exit slot whose definition does not dominate") }
+          s = s + 1
+        }
+      }
+      let root = rootOf(f, inst)
+      if root != NONE && !defined(f, idom, root, b, index) { fail broken(b, index, root, b"a borrow whose root does not dominate") }
+      i = i + 1
+    }
+    b = b + 1
+  }
+}
+
+/// The owned root of a borrowed operand of `inst`, or NONE.
+fn rootOf(f: &Function, inst: Inst) -> u32 {
+  if !readsA(inst.op) { return NONE }
+  let info = f.value(inst.a)
+  if info.own == Own.Borrowed && info.rootKind == RootKind.Value { return info.root }
+  return NONE
+}
+
+/// Owned values: consumed exactly once on every path, never used after, predecessors agree,
+/// exits move every outstanding value exactly once.
+effect fn ownership(f: &Function) -> () ! VerifyError | OutOfMemoryError ? &mut Allocator {
+  let n = u32.toUsize(f.valueCount())
+  let blocks = u32.toUsize(f.blockCount())
+  let mut known = List<bool>.make() run known.appendRepeated(false, blocks)
+  let mut entry = List<bool>.make() run entry.appendRepeated(false, blocks * n)
+  if blocks > 0 { known.set(0, true) }
+  let mut state = List<bool>.make() run state.appendRepeated(false, n)
+  let mut scratch = List<bool>.make() run scratch.appendRepeated(false, n)
+  let mut moved = List<u32>.make() run moved.appendRepeated(0, n)
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let base = u32.toUsize(b) * n
+    if !known.get(u32.toUsize(b)) { fail broken(b, NONE, NONE, b"a block reached by no forward edge") }
+    let mut v: usize = 0
+    while v < n { state.set(v, entry.get(base + v)) v = v + 1 }
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut p: u32 = 0
+    while p < block.paramCount { let pv = f.paramAt(block, p) if isOwned(f, pv) { state.set(u32.toUsize(pv), true) } p = p + 1 }
+    let mut i: u32 = 0
+    while i < block.instCount {
+      let index = block.firstInst + i
+      let inst = f.inst(index)
+      // Uses read live values only.
+      if readsA(inst.op) { run live(f, &state, b, index, inst.a) }
+      if readsB(inst.op) { run live(f, &state, b, index, inst.b) }
+      if inst.exit != NONE {
+        let exit = f.exit(inst.exit)
+        let mut s: u32 = 0
+        while s < f.localCount + exit.stackDepth {
+          let slot = f.slot(exit, s)
+          run live(f, &state, b, index, slot.value)
+          if slot.mode == SlotMode.Move { let before = moved.get(u32.toUsize(slot.value)) moved.set(u32.toUsize(slot.value), before + 1) }
+          s = s + 1
+        }
+        // Each outstanding value in exactly one move slot, and nothing else moved.
+        v = 0
+        while v < n {
+          let count = moved.get(v)
+          if state.get(v) && count != 1 { fail broken(b, index, usize.toU32(v), b"an exit does not move an outstanding owned value exactly once") }
+          if !state.get(v) && count != 0 { fail broken(b, index, usize.toU32(v), b"an exit moves a value that is not outstanding") }
+          moved.set(v, 0)
+          v = v + 1
+        }
+      }
+      if inst.op == Op.Release { state.set(u32.toUsize(inst.a), false) }
+      if inst.op == Op.Retain { state.set(u32.toUsize(inst.result), true) }
+      if inst.op == Op.Return {
+        if isOwned(f, inst.a) { state.set(u32.toUsize(inst.a), false) }
+        v = 0
+        while v < n { if state.get(v) { fail broken(b, index, usize.toU32(v), b"an owned value outstanding at return (a leak)") } v = v + 1 }
+      }
+      if inst.edge != NONE {
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let edge = f.edge(inst.edge + e)
+          v = 0
+          while v < n { scratch.set(v, state.get(v)) v = v + 1 }
+          let target = f.blocks.get(u32.toUsize(edge.target))
+          let mut g: u32 = 0
+          while g < edge.argCount {
+            let arg = f.edgeArg(edge, g)
+            run live(f, &state, b, index, arg)
+            if isOwned(f, arg) && isOwned(f, f.paramAt(target, g)) {
+              if !scratch.get(u32.toUsize(arg)) { fail broken(b, index, arg, b"an owned value passed twice on one edge") }
+              scratch.set(u32.toUsize(arg), false)
+            }
+            g = g + 1
+          }
+          let tbase = u32.toUsize(edge.target) * n
+          if known.get(u32.toUsize(edge.target)) {
+            v = 0
+            while v < n {
+              if entry.get(tbase + v) != scratch.get(v) { fail broken(b, index, usize.toU32(v), b"predecessors disagree on the outstanding owned values of a block") }
+              v = v + 1
+            }
+          } else {
+            v = 0
+            while v < n { entry.set(tbase + v, scratch.get(v)) v = v + 1 }
+            known.set(u32.toUsize(edge.target), true)
+          }
+          e = e + 1
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+}
+
+/// `v` may be read here: an owned value not yet consumed, a borrow whose owned root is live.
+effect fn live(f: &Function, state: &List<bool>, b: u32, index: u32, v: u32) -> () ! VerifyError {
+  let info = f.value(v)
+  if info.ty != Type.Value { return () }
+  if info.own == Own.Owned && !state.get(u32.toUsize(v)) { fail broken(b, index, v, b"an owned value used after it was consumed") }
+  if info.own == Own.Borrowed && info.rootKind == RootKind.Value && !state.get(u32.toUsize(info.root)) { fail broken(b, index, v, b"a borrow used after its root was consumed") }
+}
