@@ -181,3 +181,119 @@ All on the cloud container (x86-64 Linux), release builds.
 - Code size and compile time (measured, `--jit-stats`): `sum` is 989 bytes and took 162-283 µs
   to compile (first compile includes reserving code memory). Over the differential run, 1916
   bytes per compiled function on average and 13.7 µs per hot report, refusals included.
+
+## 7. Calls and frames (milestone 7, workstream H)
+
+Design written before the code of each step; "measured" and "ran" mark what was checked.
+
+### 7.1 Entering compiled code from a call site, before any frame
+
+A call made by the dispatch loop to a linked function no longer goes through `callInternal`.
+`enterCallWith` (and `enterKnownCall` for known local functions) still refuses a linked callee
+for free (its `frameCells` is the stub sentinel, section 1); the refusal branch, which runs only
+when `enterFrame` refused, re-decodes the call out of line (`linkedCall`) and, when the callee is
+linked, runs the machine code on the caller's operand cells (`enterCompiled`): no frame, no
+`activation.publish`, no debugger activation. The interrupt counter is charged as for an inline
+entry.
+
+- **Return**: the operands from the callee's cell up are released and replaced by the result;
+  the caller continues at the next instruction, as after a leaf run.
+- **Deopt or poll exit**: the exit already carries the whole interpreter state, so only now is a
+  frame built: an *inline* frame (`activation.enterResumed`: `enterFrame` with the frame size
+  the link saved in `CompiledEntry.frameCells`, not counted, without the `push_this` prologue),
+  into which `js_compiled.restore` writes the exit state. The dispatch loop then simply runs that
+  frame; its return goes through `finishInline` like any inline call.
+- **Skipped**: while instructions are observed, or when the region has no room for the frame a
+  deopt would need (checked before running the code, `activation.linkedRoom`), the call falls
+  back to `callInline`, which runs the code too (`callCompiled`) and on a deopt continues in a
+  base frame: `callInternal` is a wrapper of `callResuming`, whose extra `Resume` argument (a
+  constant "none" at every other call site, so the inlined copies fold it away) makes the new
+  frame restore an exit instead of starting at offset 0. `callKnown` takes the same argument.
+
+Why the refusal is decoded again instead of passing its values on (measured): passing the
+already decoded function, callee, arguments and receiver to the out-of-line path from the
+refusal branch kept them live across the inlined `enterFrame` in every call arm and cost the
+interpreter-only micro loop below 2.2 percent more instructions; re-decoding cost 0.1 percent.
+
+### 7.2 Leaf functions
+
+A leaf (`FunctionBytecode.leaf`) runs frameless and uncounted from interpreted callers, and
+counting leaf runs cost up to 0.9 percent of all instructions (tier-seam.md). The trigger chosen
+is "the caller is compiled": a call made by compiled code goes through the runtime call (7.3),
+which enters callees through `callInternal`'s `describe` and therefore counts them, leaves
+included. A hot leaf called from compiled code is reported, compiled and linked (linking already
+clears `leaf`); from then on interpreted callers reach it through 7.1 and compiled callers
+through 7.4. A leaf called only from interpreted code stays an interpreter leaf, which is the
+cheap case the leaf runner exists for; the interpreter-only cost of this choice is zero.
+
+### 7.3 Calls from compiled code: the generic runtime call
+
+SSA: `call v_function, v_this, (v_args...)` produces an owned `value`, is `mayReenter`, and has
+two exits: none for the ordinary path, and a **throw exit** naming the frame state *before* the
+call (the call's operands still on the operand stack, as the interpreter holds them while a call
+runs). The translator emits it for `call0..3`, `call` and `call_method` (the callee and receiver
+come from the operand stack like any other value); every value live across it is either owned,
+an immediate, an unboxed `i32`/`bool`, or a borrow of an argument cell.
+
+Backend: the operands are written as `ValueBits` into a stack area (function, this, arguments),
+and the code calls the helper `jit_helpers.CALL` (H's index range) through the environment's
+table with `(env, frame, area, count, result)`. The helper is ordinary Silk in modules/jit; it
+makes the call through the engine's own catching entry (`vm.call`-like, which runs bytecode in
+`callInternal`, natives through their class, linked callees through `js_compiled.runCode`
+directly) and returns 0 with the owned result written, or 1 when the call threw (the exception
+is pending in `RuntimeState.currentException`, exactly where the interpreter leaves it).
+Compiled code tests the status and on 1 jumps to the throw exit.
+
+What the rest of the engine sees, case by case:
+
+- **The callee throws.** No unwinding through generated code ever happens: the helper returns.
+  The throw exit is a deopt stub returning `EXIT_THROW` (3) with the state before the call. The
+  engine restores that state into a frame and, instead of executing, takes the branch the
+  `callInternal` loop takes when `execute` fails at the call instruction (`exceptionBoundary`,
+  then `unwindFrames`), so handlers in the compiled function (`catch`, `finally`) and the
+  release of the call's operands are the interpreter's own. The first version translates no
+  `catch`/`gosub`, so every throw leaves the function; the restore is still the general
+  mechanism. From a frameless entry (7.1) the engine builds the frame first (base frame through
+  `callResuming`, which can fail), so functions that make calls are entered through
+  `callCompiled`, never `enterCompiled`.
+- **The callee polls, collects garbage, or reenters the engine.** The engine reference-counts
+  and never moves objects. Values the compiled frame holds across the call are owned (one count
+  each, invisible to the cycle collector's internal-reference subtraction, so they are treated as
+  external roots), immediates, or borrows of the frame's argument cells. Argument cells are the
+  caller's operands or the frame's own copies; nothing else writes them while the function runs
+  (the translator refuses `arguments` and argument writes, `Function.prototype.arguments` is a
+  poison pill, and observation runs interpreted code only), so an argument borrow survives a
+  call. Any other borrow ends at a `mayReenter` instruction (the ownership pass retains it before
+  the call if it is used after). No stack map is needed.
+- **The callee reads the stack** (an `Error` captures its stack, a backtrace is built at unwind,
+  `Error.prepareStackTrace`). Backtraces walk `RuntimeState.currentStackFrame`. A function entered
+  through `callInternal` already has its published `StackFrame`; one entered frameless publishes
+  a minimal `StackFrame` record on the native stack for the duration of the run
+  (`previous`, `currentFunction`, `mode`, `debuggerId` 0, empty locals, the argument cells), and
+  the compiled code writes the call's bytecode offset to its `currentPc` before each call
+  (`CompiledFrame` gains a `stackFrame` pointer at its end). The backtrace then shows the
+  compiled function at the right line, exactly as the interpreter would.
+- **The debugger.** Compiled code never runs while instructions are observed. When a callee
+  turns observation on, the compiled caller continues until its next poll or exit; the debugger
+  sees it as a frame without locals (the record above) until it deoptimizes.
+
+AOT: the helper is named by its table index; the area, the status and the record offsets are
+fixed by the ABI. No per-runtime value enters the code bytes.
+
+### 7.4 Direct calls to a known compiled callee
+
+`js_feedback` records call targets (94 percent of call sites are monomorphic). When a site's
+feedback names one closure, the call is lowered as: compare the callee's `FunctionBytecode`
+(loaded from the function object) with the bytecode the feedback named (passed through a
+per-compilation constant table, never as an address in the code), and when it is linked, call
+`js_compiled.runCode`'s machine code directly with the argument area as its `arguments` and a
+`CompiledFrame` built in the caller's frame; any other callee takes the generic helper. A
+callee deopt returns `EXIT_DEOPT` to the caller's call site, which then runs the helper's
+"resume" entry (build the callee's base frame from its exit state and finish it interpreted).
+
+### 7.5 Inlining (design only unless time allows)
+
+A small monomorphic callee is translated into the caller's SSA at the call (its `arg n` are the
+call's operands). Every exit inside the inlined body carries two frame states, the caller's
+(at the call, its operands on the stack) and the callee's; the engine rebuilds the caller's frame,
+then the callee's frame inline above it, so the interpreter returns into the caller normally.
