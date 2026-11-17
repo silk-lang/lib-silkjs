@@ -26,7 +26,7 @@ import silk.num.u8
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Shift, UnboundLabelError, Width, Xmm }
-import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK }
 import value_layout { ValueLayout }
 import x64_backend_float as float
 import x64_regalloc { Allocation, Place, GPR, XMM, getI32, putI32, aluWith, getF64, putF64, getBits, putBits, gprAt, gprCount }
@@ -78,7 +78,7 @@ pub struct Emitter {
   pub inputs: i32,
   pub settings: Settings,
   /// Where each value lives (x64_regalloc).
-  places: Allocation,
+  pub places: Allocation,
   /// Per value: its reads (operands, edge arguments, exit slots; an over-count only costs
   /// speed), the reads that take it as an immediate, and the instruction defining it or NONE.
   uses: List<u32>,
@@ -106,8 +106,8 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let mut pushes: u32 = 0
   let mut r: usize = 0
   while r < gprCount() { if u32.bitAnd(u32.shiftRight(places.savedMask, usize.toU32(r)), 1) != 0 { pushes = pushes + 1 } r = r + 1 }
-  // Values, one edge scratch slot, then the ABI inputs; 16-byte aligned at calls below the
-  // return address and the saved registers.
+  // The value slots, the edge moves' scratch slot, then the six ABI inputs; 16-byte aligned
+  // at calls below the return address and the saved registers.
   let inputs = (values + 1) * SLOT_BYTES
   let raw = inputs + INPUT_COUNT * 8 + 8 + pushes * 8
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
@@ -413,6 +413,78 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
       return ()
     }
+    if op == Op.GetElem || op == Op.PutElem || op == Op.GetLength {
+      run self.stressGuard(inst.exit)
+      // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
+      // get_length(env, object, out) -> 1 when done.
+      run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+      if op == Op.GetElem {
+        let index = self.at(inst.b) run getI32(&mut self.a, Reg.Rdx, index)
+        run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
+        run self.callHelper(helpers.GET_ELEM)
+      } else if op == Op.PutElem {
+        let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
+        run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
+        run self.callHelper(helpers.PUT_ELEM)
+      } else {
+        run self.a.lea(Width.W64, Reg.Rdx, slotOf(inst.result))
+        run self.callHelper(helpers.GET_LENGTH)
+      }
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
+    if op == Op.GetScope || op == Op.PutScope {
+      run self.stressGuard(inst.exit)
+      // get_scope(env, frame, site, out) / put_scope(env, frame, site, value) -> 1 when done;
+      // site = slot | checked << 31.
+      let frame = self.input(INPUT_FRAME)
+      let site = u32.bitOr(i32.wrappingToU32(inst.k) & 0xffff, u32.shiftLeft(u32.shiftRight(i32.wrappingToU32(inst.k), 16) & 1, 31))
+      run self.a.load(Width.W64, Reg.Rsi, frame)
+      run self.a.movImm32(Reg.Rdx, site)
+      if op == Op.GetScope { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result)) run self.callHelper(helpers.GET_SCOPE) }
+      else { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a)) run self.callHelper(helpers.PUT_SCOPE) }
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
+    if op == Op.GetVar || op == Op.PutVar {
+      run self.stressGuard(inst.exit)
+      // get_var(env, frame, index, out) / put_var(env, frame, index, value) -> 1 when done.
+      let frame = self.input(INPUT_FRAME)
+      run self.a.load(Width.W64, Reg.Rsi, frame)
+      run self.a.movImm32(Reg.Rdx, i32.wrappingToU32(inst.k))
+      if op == Op.GetVar { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result)) run self.callHelper(helpers.GET_VAR) }
+      else { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a)) run self.callHelper(helpers.PUT_VAR) }
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
+    if op == Op.AtomValue {
+      run self.stressGuard(inst.exit)
+      // atom_value(env, frame, site, out) -> 1 when out holds the owned string.
+      let frame = self.input(INPUT_FRAME)
+      run self.a.load(Width.W64, Reg.Rsi, frame)
+      run self.a.movImm32(Reg.Rdx, u32.bitOr(inst.pc, u32.shiftLeft(i32.wrappingToU32(inst.k), 31)))
+      run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
+      run self.callHelper(helpers.ATOM_VALUE)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
+    if op == Op.PutField {
+      run self.stressGuard(inst.exit)
+      // put_field(env, frame, pc, object, value) -> 1 when stored (the object retained value).
+      let frame = self.input(INPUT_FRAME)
+      run self.a.load(Width.W64, Reg.Rsi, frame)
+      run self.a.movImm32(Reg.Rdx, inst.pc)
+      run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a))
+      run self.a.lea(Width.W64, Reg.R8, slotOf(inst.b))
+      run self.callHelper(helpers.PUT_FIELD)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
     if op == Op.CallArg {
       // Borrowed into the call area; an i32 or bool is boxed there.
       run self.callBlock(Reg.R11)
@@ -553,6 +625,7 @@ impl Emitter {
     while i < function.insts.length() {
       let inst = function.insts.get(i)
       if inst.a != NONE && inst.a < function.valueCount() { self.read(inst.a) }
+      if readsK(inst.op) { self.read(i32.wrappingToU32(inst.k)) }
       if inst.b != NONE && inst.b < function.valueCount() {
         self.read(inst.b)
         if (inst.op == Op.Add || inst.op == Op.Sub || inst.op == Op.Cmp) && self.constant(&function, inst.b) {

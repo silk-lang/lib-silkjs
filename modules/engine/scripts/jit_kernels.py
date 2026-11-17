@@ -4,7 +4,7 @@
 Each kernel is fixed work with one feature (integer loop, calls, method calls, doubles, arrays,
 typed arrays). One `kernel()` call is timed inside the process, so startup is excluded and
 compilation and warmup are included. Rounds are processes, interleaved across engines. Every
-engine must return the same checksum. silkjs-jit also runs with --jit-stats, whose counters are
+engine must return the same checksum. silkjs-jit (and silkjs-jit-calls, with --jit-calls) also runs with --jit-stats, whose counters are
 printed beside its time so a non-result can be explained.
 
     python3 scripts/jit_kernels.py                       # every installed engine, 5 rounds
@@ -27,7 +27,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNELS = os.path.join(ROOT, "bench", "kernels")
 ORDER = ["sum-calls", "sum-long", "nested", "calls", "method", "doubles", "array-sum", "typed-array"]
-ENGINES = ["silkjs", "silkjs-jit", "v8-jitless", "v8-jit", "jsc-nojit", "jsc-jit", "qjs"]
+ENGINES = ["silkjs", "silkjs-jit", "silkjs-jit-calls", "v8-jitless", "v8-jit", "jsc-nojit", "jsc-jit", "qjs"]
 
 PRELUDE = """var __now = (typeof preciseTime === 'function') ? function () { return preciseTime() * 1000; }
   : (typeof performance !== 'undefined' && typeof performance.now === 'function') ? function () { return performance.now(); }
@@ -60,6 +60,7 @@ def commands(work):
             missing[name] = (path or "(not on PATH)") + " is missing; " + hint
     put("silkjs", engine, [], "build it with `silk build --release` or set SILKJS_ENGINE")
     put("silkjs-jit", shell, ["--jit", "--jit-stats"], "build modules/jit/shell with `silk build --release` or set SILKJS_JIT")
+    put("silkjs-jit-calls", shell, ["--jit", "--jit-calls", "--jit-stats"], "build modules/jit/shell with `silk build --release` or set SILKJS_JIT")
     put("v8-jitless", node, ["--jitless"], "install Node 24 or set NODE_REFERENCE")
     put("v8-jit", node, [], "install Node 24 or set NODE_REFERENCE")
     put("jsc-nojit", jsc, ["--useJIT=false"], "run `silk task bench-setup jsc` or set JSC")
@@ -137,7 +138,7 @@ def main():
         paths[kernel + "/units"] = units
 
     times = {k: {c: [] for c in columns} for k in kernels}
-    stats = {k: "" for k in kernels}
+    stats = {k: {} for k in kernels}
     results = {k: {} for k in kernels}
     failures = []
     for round_index in range(args.rounds):
@@ -151,7 +152,7 @@ def main():
                 times[kernel][column].append(ms)
                 results[kernel][column] = result
                 if line:
-                    stats[kernel] = line
+                    stats[kernel][column] = line
         print("round %d of %d done" % (round_index + 1, args.rounds), file=sys.stderr)
 
     print()
@@ -191,8 +192,8 @@ def main():
         distinct = set(results[kernel].values())
         if len(distinct) > 1:
             failures.append("%s: checksums differ: %s" % (kernel, results[kernel]))
-        if stats[kernel]:
-            print("silkjs-jit %-12s %s" % (kernel, stats[kernel]))
+        for column, line in sorted(stats[kernel].items()):
+            print("%s %-12s %s" % (column, kernel, line))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"rounds": args.rounds, "commands": {c: found[c] for c in columns}, "omitted": {c: missing[c] for c in chosen if c in missing},
