@@ -145,6 +145,23 @@ fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
   return true
 }
 
+/// Whether one of input's widened sites is an equality.
+fn wideEquality(input: &FunctionInput) -> bool {
+  let mut i: usize = 0
+  while i < input.doubleSites.length() {
+    let pc = u32.toUsize(input.doubleSites.get(i))
+    if pc < input.code.length() {
+      let o = byteAt(input, pc)
+      if equality(o) || o == op.OP_strict_eq_imm8 || o == op.OP_strict_neq_imm8 { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+fn equality(opcode: u8) -> bool {
+  return opcode == op.OP_eq || opcode == op.OP_neq || opcode == op.OP_strict_eq || opcode == op.OP_strict_neq
+}
+
 /// Workstream H's calls: `call0`..`call3`, `call`, `call_method` and `call_constructor`.
 pub fn callOpcode(opcode: u8) -> bool {
   return (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor
@@ -482,6 +499,9 @@ struct Translator {
   broken: bool,
   /// On-stack replacement: argument n's number, guarded once at entry, or NONE (or empty).
   argNumbers: List<u32>,
+  /// Whether an equality site of the function deoptimized: then every equality of a boxed
+  /// operand goes through Equals (sites of one function tend to meet the same values).
+  wideEquality: bool,
 }
 
 /// Lexical locals that may be uninitialized (still in their TDZ) on entry to each leader, from a
@@ -794,6 +814,16 @@ impl Translator {
   /// `add`/`sub`/`mul` or a comparison of the two top operands.
   effect fn binary(self: &mut Self, opcode: u8, pc: u32) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
     let a = self.top(2) let b = self.top(1)
+    if equality(opcode) && self.wideEquality && (self.f.value(a).ty == Type.Value || self.f.value(b).ty == Type.Value) {
+      // A site that deoptimized: equality of any two values through the interpreter's
+      // identity tests, exiting only where the operator would coerce.
+      let strict = opcode == op.OP_strict_eq || opcode == op.OP_strict_neq
+      let r = run self.equals(a, b, strict, opcode == op.OP_neq || opcode == op.OP_strict_neq, pc)
+      drop self.pop() drop self.pop()
+      run self.release(a, pc) run self.release(b, pc)
+      run self.push(r)
+      return ()
+    }
     if self.numberSite(pc, a, b) { run self.numberBinary(opcode, pc) return () }
     let x = run self.int(a, pc) let y = run self.int(b, pc)
     if x == NONE || y == NONE { fail refuse(pc, opcode, b"a boolean operand of arithmetic") }
@@ -813,6 +843,18 @@ impl Translator {
     drop self.pop() drop self.pop()
     run self.release(a, pc) run self.release(b, pc)
     run self.push(r)
+  }
+
+  /// `a === b` (strict) or `a == b` of any two operands, negated for `!==` and `!=`: an Equals
+  /// helper call with an exit for the cases that coerce.
+  effect fn equals(self: &mut Self, a: u32, b: u32, strict: bool, negate: bool, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let x = run self.boxed(a, pc) let y = run self.boxed(b, pc)
+    let mut k: i32 = 0
+    if strict { k = 1 }
+    let r = run self.f.emit(self.current, Op.Equals, true, Type.Bool, Own.Unboxed, x, y, k, pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
+    if negate { return run self.f.emit(self.current, Op.NotBool, true, Type.Bool, Own.Unboxed, r, NONE, 0, pc) }
+    return r
   }
 
   /// The truth of `v` for a branch: a bool as it is, an i32 compared with 0, a boxed value
@@ -953,7 +995,11 @@ impl Translator {
       let mut kind = Cmp.Eq
       if opcode == op.OP_strict_neq_imm8 { kind = Cmp.Ne }
       let mut r = NONE
-      if self.numberSite(at, a, a) {
+      if self.f.value(a).ty == Type.Bool { r = run self.constBool(opcode == op.OP_strict_neq_imm8, at) }
+      else if self.f.value(a).ty == Type.Value && self.wideEquality {
+        let c = run self.constant(k, at)
+        r = run self.equals(a, c, true, opcode == op.OP_strict_neq_imm8, at)
+      } else if self.numberSite(at, a, a) {
         let x = run self.number(a, at)
         if x == NONE { fail refuse(at, opcode, b"a boolean compared with a number") }
         let c = run self.doubleConstant(i32.toF64(k), at)
@@ -1869,7 +1915,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
-    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false }
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, wideEquality: wideEquality(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   // A block per leader, with one parameter per local and per operand at that point.
@@ -2098,7 +2144,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
-    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false }
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, wideEquality: wideEquality(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
