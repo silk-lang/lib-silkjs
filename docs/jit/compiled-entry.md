@@ -8,7 +8,7 @@ marked measured or ran is a design statement.
 ## 1. Where the JIT attaches
 
 The engine never imports `modules/jit`. A JIT-enabled executable is a separate package,
-`modules/jit/shell` (binary `silkjs-jit`), that links the engine, `modules/jit` and the same
+`modules/jit/shell` (binary `silkjs-jit-shell`), that links the engine, `modules/jit` and the same
 libc session as `qjs`. It parses its own `--jit*` flags, then runs the ordinary `qjs` launch
 with a runtime setup callback that installs three things:
 
@@ -32,9 +32,12 @@ Which entries check the slot:
 
 - `callInternal` and `callKnown` (native-stack entries) run the compiled code. The check reads
   a field `describe` already loads.
-- `enterFrame` (every inline entry) refuses an inline frame when the slot is set, so the call
-  falls back through `callInline` to `callInternal`. That is one load from a cache line
-  `enterFrame` already reads and one branch per inline call: the cost a JIT-less run pays.
+- `enterFrame` (every inline entry) never takes a linked function, at no cost of its own:
+  `js_runtime.linkCompiled` keeps the function's `frameCells` in its `CompiledEntry` and sets
+  the field to `STUB_FRAME_CELLS`, the sentinel lazily compiled stubs already use, so the
+  existing room check fails and the call falls back through `callInline` to `callInternal`.
+  Unlinking restores it. (Ran: a first version that tested `compiled` in `enterFrame` cost
+  richards +0.98% instructions; this one +0.02%, see Measurements.)
 - Leaf runs, generator and async frames, `vm.resume` and the observed loop never run compiled
   code. While instructions are observed (`observeInstructions`, the debugger) the compiled
   entry is skipped and the interpreter runs.
@@ -94,7 +97,7 @@ After a deopt the function is kept: the entry counts deopts and the engine unlin
 (`FunctionBytecode.compiled = 0`) after `deoptLimit` deopts, since a guard that failed that
 often will keep failing until feedback recompiles it. The code itself stays with the embedder,
 which frees all of it when the session ends. Poll exits do not count. `RuntimeState` keeps
-runtime-wide counters (runs, deopts, poll exits, unlinks) that `silkjs-jit --jit-stats` prints.
+runtime-wide counters (runs, deopts, poll exits, unlinks) that `silkjs-jit-shell --jit-stats` prints.
 
 ## 4. Ahead of time
 
