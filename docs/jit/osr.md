@@ -103,3 +103,26 @@ word are arguments, as before). `OsrEntry` tables are runtime state, never store
   still a function spending its time in a loop.
 - What the hot loops of navier-stokes and crypto need is outside this workstream: element reads
   and writes, closure scope reads (`get_scope0`), bit operations, doubles (see Measurements).
+
+## Measurements
+
+Cloud container (x86-64 Linux, 4 cores), release builds, head of
+`claude/project-thread-xytm2y` after merging J's value ABI (a6c063b).
+
+- Interpreter-only cost, no JIT (measured, `v8bench.py --instructions`): against a 14e4181
+  (no hook) build, all eight benchmarks 1.000x except regexp 0.984x (that benchmark varies by
+  about 1.7 percent between builds of the same code). The first placement, a call in each arm,
+  was richards 1.0035x, earley-boyer 1.003x.
+- A loop that stays compiled (measured, wall clock, 3 runs): 1e8 iterations of an int loop in
+  a function called once, plain engine 835-990 ms, `--jit` 478-637 ms; 10000 OSR runs, 9999
+  poll re-entries, 0 deopts. (Before the value ABI: 379-472 ms.)
+- Differential (ran, 3000 programs, plain, observed, jit, jit-stress, node, with the long-loop
+  phases): 3000 agree. jit: 33707 OSR runs, 23889 OSR entries compiled, 13980 functions linked
+  for OSR only, 31831 OSR deopts (mostly side exits). jit-stress: 39392 OSR runs.
+- navier-stokes and crypto (ran, `--jit-stats --jit-dump`): navier-stokes now reports 8 loop
+  functions (none before) and compiles 25 OSR entries; crypto reports 14 and compiles 17. Every
+  entry leaves at its first side exit, so the time does not move (5 runs each, within noise).
+  Opcodes outside the subset inside their loop bodies (static sites): navier-stokes
+  `get_scope0` 96, `put_array_el` 33, `get_arg_el8` 29, `get_array_el` 16, `insert3` 10;
+  crypto `put_array_el` 24, `get_loc_field8` 24, `get_loc_el8` 23, `get_var` 22, `get_field2`
+  16, `call_method` 12, `and` 11, `shl`/`sar` 7 each, plus doubles throughout.
