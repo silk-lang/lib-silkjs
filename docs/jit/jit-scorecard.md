@@ -11,7 +11,18 @@ host of its section unless it says otherwise. Raw files are in
 
 ## Latest: integration da86b81c (2026-11-17 13:18 UTC)
 
-The newest dated run below, as one table. Kernel rows: ns per loop iteration, median of 7 processes, lower is better. Octane rows: score, median round, higher is better. Ratio columns: how many times faster the first engine is than the second (above 1x: the first is faster). From `python3 docs/jit/perf_table.py kernels.json octane.json`.
+Read one column: **Slower than V8**, how many times slower silkjs-jit (`--jit`) is than V8's JIT (1x would be V8's speed; lower is better). JSC's JIT gives nearly the same numbers. The second column is what the JIT gains over our own interpreter.
+
+| What | Slower than V8 | Gain from our JIT (vs our interpreter) |
+|---|---:|---:|
+| Simple loops (sum-calls, sum-long, nested, doubles) | 1.3x to 3.0x | 3.6x to 5.9x faster |
+| Array loop (array-sum) | 5.1x | 2.7x faster |
+| Function and method calls (calls, method) | 27.0x to 31.8x | none yet (1.0x) |
+| Typed arrays (typed-array) | 32.8x | none yet (1.0x) |
+| **All 8 kernels (geomean)** | **6.5x** | **2.5x faster** |
+| **Octane, the real-world suite (geomean)** | **9.3x** | **none yet (1.0x)** |
+
+Full table, every engine and benchmark. Kernel rows: ns per loop iteration, median of 7 processes, lower is better. Octane rows: score, median round, higher is better. Ratio columns: how many times faster the first engine is than the second. From `python3 docs/jit/perf_table.py [--simple] kernels.json octane.json`.
 
 | Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
