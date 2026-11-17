@@ -160,8 +160,16 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
     || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode)
+    || exceptionOpcode(opcode)
     || opcode == op.OP_instanceof || opcode == op.OP_put_arg || opcode == op.OP_set_arg
 }
+
+/// Stream P's opcodes (docs/jit/compiled-entry.md 3.1): `throw` and `throw_error` leave
+/// through a cold exit at the instruction itself.
+pub fn exceptionOpcode(opcode: u8) -> bool {
+  return isThrow(opcode) || opcode == op.OP_catch || opcode == op.OP_nip_catch || opcode == op.OP_gosub || opcode == op.OP_ret
+}
+fn isThrow(opcode: u8) -> bool { return opcode == op.OP_throw || opcode == op.OP_throw_error }
 
 /// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
 /// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
@@ -347,9 +355,41 @@ fn targetOf(input: &FunctionInput, pc: usize) -> i64 {
 
 /// Pass A: every reachable instruction start, every block leader and the operand stack depth
 /// at each leader, from the engine's pops and pushes. Fails on code outside the subset.
-struct Shape { leader: List<bool>, depth: List<i32>, start: List<bool> }
+///
+/// Try regions (stream P): `catch` pushes a marker the interpreter's unwinder looks for. The
+/// handler is not followed (only the unwinder reaches it, in the interpreter). `catchTop` is
+/// the pc of the innermost `catch` whose marker is on the stack before each instruction (-1:
+/// none); `catchLevel` and `catchParent`, indexed by a `catch`'s pc, are the stack slot of its
+/// marker and the enclosing `catch`. `gosub` (finally) jumps to its target with its return
+/// offset pushed, and `ret` returns to the instruction after one of `returns`.
+struct Shape { leader: List<bool>, depth: List<i32>, start: List<bool>, catchTop: List<i32>, catchLevel: List<i32>,
+  catchParent: List<i32>, returns: List<u32> }
 
-effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator { return run shapeAt(input, 0, false, true, 0, u32.MAX) }
+effect fn shape(input: &FunctionInput) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
+  let none = List<u32>.make()
+  return run shapeAt(input, 0, false, true, 0, u32.MAX, &none)
+}
+
+/// The catch instructions whose try bodies enclose loop header pc, outermost first: their
+/// markers are the operand stack under the header (an OSR entry's base; js_compiled_osr
+/// enters only when the frame's operands are exactly such markers).
+pub effect fn osrMarkers(input: &FunctionInput, header: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u32>.make()
+  let length = input.code.length()
+  let at = u32.toUsize(header)
+  let mut pc: usize = 0
+  while pc < length && pc < at {
+    let opcode = byteAt(input, pc)
+    let size = sizeAt(input, pc)
+    if size == 0 || pc + size > length { return move out }
+    if opcode == op.OP_catch {
+      let handler = usize.toI64(pc + 1) + i32.toI64(i32At(input, pc + 1))
+      if handler > usize.toI64(at) { run out.append(usize.toU32(pc)) }
+    }
+    pc = pc + size
+  }
+  return move out
+}
 
 /// Whether input passes the translator's first walk: every reachable opcode is in the subset
 /// (and none is a call unless allowCalls). A cheap test before work that only pays for a
@@ -377,25 +417,42 @@ pub effect fn admits(input: &FunctionInput, allowCalls: bool) -> bool ! OutOfMem
 /// shape walking from the instruction at `begin` (stack empty there). With `sideExits`, an
 /// opcode outside the subset, or an instruction outside [low, high], ends its block (the
 /// translator exits there) instead of refusing.
-effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: bool, low: u32, high: u32) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
+effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: bool, low: u32, high: u32, markers: &List<u32>) -> Shape ! Refusal | OutOfMemoryError ? &mut Allocator {
   let length = input.code.length()
   let mut leader = List<bool>.make() run leader.appendRepeated(false, length + 1)
   let mut start = List<bool>.make() run start.appendRepeated(false, length + 1)
   let mut depth = List<i32>.make() run depth.appendRepeated(-1, length + 1)
+  let mut catchTop = List<i32>.make() run catchTop.appendRepeated(-1, length + 1)
+  let mut catchLevel = List<i32>.make() run catchLevel.appendRepeated(-1, length + 1)
+  let mut catchParent = List<i32>.make() run catchParent.appendRepeated(-1, length + 1)
+  let mut returns = List<u32>.make()
   let mut work = List<usize>.make()
   let mut workDepth = List<i32>.make()
+  let mut workCatch = List<i32>.make()
   if begin >= length { fail refuse(usize.toU32(begin), 0, b"control falls off the end of the code") }
-  leader.set(begin, true) depth.set(begin, 0)
-  run work.append(begin) run workDepth.append(0)
+  // The markers under an OSR header, each a try region with the one before as its parent.
+  let mut c0: i32 = -1
+  let mut m: usize = 0
+  while m < markers.length() {
+    let at = u32.toUsize(markers.get(m))
+    catchLevel.set(at, usize.toI32(m)) catchParent.set(at, c0)
+    c0 = u32.wrappingToI32(markers.get(m))
+    m = m + 1
+  }
+  let d0 = usize.toI32(markers.length())
+  leader.set(begin, true) depth.set(begin, d0)
+  run work.append(begin) run workDepth.append(d0) run workCatch.append(c0)
   while work.length() > 0 {
     let mut pc = work.pop().unwrapOr(0)
     let mut d = workDepth.pop().unwrapOr(0)
+    let mut c = workCatch.pop().unwrapOr(-1)
     let mut going = true
     while going {
       if pc >= length { fail refuse(usize.toU32(pc), 0, b"control falls off the end of the code") }
       if start.get(pc) { going = false }
       else {
         start.set(pc, true)
+        catchTop.set(pc, c)
         let opcode = byteAt(input, pc)
         if !supported(opcode) && !sideExits { fail refuse(usize.toU32(pc), opcode, b"opcode outside the subset") }
         // A side exit: the state before it is the block's, nothing after it is reached.
@@ -403,12 +460,41 @@ effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: b
         let info = op.opcodeInfo(opcode, true)
         let size = u8.toUsize(info.size)
         if size == 0 || pc + size > length { fail refuse(usize.toU32(pc), opcode, b"truncated instruction") }
-        d = d - u8.toI32(info.pops) + u8.toI32(info.pushes)
+        let before = d
+        let mut popped = u8.toI32(info.pops)
         // A call's table entry counts only its fixed operands; the argument count is in the code.
-        if opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor { d = d - u16.toI32(u16At(input, pc + 1)) }
-        if opcode >= op.OP_call0 && opcode <= op.OP_call3 { d = d - u8.toI32(opcode - op.OP_call0) }
+        if opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor { popped = popped + u16.toI32(u16At(input, pc + 1)) }
+        if opcode >= op.OP_call0 && opcode <= op.OP_call3 { popped = popped + u8.toI32(opcode - op.OP_call0) }
+        d = d - popped + u8.toI32(info.pushes)
+        if opcode == op.OP_nip_catch {
+          // The result replaces the innermost marker; everything above it goes.
+          if c < 0 { fail refuse(usize.toU32(pc), opcode, b"nip_catch outside a try region") }
+          d = catchLevel.get(i32.toUsize(c)) + 1
+          c = catchParent.get(i32.toUsize(c))
+        } else if opcode == op.OP_gosub { d = before + 1 }
         if d < 0 { fail refuse(usize.toU32(pc), opcode, b"operand stack underflow") }
-        if isReturn(opcode) { going = false }
+        if opcode == op.OP_catch {
+          catchLevel.set(pc, before) catchParent.set(pc, c)
+          c = usize.toI32(pc)
+        } else if c >= 0 && opcode != op.OP_nip_catch && before - popped <= catchLevel.get(i32.toUsize(c)) {
+          // Only drop and nip remove a marker; anything else that reads one is not translated.
+          let level = catchLevel.get(i32.toUsize(c))
+          if opcode == op.OP_drop && d == level { c = catchParent.get(i32.toUsize(c)) }
+          else if opcode == op.OP_nip && before - 2 == level { c = catchParent.get(i32.toUsize(c)) }
+          else if !isReturn(opcode) && !isThrow(opcode) && !(opcode == op.OP_nip && before - 2 > level) {
+            fail refuse(usize.toU32(pc), opcode, b"an instruction that reads a catch offset")
+          }
+        }
+        if isReturn(opcode) || isThrow(opcode) || opcode == op.OP_ret { going = false }
+        else if opcode == op.OP_gosub {
+          // The finally block runs with the return offset pushed; ret comes back after the gosub.
+          let target = usize.toI64(pc + 1) + i32.toI64(i32At(input, pc + 1))
+          if target < 0 || target >= usize.toI64(length) || pc + 5 >= length { fail refuse(usize.toU32(pc), opcode, b"jump outside the code") }
+          run mark(&mut leader, &mut depth, &mut catchTop, &mut work, &mut workDepth, &mut workCatch, i64.toUsize(target), d, c, pc, opcode)
+          run mark(&mut leader, &mut depth, &mut catchTop, &mut work, &mut workDepth, &mut workCatch, pc + 5, before, c, pc, opcode)
+          run returns.append(usize.toU32(pc + 5))
+          going = false
+        }
         else if isBranch(opcode) || isGoto(opcode) {
           let target = targetOf(input, pc)
           if target < 0 || target >= usize.toI64(length) { fail refuse(usize.toU32(pc), opcode, b"jump outside the code") }
@@ -416,32 +502,38 @@ effect fn shapeAt(input: &FunctionInput, begin: usize, sideExits: bool, calls: b
           // The taken edge of a keep branch still has the tested value.
           let mut taken = d
           if keepBranch(opcode) { taken = d + 1 }
-          run mark(&mut leader, &mut depth, &mut work, &mut workDepth, t, taken, pc, opcode)
-          if isBranch(opcode) { run mark(&mut leader, &mut depth, &mut work, &mut workDepth, pc + size, d, pc, opcode) }
+          run mark(&mut leader, &mut depth, &mut catchTop, &mut work, &mut workDepth, &mut workCatch, t, taken, c, pc, opcode)
+          if isBranch(opcode) { run mark(&mut leader, &mut depth, &mut catchTop, &mut work, &mut workDepth, &mut workCatch, pc + size, d, c, pc, opcode) }
           going = false
         } else {
           pc = pc + size
           if leader.get(pc) {
-            run mark(&mut leader, &mut depth, &mut work, &mut workDepth, pc, d, pc, opcode)
+            run mark(&mut leader, &mut depth, &mut catchTop, &mut work, &mut workDepth, &mut workCatch, pc, d, c, pc, opcode)
             going = false
           }
         }
       }
     }
   }
-  return Shape { leader: move leader, depth: move depth, start: move start }
+  return Shape { leader: move leader, depth: move depth, start: move start, catchTop: move catchTop, catchLevel: move catchLevel,
+    catchParent: move catchParent, returns: move returns }
 }
 
-effect fn mark(leader: &mut List<bool>, depth: &mut List<i32>, work: &mut List<usize>, workDepth: &mut List<i32>,
-  pc: usize, d: i32, from: usize, opcode: u8) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
+effect fn mark(leader: &mut List<bool>, depth: &mut List<i32>, catchTop: &mut List<i32>, work: &mut List<usize>, workDepth: &mut List<i32>,
+  workCatch: &mut List<i32>, pc: usize, d: i32, c: i32, from: usize, opcode: u8) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
   leader.set(pc, true)
   let known = depth.get(pc)
   if known >= 0 {
-    if known != d { fail refuse(usize.toU32(from), opcode, b"operand stack depths disagree at a join") }
+    if known != d {
+      if opcode == op.OP_gosub { fail refuse(usize.toU32(from), opcode, b"a finally block entered at different stack depths") }
+      fail refuse(usize.toU32(from), opcode, b"operand stack depths disagree at a join")
+    }
+    if catchTop.get(pc) != c { fail refuse(usize.toU32(from), opcode, b"try regions disagree at a join") }
     return ()
   }
   depth.set(pc, d)
-  run work.append(pc) run workDepth.append(d)
+  catchTop.set(pc, c)
+  run work.append(pc) run workDepth.append(d) run workCatch.append(c)
 }
 
 /// The interpreter state the translator tracks: one SSA value per local and operand.
@@ -465,6 +557,15 @@ struct Translator {
   doubleSites: List<u32>,
   /// Whether a widened store may leave through a call exit (not in OSR code, which makes no calls).
   exits: bool,
+  /// Shape.catchTop, catchLevel, depth and returns, copied (try regions and finally blocks).
+  catchTop: List<i32>,
+  catchLevel: List<i32>,
+  depthAt: List<i32>,
+  returns: List<u32>,
+  /// Which lexical locals may be uninitialized at each block leader (`Tdz`), and which block
+  /// parameters (by value) are proven initialized.
+  tdz: Tdz,
+  initialized: List<bool>,
   // ---- inlining (docs/jit/inlining.md): the state of the inlined body being translated.
   /// How many inlined bodies deep the translator is; 0 in the function's own code.
   depth: u32,
@@ -493,6 +594,103 @@ struct Translator {
   /// argumentCount, and `locals` holds them after the real locals; else 0 and parameters are
   /// read from their argument cells.
   argSlots: u32,
+}
+
+/// Lexical locals that may be uninitialized (still in their TDZ) on entry to each leader, from a
+/// forward dataflow over the edges the translator follows. A try region's handler is not one of
+/// them, so a local the handler path leaves in any state is still known on the translated paths.
+/// `tracked` is false when the code has no `set_loc_uninitialized`: nothing is ever uninitialized.
+struct Tdz { tracked: bool, locals: usize, slot: List<u32>, maybe: List<bool> }
+
+/// The local an instruction writes (`written`) or marks uninitialized, or usize.MAX.
+fn tdzLocal(input: &FunctionInput, pc: usize, opcode: u8) -> usize {
+  if opcode == op.OP_set_loc_uninitialized || opcode == op.OP_put_loc || opcode == op.OP_set_loc || opcode == op.OP_get_loc_check
+    || opcode == op.OP_put_loc_check || opcode == op.OP_put_loc_check_init { return u16.toUsize(u16At(input, pc + 1)) }
+  if opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8 { return u8.toUsize(byteAt(input, pc + 1)) }
+  if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { return u8.toUsize(opcode - op.OP_put_loc0) }
+  return usize.MAX
+}
+
+effect fn tdzMerge(tdz: &mut Tdz, seen: &mut List<bool>, work: &mut List<usize>, current: &List<bool>, pc: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let index = tdz.slot.get(pc)
+  if index == NONE { return () }
+  let base = u32.toUsize(index) * tdz.locals
+  let mut changed = !seen.get(u32.toUsize(index))
+  seen.set(u32.toUsize(index), true)
+  let mut i: usize = 0
+  while i < tdz.locals {
+    if current.get(i) && !tdz.maybe.get(base + i) { tdz.maybe.set(base + i, true) changed = true }
+    i = i + 1
+  }
+  if changed { run work.append(pc) }
+}
+
+/// The Tdz of `input`, whose shape is `shapeOf`, entered at `begin` (an OSR entry: every lexical
+/// local may be uninitialized there).
+effect fn tdzOf(input: &FunctionInput, shapeOf: &Shape, begin: usize, sideExits: bool, calls: bool, low: u32, high: u32) -> Tdz ! OutOfMemoryError ? &mut Allocator {
+  let length = input.code.length()
+  let locals = u32.toUsize(input.localCount)
+  let mut tdz = Tdz { tracked: false, locals: locals, slot: List<u32>.make(), maybe: List<bool>.make() }
+  let mut leaders: u32 = 0
+  // Every instruction, not only those the shape reached: an OSR entry starts after the
+  // set_loc_uninitialized that opened a lexical slot's TDZ.
+  let mut pc: usize = 0
+  while pc < length {
+    if byteAt(input, pc) == op.OP_set_loc_uninitialized { tdz.tracked = true }
+    let size = sizeAt(input, pc)
+    if size == 0 { pc = length } else { pc = pc + size }
+  }
+  if !tdz.tracked || locals == 0 { return move tdz }
+  run tdz.slot.appendRepeated(NONE, length + 1)
+  pc = 0
+  while pc < length {
+    if shapeOf.leader.get(pc) && shapeOf.start.get(pc) { tdz.slot.set(pc, leaders) leaders = leaders + 1 }
+    pc = pc + 1
+  }
+  run tdz.maybe.appendRepeated(false, u32.toUsize(leaders) * locals)
+  let mut seen = List<bool>.make() run seen.appendRepeated(false, u32.toUsize(leaders))
+  let mut work = List<usize>.make()
+  let mut current = List<bool>.make() run current.appendRepeated(sideExits, locals)
+  run tdzMerge(&mut tdz, &mut seen, &mut work, &current, begin)
+  while work.length() > 0 {
+    let leader = work.pop().unwrapOr(0)
+    let base = u32.toUsize(tdz.slot.get(leader)) * locals
+    let mut i: usize = 0
+    while i < locals { current.set(i, tdz.maybe.get(base + i)) i = i + 1 }
+    let mut at = leader
+    let mut going = true
+    while going && at < length {
+      let opcode = byteAt(input, at)
+      if sideExits && (osrExit(opcode, calls) || outside(at, low, high)) { going = false continue }
+      let size = sizeAt(input, at)
+      let local = tdzLocal(input, at, opcode)
+      if local < locals { current.set(local, opcode == op.OP_set_loc_uninitialized) }
+      if isReturn(opcode) || isThrow(opcode) { going = false }
+      else if opcode == op.OP_ret {
+        let mut r: usize = 0
+        while r < shapeOf.returns.length() { run tdzMerge(&mut tdz, &mut seen, &mut work, &current, u32.toUsize(shapeOf.returns.get(r))) r = r + 1 }
+        going = false
+      } else if opcode == op.OP_gosub {
+        run tdzMerge(&mut tdz, &mut seen, &mut work, &current, i64.toUsize(usize.toI64(at + 1) + i32.toI64(i32At(input, at + 1))))
+        run tdzMerge(&mut tdz, &mut seen, &mut work, &current, at + 5)
+        going = false
+      } else if isBranch(opcode) || isGoto(opcode) {
+        run tdzMerge(&mut tdz, &mut seen, &mut work, &current, i64.toUsize(targetOf(input, at)))
+        if isBranch(opcode) { run tdzMerge(&mut tdz, &mut seen, &mut work, &current, at + size) }
+        going = false
+      } else {
+        at = at + size
+        if at < length && shapeOf.leader.get(at) { run tdzMerge(&mut tdz, &mut seen, &mut work, &current, at) going = false }
+      }
+    }
+  }
+  return move tdz
+}
+
+effect fn copyI32(from: &List<i32>) -> List<i32> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<i32>.make()
+  run out.appendSlice(from.asSlice())
+  return move out
 }
 
 impl Translator {
@@ -674,6 +872,34 @@ impl Translator {
       if i < local { run self.locals.append(params.get(i)) } else { run self.stack.append(params.get(i)) }
       i = i + 1
     }
+    if self.tdz.tracked {
+      let index = self.tdz.slot.get(pc)
+      i = 0
+      while index != NONE && i < local && i < params.length() {
+        if !self.tdz.maybe.get(u32.toUsize(index) * self.tdz.locals + i) { run self.markInitialized(params.get(i)) }
+        i = i + 1
+      }
+    }
+  }
+  /// Records that value `v` (a block parameter) is proven not to be Uninitialized.
+  effect fn markInitialized(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let at = u32.toUsize(v)
+    let have = self.initialized.length()
+    if have <= at { run self.initialized.appendRepeated(false, at + 1 - have) }
+    self.initialized.set(at, true)
+  }
+  /// Whether `v` holds an Uninitialized marker: 0 no, 1 yes, -1 not known.
+  fn uninitializedState(self: &Self, v: u32) -> i32 {
+    let info = self.f.value(v)
+    if info.ty != Type.Value { return 0 }
+    if info.def != NONE {
+      let def = self.f.inst(info.def)
+      if def.op == Op.Imm && def.k == u8.toI32(Imm.value(Imm.Uninitialized)) { return 1 }
+      return 0
+    }
+    if !self.tdz.tracked { return 0 }
+    if u32.toUsize(v) < self.initialized.length() && self.initialized.get(u32.toUsize(v)) { return 0 }
+    return -1
   }
 
   /// Releases every local and operand, for a return.
@@ -1075,15 +1301,9 @@ impl Translator {
       // Only when the slot's state is known here: an Uninitialized constant, or a value that
       // is not one (an i32 or bool, or an instruction other than that constant).
       let current = self.locals.get(index)
-      let info = self.f.value(current)
-      let mut uninitialized = false
-      let mut known = info.ty != Type.Value
-      if !known && info.def != NONE {
-        let def = self.f.inst(info.def)
-        known = true
-        uninitialized = def.op == Op.Imm && def.k == u8.toI32(Imm.value(Imm.Uninitialized))
-      }
-      if !known { fail refuse(at, opcode, b"cannot prove whether a lexical slot is initialized") }
+      let state = self.uninitializedState(current)
+      let uninitialized = state == 1
+      if state < 0 { fail refuse(at, opcode, b"cannot prove whether a lexical slot is initialized") }
       if opcode == op.OP_put_loc_check_init {
         if !uninitialized { fail refuse(at, opcode, b"initializing a slot that may be initialized") }
         let v = self.pop() run self.store(index, v, at) return true
@@ -1261,6 +1481,40 @@ impl Translator {
       run self.f.terminate(self.current, Op.Return, u, NONE, at)
       return false
     }
+    if opcode == op.OP_catch {
+      // The marker the interpreter's unwinder finds in the exit state when anything in the
+      // region throws; the handler itself only ever runs in the interpreter.
+      let handler = usize.toI64(pc + 1) + i32.toI64(i32At(input, pc + 1))
+      if handler <= 0 || handler >= usize.toI64(input.code.length()) || handler > 2147483647 - 8 { fail refuse(at, opcode, b"a catch handler outside the code") }
+      let marker = run self.f.emit(self.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, ssa.IMM_CATCH + i64.wrappingToI32(handler), at)
+      run self.push(marker)
+      return true
+    }
+    if opcode == op.OP_nip_catch {
+      // The result replaces the innermost marker; what is above it is released.
+      let c = self.catchTop.get(pc)
+      if c < 0 { fail refuse(at, opcode, b"nip_catch outside a try region") }
+      let level = i32.toUsize(self.catchLevel.get(i32.toUsize(c)))
+      if self.stack.length() < level + 2 { fail refuse(at, opcode, b"operand stack underflow") }
+      let result = self.pop()
+      while self.stack.length() > level { let v = self.pop() run self.release(v, at) }
+      run self.push(result)
+      return true
+    }
+    if opcode == op.OP_gosub {
+      // The interpreter pushes the return offset as an Int: a constant per gosub site.
+      let back = run self.constant(usize.toI32(pc + 5), at)
+      run self.push(back)
+      run self.jumpTo(i64.toUsize(usize.toI64(pc + 1) + i32.toI64(i32At(input, pc + 1))), at)
+      return false
+    }
+    if opcode == op.OP_ret { run self.ret(at) return false }
+    if isThrow(opcode) {
+      // The interpreter re-executes the throw from the exit state (the operand on the stack);
+      // the engine does not count an exit at a throw as a deopt (js_compiled.coldExit).
+      run sideExit(&mut self, at)
+      return false
+    }
     if testOpcode(opcode) {
       let v = self.top(1)
       let mut r = NONE
@@ -1300,6 +1554,64 @@ impl Translator {
     if callOpcode(opcode) { return run self.call(input, pc) }
     if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
     fail refuse(at, opcode, b"opcode outside the subset")
+  }
+
+  // ---- finally blocks (stream P) ----
+
+  /// A block whose parameters are the current state (one owned value per local and operand).
+  effect fn stateBlock(self: &mut Self) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let block = run self.f.block()
+    let mut i: usize = 0
+    while i < self.locals.length() + self.stack.length() { drop run self.f.addParam(block, Type.Value, Own.Owned) i = i + 1 }
+    return block
+  }
+  /// Continues in `block`, made by stateBlock: its parameters become the state.
+  effect fn enterState(self: &mut Self, block: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.current = block
+    let params = run self.f.paramsOf(block)
+    let local = self.locals.length()
+    let mut i: usize = 0
+    while i < local && i < params.length() {
+      if self.uninitializedState(self.locals.get(i)) == 0 { run self.markInitialized(params.get(i)) }
+      i = i + 1
+    }
+    self.locals.clear() self.stack.clear()
+    i = 0
+    while i < params.length() {
+      if i < local { run self.locals.append(params.get(i)) } else { run self.stack.append(params.get(i)) }
+      i = i + 1
+    }
+  }
+  /// `ret` at `pc`: the return offset on top is one of the gosub sites whose return point has
+  /// this stack depth and try region; compare it with each and jump there. Any other value
+  /// (none reaches here in compiled code) exits, and the interpreter runs the ret.
+  effect fn ret(self: &mut Self, pc: u32) -> () ! Refusal | OutOfMemoryError ? &mut Allocator {
+    if self.stack.length() == 0 { fail refuse(pc, op.OP_ret, b"operand stack underflow") }
+    let after = usize.toI32(self.stack.length() - 1)
+    let region = self.catchTop.get(u32.toUsize(pc))
+    let mut i: usize = 0
+    while i < self.returns.length() {
+      let back = u32.toUsize(self.returns.get(i))
+      i = i + 1
+      if self.depthAt.get(back) != after || self.catchTop.get(back) != region || self.blockAt.get(back) == NONE { continue }
+      let offsetValue = self.top(1)
+      let x = run self.int(offsetValue, pc)
+      if x == NONE { fail refuse(pc, op.OP_ret, b"a boolean return offset") }
+      let k = run self.constant(usize.toI32(back), pc)
+      let same = run self.f.emit(self.current, Op.Cmp, true, Type.Bool, Own.Unboxed, x, k, u8.toI32(Cmp.value(Cmp.Eq)), pc)
+      let matched = run self.stateBlock()
+      let next = run self.stateBlock()
+      let edge = run self.edgeTo(matched, pc)
+      drop run self.edgeTo(next, pc)
+      run self.f.terminate(self.current, Op.Branch, same, edge, pc)
+      run self.enterState(matched)
+      let offset = self.pop() run self.release(offset, pc)
+      let target = self.blockAt.get(back)
+      let jump = run self.edgeTo(target, pc)
+      run self.f.terminate(self.current, Op.Jump, NONE, jump, pc)
+      run self.enterState(next)
+    }
+    run sideExit(&mut self, pc)
   }
 
   // ---- calls (workstream H) ----
@@ -1482,6 +1794,11 @@ impl Translator {
       let opcode = byteAt(callee, pc)
       let at = usize.toU32(pc)
       if !inlinable(opcode) { fail refuse(at, opcode, b"an opcode an inlined body cannot have") }
+      // Try regions and the uninitialized-local analysis are per function (catchTop, tdz are
+      // the caller's tables): a body that needs them is called, not inlined.
+      if isThrow(opcode) || opcode == op.OP_catch || opcode == op.OP_nip_catch || opcode == op.OP_gosub || opcode == op.OP_ret
+        || opcode == op.OP_set_loc_uninitialized || opcode == op.OP_get_loc_check || opcode == op.OP_put_loc_check
+        || opcode == op.OP_put_loc_check_init { fail refuse(at, opcode, b"a try region or an uninitialized local in an inlined body") }
       if opcode == op.OP_return {
         let v = self.pop()
         run self.releaseAll(at)
@@ -1751,7 +2068,10 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
   let shapeOf = run shape(input)
   let length = input.code.length()
   let mut t = Translator { f: Function.make(input.argumentCount, input.localCount), blockAt: List<u32>.make(), current: 0,
-    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites), argNumbers: List<u32>.make(),
+    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
+    catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
+    returns: run copyList(&shapeOf.returns),
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
     args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", exits: true, wideEquality: wideEquality(input), argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -1974,12 +2294,16 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
   if op.opcodeInfo(op.OP_fuse_prefix, true).size != 5 { fail refuse(NONE, op.OP_fuse_prefix, b"fusion prefix size changed") }
   let begin = u32.toUsize(header)
   let region = run loopRegion(input, header)
-  let shapeOf = run shapeAt(input, begin, true, calls, region.start, region.end)
+  let markers = run osrMarkers(input, header)
+  let shapeOf = run shapeAt(input, begin, true, calls, region.start, region.end, &markers)
   let back = run loopsBack(input, begin, calls, &region)
   if !back { fail refuse(header, byteAt(input, begin), b"every path around the loop leaves through an exit") }
   let length = input.code.length()
   let mut t = Translator { f: Function.make(input.argumentCount + input.localCount, input.localCount), blockAt: List<u32>.make(), current: 0,
-    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites), argNumbers: List<u32>.make(),
+    locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
+    catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
+    returns: run copyList(&shapeOf.returns),
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
     args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", exits: false, wideEquality: wideEquality(input), argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -2008,6 +2332,16 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
   t.f.argumentSlots = t.argSlots
   i = 0
   while i < t.argSlots { let a = run t.argument(i, header) let r = run t.f.emit(t.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, header) run t.locals.append(r) i = i + 1 }
+  // The catch markers under the header, as the catch instructions pushed them.
+  let mut m: usize = 0
+  while m < markers.length() {
+    let at = u32.toUsize(markers.get(m))
+    let handler = usize.toI64(at + 1) + i32.toI64(i32At(input, at + 1))
+    if handler > 2147483647 - 8 { fail refuse(header, op.OP_catch, b"a catch handler outside the code") }
+    let marker = run t.f.emit(t.current, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, ssa.IMM_CATCH + i64.wrappingToI32(handler), header)
+    run t.stack.append(marker)
+    m = m + 1
+  }
   // Speculated locals: one guard each (an exit at the header with every local as it came),
   // then the local is the boxed number, its frame value released.
   i = 0
