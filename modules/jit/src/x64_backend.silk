@@ -79,6 +79,15 @@ pub struct Emitter {
   pub settings: Settings,
   /// Where each value lives (x64_regalloc).
   places: Allocation,
+  /// Per value: its reads (operands, edge arguments, exit slots; an over-count only costs
+  /// speed), the reads that take it as an immediate, and the instruction defining it or NONE.
+  uses: List<u32>,
+  immediateUses: List<u32>,
+  defs: List<u32>,
+  /// Per value: its constant when a `const.i32` defines it.
+  constants: List<Option<i32>>,
+  /// The block being lowered: a jump to the next one falls through.
+  current: u32,
 }
 
 pub fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES)) }
@@ -104,7 +113,9 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   let frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
   let mut emitter = Emitter { a: Assembler.make(), blockLabels: List<Label>.make(), exitLabels: List<Label>.make(),
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
-    scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places }
+    scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places,
+    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0 }
+  run emitter.countUses(&function)
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
   let mut x: usize = 0
@@ -133,6 +144,7 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
   b = 0
   while b < function.blockCount() {
     let block = function.blocks.get(u32.toUsize(b))
+    emitter.current = b
     emitter.a.bind(emitter.blockLabels.get(u32.toUsize(b)))
     let mut i: u32 = 0
     while i < block.instCount {
@@ -191,6 +203,7 @@ impl Emitter {
       return ()
     }
     if op == Op.ConstI32 {
+      if self.onlyImmediate(inst.result) { return () }
       let out = self.at(inst.result)
       if out.kind == GPR { run self.a.movImm32(out.gpr, i32.wrappingToU32(inst.k)) return () }
       run self.a.storeImm(Width.W64, slotOf(inst.result), 0)
@@ -232,7 +245,9 @@ impl Emitter {
     if op == Op.Add || op == Op.Sub {
       run self.stressGuard(inst.exit)
       let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
-      if op == Op.Add { let place3 = self.at(inst.b) run aluWith(&mut self.a, Alu.Add, Reg.Rax, place3) } else { let place4 = self.at(inst.b) run aluWith(&mut self.a, Alu.Sub, Reg.Rax, place4) }
+      let mut alu = Alu.Sub
+      if op == Op.Add { alu = Alu.Add }
+      run self.operate(alu, Reg.Rax, inst.b)
       run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
       let place102 = self.at(inst.result) run putI32(&mut self.a, place102, Reg.Rax)
       return ()
@@ -257,9 +272,10 @@ impl Emitter {
       return ()
     }
     if op == Op.Cmp {
+      // A compare whose only reader is the branch right after it is that branch's flags.
+      if self.fusedCompare(&function, inst) { return () }
       run self.a.movImm32(Reg.R9, 0)
-      let place7 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place7)
-      let place8 = self.at(inst.b) run aluWith(&mut self.a, Alu.Cmp, Reg.Rax, place8)
+      run self.compare(inst)
       run self.a.setcc(condition(inst.k), Reg.R9)
       let place104 = self.at(inst.result) run putI32(&mut self.a, place104, Reg.R9)
       return ()
@@ -328,12 +344,33 @@ impl Emitter {
       return ()
     }
     if op == Op.Branch {
+      // taken: the condition under which the first (true) edge is followed.
+      let mut taken = Cond.NotEqual
+      let mut untaken = Cond.Equal
+      let def = self.defs.get(u32.toUsize(inst.a))
+      if def != NONE && self.fusedCompare(&function, function.inst(def)) {
+        let compared = function.inst(def)
+        run self.compare(compared)
+        taken = condition(compared.k) untaken = condition(opposite(compared.k))
+      } else {
+        let place = self.at(inst.a)
+        if place.kind == GPR { run self.a.test(Width.W32, place.gpr, place.gpr) }
+        else { run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a)) run self.a.test(Width.W32, Reg.Rax, Reg.Rax) }
+      }
+      // An edge without moves is a conditional jump straight to its block.
+      if !self.moves(&function, inst.edge) {
+        run self.a.jcc(taken, self.blockLabels.get(u32.toUsize(function.edge(inst.edge).target)))
+        run self.edge(&function, inst.edge + 1)
+        return ()
+      }
+      if !self.moves(&function, inst.edge + 1) {
+        run self.a.jcc(untaken, self.blockLabels.get(u32.toUsize(function.edge(inst.edge + 1).target)))
+        run self.edge(&function, inst.edge)
+        return ()
+      }
       let otherwise = run self.a.label()
-      let condition = self.at(inst.a)
-      if condition.kind == GPR { run self.a.test(Width.W32, condition.gpr, condition.gpr) }
-      else { run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a)) run self.a.test(Width.W32, Reg.Rax, Reg.Rax) }
-      run self.a.jcc(Cond.Equal, otherwise)
-      run self.edge(&function, inst.edge)
+      run self.a.jcc(untaken, otherwise)
+      run self.edgeThen(&function, inst.edge, false)
       self.a.bind(otherwise)
       run self.edge(&function, inst.edge + 1)
       return ()
@@ -441,6 +478,10 @@ impl Emitter {
   }
   /// Moves an edge's arguments into its target's parameters, then jumps there.
   effect fn edge(self: &mut Self, function: &Function, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.edgeThen(&function, index, true)
+  }
+  /// edge, where last says whether its code ends the block (so a jump to the next block falls through).
+  effect fn edgeThen(self: &mut Self, function: &Function, index: u32, last: bool) -> () ! OutOfMemoryError ? &mut Allocator {
     let edge = function.edge(index)
     let target = function.blocks.get(u32.toUsize(edge.target))
     // A parallel move: emit any move whose destination no pending move still reads; when
@@ -480,7 +521,93 @@ impl Emitter {
         run self.park(&function, parked)
       }
     }
-    run self.a.jmp(self.blockLabels.get(u32.toUsize(edge.target)))
+    if !last || edge.target != self.current + 1 { run self.a.jmp(self.blockLabels.get(u32.toUsize(edge.target))) }
+  }
+  /// Whether following edge index moves any value.
+  fn moves(self: &Self, function: &Function, index: u32) -> bool {
+    let edge = function.edge(index)
+    let target = function.blocks.get(u32.toUsize(edge.target))
+    let mut i: u32 = 0
+    while i < edge.argCount {
+      if self.key(function.edgeArg(edge, i)) != self.key(function.paramAt(target, i)) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  effect fn countUses(self: &mut Self, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = u32.toUsize(function.valueCount())
+    run self.uses.appendRepeated(0, count)
+    run self.immediateUses.appendRepeated(0, count)
+    run self.defs.appendRepeated(NONE, count)
+    run self.constants.appendRepeated(Option<i32>.none(), count)
+    let mut i: usize = 0
+    while i < function.insts.length() {
+      let inst = function.insts.get(i)
+      if inst.result != NONE && inst.result < function.valueCount() {
+        self.defs.set(u32.toUsize(inst.result), usize.toU32(i))
+        if inst.op == Op.ConstI32 { self.constants.set(u32.toUsize(inst.result), Option<i32>.some(inst.k)) }
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < function.insts.length() {
+      let inst = function.insts.get(i)
+      if inst.a != NONE && inst.a < function.valueCount() { self.read(inst.a) }
+      if inst.b != NONE && inst.b < function.valueCount() {
+        self.read(inst.b)
+        if (inst.op == Op.Add || inst.op == Op.Sub || inst.op == Op.Cmp) && self.constant(&function, inst.b) {
+          let at = u32.toUsize(inst.b)
+          let before = self.immediateUses.get(at)
+          self.immediateUses.set(at, before + 1)
+        }
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < function.edgeArgs.length() { self.read(function.edgeArgs.get(i)) i = i + 1 }
+    i = 0
+    while i < function.slots.length() { self.read(function.slots.get(i).value) i = i + 1 }
+  }
+  fn read(self: &mut Self, v: u32) -> () {
+    if v == NONE || u32.toUsize(v) >= self.uses.length() { return () }
+    let before = self.uses.get(u32.toUsize(v))
+    self.uses.set(u32.toUsize(v), before + 1)
+  }
+  fn constant(self: &Self, function: &Function, v: u32) -> bool {
+    let def = self.defs.get(u32.toUsize(v))
+    return def != NONE && function.inst(def).op == Op.ConstI32
+  }
+  fn onlyImmediate(self: &Self, v: u32) -> bool {
+    return self.uses.get(u32.toUsize(v)) == self.immediateUses.get(u32.toUsize(v))
+  }
+  /// Whether compare's only reader is its block's terminator, a branch, with no code between.
+  fn fusedCompare(self: &Self, function: &Function, compare: Inst) -> bool {
+    if compare.op != Op.Cmp || self.uses.get(u32.toUsize(compare.result)) != 1 { return false }
+    let block = function.blocks.get(u32.toUsize(compare.block))
+    let last = block.firstInst + block.instCount - 1
+    let branch = function.inst(last)
+    if branch.op != Op.Branch || branch.a != compare.result { return false }
+    // Find compare, then only code-free instructions until the branch.
+    let mut i = block.firstInst
+    while i < last && function.inst(i).result != compare.result { i = i + 1 }
+    i = i + 1
+    while i < last { if function.inst(i).op != Op.Release { return false } i = i + 1 }
+    return true
+  }
+  /// The flags of compare's operands (it stores nothing).
+  effect fn compare(self: &mut Self, compare: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    let left = self.at(compare.a)
+    let mut dst = Reg.Rax
+    if left.kind == GPR { dst = left.gpr } else { run getI32(&mut self.a, Reg.Rax, left) }
+    run self.operate(Alu.Cmp, dst, compare.b)
+  }
+  /// dst = dst op b, with b an immediate when it is a constant.
+  effect fn operate(self: &mut Self, alu: Alu, dst: Reg, b: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    match self.constants.get(u32.toUsize(b)) {
+      Option<i32>.Some { value } => { run self.a.aluImm(alu, Width.W32, dst, value) return () }
+      Option<i32>.None => ()
+    }
+    let place = self.at(b) run aluWith(&mut self.a, alu, dst, place)
   }
   /// What v's place is, as a number: equal numbers are the same storage.
   fn key(self: &Self, v: u32) -> u32 {
@@ -761,6 +888,15 @@ fn immTag(layout: &ValueLayout, k: i32) -> u32 {
   return layout.uninitialized()
 }
 fn immPayload(k: i32) -> i32 { if k == 3 { return 1 } return 0 }
+/// The comparison k's negation, for i32 operands (there is no NaN).
+fn opposite(k: i32) -> i32 {
+  if k == 0 { return 3 }
+  if k == 1 { return 2 }
+  if k == 2 { return 1 }
+  if k == 3 { return 0 }
+  if k == 4 { return 5 }
+  return 4
+}
 fn condition(k: i32) -> Cond {
   if k == 0 { return Cond.Less }
   if k == 1 { return Cond.LessOrEqual }
