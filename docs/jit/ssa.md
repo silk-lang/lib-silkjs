@@ -226,7 +226,9 @@ argument-web rule, simplify again.
 - dead code: pure instructions (constants, `arg`, `imm`, boxes, comparisons) with no use go;
 - parameter unboxing: a `value` parameter whose every incoming argument is an `i32` (or bool) or
   a box of one becomes an `i32` (`bool`) parameter, so a counted loop carries its counters
-  unboxed;
+  unboxed. Parameters that pass a value between each other unchanged (a loop header's and a
+  merge's, for a counter updated on one branch only) form a web and are unboxed together when
+  every argument entering the web from outside is a box of the kind;
 - common values: an instruction that repeats one dominating it (same operation, operands and
   constant) is replaced by it. Guards are included: a guard's outcome depends only on its
   operands, so once the dominating copy did not exit, the repeat cannot. The loop condition's

@@ -274,7 +274,8 @@ class Generator:
             # A double accumulator in a counted loop (docs/jit/doubles.md): it starts as an Int or
             # a double, so an int add may overflow or meet a double and deoptimize, after which
             # the recompiled function carries it as f64. Comparisons meet NaN and -0.
-            start = self.pick(["0", "0.5", "a", "-0", "b / 2", "2147483600"])
+            # A numeric start: a string a would double in length each time round.
+            start = self.pick(["0", "0.5", "+a", "-0", "b / 2", "2147483600"])
             step = self.pick(["d + i * 0.5", "d + 1073741824", "d / 3 + i", "d * 1.5 - b", "d + Math.sqrt(i)",
                               "Math.floor(d / 2) + i", "Math.abs(d - a) + 0.25", "-d + i", "d + (i | 0) / 7"])
             test = self.pick(["d < b", "d >= 0", "d !== d", "d === 0", "d > 1e9", "!(d <= a)"])
