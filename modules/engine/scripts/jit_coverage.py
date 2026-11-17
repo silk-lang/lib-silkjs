@@ -89,9 +89,12 @@ def counters(shell, path, cwd, timeout):
                                   if line.startswith("jit: deoptimized at: "))
     stuck = collections.Counter(line[len("jit: refused after deoptimizing at: "):] for line in done.stderr.splitlines()
                                 if line.startswith("jit: refused after deoptimizing at: "))
+    # "jit: deopt operands: <op> <decisive>/<next>" follows a deopt-site line (J2, cb9be3f).
+    operands = collections.Counter(line[len("jit: deopt operands: "):] for line in done.stderr.splitlines()
+                                   if line.startswith("jit: deopt operands: "))
     errors = [line for line in done.stdout.splitlines() if "ERROR" in line]
     return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "deopted": dict(deopted),
-            "stuck": dict(stuck),
+            "stuck": dict(stuck), "operands": dict(operands),
             "errors": errors}
 
 
@@ -254,6 +257,13 @@ def main():
     if stuck:
         print("\nsites of functions refused after deoptimizing (widened sites included), by opcode:")
         for name, count in stuck.most_common(12):
+            print("  %5d  %s" % (count, name))
+    operands = collections.Counter()
+    for entry in results.values():
+        operands.update(entry["counters"].get("operands", {}))
+    if operands:
+        print("\ndeopt sites by opcode and operand kinds met at compile time (decisive/next):")
+        for name, count in operands.most_common(16):
             print("  %5d  %s" % (count, name))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
