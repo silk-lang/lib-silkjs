@@ -467,11 +467,66 @@ Open finding (L, worker-measured, sent to H): Box2D executes 4.3 percent more in
 `--jit`, with only 2 functions compiled. Hypothesis, read not proved: linking sets
 `STUB_FRAME_CELLS`, the inline call path refuses, and callers build a real arguments object.
 
-Not merged yet (heads as reported by the workers; each conflicts with K's merge in the SSA and
-backend files and must merge the integration branch first): I `c84db2e` on
-`claude/project-thread-xytm2y` (OSR, poll re-entry, loop hotness), H `fd3a8307` on
-`claude/project-thread-g1zedu` (direct compiled entry from inline call sites), J `b7b8c7f` on
-`claude/project-thread-k45qjk` (real retain/release, property reads through a helper).
+Second round of merges (2026-11-17, lead's reruns on this host):
+
+| Head | Contains | Lead's checks |
+| --- | --- | --- |
+| `34c3ae88` | H: compiled entry from inline call sites, `callLinked` (apply, call, lazy arguments run a linked target frameless), bodies under 3 bytecode bytes refused, `--jit-calls` (off by default) | JIT tests 68; builds exit 0; v8bench vs `8e5a87b3` at most 1.002x; differential 3000 with `plain,observed,jit,jit-stress,jit-calls,jit-calls-stress,node` agree 3000; self-test PASS; native 564/2 known |
+| `427f9fca` | H: direct calls to compiled leaf callees through helper `CALL_FAST` (index 32) | JIT tests 68; v8bench vs `34c3ae88` 1.000x; differential 3000 agree (jit-calls direct-calls 24690); native 564/2 known |
+| `b2b8778f` | K round 2 (`14f848c`: compare fused into branch, i32 immediates, register hints, loop-depth spill weights) and L's `6229fac` | JIT tests 69; engine binary identical to `427f9fca`; differential 3000 agree; self-test PASS |
+| `295c2bdb` | I (`1d0ad3d`: OSR at back-edge polls, loop hotness, OSR-only entries), J (`a182e6e`: `this`, field reads and stores, atoms, globals, own scope slots, fast array elements; NaN truthiness fix), K (`d2ee2cf`: NaN branch tests, differential number loops with NaN and Infinity), H (`94d3b67a`: activation side stack, native nested calls, suspended-frame experiment removed) | JIT tests 70; encodings current; builds exit 0; v8bench vs the previous engine 1.000x on all eight (regexp's count is bimodal, 1359.8M or 1382.4M, on every binary); differential 3000 with seven configs agree 3000; self-test PASS; native 564/2 known |
+
+Notes on that record:
+
+- Box2D: the 4.3 percent `--jit` cost is gone (H MEASURED 2506.5M vs 2509.5M plain; L confirmed
+  independently, 1.0008x). The cause was `callInline` refusing linked targets on the apply, call
+  and lazy-arguments paths.
+- Intermediate head `4a0d4fbe` (I and K's NaN generator without J) had 4 differential
+  mismatches, all F64 truthiness at NaN (`ne.f64 x, 0`); J's `0524c48` fixes it (`abs` then
+  `gt 0`). The lead reproduced the 4 programs failing before and passing after.
+- Intermediate head `9cf82b2e` (I, J, K without H's later work) failed one JIT test,
+  `callsFromCompiledCode`; H's merge `e5d7037c` adapts it. It was never pushed.
+- The lead once started a gate while the previous one was still in its native-suite build; that
+  native run was OOM-killed (exit 137) and its result discarded. The native result above is from
+  the later, clean run.
+- Workers' containers have `llvm-mc` 18.1.3, so `encodings.py --check` exits 1 there on the
+  header line only; it is current on the lead's host (22.1.8).
+
+Kernels at `295c2bdb`, MEASURED by the lead (`jit_kernels.py --rounds 7`, ms per `kernel()`
+call, median of 7; the host was noisier than for the table above, compare ratios not rows):
+
+| Kernel | silkjs | silkjs-jit | silkjs-jit-calls | v8-jit | jsc-jit | jit vs v8 / jsc |
+| --- | --- | --- | --- | --- | --- | --- |
+| sum-calls | 157.2 | 27.6 | 24.9 | 16.7 | 19.7 | 1.7x / 1.4x |
+| sum-long | 241.3 | 54.8 | 70.7 | 21.8 | 13.1 | 2.5x / 4.2x |
+| nested | 210.0 | 37.0 | 33.3 | 11.9 | 27.7 | 3.1x / 1.3x |
+| calls | 236.8 | 243.4 | 226.1 | 6.6 | 8.7 | 36.7x / 28.1x |
+| method | 344.9 | 333.1 | 354.2 | 9.9 | 17.3 | 33.6x / 19.2x |
+| doubles | 168.2 | 26.0 | 24.7 | 15.8 | 20.5 | 1.6x / 1.3x |
+| array-sum | 253.0 | 117.0 | 118.3 | 17.1 | 19.6 | 6.9x / 6.0x |
+| typed-array | 420.9 | 433.2 | 415.3 | 12.2 | 10.6 | 35.6x / 41.0x |
+
+Loops, integer and double arithmetic are within 1.3x to 3.1x of V8 and JSC. Calls are the
+problem: compiled code that calls is no faster than the interpreter, because each call leaves
+through a C helper. Worker-measured on deltablue with `--jit-calls` (callgrind): 1.164x plain at
+`427f9fca`, 2.37x once J made 45 of 63 hot functions compile, 1.90x after J's inline field
+reads and H's inlined activation push (`a701fc89`, not merged yet). That is why `--jit-calls`
+stays off by default, and why Octane's geomean has not moved (L at `34c3ae88`: silkjs 5763,
+silkjs-jit 5829, silkjs-jit-calls 5287, v8-jit 52964, jsc-jit 51590).
+
+In progress, not merged (heads as reported by the workers):
+
+- H `a701fc89` on `claude/project-thread-g1zedu`: `new` from compiled code, inlined activation
+  push; next is calling the callee's code from machine code (the entry looked up through the
+  table, no address in code).
+- J `484f69d` on `claude/project-thread-k45qjk`: field reads inline through the bytecode's own
+  inline key (about 29 instructions, 21 when borrowed), inline release, inline array length and
+  elements, borrowed field results, transition stores, outer captured variables.
+- K: making the recompile path converge (7 deltablue functions refused with "deoptimized again
+  where it was already widened"), tag tests and stack ops (`if_nullish8`, `is_undefined_or_null`,
+  `insert2`), then typed arrays and Math.
+- L `250f9a9` on `claude/project-thread-6ys4ab`: scorecard section for `34c3ae88`, a
+  `silkjs-jit-calls` column.
 
 ## Next steps
 
