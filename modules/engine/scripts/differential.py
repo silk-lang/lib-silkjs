@@ -77,6 +77,8 @@ BUILTIN = {
     "jit": "{jit} --jit --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-stress": "{jit} --jit --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-calls": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-eager": "{jit} --jit --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-calls-eager": "{jit} --jit --jit-calls --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-calls-stress": "{jit} --jit --jit-calls --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
 }
 REFERENCES = {"node"}
