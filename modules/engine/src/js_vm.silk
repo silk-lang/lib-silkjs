@@ -18,6 +18,7 @@ import silk.num.u64
 import runtime_memory { AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapCell, HeapHeader }
+import thin_list { BoxList }
 import js_strings { Strings }
 import js_atoms { AtomTable }
 import js_value { ValueBits }
@@ -858,6 +859,12 @@ pub unsafe fn fastCall(frame: &compiled.CompiledFrame, block: *mut u64) -> u32 {
     entry.activationWords = usize.toU32(compiled.stateWords(u16.toUsize(code.variableCount), u16.toUsize(code.stackSize)))
     let mut contextAnchor = () let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, realm)
     entry.counter = Pointer.fromMutRef<i32>(&mut context.interruptCounter)
+    if u32.toUsize(entry.activationWords) <= compiled.CALL_STATE_WORDS {
+      // Machine code may call it directly from now on (DIRECT_*).
+      entry.directRealm = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(realm)
+      entry.directCode = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(start)
+      entry.directArity = usize.toU32(parameters)
+    }
   }
   drop code
   if u32.toUsize(entry.activationWords) > compiled.CALL_STATE_WORDS { return compiled.FAST_GENERIC }
@@ -4833,4 +4840,77 @@ unsafe effect fn instruction<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
   let hex = b"0123456789abcdef" let encoded = [hex[u8.toUsize(opcode / 16)], hex[u8.toUsize(opcode % 16)]]
   message.append(&encoded)
   return run hooks.throwError(unsafe lendRealm(&machine.context, machine.context), NativeErrorKind.Internal, message.bytes())
+}
+// ---- direct calls from machine code (docs/jit/compiled-entry.md 7.7) ----
+
+/// The first js_compiled.DIRECT_* constant that does not match this build's layout, for
+/// function (a bytecode closure linked as a table entry of runtime): field 0 when all hold,
+/// else its 1-based place in the list below and the offset this build has.
+pub struct DirectLayoutCheck { pub field: u32, pub actual: i64 }
+fn offset(base: usize, at: usize) -> i64 { return usize.wrappingToI64(usize.wrappingSubtract(at, base)) }
+pub unsafe fn directLayoutHolds(runtime: *mut HeapHeader, function: ValueBits) -> DirectLayoutCheck {
+  let anchor = ()
+  let mut checks: [i64; 24] = [0; 24]
+  let mut wanted: [i64; 24] = [0; 24]
+  let mut n: usize = 0
+  // 1: the tag byte of an object value.
+  let tag = u8.toU32(unsafe Pointer.read<u8>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const u8>(Pointer.fromRef<ValueBits>(&function))))
+  checks[n] = u32.toI64(tag) wanted[n] = u32.toI64(compiled.DIRECT_OBJECT_TAG) n = n + 1
+  let object = core.reference(function)
+  let base = Pointer.address<HeapHeader>(object)
+  // 2: the class at DIRECT_OBJECT_CLASS; 3: the bytecode class.
+  let at = i32.toUsize(compiled.DIRECT_OBJECT_CLASS)
+  let word = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u64>(object)), at / 8))
+  let class = u64.wrappingToU32(u64.shiftRight(word, usize.toU64((at % 8) * 8)) & 0xffff)
+  checks[n] = u32.toI64(class) wanted[n] = u32.toI64(unsafe classId(function)) n = n + 1
+  checks[n] = u32.toI64(classes.JS_CLASS_BYTECODE_FUNCTION) wanted[n] = u32.toI64(compiled.DIRECT_BYTECODE_CLASS) n = n + 1
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let mut bytecode = Pointer.null<HeapHeader>()
+  match &data.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => {
+      // 4-6: the closure's fields; 7: the captured cells after the list's block.
+      checks[n] = offset(base, Pointer.address<*mut HeapHeader>(Pointer.fromRef<*mut HeapHeader>(&closure.bytecode))) wanted[n] = i32.toI64(compiled.DIRECT_CLOSURE_BYTECODE) n = n + 1
+      let list = Pointer.address<BoxList<?*mut HeapHeader>>(Pointer.fromRef<BoxList<?*mut HeapHeader>>(&closure.varRefs))
+      checks[n] = offset(base, list) wanted[n] = i32.toI64(compiled.DIRECT_CLOSURE_REFERENCES) n = n + 1
+      checks[n] = offset(base, Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&closure.scope))) wanted[n] = i32.toI64(compiled.DIRECT_CLOSURE_SCOPE) n = n + 1
+      if closure.varRefs.length() != 0 {
+        let block = usize.toU64(unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*const BoxList<?*mut HeapHeader>, *const usize>(Pointer.fromRef<BoxList<?*mut HeapHeader>>(&closure.varRefs))))
+        let first = Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0]))
+        checks[n] = offset(u64.toUsize(block), first) wanted[n] = i32.toI64(compiled.DIRECT_BOX_DATA) n = n + 1
+      }
+      bytecode = closure.bytecode
+    }
+    _ => { return DirectLayoutCheck { field: 100, actual: 0 } }
+  }
+  drop data
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(bytecode))
+  checks[n] = offset(Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(bytecode)), Pointer.address<u32>(Pointer.fromRef<u32>(&code.compiled))) wanted[n] = i32.toI64(compiled.DIRECT_BYTECODE_INDEX) n = n + 1
+  let index = code.compiled
+  drop code
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let r = Pointer.address<HeapHeader>(runtime)
+  checks[n] = offset(r, Pointer.address<bool>(Pointer.fromRef<bool>(&state.observeInstructions))) wanted[n] = i32.toI64(compiled.DIRECT_RUNTIME_OBSERVE) n = n + 1
+  checks[n] = offset(r, Pointer.address<?*mut CompiledEntry>(Pointer.fromRef<?*mut CompiledEntry>(&state.compiled.entries))) wanted[n] = i32.toI64(compiled.DIRECT_RUNTIME_ENTRIES) n = n + 1
+  checks[n] = offset(r, Pointer.address<u32>(Pointer.fromRef<u32>(&state.compiled.count))) wanted[n] = i32.toI64(compiled.DIRECT_RUNTIME_COUNT) n = n + 1
+  drop state
+  if index == 0 { return DirectLayoutCheck { field: 101, actual: 0 } }
+  let slot = unsafe compiled.entryAt(runtime, index)
+  let entry = unsafe Pointer.borrow<(), CompiledEntry>(&anchor, slot)
+  let e = Pointer.address<CompiledEntry>(slot)
+  checks[n] = u32.toI64(usize.toU32(Layout.of<CompiledEntry>().bytes)) wanted[n] = u32.toI64(compiled.DIRECT_ENTRY_BYTES) n = n + 1
+  checks[n] = offset(e, Pointer.address<?*const u8>(Pointer.fromRef<?*const u8>(&entry.code))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_CODE) n = n + 1
+  checks[n] = offset(e, Pointer.address<?*mut u8>(Pointer.fromRef<?*mut u8>(&entry.data))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_DATA) n = n + 1
+  checks[n] = offset(e, Pointer.address<?*mut u8>(Pointer.fromRef<?*mut u8>(&entry.env))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_ENV) n = n + 1
+  checks[n] = offset(e, Pointer.address<u64>(Pointer.fromRef<u64>(&entry.runs))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_RUNS) n = n + 1
+  checks[n] = offset(e, Pointer.address<?*mut i32>(Pointer.fromRef<?*mut i32>(&entry.counter))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_COUNTER) n = n + 1
+  checks[n] = offset(e, Pointer.address<u32>(Pointer.fromRef<u32>(&entry.directArity))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_ARITY) n = n + 1
+  checks[n] = offset(e, Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&entry.directRealm))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_REALM) n = n + 1
+  checks[n] = offset(e, Pointer.address<?*const u8>(Pointer.fromRef<?*const u8>(&entry.directCode))) wanted[n] = i32.toI64(compiled.DIRECT_ENTRY_SOURCE) n = n + 1
+  // The table index is 1-based: entry index sits at entries + (index - 1) * the entry size.
+  let mut i: usize = 0
+  while i < n {
+    if checks[i] != wanted[i] { return DirectLayoutCheck { field: usize.toU32(i + 1), actual: checks[i] } }
+    i = i + 1
+  }
+  return DirectLayoutCheck { field: 0, actual: 0 }
 }
