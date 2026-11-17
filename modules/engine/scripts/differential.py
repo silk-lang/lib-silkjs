@@ -79,6 +79,8 @@ BUILTIN = {
     "jit": "{jit} --jit --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-stress": "{jit} --jit --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-calls": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-eager": "{jit} --jit --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-calls-eager": "{jit} --jit --jit-calls --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-calls-stress": "{jit} --jit --jit-calls --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-inline-stress": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stress=5 --jit-deopt-limit=0 --jit-stats={stats} {file}",
 }
@@ -165,7 +167,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "tries", "tries", "tdz",
+           "calls", "calls", "fields", "elements", "globals", "method", "literals", "operators", "classes", "tests", "shuffles", "instanceof", "tries", "tries", "tdz",
            "protos", "protos", "protos", "iteration", "iteration"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
@@ -467,6 +469,33 @@ class Generator:
                         f"for (var key in o) {{ t = (t + key.length) | 0; {self.pick(['', 'if (key === \'k3\') delete o.k5;', 'if (key === \'k2\') o.extra = 1;'])} }} return t;")
             return (head + f"try {{ for (var v of {source}) {{ {step} {mutate} j++; }} }} catch (e) {{ t = __clamp(t + __err(e)); }} "
                     f"return [t, j, arr.length];")
+        if flavor == "literals":
+            # Object, array and regexp literals and string constants in a hot function (generic
+            # instruction exits): fields from the arguments, computed keys, deletes.
+            key = self.pick(["'k'", "'k' + (a & 1)", "typeof b"])
+            regexp = self.pick(["/a+/g", "/[0-9]/", "/x/y"])
+            return (f"var o = {{x: {self.clamped()}, y: 's', [{key}]: b}}; var r = {regexp}; var arr = [a, o.x, 'z']; "
+                    f"var t = 0; for (var i = 0; i < {self.pick([2, 5])}; i++) {{ t = t + (r.test('aa' + i + a) ? 1 : 0) + arr.length; }} "
+                    f"delete o.y; return [__clamp(o.x), 'y' in o ? 1 : 0, {key} in o ? 1 : 0, t, r.lastIndex, arr[2]];")
+        if flavor == "operators":
+            # typeof, in, instanceof, delete and ** on mixed types, with the throwing forms
+            # (in and instanceof of a primitive right side) caught in the function.
+            target = self.pick(["a", "b", "[a]", "{p: a}", "null", "Object(b)"])
+            ctor = self.pick(["Object", "Array", "Number", "b", "{}"])
+            # Integer exponents of small bases only: pow of other operands differs from V8 in
+            # the last place (the interpreter's, too), which is not what this flavour tests.
+            power = self.pick(["a ** 2", "((a | 0) % 7) ** ((b | 0) % 4)", "2 ** -1", "(-0) ** 3", "((b | 0) & 15) ** 3"])
+            return (f"var v = {target}; var w = 0; for (var i = 0; i < {self.pick([1, 3, 6])}; i++) {{ "
+                    f"try {{ w = w + ('p' in v ? 1 : 2); }} catch (e) {{ w = w + 10; }} "
+                    f"try {{ w = w + (v instanceof {ctor} ? 100 : 200); }} catch (e) {{ w = w + 1000; }} }} "
+                    f"var d = {{p: 1, q: 2}}; delete d[typeof a === 'number' ? 'p' : 'q']; "
+                    f"return [typeof v, w, __clamp({power}), 'p' in d ? 1 : 0, typeof (v && v.p)];")
+        if flavor == "classes":
+            # Methods with private fields, `#p in`, computed method names (the class is made
+            # once, below, so its methods run hot).
+            return (f"var k = new __K{self.functions}(a); var s = 0; for (var i = 0; i < {self.pick([1, 4])}; i++) {{ "
+                    f"s = s + __clamp(k.add(i)); }} return [__clamp(k.get()), s, __K{self.functions}.has(k) ? 1 : 0, "
+                    f"__K{self.functions}.has({{}}) ? 1 : 0, k['m' + (b & 1)]()];")
         if flavor == "tests":
             # Nullish, undefined and typeof tests (J2) on values of every type, as branch
             # conditions and as values; `??` keeps its operand on one edge only.
@@ -505,6 +534,11 @@ class Generator:
             body = f"if (a === __at) throw {self.thrown()}; " + body
             self.guarded.append(name)
         self.functions += 1
+        if flavor == "classes":
+            klass = (f"var __K{self.functions - 1} = class {{ #p; constructor(v) {{ this.#p = __clamp(v); }} get() {{ return this.#p; }} "
+                     f"add(x) {{ this.#p = __clamp(this.#p + x); return this.#p; }} static has(o) {{ return #p in o; }} "
+                     f"m0() {{ return 0; }} ['m' + 1]() {{ return typeof this.#p; }} }};")
+            return f"{klass} function {name}(a, b) {{ {body} }}"
         if flavor == "closure" and self.random.random() < 0.5:
             # A closure made once, whose captured state lives across every call of the program.
             return (f"var {name} = (function () {{ var c0 = {self.integer()}, c1 = 0; return function (a, b) {{ "
