@@ -394,6 +394,29 @@ class Generator:
         a, b = self.value(kinds[0]), self.value(kinds[1])
         return [f"for (var i = 0; i < {count}; i++) {{ __try({target}, {a}, {b}); }}", f"__phase('{phase}');"]
 
+    def longLoops(self, stable: tuple[str, str]) -> list[str]:
+        """Loops long enough for an interrupt poll (every 10000 back edges and calls) to land in
+        them: on-stack replacement into a running frame, called once from the top level and
+        from another function's loop (an inline frame), with stable and then changed argument
+        types. Heap values in locals cross the entry and the exits; an update can overflow
+        int32, and statements outside the first subset make side exits (docs/jit/osr.md)."""
+        update = self.pick(["t + i", "t - a", "t * 3 + i", "t + a * i", "a - t + i", "t + i * i - b", "t + 3"])
+        side = self.pick(["", "", "o.x = o.x + 1; ", "t = t | 0; ", "if ((i & 1023) === 0) s = s + i; ",
+                          "if (i === n - 2) o = [t]; ", "u = u + 0.5; "])
+        lines = [f"function long0(a, b, n) {{ var t = {self.pick(['0', 'a', 'b', '1'])}; var o = {{x: 1}}; var s = 's'; var u = 0; "
+                 f"for (var i = 0; i < n; i++) {{ t = {update}; if (t > 100000 || t < -100000) t = {self.pick(['0', 'b', 't % 7'])}; {side}}} "
+                 f"return [t, o.x, o.length, s.length, u]; }}",
+                 f"function long1(a, b, n) {{ var r = 0; for (var k = 0; k < 3; k++) {{ r = __clamp(r + long0(a, b, n + k)[0]); }} return r; }}",
+                 f"function long2(n) {{ var t = 0; while (n > 0) {{ var j = 0; do {{ t = t + j; j = j + 1; }} while (j < 50); "
+                 f"if (t > 1000000) t = t - 1000000; n = n - 1; }} return t; }}"]
+        a, b = re.sub(r"\bi\b", "7", self.value(stable[0])), re.sub(r"\bi\b", "3", self.value(stable[1]))
+        changed = re.sub(r"\bi\b", "5", self.value(self.pick(["double", "string", "objectA", "odd", "big"])))
+        calls = [(f"long0({a}, {b}, {self.pick([12000, 25000])})", "long loop"), (f"long1({a}, {b}, {self.pick([4000, 9000])})", "long inline"),
+                 (f"long2({self.pick([300, 700])})", "long nested"), (f"long0({changed}, {b}, 12000)", "long changed")]
+        for call, phase in calls:
+            lines += [f"try {{ __mix({call}); }} catch (e) {{ __mix('threw ' + __err(e)); }}", f"__phase('{phase}');"]
+        return lines
+
     def program(self) -> str:
         lines = [f"// differential.py seed {self.seed} hot {self.hot}"]
         count = self.random.randrange(2, 6)
@@ -445,6 +468,7 @@ class Generator:
         # Back to the stable types: code that deoptimised must still be right, and may tier up again.
         for name in names[:2]:
             lines += self.loop(f"again {name}", self.hot, name, stable)
+        lines += self.longLoops(stable)
         lines.append("__phase('end');")
         return PRELUDE + "\n".join(lines) + "\n"
 
