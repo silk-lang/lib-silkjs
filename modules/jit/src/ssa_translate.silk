@@ -87,6 +87,7 @@ pub fn supported(opcode: u8) -> bool {
     || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode)
     || exceptionOpcode(opcode)
     || opcode == op.OP_instanceof
+    || genericOpcode(opcode)
 }
 
 /// Stream P's opcodes (docs/jit/compiled-entry.md 3.1): `throw` and `throw_error` leave
@@ -98,7 +99,7 @@ fn isThrow(opcode: u8) -> bool { return opcode == op.OP_throw || opcode == op.OP
 
 /// Where on-stack-replacement code leaves for the interpreter: outside the subset, or a call
 /// (OSR code runs on a live, possibly inline frame with no call block; docs/jit/osr.md).
-fn osrExit(opcode: u8, calls: bool) -> bool { return !supported(opcode) || (!calls && callOpcode(opcode)) }
+fn osrExit(opcode: u8, calls: bool) -> bool { return !supported(opcode) || (!calls && callOpcode(opcode)) || (genericOpcode(opcode) && opcode != op.OP_instanceof) }
 /// Whether OSR code for input may make calls: asked for, no captured local, and no
 /// arguments object or direct eval that could alias the frame's cells.
 fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
@@ -112,6 +113,18 @@ fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
     pc = pc + size
   }
   return true
+}
+
+/// Stream N's generic instruction exits, group 1: plain stack-effect opcodes with no slot
+/// operand and no control flow, pushing at most one value (js_vm.genericStep runs them).
+pub fn genericOpcode(opcode: u8) -> bool {
+  return opcode == op.OP_typeof || opcode == op.OP_instanceof || opcode == op.OP_in || opcode == op.OP_delete
+    || opcode == op.OP_pow || opcode == op.OP_to_object || opcode == op.OP_to_propkey || opcode == op.OP_object
+    || opcode == op.OP_array_from || opcode == op.OP_regexp || opcode == op.OP_define_field || opcode == op.OP_set_name
+    || opcode == op.OP_set_proto || opcode == op.OP_define_method || opcode == op.OP_define_method_computed
+    || opcode == op.OP_get_super || opcode == op.OP_get_private_field || opcode == op.OP_put_private_field
+    || opcode == op.OP_define_private_field || opcode == op.OP_private_in || opcode == op.OP_add_brand
+    || opcode == op.OP_push_bigint_i32 || opcode == op.OP_private_symbol
 }
 
 /// Workstream H's calls: `call0`..`call3`, `call`, `call_method` and `call_constructor`.
@@ -868,7 +881,8 @@ impl Translator {
       let constant = input.numberConstants.get(index)
       if constant.kind == CONSTANT_INT { let c = run self.constant(u32.wrappingToI32(u64.wrappingToU32(constant.bits)), at) run self.push(c) return true }
       if constant.kind == CONSTANT_DOUBLE { let c = run self.doubleConstant(f64.fromBits(constant.bits), at) run self.push(c) return true }
-      fail refuse(at, opcode, b"a constant that is not a number")
+      // A string, regexp source or other constant: the engine pushes it.
+      return run self.generic(input, pc)
     }
     if opcode == op.OP_div { run self.numberBinary(opcode, at) return true }
     if opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8 {
@@ -1304,6 +1318,7 @@ impl Translator {
     if objectOpcode(opcode) { return run self.object(input, pc) }
     if callOpcode(opcode) { return run self.call(input, pc) }
     if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
+    if genericOpcode(opcode) { return run self.generic(input, pc) }
     fail refuse(at, opcode, b"opcode outside the subset")
   }
 
@@ -1365,6 +1380,38 @@ impl Translator {
     run sideExit(&mut self, pc)
   }
 
+  // ---- generic instruction exits (stream N) ----
+
+  /// An instruction the engine runs as the interpreter does (docs/jit/compiled-entry.md 7.8):
+  /// a `call` flagged calls.GENERIC whose arguments are the instruction's operands, bottom
+  /// first, and whose result is what it pushes (undefined, released, when it pushes none).
+  /// The exit before it holds the operands, so a throw is the interpreter's to unwind.
+  effect fn generic(self: &mut Self, input: &FunctionInput, pc: usize) -> bool ! Refusal | OutOfMemoryError ? &mut Allocator {
+    let opcode = byteAt(input, pc)
+    let at = usize.toU32(pc)
+    let info = op.opcodeInfo(opcode, true)
+    let mut count = u8.toUsize(info.pops)
+    if opcode == op.OP_array_from { count = u16.toUsize(u16At(input, pc + 1)) }
+    if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many operands for a generic instruction") }
+    if self.stack.length() < count { fail refuse(at, opcode, b"generic instruction operands missing") }
+    // Boxes come before the call.arg run, which must stay contiguous.
+    let mut operands = List<u32>.make()
+    let mut i: usize = 0
+    while i < count { let given = self.top(count - i) let boxed = run self.boxed(given, at) run operands.append(boxed) i = i + 1 }
+    let none = run self.imm(Imm.Undefined, at)
+    i = 0
+    while i < count {
+      drop run self.f.emit(self.current, Op.CallArg, false, Type.I32, Own.Unboxed, operands.get(i), NONE, usize.toI32(i), at)
+      i = i + 1
+    }
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, none, none, usize.toI32(count) | calls.GENERIC, at)
+    let last = self.f.lastInst() run self.exitHere(last, at)
+    i = 0
+    while i < count { let v = self.pop() run self.release(v, at) i = i + 1 }
+    if info.pushes == 0 { run self.release(r, at) } else { run self.push(r) }
+    return true
+  }
+
   // ---- calls (workstream H) ----
 
   /// A call through the engine's call entry: the callee, its receiver (undefined unless a
@@ -1398,6 +1445,7 @@ impl Translator {
     }
     let mut k = usize.toI32(count)
     if construct { k = k | calls.CONSTRUCT }
+    if self.widened(at) { k = k | calls.ALWAYS }
     let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
     i = 0

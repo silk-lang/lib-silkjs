@@ -724,6 +724,10 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let pc = u64.toUsize(site & 0xffffffff)
   let count = compiled.siteCount(site)
   let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
+  if (site & compiled.SITE_GENERIC) != 0 {
+    let mut scratch = machine.*
+    return run unsafe compiledOp(&mut hooks, memory, &mut scratch, block)
+  }
   let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
   match Pointer.nonNullMut<Activation>(unsafe pushedCallee(block)) {
     Option<*mut Activation>.Some { value: root } => {
@@ -748,6 +752,7 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   // enough of these deopts unlink a caller whose calls stay interpreted. One not yet hot is
   // called here, which counts its entry.
   if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION
+    && (site & compiled.SITE_CALL_ALWAYS) == 0
     && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT)) == 0
     && unsafe reportedWithoutCode(machine.runtime, (unsafe activation.calleeOf(function)).bytecode) {
     return compiled.CALL_DEOPT
@@ -914,6 +919,83 @@ pub unsafe fn fastCall(frame: &compiled.CompiledFrame, block: *mut u64) -> u32 {
   }
   unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT), u64.bitOr(u32.toU64(exit), u64.shiftLeft(u32.toU64(index), 32)))
   return compiled.FAST_EXITED
+}
+/// The generic instruction exit compiled code left to make (the call block at block, its site
+/// SITE_GENERIC), run on machine, a scratch copy of the running frame's: the instruction at
+/// the site's pc runs as the interpreter runs it, with its operands (retained here, so the
+/// code keeps its own) as the operand stack. CALL_RETURNED with its result at CALL_AREA + 2,
+/// or CALL_THREW with what it left on the stack released and the exception pending.
+@inlineNever
+unsafe effect fn compiledOp<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, block: *mut u64) -> u64 ? &mut Allocator {
+  let words = unsafe Pointer.assumeManyMut<u64>(block)
+  let site = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_SITE))
+  let pc = u64.toUsize(site & 0xffffffff)
+  let count = compiled.siteCount(site)
+  let cells = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA))), 2)
+  let stack = unsafe Pointer.assumeManyMut<ValueBits>(cells)
+  let mut i: usize = 0
+  while i < count {
+    let bits = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(stack, i))
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(stack, i), unsafe bits.retained())
+    i = i + 1
+  }
+  machine.stack = cells
+  machine.stackTop = unsafe Pointer.atMut<ValueBits>(stack, count)
+  let opcode = unsafe machine.byteAt(pc)
+  let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+  unsafe machine.setPc(pc + 1)
+  // Backtraces name the instruction as the interpreter's would.
+  unsafe machine.publishPc()
+  let ran = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe genericStep(&mut hooks, memory, &mut machine, opcode), failed)
+  match move ran {
+    bool _ => {
+      if machine.pc() != pc + size { return Intrinsic.trap("a generic instruction moved control") }
+      if machine.sp() == 0 { unsafe Pointer.write<ValueBits>(cells, ValueBits.Undefined) }
+      return compiled.CALL_RETURNED
+    }
+    Failed { error } => {
+      if !unsafe restricted.rejected(machine.runtime) {
+        let _pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+      } else { drop error }
+      while machine.sp() != 0 { let left = unsafe machine.pop() unsafe locals.releaseIn(&mut hooks, &machine, left) }
+      return compiled.CALL_THREW
+    }
+  }
+}
+/// The opcodes a generic instruction exit runs (ssa_translate.genericOpcode), each through the
+/// interpreter's general implementation: never a fused or quick path, which may read the
+/// instructions after it.
+unsafe effect fn genericStep<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if opcode == op.OP_typeof { run unsafe operators.typeofValue(&mut hooks, &mut machine) return true }
+  if opcode == op.OP_delete { drop run unsafe properties.deleteOperation(&mut hooks, memory, &mut machine) return true }
+  if opcode == op.OP_pow || opcode == op.OP_to_object || opcode == op.OP_to_propkey { drop run unsafe operators.step(&mut hooks, memory, &mut machine, opcode) return true }
+  if opcode == op.OP_object || opcode == op.OP_regexp { drop run unsafe factories.step(&mut hooks, memory, &mut machine, opcode) return true }
+  if opcode == op.OP_array_from { drop run unsafe factories.arrayFrom(&mut hooks, memory, &mut machine) return true }
+  if opcode == op.OP_push_bigint_i32 || opcode == op.OP_push_const || opcode == op.OP_push_const8 { drop run unsafe values.step(&mut hooks, &mut machine, opcode) return true }
+  drop run unsafe objects.step(&mut hooks, memory, &mut machine, opcode)
+  return true
+}
+/// A Machine for the instruction an activation's code left to run (compiledOp): its frame's
+/// function, receiver, arguments and published stack frame, no locals.
+unsafe fn activationMachine(entry: *mut Activation) -> Machine {
+  let mut anchor = () let running = unsafe Pointer.borrowMut<(), Activation>(&mut anchor, entry)
+  let codeAnchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, running.frame.bytecode)
+  let empty = unsafe Intrinsic.pointerReinterpret<*mut Activation, *mut ValueBits>(entry)
+  let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(empty)
+  if code.constants.length() != 0 { constants = Pointer.fromRef<ValueBits>(&code.constants.asSlice()[0]) }
+  drop code
+  let cells = unsafe Intrinsic.pointerRequalify<*const ValueBits, *mut ValueBits>(running.cells)
+  return Machine { context: running.frame.context, callerContext: running.frame.context, runtime: running.frame.runtime,
+    bytecode: running.frame.bytecode, frame: running.stackFrame, code: running.frame.code, constants: constants,
+    closureReferences: running.frame.closureReferences, originalArguments: Pointer.fromRef<FrameSlots>(&running.argv),
+    arguments: cells, locals: empty, stack: empty, thisValue: running.receiver, newTarget: ValueBits.Undefined,
+    argumentCount: running.argv.count, ip: running.frame.code, stackTop: empty, record: Pointer.null<u8>(), scope: running.frame.scope }
 }
 /// Writes how a call through the engine went to the call block at words: CALL_RETURNED with
 /// the owned result, or CALL_THREW.
@@ -1221,11 +1303,18 @@ unsafe effect fn activationCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
   let site = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_SITE))
   let count = compiled.siteCount(site)
   let area = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(words, compiled.CALL_AREA)))
+  if (site & compiled.SITE_GENERIC) != 0 {
+    unsafe noteCall(&mut running, site)
+    drop running
+    unsafe publishActivations(runtime, entry)
+    let mut scratch = unsafe activationMachine(entry)
+    return run unsafe compiledOp(&mut hooks, memory, &mut scratch, block)
+  }
   let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 0))
   if let ValueBits.FunctionBytecode { .. } = function { return compiled.CALL_DEOPT }
   let calleeExit = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT))
   if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION && calleeExit == 0
-    && unsafe reportedWithoutCode(runtime, (unsafe activation.calleeOf(function)).bytecode) {
+    && (site & compiled.SITE_CALL_ALWAYS) == 0 && unsafe reportedWithoutCode(runtime, (unsafe activation.calleeOf(function)).bytecode) {
     return compiled.CALL_DEOPT
   }
   unsafe noteCall(&mut running, site)

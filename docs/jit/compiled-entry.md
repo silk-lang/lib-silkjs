@@ -384,7 +384,15 @@ leaves the owned result at `CALL_STATE`; an exit stores `exit | index << 32` in
   change fails a test instead of the code.
 - **Readiness.** `directArity` stays `DIRECT_NOT_READY` until the first CALL_FAST call of a leaf
   callee caches its realm, code, counter and arity, and only when its exit state fits
-  `CALL_STATE`. Code that makes calls never gets it, so those calls keep CALL_FAST (7.6).
+  `CALL_STATE`. For a callee whose code makes calls, the first CALL_FAST call that pushes its
+  activation readies it the same way, with the arity at the site's argument count.
+- **Callees that make calls.** When the entry's `callWords` is not zero, the code pushes the
+  callee's activation itself (`nestedCall` in x64_backend): it checks the runtime's depth against
+  `DIRECT_NESTING` and the activation stack's room, fills every `DIRECT_ACT_*` field of the next
+  record (28 words, header 48), calls the code and drops the depth. A return pops the record, or
+  calls helper `CALL_POP` (`vm.popDirect`) when the engine published it during the run; an exit
+  marks the record `CALLEE_PUSHED` and takes the call exit, and `compiledCall` continues the
+  activation as in 7.6. Any failed check takes CALL_FAST instead.
 - **Interpreted callers.** An interpreted call to code that makes calls (`callInline`, through
   `linkedCall` with `handOff`) starts an activation and runs it on the native stack; a run that
   leaves is parked in `CompiledTable.handedOff` and that `callInline` continues it before
@@ -393,6 +401,52 @@ leaves the owned result at `CALL_STATE`; an exit stores `exit | index << 32` in
 Measured (callgrind): calls kernel 336 instructions per call interpreted, 227 compiled; method
 kernel 496 per iteration interpreted, 318 compiled; deltablue `--jit-calls` 1.739x plain,
 richards 1.031x (the rest is mostly the 17 functions the JIT refuses).
+
+### 7.8 Generic instruction exits (milestone 7, stream N)
+
+As built. An instruction the JIT has no machine code for, but whose effect on the stack is
+plain (it pops n values and pushes zero or one, and touches nothing else of the frame), is
+translated as a call exit that runs that one instruction in the engine. There is no separate
+exit kind: it is an SSA `call` with `k = n | calls.GENERIC`, an undefined function and receiver
+and the operands as `CallArg 0..n-1`, so liveness, register allocation and ownership treat it as
+any call, and the site word carries `SITE_GENERIC` (bit 41).
+
+- **Which instructions.** `ssa_translate.genericOpcode`: typeof, instanceof, in, delete, pow,
+  to_object, to_propkey, object and regexp literals, array_from, the class and private-field
+  instructions (define_field, set_name, set_proto, define_method(_computed), get_super,
+  get(put/define)_private_field, private_in, add_brand, private_symbol), push_bigint_i32 and
+  push_const of a non-number. At most 8 operands.
+- **Frame state.** The exit state is the state before the instruction, operands on the stack,
+  so a throw is unwound by the interpreter from the instruction's own pc, and a deopt resumes
+  there.
+- **Engine side.** `compiledCall` and `activationCall` send a `SITE_GENERIC` site to
+  `compiledOp`. It retains the operands (they sit at `CALL_AREA + 2` slots, borrowed from the
+  code), copies the caller's `Machine` (an activation's comes from `activationMachine`), points
+  its stack at the area with `ip = pc + 1` and the pc published, and runs `genericStep`, which
+  calls each family's general step only, never a fused or quickened path. The pc must then be
+  the next instruction, or it traps. The result is left owned in the area's first slot
+  (undefined when nothing is pushed); a throw is materialized, what is left on the stack is
+  released and the exit reports `CALL_THREW`.
+- **No `--jit-calls` needed.** `calls.callsFunctions` ignores generic sites, so a function whose
+  only calls are generic exits compiles with plain `--jit`.
+- **OSR.** Loops compiled for OSR refuse calls, so they refuse generic sites too.
+- **Counters.** `generic-sites` (sites installed) and `generic-runs` (exits taken, counted in
+  machine code at `CompiledEnv.genericRuns`).
+
+### 7.9 Calls to callees without code
+
+As built. A call from compiled code to a bytecode callee that js_hotness reported but that has
+no code (refused, or waiting to compile) returns CALL_DEOPT, so the caller continues in the
+interpreter, whose inline call costs less than a base frame. The deopt records the call pc, and
+the caller's next compilation (jit_recompile) marks that call `calls.ALWAYS`, which the site
+word carries as `SITE_CALL_ALWAYS` (bit 42): the engine then makes the call through
+`callFromCompiled` instead of leaving, so the caller stays linked, and the machine-code direct
+path takes over once the callee has code. A known local function (`ValueBits.FunctionBytecode`)
+still leaves, since its value needs the caller's frame.
+
+Measured (callgrind, v8 deltablue, `--jit --jit-calls`): 1281.6M instructions before, 1152.3M
+after (plain 748.3M); functions refused with "deoptimized again where it was already widened"
+13 before, 6 after, none of them at a call any more.
 
 ### 7.5 Inlining (design only unless time allows)
 
