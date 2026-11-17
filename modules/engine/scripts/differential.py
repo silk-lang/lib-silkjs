@@ -90,8 +90,10 @@ PRELUDE = """\
 var __out = typeof print === 'function' ? print : console.log;
 var __sum = 0;
 var __fin = 0;
+var __long = 0;
 var __at = -1;
 var __g = 0;
+var __eo = {};
 function __sumthis(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + this.x + this.y; } return t; }
 function __show(v) {
   if (typeof v === 'number') return Object.is(v, -0) ? '-0' : String(v);
@@ -170,7 +172,8 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "protos", "protos", "protos"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "tries", "tries", "tdz",
+           "protos", "protos", "protos", "equality"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -401,6 +404,57 @@ class Generator:
             return (f"var k = {self.pick(['a', '0', 'b', '2147483646'])}; var s = 0; "
                     f"for (var i = 0; i < {self.pick([3, 8, 40])}; i++) {{ {form}; s = s + (k++ & 7) + ({keep}); }} "
                     f"return [k, s];")
+        if flavor == "tries":
+            # Try regions in hot code (stream P): the region holds arithmetic, a property read,
+            # a call that may throw or a throwing getter; it throws a primitive, an object or an
+            # Error at an iteration that depends on the arguments; finally blocks see return,
+            # break and continue; handlers rethrow into an outer try.
+            n = self.pick([3, 6, 20])
+            thrown = self.thrown()
+            body = self.pick([
+                f"t = {self.clamped(['t', 'j'])};",
+                f"t = __clamp(t + a.x + j);",
+                f"t = __clamp(t + {self.pick(['a.f(j, b)', 'a.k(j)', 'b(j)', 'a.g(j, b)'])});",
+                f"t = __clamp(t + {self.pick(['{get x() { throw new TypeError(\'g\'); }}', '{get x() { return j; }}', '{x: j}'])}.x);",
+            ])
+            when = self.pick(["j === (b & 7)", "(t & 15) === 3", "j === 2 && a === b", f"({self.using(['t', 'j'])}) === 1"])
+            shape = self.pick(["catch", "catch", "finally", "nested", "return", "jumps", "rethrow", "header", "header"])
+            head = f"var t = {self.pick(['0', 'b', '1'])}; "
+            if shape == "header":
+                # A long loop inside the try region on the first calls (__long): its header
+                # has the marker under it, so on-stack replacement enters with it.
+                inner, close = self.pick([("", ""), ("try { ", "} finally { __fin = (__fin + 1) | 0; } ")])
+                return (f"var n = __long < 3 ? 12000 : {n}; __long = __long + 1; " + head +
+                        f"try {{ {inner}for (var j = 0; j < n; j++) {{ t = (t + (j & 7)) | 0; if (j === n - 1 - (b & 3) && {self.pick(['true', 'a === b', '(t & 1) === 0'])}) {self.pick([f'throw {thrown};', 'return [t, j];', 'break;'])} }} "
+                        f"{close}}} catch (e) {{ t = __clamp(__err(e) + t); }} return t;")
+            if shape == "catch":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                        f"catch (e) {{ t = __clamp(__err(e) + j); }} }} return t;")
+            if shape == "finally":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                        f"finally {{ __fin = (__fin + 1) | 0; t = __clamp(t + 1); }} }} return t;")
+            if shape == "nested":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                        f"catch (e) {{ if (j & 1) throw e; t = __clamp(t - j); }} }} catch (f) {{ t = __clamp(__err(f) + t); }} }} return t;")
+            if shape == "return":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) return [t, j]; }} "
+                        f"{self.pick(['catch (e) { return __err(e); }', 'finally { __fin = (__fin + 1) | 0; }'])} }} return t;")
+            if shape == "jumps":
+                return (head + f"for (var j = 0; j < {n}; j++) {{ try {{ if (j === 1) continue; {body} if ({when}) break; }} "
+                        f"finally {{ __fin = (__fin + 1) | 0; t = __clamp(t + j); {self.pick(['', 'if (j === 4) return t;'])} }} }} return t;")
+            return (head + f"try {{ for (var j = 0; j < {n}; j++) {{ try {{ {body} if ({when}) throw {thrown}; }} "
+                    f"catch (e) {{ t = __clamp(t + 1); throw e; }} }} }} catch (e) {{ return [t, __err(e)]; }} return t;")
+        if flavor == "tdz":
+            # Lexical slots in a loop long enough for on-stack replacement on its first calls
+            # (__long): one read before its initialization at an iteration that depends on the
+            # arguments (a ReferenceError, or never), one initialized before the loop, one made
+            # per iteration and captured by a closure.
+            when = self.pick(["j === n - 1 - (b & 7)", "j === 11000 && a === b", "j < 0", "j > 10000 && (t & 4095) === 77"])
+            return (f"var n = __long < 3 ? 12000 : {self.pick([3, 8])}; __long = __long + 1; var t = 0; var h = null; "
+                    f"let early = {self.pick(['a', '3', 'b'])}; "
+                    f"for (var j = 0; j < n; j++) {{ if ({when}) t = __clamp(t + late); else t = (t + (j & 7)) | 0; "
+                    f"{self.pick(['', 't = __clamp(t + early);', 'let c = j & 3; h = function () { return c; }; t = (t + h()) | 0;'])} }} "
+                    f"let late = {self.pick(['a', '1'])}; return [t, h ? h() : 0];")
         if flavor == "tests":
             # Nullish, undefined and typeof tests (J2) on values of every type, as branch
             # conditions and as values; `??` keeps its operand on one edge only.
@@ -427,6 +481,14 @@ class Generator:
             return (f"class P {{}} class Q extends P {{}} class H {{ static [Symbol.hasInstance](v) {{ return v === 1; }} }} "
                     f"var C = {right}; var vs = [a, b, new P(), new Q(), {{}}, [1], 1, 's', null, undefined, __sumthis]; var c = 0; "
                     f"for (var i = 0; i < vs.length; i++) {{ if (vs[i] instanceof C) c = c + i + 1; if (vs[i] instanceof P) c = c * 2 + 1; }} "
+                    f"return c;")
+        if flavor == "equality":
+            # ===, !==, == and != between values of every kind (J2): sites that start on ints
+            # and meet objects, strings, null, undefined, NaN and -0, and == that coerces.
+            test = self.pick(["x === y", "x !== y", "x == y", "x != y", "x === 7", "x !== 0", "x == null", "x === a"])
+            return (f"var xs = [1, 2, a, b, {{}}, 's', null, undefined, NaN, -0, 7, '7', true, __eo]; "
+                    f"var ys = [1, 3, b, a, __eo, 's', undefined, null, NaN, 0, 7.0, 7, 1, __eo]; var c = 0; "
+                    f"for (var i = 0; i < xs.length; i++) {{ var x = xs[i]; var y = ys[i]; if ({test}) c = c + i + 1; }} "
                     f"return c;")
         raise ValueError(flavor)
 
