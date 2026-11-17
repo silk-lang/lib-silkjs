@@ -14,7 +14,6 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.u32
 import silk.num.u64
-import silk.num.i64
 import silk.num.usize
 import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_core_types { FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
@@ -31,6 +30,7 @@ import jit_recompile as recompile
 import ssa_input { inputOf }
 import ssa_translate { loopHeaders }
 import jit_helpers { CompiledEnv }
+import jit_cost { Cost, now }
 
 /// Functions one runtime can have compiled; the table never moves.
 pub const CAPACITY: usize = 4096
@@ -103,7 +103,9 @@ pub struct Jit {
   /// Functions linked for on-stack replacement only (their normal entry was refused).
   pub osrOnly: u64,
   pub osrRuns: u64,
-  pub osrDeopts: u64
+  pub osrDeopts: u64,
+  /// Compile time by phase and the sizes compiled (jit_cost).
+  pub cost: Cost
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
@@ -115,7 +117,7 @@ impl Jit {
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
       history: History.make(), recompiled: 0,
-      osrLists: List<List<OsrEntry>>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0 }
+      osrLists: List<List<OsrEntry>>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make() }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -146,6 +148,14 @@ impl Jit {
     run line.appendSlice(b" osr-deopts ") run decimal(&mut line, self.osrDeopts)
     run line.appendSlice(b" code-bytes ") run decimal(&mut line, self.codeBytes)
     run line.appendSlice(b" compile-ns ") run decimal(&mut line, self.compileNanoseconds)
+    run line.appendSlice(b" translate-ns ") run decimal(&mut line, self.cost.translate)
+    run line.appendSlice(b" optimize-ns ") run decimal(&mut line, self.cost.optimize)
+    run line.appendSlice(b" verify-ns ") run decimal(&mut line, self.cost.verify)
+    run line.appendSlice(b" backend-ns ") run decimal(&mut line, self.cost.backend)
+    run line.appendSlice(b" attempts ") run decimal(&mut line, self.cost.attempts)
+    run line.appendSlice(b" bytecode-bytes ") run decimal(&mut line, self.cost.bytecodeBytes)
+    run line.appendSlice(b" ssa-translated ") run decimal(&mut line, self.cost.translated)
+    run line.appendSlice(b" ssa-optimized ") run decimal(&mut line, self.cost.optimized)
     run line.append(10)
     return move line
   }
@@ -180,13 +190,6 @@ effect fn hex(line: &mut List<u8>, value: u8) -> () ! OutOfMemoryError ? &mut Al
   run line.append(table[u8.toUsize(u8.shiftRight(value, 4))]) run line.append(table[u8.toUsize(value & 15)])
 }
 
-unsafe extern "C" fn clock_gettime(clock: i32, time: *mut i64) -> i32
-/// CLOCK_MONOTONIC in nanoseconds.
-pub fn now() -> u64 {
-  let mut time: [i64; 2] = [0; 2]
-  drop unsafe clock_gettime(1, Pointer.fromMutRef<i64>(&mut time[0]))
-  return i64.wrappingToU64(time[0]) * 1000000000 + i64.wrappingToU64(time[1])
-}
 fn hotAddress() -> *const u8 {
   let function: extern "C" fn(*mut HeapHeader, *mut HeapHeader, ?*mut u8) -> () = jitHotFunction
   let slot = unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut HeapHeader, *mut HeapHeader, ?*mut u8) -> (), *const *const u8>(Pointer.fromRef(&function))
@@ -249,7 +252,10 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
     if jit.options.dump { run say(b"jit: refused: ", plan.why) }
     return ()
   }
-  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, jit.options.calls, &plan.sites))
+  let mut cost = Cost.make()
+  let lowered = run Effect.result(unsafe lower.lowerWithSites(&function, jit.options.stress, jit.options.calls, &plan.sites, &mut cost))
+  jit.cost.add(&cost)
+  if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
   drop function
   let osr = run unsafe compileLoops(&mut jit, bytecode, &plan.sites)
   let result = match move lowered {
@@ -291,7 +297,10 @@ unsafe effect fn compileLoops(jit: &mut Jit, bytecode: *mut HeapHeader, doubleSi
   while position < headers.length() {
     let header = headers.get(position)
     position = position + 1
-    let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, doubleSites, header))
+    let mut cost = Cost.make()
+    let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, doubleSites, header, &mut cost))
+    jit.cost.add(&cost)
+    if jit.options.dump { run dumpCost(b"jit: cost osr", &cost) }
     let result = match move lowered {
       Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
       Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 continue }
@@ -397,6 +406,20 @@ effect fn sayRefusal(reason: &Refusal) -> () ! OutOfMemoryError ? &mut Allocator
   let mut line = List<u8>.make()
   run line.appendSlice(b"jit: refused: ") run line.appendSlice(reason.text())
   if reason.hasOpcode { run line.appendSlice(b": ") run line.appendSlice(op.opcodeName(reason.opcode, true)) }
+  run line.append(10)
+  io.stderr(line.asSlice())
+}
+/// --jit-dump: one compilation's phase times and sizes.
+effect fn dumpCost(prefix: &[u8], cost: &Cost) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(prefix)
+  run line.appendSlice(b" bytes ") run decimal(&mut line, cost.bytecodeBytes)
+  run line.appendSlice(b" ssa ") run decimal(&mut line, cost.translated)
+  run line.appendSlice(b" optimized ") run decimal(&mut line, cost.optimized)
+  run line.appendSlice(b" translate-ns ") run decimal(&mut line, cost.translate)
+  run line.appendSlice(b" optimize-ns ") run decimal(&mut line, cost.optimize)
+  run line.appendSlice(b" verify-ns ") run decimal(&mut line, cost.verify)
+  run line.appendSlice(b" backend-ns ") run decimal(&mut line, cost.backend)
   run line.append(10)
   io.stderr(line.asSlice())
 }
