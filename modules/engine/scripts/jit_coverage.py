@@ -99,16 +99,32 @@ def compiled_fraction(shell, path, cwd, timeout):
                                shell, "--jit", *EXTRA, "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if done.returncode != 0 or " done" not in done.stdout:
             return {"exit": done.returncode, "error": (done.stdout + done.stderr)[-600:]}
-        total, unknown = per_object(out.name)
+        total, unknown, compiling = per_object(out.name, compiler_functions(shell))
     return {"exit": 0, "instructions": total, "compiled": unknown, "fraction": unknown / total if total else 0.0,
+            "compiler": compiling, "compiler_fraction": compiling / total if total else 0.0,
             "stats": parse_stats(done.stderr)}
 
 
-def per_object(path):
-    """Total self Ir, and self Ir in object ??? (anonymous executable memory), of a callgrind file."""
-    names = {}
-    total = unknown = 0
-    current = None
+def compiler_functions(shell):
+    """Hashed symbol names of the JIT compiler's functions (package silkjs-jit), from <shell>.symbols."""
+    found = set()
+    try:
+        with open(shell + ".symbols", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3 and "silkjs-jit@" in parts[2] and "jit_runtime.silk" not in parts[2]:
+                    found.add(parts[0])
+    except OSError:
+        pass
+    return found
+
+
+def per_object(path, compiler=frozenset()):
+    """Total self Ir, self Ir in object ??? (anonymous executable memory, the compiled code), and
+    self Ir in the JIT compiler's own functions (`compiler`, hashed names), of a callgrind file."""
+    objects, functions = {}, {}
+    total = unknown = compiling = 0
+    current = function = None
     after_call = False
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -123,20 +139,25 @@ def per_object(path):
                     total += cost
                     if current == "???":
                         unknown += cost
+                    elif function in compiler:
+                        compiling += cost
                 continue
             key, _, value = line.rstrip("\n").partition("=")
-            if key in ("ob", "cob"):
+            if key in ("ob", "cob", "fn", "cfn"):
+                table = objects if key in ("ob", "cob") else functions
                 found = re.match(r"\((\d+)\)(?: (.*))?$", value)
                 name = value
                 if found:
                     if found.group(2) is not None:
-                        names[found.group(1)] = found.group(2)
-                    name = names.get(found.group(1))
+                        table[found.group(1)] = found.group(2)
+                    name = table.get(found.group(1))
                 if key == "ob":
                     current = name
+                elif key == "fn":
+                    function = (name or "").split("'")[0]
             elif key == "calls":
                 after_call = True
-    return total, unknown
+    return total, unknown, compiling
 
 
 def main():
@@ -201,6 +222,13 @@ def main():
                 c = entry["callgrind"]
                 line += " compiled-instr %s" % ("%.4f%%" % (100 * c["fraction"]) if c.get("exit") == 0 else "FAILED")
             print(line, flush=True)
+            # Compile cost: what the JIT spent against what it ran (regressions like zlib's show here).
+            cost = "%-22s   cost: compile-ms %.1f code-bytes %s osr-compiled %s osr-runs %s osr-deopts %s" % (
+                "", s.get("compile-ns", 0) / 1e6, s.get("code-bytes"), s.get("osr-compiled"), s.get("osr-runs"), s.get("osr-deopts"))
+            if "callgrind" in entry and entry["callgrind"].get("exit") == 0:
+                c = entry["callgrind"]
+                cost += " compiled-instr %.4f%% compiler-instr %.4f%%" % (100 * c["fraction"], 100 * c["compiler_fraction"])
+            print(cost, flush=True)
             top = sorted(entry["counters"]["refused"].items(), key=lambda kv: -kv[1])[:4]
             if top:
                 print("%-22s   refused: %s" % ("", "; ".join("%s x%d" % kv for kv in top)), flush=True)
