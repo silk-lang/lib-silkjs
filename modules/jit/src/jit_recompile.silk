@@ -28,7 +28,14 @@ struct Record {
   compiles: u32,
   /// The table entry of the code compiled last, or NONE.
   entry: u32,
-  sites: List<u32>
+  sites: List<u32>,
+  /// Bytecode bytes translated for it so far, normal and OSR lowerings and refusals alike:
+  /// what the compile budget counts (jit_runtime Options.compileBudget).
+  lowered: u64,
+  /// Whether its coming recompilation already waited for the function to prove hot again.
+  waited: bool,
+  /// Whether it was sent to record feedback before its first compilation (profile).
+  profiled: bool
 }
 
 pub struct History { records: List<Record> }
@@ -38,7 +45,9 @@ pub struct History { records: List<Record> }
 /// whether this is a function's second or later compilation.
 /// kinds: for each of sites the operand kinds the entry recorded there (CompiledEntry.deoptKinds),
 /// 0 for a site of an earlier compilation.
-pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub kinds: List<u8>, pub recompile: bool, record: usize }
+pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub kinds: List<u8>, pub recompile: bool, record: usize,
+  /// Where in `sites` the offsets its last code deoptimized at begin (the rest were known).
+  pub fresh: usize }
 
 /// FNV-1a over the code and the counts the translator reads.
 unsafe fn hashOf(function: &FunctionBytecode) -> u64 {
@@ -82,10 +91,15 @@ impl History {
     if same < self.records.length() {
       // Reported again: its code was unlinked (or it was refused and the engine re-armed it).
       let record = &mut self.records.asMutSlice()[same]
+      // Back from recording feedback: this is its first compilation.
+      if record.compiles == 0 && record.profiled {
+        return Plan { refuse: false, why: b"", sites: run copy(&record.sites), kinds: List<u8>.make(), recompile: false, record: same, fresh: 0 }
+      }
       if record.compiles > MAX_RECOMPILES {
-        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), kinds: List<u8>.make(), recompile: true, record: same }
+        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), kinds: List<u8>.make(), recompile: true, record: same, fresh: 0 }
       }
       let mut sites = run copy(&record.sites)
+      let fresh = sites.length()
       let mut widened = false
       if record.entry != NONE {
         let entry = &entries.asSlice()[u32.toUsize(record.entry)]
@@ -110,14 +124,14 @@ impl History {
       }
       if !widened {
         record.compiles = MAX_RECOMPILES + 1
-        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, kinds: move kinds, recompile: true, record: same }
+        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, kinds: move kinds, recompile: true, record: same, fresh: fresh }
       }
-      return Plan { refuse: false, why: b"", sites: move sites, kinds: move kinds, recompile: true, record: same }
+      return Plan { refuse: false, why: b"", sites: move sites, kinds: move kinds, recompile: true, record: same, fresh: fresh }
     }
     let mut sites = List<u32>.make()
     if alike < self.records.length() { sites = run copy(&self.records.asSlice()[alike].sites) }
-    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make() })
-    return Plan { refuse: false, why: b"", sites: move sites, kinds: List<u8>.make(), recompile: false, record: self.records.length() - 1 }
+    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make(), lowered: 0, waited: false, profiled: false })
+    return Plan { refuse: false, why: b"", sites: move sites, kinds: List<u8>.make(), recompile: false, record: self.records.length() - 1, fresh: 0 }
   }
 
   /// Records the outcome of `plan`: compiled into table entry `entry`, or NONE when refused.
@@ -125,8 +139,57 @@ impl History {
     let record = &mut self.records.asMutSlice()[plan.record]
     record.compiles = record.compiles + 1
     record.entry = entry
+    record.waited = false
     record.sites.clear()
     run record.sites.appendSlice(plan.sites.asSlice())
+  }
+}
+
+impl History {
+  /// Whether lowering `bytes` more bytecode bytes for plan's function stays within `budget`
+  /// (0: no budget); if so they are counted.
+  pub fn charge(self: &mut Self, plan: &Plan, bytes: usize, budget: u64) -> bool {
+    let record = &mut self.records.asMutSlice()[plan.record]
+    let total = record.lowered + usize.toU64(bytes)
+    if budget != 0 && total > budget { return false }
+    record.lowered = total
+    return true
+  }
+}
+
+/// Entries a recompilation waits for, as a multiple of the hot budget, per compilation so far.
+const BACKOFF: u32 = 8
+
+impl History {
+  /// How many hot budgets of entries plan's function must run before it is compiled again, or
+  /// 0 to compile now. Code that deoptimized until it was unlinked was wasted work, so each
+  /// recompilation asks for BACKOFF times more proof than the one before; asked once per
+  /// recompilation (the function is reported again when the entries are used up). While it
+  /// waits its count is above the hot budget, which the engine takes for a function without
+  /// code: compiled callers deoptimize at their calls to it and are unlinked too
+  /// (js_vm.reportedWithoutCode). Measured, that costs less than keeping them linked: a call
+  /// from compiled code to an interpreted function costs more than the interpreter's own.
+  pub fn backoff(self: &mut Self, plan: &Plan) -> u32 {
+    if !plan.recompile || plan.refuse { return 0 }
+    let record = &mut self.records.asMutSlice()[plan.record]
+    if record.waited { return 0 }
+    record.waited = true
+    let mut wait: u32 = BACKOFF
+    let mut n: u32 = 1
+    while n < record.compiles && n < MAX_RECOMPILES { wait = wait * BACKOFF n = n + 1 }
+    return wait
+  }
+}
+
+impl History {
+  /// Whether plan's function should record feedback before it is compiled: once, before its
+  /// first compilation, unless another function with the same code already taught its sites.
+  pub fn profile(self: &mut Self, plan: &Plan) -> bool {
+    if plan.recompile || plan.refuse || plan.sites.length() != 0 { return false }
+    let record = &mut self.records.asMutSlice()[plan.record]
+    if record.compiles != 0 || record.profiled { return false }
+    record.profiled = true
+    return true
   }
 }
 
