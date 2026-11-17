@@ -433,6 +433,21 @@ any call, and the site word carries `SITE_GENERIC` (bit 41).
 - **Counters.** `generic-sites` (sites installed) and `generic-runs` (exits taken, counted in
   machine code at `CompiledEnv.genericRuns`).
 
+### 7.9 Calls to callees without code
+
+As built. A call from compiled code to a bytecode callee that js_hotness reported but that has
+no code (refused, or waiting to compile) returns CALL_DEOPT, so the caller continues in the
+interpreter, whose inline call costs less than a base frame. The deopt records the call pc, and
+the caller's next compilation (jit_recompile) marks that call `calls.ALWAYS`, which the site
+word carries as `SITE_CALL_ALWAYS` (bit 42): the engine then makes the call through
+`callFromCompiled` instead of leaving, so the caller stays linked, and the machine-code direct
+path takes over once the callee has code. A known local function (`ValueBits.FunctionBytecode`)
+still leaves, since its value needs the caller's frame.
+
+Measured (callgrind, v8 deltablue, `--jit --jit-calls`): 1281.6M instructions before, 1152.3M
+after (plain 748.3M); functions refused with "deoptimized again where it was already widened"
+13 before, 6 after, none of them at a call any more.
+
 ### 7.5 Inlining (design only unless time allows)
 
 A small monomorphic callee is translated into the caller's SSA at the call (its `arg n` are the
