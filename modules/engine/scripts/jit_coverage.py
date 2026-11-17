@@ -76,9 +76,12 @@ def parse_stats(text):
     return {}
 
 
+EXTRA = []  # --calls: ["--jit-calls"]
+
+
 def counters(shell, path, cwd, timeout):
     env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
-    done = subprocess.run([shell, "--jit", "--jit-dump", "--jit-stats", path], capture_output=True, text=True,
+    done = subprocess.run([shell, "--jit", *EXTRA, "--jit-dump", "--jit-stats", path], capture_output=True, text=True,
                           timeout=timeout, env=env, cwd=cwd)
     refused = collections.Counter(line[len("jit: refused: "):] for line in done.stderr.splitlines()
                                   if line.startswith("jit: refused: "))
@@ -90,7 +93,7 @@ def compiled_fraction(shell, path, cwd, timeout):
     with tempfile.NamedTemporaryFile(suffix=".callgrind") as out:
         env = dict(os.environ, SILKJS_PREPARSE_THREADS="0")
         done = subprocess.run(["valgrind", "--tool=callgrind", "--smc-check=all-non-file", "--callgrind-out-file=" + out.name,
-                               shell, "--jit", "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+                               shell, "--jit", *EXTRA, "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if done.returncode != 0 or " done" not in done.stdout:
             return {"exit": done.returncode, "error": (done.stdout + done.stderr)[-600:]}
         total, unknown = per_object(out.name)
@@ -139,9 +142,11 @@ def main():
     parser.add_argument("--work", default=os.environ.get("SILKJS_BENCH_WORK") or os.path.join(ROOT, "build", "bench"))
     parser.add_argument("--instructions", action="store_true", help="also run fixed iterations under callgrind")
     parser.add_argument("--kernels", action="store_true", help="also measure bench/kernels")
+    parser.add_argument("--calls", action="store_true", help="run the JIT with --jit-calls")
     parser.add_argument("--json", default="")
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()
+    if args.calls: EXTRA.append("--jit-calls")
     found, missing = jit_kernels.commands(args.work)
     if "silkjs-jit" not in found:
         sys.exit("silkjs-jit: " + missing["silkjs-jit"])
