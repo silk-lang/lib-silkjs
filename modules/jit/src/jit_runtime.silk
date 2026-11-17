@@ -17,6 +17,7 @@ import silk.num.u64
 import silk.num.i64
 import silk.num.usize
 import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_compiled as compiled
 import silkjs.js_core_types { FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
 import silkjs.js_runtime as runtime
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
@@ -29,7 +30,8 @@ import x64_lower as lower
 import jit_recompile { History, Plan }
 import jit_recompile as recompile
 import ssa_input { inputOf }
-import ssa_translate { loopHeaders }
+import ssa_translate { loopHeaders, translateOsr, Refusal as TranslateRefusal }
+import ssa { Function }
 import jit_helpers { CompiledEnv }
 
 /// Functions one runtime can have compiled; the table never moves.
@@ -83,7 +85,7 @@ pub struct Jit {
   /// Countdown the stress configuration's guards share (CompiledEntry.data).
   stressCounter: i32,
   handler: HotHandler,
-  runtime: ?*mut HeapHeader,
+  pub runtime: ?*mut HeapHeader,
   pub reported: u64,
   pub compiledFunctions: u64,
   pub refused: u64,
@@ -274,7 +276,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   if jit.options.dump { run unsafe dumpBytecode(&function) }
   let plan = run unsafe jit.history.plan(&function, Pointer.address<HeapHeader>(bytecode), &jit.entries)
   if plan.recompile { jit.recompiled = jit.recompiled + 1 }
-  if jit.options.dump && plan.recompile { run unsafe dumpSites(&function, &plan.sites) }
+  if jit.options.dump && plan.recompile { run unsafe dumpSites(&function, plan.sites.asSlice(), plan.refuse) }
   if plan.refuse {
     jit.refused = jit.refused + 1
     if jit.options.dump { run say(b"jit: refused: ", plan.why) }
@@ -341,6 +343,12 @@ unsafe effect fn compileLoops(jit: &mut Jit, bytecode: *mut HeapHeader, plan: &P
       jit.overBudget = jit.overBudget + 1
       if jit.options.dump { run say(b"jit: osr refused: ", b"over the compile budget (--jit-compile-budget)") }
       break
+    }
+    if jit.options.dump {
+      match move run Effect.result(translateOsr(&input, header)) {
+        Result<Function, TranslateRefusal | OutOfMemoryError>.Success { value } => { let mut out = List<u8>.make() run value.print(&mut out) io.stderr(out.asSlice()) }
+        Result<Function, TranslateRefusal | OutOfMemoryError>.Failure { .. } => ()
+      }
     }
     let started = now()
     let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, &plan.sites, header))
@@ -409,7 +417,8 @@ unsafe effect fn installOsrOnly(jit: &mut Jit, bytecode: *mut HeapHeader, list: 
 }
 fn blankEntry(code: ?*const u8, data: ?*mut u8, env: ?*mut u8, deoptLimit: u32, callWords: u32) -> CompiledEntry {
   return CompiledEntry { code: code, data: data, env: env, deoptLimit: deoptLimit, frameCells: 0, leaf: 0, callWords: callWords, runs: 0, deopts: 0, polls: 0, deoptPcs: [0; 4], deoptPcCount: 0,
-    osr: Pointer.null<OsrEntry>(), osrCount: 0, osrRuns: 0, osrDeopts: 0, activationWords: 0, counter: Pointer.null<i32>() }
+    osr: Pointer.null<OsrEntry>(), osrCount: 0, osrRuns: 0, osrDeopts: 0, activationWords: 0, counter: Pointer.null<i32>(),
+    directArity: compiled.DIRECT_NOT_READY, directRealm: Pointer.null<HeapHeader>(), directCode: Pointer.null<u8>() }
 }
 
 /// Links code, lowered from bytecode by this or another runtime's compiler (it holds no
@@ -483,20 +492,19 @@ effect fn dumpMachine(code: &Code) -> () ! OutOfMemoryError ? &mut Allocator {
   io.stderr(line.asSlice())
 }
 
-/// --jit-dump: the sites a recompilation widens (deoptimization pcs), with their opcodes.
-unsafe effect fn dumpSites(function: &FunctionBytecode, sites: &List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut line = List<u8>.make()
-  run line.appendSlice(b"jit: widened")
+/// --jit-dump: the opcodes at the sites a recompiled function deoptimized at so far (refused:
+/// it is refused now, for deoptimizing again there or recompiling too often).
+unsafe effect fn dumpSites(function: &FunctionBytecode, sites: &[u32], refused: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let bytes = unsafe function.code.asSlice()
-  let mut k: usize = 0
-  while k < sites.length() {
-    let pc = sites.get(k)
-    run line.append(32) run decimal(&mut line, u32.toU64(pc))
-    if u32.toUsize(pc) < bytes.length { run line.append(58) run line.appendSlice(op.opcodeName(bytes[u32.toUsize(pc)], true)) }
-    k = k + 1
+  let mut index: usize = 0
+  while index < sites.length {
+    let pc = u32.toUsize(sites[index])
+    if pc < bytes.length {
+      if refused { run say(b"jit: refused after deoptimizing at: ", op.opcodeName(bytes[pc], true)) }
+      else { run say(b"jit: deoptimized at: ", op.opcodeName(bytes[pc], true)) }
+    }
+    index = index + 1
   }
-  run line.append(10)
-  io.stderr(line.asSlice())
 }
 
 unsafe effect fn dumpBytecode(function: &FunctionBytecode) -> () ! OutOfMemoryError ? &mut Allocator {

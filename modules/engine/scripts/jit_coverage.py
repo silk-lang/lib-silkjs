@@ -87,8 +87,11 @@ def counters(shell, path, cwd, timeout):
                                   if line.startswith("jit: refused: "))
     deopted = collections.Counter(line[len("jit: deoptimized at: "):] for line in done.stderr.splitlines()
                                   if line.startswith("jit: deoptimized at: "))
+    stuck = collections.Counter(line[len("jit: refused after deoptimizing at: "):] for line in done.stderr.splitlines()
+                                if line.startswith("jit: refused after deoptimizing at: "))
     errors = [line for line in done.stdout.splitlines() if "ERROR" in line]
     return {"exit": done.returncode, "stats": parse_stats(done.stderr), "refused": dict(refused), "deopted": dict(deopted),
+            "stuck": dict(stuck),
             "errors": errors}
 
 
@@ -216,6 +219,13 @@ def main():
     if sites:
         print("\ndeoptimization sites over all benchmarks (sites of recompiled functions, by opcode):")
         for name, count in sites.most_common(12):
+            print("  %5d  %s" % (count, name))
+    stuck = collections.Counter()
+    for entry in results.values():
+        stuck.update(entry["counters"].get("stuck", {}))
+    if stuck:
+        print("\nsites of functions refused after deoptimizing (widened sites included), by opcode:")
+        for name, count in stuck.most_common(12):
             print("  %5d  %s" % (count, name))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
