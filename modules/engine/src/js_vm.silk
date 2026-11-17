@@ -49,6 +49,7 @@ import js_bigint { BigIntError }
 import js_vm_state { Machine, cellAt }
 import js_compiled as compiled
 import js_compiled_osr as osr
+import js_hotness as hotness
 import js_compiled { CompiledFrame }
 import js_vm_activation as activation
 import js_scopes as scopes
@@ -747,14 +748,12 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   }
   // A known local function's value needs the caller's frame: the interpreter makes that call.
   if let ValueBits.FunctionBytecode { .. } = function { return compiled.CALL_DEOPT }
-  // So does a bytecode callee js_hotness already reported that has no code (refused, or
-  // waiting to compile): the interpreter's inline call costs less than a base frame, and
-  // enough of these deopts unlink a caller whose calls stay interpreted. One not yet hot is
-  // called here, which counts its entry.
+  // So does a bytecode callee the JIT refused for good (leavesForCallee): the interpreter's
+  // inline call costs less than a base frame, and enough of these deopts unlink a caller whose
+  // calls stay interpreted. One not yet hot, or waiting to compile, is called here.
   if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION
-    && (site & compiled.SITE_CALL_ALWAYS) == 0
     && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT)) == 0
-    && unsafe reportedWithoutCode(machine.runtime, (unsafe activation.calleeOf(function)).bytecode) {
+    && unsafe leavesForCallee(machine.runtime, (unsafe activation.calleeOf(function)).bytecode, site) {
     return compiled.CALL_DEOPT
   }
   let receiver = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(area, 1))
@@ -793,20 +792,33 @@ unsafe effect fn compiledCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
     FailedJs { .. } => { return compiled.CALL_THREW }
   }
 }
-/// Whether bytecode has no machine code although js_hotness reported it (its count was set
-/// past the runtime's budget then).
-unsafe fn reportedWithoutCode(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> bool {
+/// Whether compiled code calling bytecode at site leaves for the interpreter (CALL_DEOPT):
+/// js_hotness reported bytecode and refused it for good (count parked at REPORTED_FLOOR or
+/// above and not pending, or loop code only), so its calls stay interpreted, where the inline
+/// call costs less than a base frame. A callee that waits to compile (pending, or a recompile
+/// put off by jit_recompile.backoff) is called: compiled-entry.md 7.9.
+unsafe fn leavesForCallee(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, site: u64) -> bool {
   let anchor = ()
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let mut refused = false
   if code.compiled != 0 {
     let index = code.compiled
     drop code
-    return unsafe compiled.callWords(runtime, index) == u32.toUsize(OSR_ONLY_CALL_WORDS)
+    refused = unsafe compiled.callWords(runtime, index) == u32.toUsize(OSR_ONLY_CALL_WORDS)
+  } else {
+    let left = code.hotness
+    drop code
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    let pending = match state.hotPending { ValueBits.FunctionBytecode { reference } => Pointer.address<HeapHeader>(reference) == Pointer.address<HeapHeader>(bytecode) _ => false }
+    refused = left >= hotness.REPORTED_FLOOR && !pending
   }
-  let left = code.hotness
-  drop code
-  return left > (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).hotEntryBudget
+  // The policy for refused callees: CALL_ALWAYS_REFUSED makes SITE_CALL_ALWAYS sites call them.
+  return refused && !(CALL_ALWAYS_REFUSED && (site & compiled.SITE_CALL_ALWAYS) != 0)
 }
+/// Whether a call site that deoptimized before (SITE_CALL_ALWAYS) calls a callee refused for
+/// good. Off while a call from compiled code into the interpreter costs more than the
+/// interpreter's inline call (raytrace, earley-boyer: compiled-entry.md 7.9).
+const CALL_ALWAYS_REFUSED: bool = false
 /// The direct call compiled code makes through the CALL_FAST helper, from the call block at
 /// block (site and area as for EXIT_CALL): a linked bytecode closure whose code makes no calls
 /// runs at once on the area's cells, while instructions are not observed. Returns a
@@ -1351,7 +1363,7 @@ unsafe effect fn activationCall<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
   if let ValueBits.FunctionBytecode { .. } = function { return compiled.CALL_DEOPT }
   let calleeExit = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(words, compiled.CALL_CALLEE_EXIT))
   if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION && calleeExit == 0
-    && (site & compiled.SITE_CALL_ALWAYS) == 0 && unsafe reportedWithoutCode(runtime, (unsafe activation.calleeOf(function)).bytecode) {
+    && unsafe leavesForCallee(runtime, (unsafe activation.calleeOf(function)).bytecode, site) {
     return compiled.CALL_DEOPT
   }
   unsafe noteCall(&mut running, site)

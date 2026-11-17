@@ -435,18 +435,20 @@ any call, and the site word carries `SITE_GENERIC` (bit 41).
 
 ### 7.9 Calls to callees without code
 
-As built. A call from compiled code to a bytecode callee that js_hotness reported but that has
-no code (refused, or waiting to compile) returns CALL_DEOPT, so the caller continues in the
-interpreter, whose inline call costs less than a base frame. The deopt records the call pc, and
-the caller's next compilation (jit_recompile) marks that call `calls.ALWAYS`, which the site
-word carries as `SITE_CALL_ALWAYS` (bit 42): the engine then makes the call through
-`callFromCompiled` instead of leaving, so the caller stays linked, and the machine-code direct
-path takes over once the callee has code. A known local function (`ValueBits.FunctionBytecode`)
-still leaves, since its value needs the caller's frame.
+As built. A call from compiled code to a bytecode callee that has no code is made by the
+engine (`callFromCompiled`) when the callee is not hot yet or waits to compile: it is pending
+report, or `jit_recompile.backoff` put its recompilation off (its count is past the budget but
+below `js_hotness.REPORTED_FLOOR`). A callee the JIT refused for good (count parked at or above
+REPORTED_FLOOR, or loop code only) makes the caller leave with CALL_DEOPT, because the
+interpreter's inline call costs less than a base frame (`js_vm.leavesForCallee`). A known local
+function (`ValueBits.FunctionBytecode`) always leaves, since its value needs the caller's frame.
 
-Measured (callgrind, v8 deltablue, `--jit --jit-calls`): 1281.6M instructions before, 1152.3M
-after (plain 748.3M); functions refused with "deoptimized again where it was already widened"
-13 before, 6 after, none of them at a call any more.
+A call pc that deoptimized in an earlier compilation carries `SITE_CALL_ALWAYS` (bit 42, k flag
+`calls.ALWAYS`; not at `Translator.depth != 0`). Whether such a site calls a refused callee is
+the one constant `js_vm.CALL_ALWAYS_REFUSED`, off: measured with it on (callgrind, v8 suite,
+`--jit --jit-calls`), deltablue went 1281.6M to 1152.3M instructions but raytrace 1819M to
+2224M and earley-boyer 1226M to 1463M, their calls to refused callees paying a base frame each.
+Turn it on once calls from compiled code into the interpreter cost less than its inline call.
 
 ### 7.5 Inlining (design only unless time allows)
 

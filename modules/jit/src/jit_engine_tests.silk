@@ -659,20 +659,38 @@ unsafe effect fn exerciseCalls<'m>(engine: &mut Engine<'m, Compiling>, context: 
   let framesThrew = run unsafe evaluate(&mut engine, context,
     b"var e='';try{ctor(3,775)}catch(x){e=x.message}var c=0;try{PC(1)}catch(x){c=x instanceof TypeError?1:2}var q=0;try{sp(5,1)}catch(x){q=x instanceof TypeError?1:2}e==='a777'&&c===1&&q===1?1:0")
   run Testing.expect(isInt(framesThrew, 1), "a frame instruction's throw reaches the caller's catch")
-  // A hot callee without code (refused here: it makes a closure) makes its compiled caller
-  // leave at the call. Recompiled, the caller calls it anyway (SITE_CALL_ALWAYS) and stays linked.
-  drop run unsafe evaluate(&mut engine, context, b"function slow(x){let f=()=>x;return f()+1}function drive(g,n){let s=0;for(let i=0;i<n;i++)s=s+g(i);return s}")
-  let recompiledBefore = engine.services.jit.recompiled
-  let waited = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<400;k++)t=t+drive(slow,10);t")
+  // A callee that deoptimizes until it is unlinked waits before it recompiles
+  // (jit_recompile.backoff). Its compiled caller calls it meanwhile instead of leaving at the
+  // call (js_vm.leavesForCallee), so only the callee is unlinked. typeof keeps it from being inlined.
+  drop run unsafe evaluate(&mut engine, context, b"function wt(o,b){let t=typeof o;return o+b}function dr(g,o,n,b){let s=0;for(let i=0;i<n;i++){s=g(o,b)}return s}function p2(){let t=0;for(let k=0;k<40;k++)t=dr(wt,2147483647,1,k);return t}")
+  let waitWarm = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<200;k++)t=t+dr(wt,5,10,2);t")
   engine.services.jit.collect()
-  run Testing.expect(isInt(waited, 22000) && engine.services.jit.recompiled >= recompiledBefore + 1, "a caller that left at a call to a callee without code is recompiled")
-  let unlinkedLater = engine.services.jit.unlinked
-  let deoptsLater = engine.services.jit.deopts
-  let runsLater = engine.services.jit.runs
-  let stays = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<400;k++)t=t+drive(slow,10);t")
+  let waitUnlinked = engine.services.jit.unlinked
+  let waitWaited = engine.services.jit.waited
+  let waitOverflowed = run unsafe evaluate(&mut engine, context, b"p2()")
+  let waitAfter = run unsafe evaluate(&mut engine, context, b"var t=0;for(var k=0;k<200;k++)t=t+dr(wt,5,10,2);t")
   engine.services.jit.collect()
-  run Testing.expect(isInt(stays, 22000) && engine.services.jit.unlinked == unlinkedLater && engine.services.jit.deopts == deoptsLater
-    && engine.services.jit.runs >= runsLater + 400, "and then calls it from compiled code and stays linked")
+  run Testing.expect(isInt(waitWarm, 1400), "a callee and its caller, compiled")
+  run Testing.expect(isNumber(waitOverflowed, 2147483686.0), "the callee's int add overflows into a double")
+  run Testing.expect(isNumber(waitAfter, 1400.0), "and the caller of the callee that waits to recompile gives the interpreter's answers")
+  run Testing.expect(engine.services.jit.waited > waitWaited && engine.services.jit.unlinked == waitUnlinked + 1,
+    "the callee waits to recompile, and its compiled caller stays linked")
+  // Small prototype methods inlined behind a callee check (docs/jit/inlining.md): a read, a
+  // nested call, and a body that ends in a store.
+  let inlinedBefore = engine.services.jit.inlinedSites
+  let inlined = run unsafe evaluate(&mut engine, context,
+    b"function V(x,y){this.x=x;this.y=y;this.n=0}V.prototype.getx=function(){return this.x};V.prototype.sum=function(k){return this.getx()+this.y+k};V.prototype.setn=function(v){this.n=v};function walk(o,n){let s=0;for(let i=0;i<n;i++){o.setn(i);s=s+o.sum(i)+o.n}return s}var vv=new V(3,4);var iw=0;for(var k=0;k<300;k++)iw=iw+walk(vv,10);iw")
+  run Testing.expect(isInt(inlined, 300 * (70 + 45 + 45)), "inlined methods return what the interpreter's do")
+  run Testing.expect(engine.services.jit.inlinedSites > inlinedBefore, "and walk's call sites were inlined")
+  // A guard inside an inlined body leaves at the caller's call: a string where the body saw
+  // ints, then a receiver the body cannot read, which throws the interpreter's TypeError.
+  let bodyDeopt = run unsafe evaluate(&mut engine, context, b"var vs=new V('a','b');walk(vs,2)==='0ab00ab11'?1:0")
+  run Testing.expect(isInt(bodyDeopt, 1), "a deopt inside an inlined body finishes in the interpreter with the same answer")
+  let bodyThrow = run unsafe evaluate(&mut engine, context, b"var vt=new V(1,2);vt.getx=function(){return this.missing.x};var bt=0;try{walk(vt,3)}catch(e){bt=e instanceof TypeError&&vt.n===0?1:2}bt")
+  run Testing.expect(isInt(bodyThrow, 1), "a throwing callee where one was inlined")
+  // The target changes after the code was compiled: the callee check fails and the call is made.
+  let retargeted = run unsafe evaluate(&mut engine, context, b"var before=walk(vv,10);V.prototype.getx=function(){return 100};var after=walk(vv,10);V.prototype.sum=function(k){return k};before===160&&after===1130&&walk(vv,10)===90?1:0")
+  run Testing.expect(isInt(retargeted, 1), "a replaced method is called, not the inlined one")
   run Testing.expect(engine.services.failures == 0, "no compile failed")
 }
 test effect fn callsFromCompiledCode() -> ()
@@ -683,7 +701,8 @@ test effect fn callsFromCompiledCode() -> ()
   let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
   let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut options = Options.make()
-  options.enabled = true options.threshold = 20 options.calls = true
+  // The script counts on when each function compiles: no recording before the first compilation.
+  options.enabled = true options.threshold = 20 options.calls = true options.profile = 0
   let jit = run Jit.make(move options) |> Effect.provideMut<Allocator>(&mut system)
   let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Compiling { jit: move jit, failures: 0 } }
   unsafe jitRuntime.attach(&mut engine.services.jit, rt)
