@@ -86,6 +86,8 @@ var __out = typeof print === 'function' ? print : console.log;
 var __sum = 0;
 var __fin = 0;
 var __at = -1;
+var __g = 0;
+function __sumthis(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + this.x + this.y; } return t; }
 function __show(v) {
   if (typeof v === 'number') return Object.is(v, -0) ? '-0' : String(v);
   if (typeof v === 'string') return JSON.stringify(v);
@@ -123,7 +125,8 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
-            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters", "calls", "calls"]
+           "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
+           "calls", "calls", "fields", "elements", "globals", "method"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -282,6 +285,31 @@ class Generator:
         if flavor == "intbranch":
             return (f"var t = a; for (var i = 0; i < {self.pick([4, 9])}; i++) {{ if (t {self.pick(['>', '<', '>=', '==='])} b) "
                     f"t = t - {self.pick(['i', '1', 'a'])}; else t = t + {self.pick(['2 * i', 'b', '3'])}; }} return t;")
+        if flavor == "fields":
+            # Named reads and stores in a counted loop, the J subset: same-shape stores to
+            # existing fields compile, reads of the arguments' fields deopt on a miss.
+            literal = self.pick(["{x: 1, y: 2}", "{y: 2, x: 1}", "{x: a, y: b}"])
+            # No update feeds o.x back into itself through t: a string would double each round.
+            update = self.pick(["o.x + i", "o.x - o.y", "o.y * 2 - i", "i - o.y"])
+            return (f"var o = {literal}; var t = 0; var n = b; if (n > {self.pick([5, 20])}) n = {self.pick([3, 20])}; "
+                    f"for (var i = 0; i < n; i++) {{ o.x = {update}; o.y = o.x - o.y; t = t + {self.pick(['a.x', 'b.y', 'o.x', 'a.y'])}; }} "
+                    f"return [o.x, o.y, t];")
+        if flavor == "elements":
+            # Element reads and stores of a fast Array in a loop over its length; an append and
+            # the arguments' elements deopt.
+            tail = self.pick(["", "arr[arr.length] = t; ", "arr[-1] = t; "])
+            return (f"var arr = [a, b, {self.integer()}, 2, 3]; var t = 0; "
+                    f"for (var i = 0; i < arr.length; i++) {{ t = t + arr[i]; arr[i] = {self.pick(['t - i', 'i', 'a', 'arr[i] + 1'])}; }} "
+                    f"{tail}for (var j = 0; j < {self.pick(['a.length', 'b.length', '2'])}; j++) {{ t = t + a[j]; }} return [t, arr];")
+        if flavor == "globals":
+            # A global read and stored in a loop.
+            return (f"var t = 0; var n = b; if (n > 20) n = {self.pick([3, 20])}; "
+                    f"for (var i = 0; i < n; i++) {{ __g = {self.pick(['__g + i', '__g - a', 'i'])}; t = t + __g; }} "
+                    f"if (__g > 1000) __g = 0; if (__g < -1000) __g = 0; return t;")
+        if flavor == "method":
+            # `this` reads in a hot prelude function, on objects of several shapes.
+            return (f"var o = {self.pick(['{x: a, y: b}', '{y: b, x: a}', '{x: a, y: b, m: 1}'])}; "
+                    f"return __sumthis.call(o, {self.pick([2, 5])}) + __sumthis.call(a, 1);")
         if flavor == "numloop":
             # A double accumulator in a counted loop (docs/jit/doubles.md): it starts as an Int or
             # a double, so an int add may overflow or meet a double and deoptimize, after which

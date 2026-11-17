@@ -4,9 +4,18 @@
 //! deoptimizes to let the interpreter run that instruction.
 import silk.mem.pointer { Pointer }
 import silk.num.u32
-import js_heap { HeapCell }
+import js_heap { HeapCell, HeapHeader }
+import silk.core.option { Option }
 import js_value { ValueBits }
-import js_core_types { FunctionBytecode }
+import js_core_types { FunctionBytecode, RuntimeState, VarRef, ObjectData, ObjectPayload, scopeSlot }
+import js_strings { Strings }
+import js_class_data as classes
+import silk.num.i32
+import silk.num.usize
+import js_var_refs as cells
+import js_gc as gc
+import js_atoms { AtomTable }
+import js_atom_data as atoms
 import js_compiled { CompiledFrame }
 import js_vm_property_ops as properties
 
@@ -15,13 +24,151 @@ import js_vm_property_ops as properties
 /// of frame.bytecode, from object. True with the value retained into out.
 pub unsafe fn readField(frame: &CompiledFrame, pc: u32, cached: bool, object: ValueBits, out: *mut ValueBits) -> bool {
   let target = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let ip = unsafe operandAt(frame, pc)
+  if cached { return unsafe properties.readFieldCachedAt(frame.runtime, ip, target, out, true) }
+  return unsafe properties.readFieldKeyedAt(frame.runtime, ip, target, out, true)
+}
+
+/// The store of the put_field, put_loc_field_loc8 or put_loc_field_arg8 at bytecode offset pc
+/// of frame.bytecode of the value at source into object: an existing own writable data
+/// property of the shape its inline key names (writeOwnField). True with the object holding
+/// its own count of the value; false with nothing changed.
+pub unsafe fn writeField(frame: &CompiledFrame, pc: u32, object: ValueBits, source: *const ValueBits) -> bool {
+  let target = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let ip = unsafe operandAt(frame, pc)
+  // writeOwnField takes the count it stores; the caller keeps its own, so add one on success.
+  let mut copy = unsafe Pointer.read<ValueBits>(source)
+  if !unsafe properties.writeOwnField(ip, target, Pointer.fromMutRef(&mut copy)) { return false }
+  drop unsafe (unsafe Pointer.read<ValueBits>(source)).retained()
+  return true
+}
+
+/// The operand after the opcode at pc of frame.bytecode: the sites' caches key on its address.
+unsafe fn operandAt(frame: &CompiledFrame, pc: u32) -> *const u8 {
   let anchor = ()
   let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, frame.bytecode)
   let code = unsafe bytecode.code.asSlice()
-  // The operand after the opcode: the sites' caches key on its address.
   let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(code))
-  let ip = unsafe Pointer.at<u8>(base, u32.toUsize(pc) + 1)
-  drop bytecode
-  if cached { return unsafe properties.readFieldCachedAt(frame.runtime, ip, target, out, true) }
-  return unsafe properties.readFieldKeyedAt(frame.runtime, ip, target, out, true)
+  return unsafe Pointer.at<u8>(base, u32.toUsize(pc) + 1)
+}
+
+/// The string push_atom_value (empty false: its atom operand) or push_empty_string (empty
+/// true) at bytecode offset pc of frame.bytecode pushes, retained into out. False for an
+/// integer atom, whose text the interpreter makes.
+pub unsafe fn atomValue(frame: &CompiledFrame, pc: u32, empty: bool, out: *mut ValueBits) -> bool {
+  let anchor = ()
+  let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, frame.runtime)
+  if empty { unsafe Pointer.write<ValueBits>(out, rt.atoms.storedValue(atoms.JS_ATOM_empty_string, true)) return true }
+  let atom = unsafe properties.fieldAtomAt(unsafe operandAt(frame, pc))
+  if AtomTable.isInteger(atom) { return false }
+  unsafe Pointer.write<ValueBits>(out, rt.atoms.storedAtomValue(atom))
+  return true
+}
+
+/// The cell of closure variable index of the running function (get_var's and put_var's
+/// operand), or None.
+unsafe fn variableCell(frame: &CompiledFrame, index: u32) -> ?*mut HeapHeader {
+  return unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(
+    unsafe Pointer.assumeMany<?*mut HeapHeader>(frame.closureReferences), u32.toUsize(index)))
+}
+/// get_var and get_var_undef of an initialized binding: its value, retained into out. False
+/// for an uninitialized one (a TDZ read, or a global not yet defined), which the
+/// interpreter resolves or throws.
+pub unsafe fn readVariable(frame: &CompiledFrame, index: u32, out: *mut ValueBits) -> bool {
+  let cell = match Pointer.nonNullMut<HeapHeader>(unsafe variableCell(frame, index)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let value = unsafe cells.read(cell)
+  if match value { ValueBits.Uninitialized => true _ => false } { return false }
+  unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+  return true
+}
+/// put_var into an initialized, non-const binding of the value at source: the binding takes
+/// its own count, and the old value is released deferred (no finalizer runs here). False
+/// with nothing changed otherwise.
+pub unsafe fn writeVariable(frame: &CompiledFrame, index: u32, source: *const ValueBits) -> bool {
+  let cell = match Pointer.nonNullMut<HeapHeader>(unsafe variableCell(frame, index)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let anchor = () let binding = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+  let constant = binding.isConst drop binding
+  if constant { return false }
+  if match unsafe cells.read(cell) { ValueBits.Uninitialized => true _ => false } { return false }
+  let previous = unsafe cells.replace(cell, unsafe (unsafe Pointer.read<ValueBits>(source)).retained())
+  unsafe gc.releaseDeferred(previous)
+  return true
+}
+
+/// Slot `slot` of the running function's own scope (get_scope0's operand), or None when the
+/// function has none.
+unsafe fn scopeCell(frame: &CompiledFrame, slot: u32) -> ?*mut ValueBits {
+  return match Pointer.nonNullMut<HeapHeader>(frame.scope) {
+    Option<*mut HeapHeader>.Some { value } => unsafe Intrinsic.pointerRequalify<*mut ValueBits, ?*mut ValueBits>(unsafe scopeSlot(value, u32.toUsize(slot)))
+    Option<*mut HeapHeader>.None => Pointer.null<ValueBits>()
+  }
+}
+/// get_scope0 (checked false) or get_scope0_check (checked true: false for an uninitialized
+/// slot, which the interpreter throws for): the slot's value, retained into out.
+pub unsafe fn readScope(frame: &CompiledFrame, slot: u32, checked: bool, out: *mut ValueBits) -> bool {
+  let at = match Pointer.nonNullMut<ValueBits>(unsafe scopeCell(frame, slot)) { Option<*mut ValueBits>.Some { value } => value Option<*mut ValueBits>.None => { return false } }
+  let value = unsafe Pointer.read<ValueBits>(at)
+  if checked && match value { ValueBits.Uninitialized => true _ => false } { return false }
+  unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+  return true
+}
+/// put_scope0 or set_scope0 (checked false), or put_scope0_check (checked true: false with
+/// nothing changed for an uninitialized slot) of the value at source: the slot takes its own
+/// count, the old value is released deferred.
+pub unsafe fn writeScope(frame: &CompiledFrame, slot: u32, checked: bool, source: *const ValueBits) -> bool {
+  let at = match Pointer.nonNullMut<ValueBits>(unsafe scopeCell(frame, slot)) { Option<*mut ValueBits>.Some { value } => value Option<*mut ValueBits>.None => { return false } }
+  let previous = unsafe Pointer.read<ValueBits>(at)
+  if checked && match previous { ValueBits.Uninitialized => true _ => false } { return false }
+  unsafe Pointer.write<ValueBits>(at, unsafe (unsafe Pointer.read<ValueBits>(source)).retained())
+  unsafe gc.releaseDeferred(previous)
+  return true
+}
+
+/// get_array_el and its fused forms on an Int index: a fast Array's element below its
+/// length, a typed array's, or a fast arguments object's (the interpreter's denseRead),
+/// retained into out. False for anything else.
+pub unsafe fn readElement(object: ValueBits, index: i32, out: *mut ValueBits) -> bool {
+  match unsafe properties.elementRead(object, ValueBits.Int { value: index }) {
+    Option<ValueBits>.Some { value } => { unsafe Pointer.write<ValueBits>(out, value) return true }
+    Option<ValueBits>.None => { return false }
+  }
+}
+/// put_array_el over an existing element of a fast Array (index below its length) of the
+/// value at source: the array takes its own count, the old element is released deferred.
+/// False with nothing changed otherwise (appends, holes, typed arrays, other objects).
+pub unsafe fn writeElement(object: ValueBits, index: i32, source: *const ValueBits) -> bool {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  if index < 0 { return false }
+  let at = i32.toUsize(index)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.classId() != classes.JS_CLASS_ARRAY { return false }
+  let mut old = ValueBits.Undefined
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      if at >= array.values().length() { return false }
+      old = array.values().get(at)
+      array.store(at, unsafe (unsafe Pointer.read<ValueBits>(source)).retained())
+    }
+    _ => { return false }
+  }
+  drop data
+  unsafe gc.releaseDeferred(old)
+  return true
+}
+/// get_length of a string or an Array (its first own property), into out. False for
+/// anything else.
+pub unsafe fn readLength(object: ValueBits, out: *mut ValueBits) -> bool {
+  match object {
+    ValueBits.String { .. } => { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: usize.toI32(Strings.length(object)) }) return true }
+    ValueBits.Rope { .. } => { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: usize.toI32(Strings.length(object)) }) return true }
+    ValueBits.Object { reference } => {
+      let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      if data.classId() != classes.JS_CLASS_ARRAY { return false }
+      let length = data.slot(0).valueBits()
+      drop data
+      unsafe Pointer.write<ValueBits>(out, unsafe length.retained())
+      return true
+    }
+    _ => { return false }
+  }
 }
