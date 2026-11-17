@@ -16,9 +16,11 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_value { ValueBits }
 import silkjs.js_compiled as compiled
 import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
 import silkjs.js_runtime as runtime
+import silkjs.js_feedback as feedback
 import silkjs.js_libc_services { HotHandler, LIBC_HOT_FUNCTION_C }
 import silkjs.cli_io as io
 import silkjs.js_opcode_data as op
@@ -34,7 +36,9 @@ import ssa { Function }
 import jit_helpers { CompiledEnv }
 import jit_cost { Cost, now }
 
-struct LoopBook { sites: List<u32>, spent: u64 }
+struct LoopBook { sites: List<u32>, spent: u64,
+  /// With --jit-dump, the function's bytecode, to name the opcodes its code deoptimized at.
+  code: List<u8> }
 
 /// The loop header of a report from entries (CompiledTable.loopPc).
 const NO_LOOP: u32 = 4294967295
@@ -74,13 +78,18 @@ pub struct Options {
   /// normal and OSR lowerings and recompilations (0: no budget). Every lowering translates the
   /// whole body, once per loop header for OSR, so compile cost grows with size times headers
   /// times reports while the run it can speed up does not.
-  pub compileBudget: u32
+  pub compileBudget: u32,
+  /// --jit-profile=N: a function reported hot at its entry first records feedback
+  /// (js_feedback) for N of its instructions, and is compiled at its next report with the
+  /// arithmetic sites that saw a double or an overflow as number sites (0: compile at once;
+  /// default DEFAULT_PROFILE).
+  pub profile: u32
 }
 /// The compile budget's default, in bytecode bytes (measured: K-doubles report, "Compile budget").
 pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 impl Options {
   pub fn make() -> Self {
-    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET }
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE }
   }
 }
 
@@ -132,7 +141,13 @@ pub struct Jit {
   /// Lowerings skipped by the compile budget (Options.compileBudget).
   pub overBudget: u64,
   /// Recompilations put off until the function ran more (jit_recompile.backoff).
-  pub waited: u64
+  pub waited: u64,
+  /// Functions sent to record feedback before their first compilation, and the number sites
+  /// those recordings gave (Options.profile).
+  pub profiled: u64,
+  pub learned: u64,
+  /// Functions refused because their recording showed a site the code would deoptimize at.
+  pub foreseen: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
@@ -144,7 +159,7 @@ impl Jit {
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
       history: History.make(), recompiled: 0,
-      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0 }
+      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -185,6 +200,9 @@ impl Jit {
     run line.appendSlice(b" ssa-optimized ") run decimal(&mut line, self.cost.optimized)
     run line.appendSlice(b" over-budget ") run decimal(&mut line, self.overBudget)
     run line.appendSlice(b" waited ") run decimal(&mut line, self.waited)
+    run line.appendSlice(b" profiled ") run decimal(&mut line, self.profiled)
+    run line.appendSlice(b" learned ") run decimal(&mut line, self.learned)
+    run line.appendSlice(b" foreseen ") run decimal(&mut line, self.foreseen)
     run line.append(10)
     return move line
   }
@@ -207,6 +225,21 @@ impl Jit {
           }
           i = i + 1
         }
+      }
+      // The entry code's own deopts: `jit: unlinked after: <opcodes>` or `jit: deopts at: <opcodes>`.
+      if entries[index].deopts != 0 && index < self.books.length() {
+        let code = self.books.asSlice()[index].code.asSlice()
+        let mut line = List<u8>.make()
+        if entries[index].deoptLimit != 0 && entries[index].deopts >= u32.toU64(entries[index].deoptLimit) { run line.appendSlice(b"jit: unlinked after:") }
+        else { run line.appendSlice(b"jit: deopts at:") }
+        let mut k: usize = 0
+        while k < u8.toUsize(entries[index].deoptPcCount) {
+          let pc = u32.toUsize(entries[index].deoptPcs[k])
+          if pc < code.length { run line.append(32) run line.appendSlice(op.opcodeName(code[pc], true)) }
+          k = k + 1
+        }
+        run line.append(10)
+        io.stderr(line.asSlice())
       }
       index = index + 1
     }
@@ -289,6 +322,76 @@ export "C" fn jitHotFunction(rt: *mut HeapHeader, bytecode: *mut HeapHeader, dat
   }
 }
 
+/// Options.profile unless --jit-profile says otherwise. Measured on Octane (compile-cost.md):
+/// 200 misses too many sites, 2000 costs more in the observed loop than it saves.
+pub const DEFAULT_PROFILE: u32 = 500
+/// Entries a function runs while it records feedback before it is reported again.
+const PROFILE_ENTRIES: u32 = 24
+
+/// Stops bytecode's recording and adds to sites what it teaches the translator: arithmetic
+/// sites that saw a double operand or an int32 overflow, branches that tested something other
+/// than a boolean. Returns why the function should stay interpreted, or nothing: a call it
+/// recorded reached a bytecode function that was reported and has no code to call (compiled
+/// code deoptimizes at each such call, js_vm.compiledCall), or a property site the helpers
+/// decline.
+unsafe effect fn learn(jit: &mut Jit, rt: *mut HeapHeader, bytecode: *mut HeapHeader, sites: &mut List<u32>) -> &'static [u8] ! OutOfMemoryError ? &mut Allocator {
+  drop unsafe feedback.stop(rt, bytecode)
+  let seen = match run unsafe feedback.snapshot(rt, bytecode) {
+    Option<feedback.Snapshot>.Some { value } => move value
+    Option<feedback.Snapshot>.None => { return b"" }
+  }
+  let mut hopeless = false
+  let mut why: &'static [u8] = b"it calls a function that stays interpreted"
+  let mut index: usize = 0
+  while index < seen.sites.length() {
+    let site = seen.sites.get(index)
+    let numeric = site.kind == feedback.KIND_BINARY || site.kind == feedback.KIND_UNARY
+    let wide = u8.bitAnd(u8.bitOr(site.left, site.right), feedback.SEEN_DOUBLE) != 0 || u8.bitAnd(site.flags, feedback.SEEN_OVERFLOW) != 0
+    let truthy = site.kind == feedback.KIND_BRANCH && u8.bitAnd(site.flags, feedback.SEEN_NOT_BOOL) != 0
+    if (numeric && wide) || truthy {
+      let mut k: usize = 0
+      let mut known = false
+      while k < sites.length() { if sites.get(k) == site.offset { known = true } k = k + 1 }
+      if !known { run sites.append(site.offset) jit.learned = jit.learned + 1 }
+    }
+    // Arithmetic and comparisons are compiled for numbers only.
+    if numeric && site.count != 0 && u8.bitAnd(u8.bitOr(site.left, site.right), u8.bitOr(u8.bitOr(feedback.SEEN_STRING, feedback.SEEN_OBJECT), feedback.SEEN_OTHER)) != 0 {
+      hopeless = true why = b"an operand of arithmetic or a comparison that is not a number"
+    }
+    // A store whose receivers had too many shapes for its caches, or a named read or store on
+    // something that is not an object: the helpers decline those and the code would deoptimize.
+    if site.kind == feedback.KIND_PROPERTY && site.count != 0 {
+      if site.left != feedback.SEEN_OBJECT && site.opcode != op.OP_get_length { hopeless = true why = b"a named property of a value that is not an object" }
+      else if site.shapeCount == feedback.MEGAMORPHIC_SHAPES && (site.opcode == op.OP_put_field || site.opcode == op.OP_put_loc_field_loc8 || site.opcode == op.OP_put_loc_field_arg8) {
+        hopeless = true why = b"a store to objects of too many shapes"
+      }
+    }
+    if site.kind == feedback.KIND_CALL && jit.options.calls {
+      if site.first != feedback.NO_TARGET && unsafe codeless(rt, &seen.targets.get(u32.toUsize(site.first))) { hopeless = true }
+      if site.second != feedback.NO_TARGET && unsafe codeless(rt, &seen.targets.get(u32.toUsize(site.second))) { hopeless = true }
+    }
+    index = index + 1
+  }
+  if hopeless { return why }
+  return b""
+}
+/// Whether target is a bytecode function the engine reported hot that was refused: no code,
+/// or code for its loops only, and not counting entries towards another report.
+unsafe fn codeless(rt: *mut HeapHeader, target: &feedback.Target) -> bool {
+  if target.kind != feedback.TARGET_BYTECODE { return false }
+  let callee = match target.function { ValueBits.FunctionBytecode { reference } => reference _ => { return false } }
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, callee)
+  if code.compiled != 0 {
+    let index = code.compiled
+    drop code
+    return unsafe compiled.callWords(rt, index) == u32.toUsize(OSR_ONLY_CALL_WORDS)
+  }
+  return code.hotness >= REPORTED_FLOOR
+}
+/// js_hotness parks a reported function's count at or above this.
+const REPORTED_FLOOR: u32 = 2147483648
+
 /// Compiles bytecode, a FunctionBytecode cell reported hot, and links it, or refuses it.
 pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
@@ -305,13 +408,43 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   jit.reported = jit.reported + 1
   if jit.entries.length() >= CAPACITY { jit.refused = jit.refused + 1 return () }
   if jit.options.dump { run unsafe dumpBytecode(&function) }
-  let plan = run unsafe jit.history.plan(&function, Pointer.address<HeapHeader>(bytecode), &jit.entries)
+  let mut plan = run unsafe jit.history.plan(&function, Pointer.address<HeapHeader>(bytecode), &jit.entries)
   if plan.recompile { jit.recompiled = jit.recompiled + 1 }
-  if jit.options.dump && plan.recompile { run unsafe dumpSites(&function, plan.sites.asSlice(), plan.refuse) }
+  if jit.options.dump && plan.recompile { run unsafe dumpSites(&function, plan.sites.asSlice(), plan.fresh, plan.refuse) }
+  if jit.options.dump && plan.recompile && jit.options.profile != 0 { run unsafe dumpSeen(attached, bytecode, &function, plan.sites.asSlice(), plan.fresh) }
   if plan.refuse {
     jit.refused = jit.refused + 1
     if jit.options.dump { run say(b"jit: refused: ", plan.why) }
     return ()
+  }
+  // A first compilation learns its number sites from a short recording first: the function is
+  // reported again after PROFILE_ENTRIES entries, or at the next poll in one of its loops.
+  if jit.options.profile != 0 {
+    if jit.history.profile(&plan) {
+      if run unsafe feedback.start(attached, bytecode, jit.options.profile) {
+        drop function
+        let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
+        // Never above the hot budget: the engine takes such a count for a function without code
+        // and deoptimizes compiled callers at their calls to it (js_vm.reportedWithoutCode).
+        let mut entries = PROFILE_ENTRIES
+        if jit.options.threshold != 0 && jit.options.threshold < entries { entries = jit.options.threshold }
+        owner.hotness = entries
+        drop owner
+        jit.profiled = jit.profiled + 1
+        jit.reported = jit.reported - 1
+        if jit.options.dump { run say(b"jit: records feedback first", b"") }
+        return ()
+      }
+    } else if !plan.recompile {
+      let why = run unsafe learn(&mut jit, attached, bytecode, &mut plan.sites)
+      if why.length != 0 {
+        jit.refused = jit.refused + 1
+        jit.foreseen = jit.foreseen + 1
+        if jit.options.dump { run say(b"jit: refused: ", why) }
+        run jit.history.remember(&plan, recompile.noEntry())
+        return ()
+      }
+    }
   }
   // A recompilation after an unlink waits for more entries first (jit_recompile.backoff); a
   // report from a loop poll is a loop running now and compiles at once.
@@ -493,6 +626,14 @@ unsafe effect fn attachOsr(jit: &mut Jit, index: usize, list: List<OsrEntry>) ->
   entries[index].osr = pointer
   entries[index].osrCount = count
 }
+unsafe effect fn codeCopy(dump: bool, bytecode: *mut HeapHeader) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  if !dump { return move out }
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  run out.appendSlice(unsafe function.code.asSlice())
+  return move out
+}
 /// Links bytecode, whose normal entry was refused, for on-stack replacement only.
 /// Returns its table index (for jit_recompile, which reads its OSR deopt sites) or
 /// recompile.noEntry() when the table is full.
@@ -508,7 +649,8 @@ unsafe effect fn installOsrOnly(jit: &mut Jit, bytecode: *mut HeapHeader, list: 
   let env = unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0]))
   let added = jit.entries.appendWithinCapacity(blankEntry(Pointer.null<u8>(), stress, env, jit.options.deoptLimit, OSR_ONLY_CALL_WORDS))
   if !added { return recompile.noEntry() }
-  run jit.books.append(LoopBook { sites: run copySites(&sites), spent: spent })
+  let kept = run unsafe codeCopy(jit.options.dump, bytecode)
+  run jit.books.append(LoopBook { sites: run copySites(&sites), spent: spent, code: move kept })
   run unsafe attachOsr(&mut jit, index, move list)
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
   unsafe runtime.linkOsr(attached, bytecode, usize.toU32(index))
@@ -544,7 +686,8 @@ pub unsafe effect fn install(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mu
   let env = unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0]))
   let added = jit.entries.appendWithinCapacity(blankEntry(entry, stress, env, jit.options.deoptLimit, callWords))
   if !added { return false }
-  run jit.books.append(LoopBook { sites: run copySites(&sites), spent: spent })
+  let kept = run unsafe codeCopy(jit.options.dump, bytecode)
+  run jit.books.append(LoopBook { sites: run copySites(&sites), spent: spent, code: move kept })
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
   unsafe runtime.linkCompiled(attached, bytecode, usize.toU32(index))
   jit.lastEntry = usize.toU64(Pointer.address<u8>(entry))
@@ -599,15 +742,48 @@ effect fn dumpMachine(code: &Code) -> () ! OutOfMemoryError ? &mut Allocator {
 
 /// --jit-dump: the opcodes at the sites a recompiled function deoptimized at so far (refused:
 /// it is refused now, for deoptimizing again there or recompiling too often).
-unsafe effect fn dumpSites(function: &FunctionBytecode, sites: &[u32], refused: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn dumpSites(function: &FunctionBytecode, sites: &[u32], fresh: usize, refused: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let bytes = unsafe function.code.asSlice()
-  let mut index: usize = 0
+  let mut index: usize = fresh
   while index < sites.length {
     let pc = u32.toUsize(sites[index])
     if pc < bytes.length {
       if refused { run say(b"jit: refused after deoptimizing at: ", op.opcodeName(bytes[pc], true)) }
       else { run say(b"jit: deoptimized at: ", op.opcodeName(bytes[pc], true)) }
     }
+    index = index + 1
+  }
+}
+/// What the recording saw at each offset of sites from fresh on: `jit: seen <opcode> count N
+/// left L right R flags F shapes S targets T` (js_feedback.Site).
+unsafe effect fn dumpSeen(rt: *mut HeapHeader, bytecode: *mut HeapHeader, function: &FunctionBytecode, sites: &[u32], fresh: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let seen = match run unsafe feedback.snapshot(rt, bytecode) {
+    Option<feedback.Snapshot>.Some { value } => move value
+    Option<feedback.Snapshot>.None => { return () }
+  }
+  let bytes = unsafe function.code.asSlice()
+  let mut index: usize = fresh
+  while index < sites.length {
+    let mut k: usize = 0
+    let mut found = false
+    while k < seen.sites.length() {
+      let site = seen.sites.get(k)
+      if site.offset == sites[index] {
+        found = true
+        let mut line = List<u8>.make()
+        run line.appendSlice(b"jit: seen ") run line.appendSlice(op.opcodeName(site.opcode, true))
+        run line.appendSlice(b" count ") run decimal(&mut line, u32.toU64(site.count))
+        run line.appendSlice(b" left ") run decimal(&mut line, u8.toU64(site.left))
+        run line.appendSlice(b" right ") run decimal(&mut line, u8.toU64(site.right))
+        run line.appendSlice(b" flags ") run decimal(&mut line, u8.toU64(site.flags))
+        run line.appendSlice(b" shapes ") run decimal(&mut line, u8.toU64(site.shapeCount))
+        run line.appendSlice(b" targets ") run decimal(&mut line, u8.toU64(site.targets))
+        run line.append(10)
+        io.stderr(line.asSlice())
+      }
+      k = k + 1
+    }
+    if !found && u32.toUsize(sites[index]) < bytes.length { run say(b"jit: unseen ", op.opcodeName(bytes[u32.toUsize(sites[index])], true)) }
     index = index + 1
   }
 }
