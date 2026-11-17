@@ -9,6 +9,40 @@ compiling functions reported hot. `silkjs` is the plain engine. Every number is 
 host of its section unless it says otherwise. Raw files are in
 [`jit-scorecard-results/`](jit-scorecard-results/), one folder per section.
 
+## Latest: integration da86b81c (2026-11-17 13:18 UTC)
+
+The newest dated run below, as one table. Kernel rows: ns per loop iteration, median of 7 processes, lower is better. Octane rows: score, median round, higher is better. Ratio columns: how many times faster the first engine is than the second (above 1x: the first is faster). From `python3 docs/jit/perf_table.py kernels.json octane.json`.
+
+| Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 5.74 | 1.04 | 1.05 | 10.78 | 0.45 | 5.28 | 0.59 | 5.51x | 5.48x | 2.32x | 1.76x |
+| kernel sum-long (ns/iter) | 7.97 | 2.23 | 2.20 | 14.46 | 0.90 | 6.69 | 0.54 | 3.57x | 3.62x | 2.48x | 4.17x |
+| kernel nested (ns/iter) | 8.36 | 1.75 | 1.75 | 12.67 | 0.58 | 7.75 | 1.35 | 4.78x | 4.78x | 3.04x | 1.29x |
+| kernel calls (ns/iter) | 19.22 | 18.65 | 13.15 | 21.22 | 0.59 | 22.38 | 0.79 | 1.03x | 1.46x | 31.82x | 23.71x |
+| kernel method (ns/iter) | 25.53 | 25.83 | 16.94 | 32.77 | 0.95 | 33.34 | 1.27 | 0.99x | 1.51x | 27.05x | 20.29x |
+| kernel doubles (ns/iter) | 12.55 | 2.12 | 2.12 | 20.80 | 1.60 | 10.15 | 1.70 | 5.92x | 5.93x | 1.33x | 1.25x |
+| kernel array-sum (ns/iter) | 8.35 | 3.09 | 3.13 | 15.48 | 0.61 | 9.86 | 0.68 | 2.70x | 2.67x | 5.10x | 4.55x |
+| kernel typed-array (ns/iter) | 34.88 | 33.47 | 33.28 | 47.15 | 1.02 | 48.97 | 0.94 | 1.04x | 1.05x | 32.83x | 35.46x |
+| **kernels geomean (ns/iter)** | **12.72** | **5.06** | **4.59** | **19.49** | **0.77** | **13.34** | **0.91** | 2.51x | 2.77x | 6.54x | 5.56x |
+| Octane Richards (score) | 2204 | 2150 | 1989 | 1857 | 47432 | 1730 | 54026 | 0.98x | 0.90x | 22.06x | 25.13x |
+| Octane DeltaBlue (score) | 2375 | 2470 | 1324 | 2129 | 110563 | 1367 | 67579 | 1.04x | 0.56x | 44.76x | 27.36x |
+| Octane Crypto (score) | 2979 | 2973 | 2838 | 1820 | 52862 | 2179 | 67075 | 1.00x | 0.95x | 17.78x | 22.56x |
+| Octane RayTrace (score) | 6521 | 6454 | 6882 | 5197 | 96347 | 2684 | 168495 | 0.99x | 1.06x | 14.93x | 26.11x |
+| Octane EarleyBoyer (score) | 8049 | 7885 | 7407 | 7580 | 69977 | 3865 | 91343 | 0.98x | 0.92x | 8.87x | 11.58x |
+| Octane RegExp (score) | 3341 | 3351 | 3270 | 3114 | 10856 | 766 | 10494 | 1.00x | 0.98x | 3.24x | 3.13x |
+| Octane Splay (score) | 7872 | 7196 | 7579 | 6152 | 25922 | 4531 | 31586 | 0.91x | 0.96x | 3.60x | 4.39x |
+| Octane SplayLatency (score) | 18055 | 20482 | 19160 | 8771 | 66704 | 15888 | 51592 | 1.13x | 1.06x | 3.26x | 2.52x |
+| Octane NavierStokes (score) | 4711 | 5041 | 4858 | 2205 | 55650 | 3492 | 47292 | 1.07x | 1.03x | 11.04x | 9.38x |
+| Octane PdfJS (score) | 11638 | 11716 | 11188 | 11005 | 48310 | 8540 | 42517 | 1.01x | 0.96x | 4.12x | 3.63x |
+| Octane Mandreel (score) | 1948 | 1669 | 1519 | 1588 | 56438 | 1218 | 73472 | 0.86x | 0.78x | 33.82x | 44.02x |
+| Octane MandreelLatency (score) | 12129 | 6963 | 6185 | 9680 | 87460 | 5182 | 52476 | 0.57x | 0.51x | 12.56x | 7.54x |
+| Octane Gameboy (score) | 15094 | 13680 | 12700 | 10453 | 110081 | 8662 | 140831 | 0.91x | 0.84x | 8.05x | 10.29x |
+| Octane CodeLoad (score) | 37902 | 44537 | 39678 | 41270 | 41461 | 24971 | 34080 | 1.18x | 1.05x | 0.93x | 0.77x |
+| Octane Box2D (score) | 8967 | 8131 | 6339 | 5549 | 144512 | 7306 | 129584 | 0.91x | 0.71x | 17.77x | 15.94x |
+| Octane zlib (score) | 3948 | 3779 | 3785 | 3096 | 102837 | 2370 | 89313 | 0.96x | 0.96x | 27.21x | 23.63x |
+| Octane Typescript (score) | 17870 | 17256 | 15589 | 23374 | 87094 | 16295 | 81787 | 0.97x | 0.87x | 5.05x | 4.74x |
+| **Octane geomean (score)** | **6900** | **6611** | **6010** | **5428** | **61738** | **4163** | **61045** | 0.96x | 0.87x | 9.34x | 9.23x |
+
 ## How to rerun
 
 From `modules/engine`, with `PATH="$HOME/.silk/bin:$PATH"`, `SILK_CLANG=$HOME/llvm-22.1.8/bin/clang`,
@@ -49,6 +83,38 @@ What the tools measure:
   (`jit: refused: opcode outside the subset: push_this`).
 
 ## 2026-11-17 baseline: integration head 14e41811
+
+### Table
+
+| Benchmark | silkjs (interp) | silkjs-jit | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 7.00 | 3.47 | 12.80 | 0.54 | 6.65 | 0.69 | 2.02x | - | 6.42x | 5.01x |
+| kernel sum-long (ns/iter) | 10.12 | 10.22 | 17.65 | 1.10 | 8.39 | 0.77 | 0.99x | - | 9.28x | 13.30x |
+| kernel nested (ns/iter) | 10.93 | 11.43 | 16.48 | 0.64 | 9.37 | 1.12 | 0.96x | - | 17.83x | 10.22x |
+| kernel calls (ns/iter) | 22.59 | 23.16 | 26.23 | 0.57 | 27.65 | 1.12 | 0.98x | - | 40.83x | 20.74x |
+| kernel method (ns/iter) | 32.76 | 31.26 | 42.82 | 0.94 | 40.63 | 1.49 | 1.05x | - | 33.13x | 20.94x |
+| kernel doubles (ns/iter) | 15.50 | 16.97 | 26.13 | 1.66 | 13.02 | 1.98 | 0.91x | - | 10.21x | 8.56x |
+| kernel array-sum (ns/iter) | 10.41 | 10.30 | 18.78 | 0.68 | 11.66 | 0.79 | 1.01x | - | 15.13x | 13.06x |
+| kernel typed-array (ns/iter) | 41.93 | 44.59 | 57.67 | 1.07 | 60.62 | 1.12 | 0.94x | - | 41.79x | 39.69x |
+| **kernels geomean (ns/iter)** | **15.80** | **14.79** | **24.22** | **0.84** | **16.47** | **1.07** | 1.07x | - | 17.62x | 13.80x |
+| Octane Richards (score) | 1673 | 1603 | 1370 | 37628 | 1306 | 39937 | 0.96x | - | 23.47x | 24.91x |
+| Octane DeltaBlue (score) | 2142 | 2162 | 1699 | 111329 | 1114 | 68333 | 1.01x | - | 51.49x | 31.61x |
+| Octane Crypto (score) | 2427 | 2469 | 1505 | 49443 | 1743 | 57124 | 1.02x | - | 20.03x | 23.14x |
+| Octane RayTrace (score) | 5354 | 5149 | 4427 | 96347 | 2427 | 141930 | 0.96x | - | 18.71x | 27.56x |
+| Octane EarleyBoyer (score) | 6413 | 6507 | 6328 | 69441 | 2994 | 77463 | 1.01x | - | 10.67x | 11.90x |
+| Octane RegExp (score) | 2664 | 2739 | 2577 | 8487 | 640 | 8637 | 1.03x | - | 3.10x | 3.15x |
+| Octane Splay (score) | 7359 | 6967 | 6315 | 27348 | 4018 | 30160 | 0.95x | - | 3.93x | 4.33x |
+| Octane SplayLatency (score) | 20490 | 20668 | 9463 | 66704 | 15321 | 60169 | 1.01x | - | 3.23x | 2.91x |
+| Octane NavierStokes (score) | 4090 | 3924 | 1837 | 43586 | 2693 | 34394 | 0.96x | - | 11.11x | 8.77x |
+| Octane PdfJS (score) | 10303 | 10255 | 8695 | 44240 | 6569 | 40099 | 1.00x | - | 4.31x | 3.91x |
+| Octane Mandreel (score) | 1511 | 1439 | 1262 | 48091 | 942 | 57000 | 0.95x | - | 33.42x | 39.61x |
+| Octane MandreelLatency (score) | 8950 | 9081 | 7531 | 70214 | 3729 | 33235 | 1.01x | - | 7.73x | 3.66x |
+| Octane Gameboy (score) | 12976 | 13378 | 8323 | 96400 | 7302 | 128428 | 1.03x | - | 7.21x | 9.60x |
+| Octane CodeLoad (score) | 38145 | 36905 | 34861 | 35287 | 22895 | 30278 | 0.97x | - | 0.96x | 0.82x |
+| Octane Box2D (score) | 8029 | 7327 | 4984 | 109199 | 5998 | 104644 | 0.91x | - | 14.90x | 14.28x |
+| Octane zlib (score) | 3266 | 3198 | 2482 | 85419 | 1964 | 79138 | 0.98x | - | 26.71x | 24.75x |
+| Octane Typescript (score) | 16962 | 16372 | 19197 | 82688 | 13585 | 82904 | 0.97x | - | 5.05x | 5.06x |
+| **Octane geomean (score)** | **5959** | **5858** | **4558** | **54836** | **3422** | **52714** | 0.98x | - | 9.36x | 9.00x |
 
 ### Host and versions
 
@@ -181,6 +247,38 @@ H) and `get_arg_field8`/`get_field2` (property reads: J). Integer bit operations
 
 ## 2026-11-17 04:27 UTC: integration 8e5a87b3 (K landed: f64, register allocation, recompile)
 
+### Table
+
+| Benchmark | silkjs (interp) | silkjs-jit | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 6.98 | 2.37 | 12.60 | 0.49 | 6.60 | 0.71 | 2.95x | - | 4.85x | 3.36x |
+| kernel sum-long (ns/iter) | 10.03 | 9.89 | 17.18 | 1.03 | 8.09 | 0.74 | 1.01x | - | 9.57x | 13.34x |
+| kernel nested (ns/iter) | 9.38 | 2.89 | 14.96 | 0.60 | 9.32 | 1.14 | 3.25x | - | 4.85x | 2.53x |
+| kernel calls (ns/iter) | 22.31 | 24.33 | 26.64 | 0.65 | 29.04 | 0.90 | 0.92x | - | 37.53x | 26.98x |
+| kernel method (ns/iter) | 30.73 | 31.32 | 40.78 | 0.91 | 39.42 | 1.59 | 0.98x | - | 34.26x | 19.67x |
+| kernel doubles (ns/iter) | 16.41 | 5.43 | 25.71 | 1.66 | 12.51 | 1.97 | 3.02x | - | 3.27x | 2.75x |
+| kernel array-sum (ns/iter) | 11.09 | 11.21 | 19.10 | 0.68 | 11.76 | 0.72 | 0.99x | - | 16.56x | 15.56x |
+| kernel typed-array (ns/iter) | 41.69 | 42.92 | 57.34 | 1.02 | 62.00 | 0.96 | 0.97x | - | 42.02x | 44.72x |
+| **kernels geomean (ns/iter)** | **15.55** | **10.38** | **23.68** | **0.82** | **16.39** | **1.02** | 1.50x | - | 12.66x | 10.18x |
+| Octane Richards (score) | 1756 | 1760 | 1457 | 42348 | 1430 | 44791 | 1.00x | - | 24.06x | 25.45x |
+| Octane DeltaBlue (score) | 2098 | 2255 | 1696 | 105888 | 1115 | 64842 | 1.07x | - | 46.96x | 28.75x |
+| Octane Crypto (score) | 2438 | 2382 | 1484 | 49046 | 1743 | 55656 | 0.98x | - | 20.59x | 23.37x |
+| Octane RayTrace (score) | 5364 | 5533 | 3964 | 94275 | 2219 | 143780 | 1.03x | - | 17.04x | 25.99x |
+| Octane EarleyBoyer (score) | 6572 | 6598 | 6086 | 61073 | 3000 | 75613 | 1.00x | - | 9.26x | 11.46x |
+| Octane RegExp (score) | 2603 | 2698 | 2496 | 8455 | 576 | 9237 | 1.04x | - | 3.13x | 3.42x |
+| Octane Splay (score) | 7140 | 6910 | 6299 | 27992 | 4115 | 30910 | 0.97x | - | 4.05x | 4.47x |
+| Octane SplayLatency (score) | 19898 | 18449 | 9757 | 72666 | 15571 | 58512 | 0.93x | - | 3.94x | 3.17x |
+| Octane NavierStokes (score) | 3764 | 4430 | 1993 | 42993 | 2786 | 35622 | 1.18x | - | 9.70x | 8.04x |
+| Octane PdfJS (score) | 10419 | 9897 | 8821 | 45245 | 7059 | 38018 | 0.95x | - | 4.57x | 3.84x |
+| Octane Mandreel (score) | 1394 | 1460 | 1234 | 44424 | 891 | 51765 | 1.05x | - | 30.43x | 35.46x |
+| Octane MandreelLatency (score) | 8536 | 8595 | 7342 | 66469 | 3521 | 33015 | 1.01x | - | 7.73x | 3.84x |
+| Octane Gameboy (score) | 11560 | 11510 | 8241 | 86752 | 6712 | 126184 | 1.00x | - | 7.54x | 10.96x |
+| Octane CodeLoad (score) | 34659 | 35585 | 34417 | 34496 | 22963 | 29047 | 1.03x | - | 0.97x | 0.82x |
+| Octane Box2D (score) | 7761 | 7142 | 5101 | 120247 | 6287 | 113206 | 0.92x | - | 16.84x | 15.85x |
+| Octane zlib (score) | 3332 | 3442 | 2568 | 89053 | 1987 | 78974 | 1.03x | - | 25.87x | 22.94x |
+| Octane Typescript (score) | 16665 | 16881 | 19490 | 93274 | 14193 | 81997 | 1.01x | - | 5.53x | 4.86x |
+| **Octane geomean (score)** | **5797** | **5853** | **4555** | **54900** | **3412** | **52633** | 1.01x | - | 9.38x | 8.99x |
+
 Same host, tools and versions as the baseline section; branch `claude/project-thread-6ys4ab`
 fast-forwarded to integration `8e5a87b3` (which contains the tools). Engine and shell rebuilt
 from it. Raw files: [`jit-scorecard-results/2026-11-17-8e5a87b3/`](jit-scorecard-results/2026-11-17-8e5a87b3/).
@@ -266,6 +364,38 @@ up from 10). Still at most 0.021% of any Octane benchmark's instructions run com
 now blocks all of mandreel.
 
 ## 2026-11-17 05:56 UTC: integration 34c3ae88 (H landed: compiled calls, `--jit-calls`)
+
+### Table
+
+| Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 6.75 | 1.91 | 1.87 | 12.59 | 0.56 | 6.51 | 0.69 | 3.54x | 3.62x | 3.41x | 2.76x |
+| kernel sum-long (ns/iter) | 9.88 | 9.56 | 9.78 | 17.29 | 1.06 | 7.86 | 0.73 | 1.03x | 1.01x | 9.04x | 13.06x |
+| kernel nested (ns/iter) | 10.52 | 2.54 | 2.50 | 15.08 | 0.62 | 9.04 | 1.15 | 4.14x | 4.20x | 4.11x | 2.22x |
+| kernel calls (ns/iter) | 23.78 | 26.21 | 25.80 | 26.20 | 0.61 | 27.95 | 0.92 | 0.91x | 0.92x | 42.97x | 28.57x |
+| kernel method (ns/iter) | 29.93 | 30.24 | 73.94 | 42.25 | 0.92 | 39.69 | 1.43 | 0.99x | 0.40x | 32.83x | 21.17x |
+| kernel doubles (ns/iter) | 16.68 | 5.01 | 5.10 | 25.78 | 1.72 | 13.62 | 2.05 | 3.33x | 3.27x | 2.91x | 2.45x |
+| kernel array-sum (ns/iter) | 11.70 | 10.52 | 10.39 | 19.32 | 0.68 | 12.57 | 0.73 | 1.11x | 1.13x | 15.48x | 14.45x |
+| kernel typed-array (ns/iter) | 42.71 | 43.30 | 43.07 | 56.06 | 1.13 | 58.92 | 0.95 | 0.99x | 0.99x | 38.39x | 45.58x |
+| **kernels geomean (ns/iter)** | **15.94** | **9.78** | **10.90** | **23.76** | **0.85** | **16.38** | **1.01** | 1.63x | 1.46x | 11.51x | 9.69x |
+| Octane Richards (score) | 1726 | 1728 | 1479 | 1502 | 40643 | 1388 | 43340 | 1.00x | 0.86x | 23.52x | 25.08x |
+| Octane DeltaBlue (score) | 2048 | 2142 | 786 | 1759 | 97253 | 1094 | 60610 | 1.05x | 0.38x | 45.40x | 28.30x |
+| Octane Crypto (score) | 2344 | 2484 | 2400 | 1494 | 47371 | 1759 | 54752 | 1.06x | 1.02x | 19.07x | 22.04x |
+| Octane RayTrace (score) | 5624 | 5338 | 5002 | 4099 | 98493 | 2356 | 148590 | 0.95x | 0.89x | 18.45x | 27.84x |
+| Octane EarleyBoyer (score) | 6405 | 6340 | 6251 | 6081 | 57251 | 2926 | 73250 | 0.99x | 0.98x | 9.03x | 11.55x |
+| Octane RegExp (score) | 2560 | 2603 | 2528 | 2284 | 8142 | 583 | 8883 | 1.02x | 0.99x | 3.13x | 3.41x |
+| Octane Splay (score) | 6919 | 6804 | 6405 | 6055 | 25709 | 4148 | 29109 | 0.98x | 0.93x | 3.78x | 4.28x |
+| Octane SplayLatency (score) | 19015 | 20225 | 19125 | 9343 | 65649 | 15558 | 53959 | 1.06x | 1.01x | 3.25x | 2.67x |
+| Octane NavierStokes (score) | 4299 | 4118 | 4066 | 1839 | 42739 | 2778 | 35319 | 0.96x | 0.95x | 10.38x | 8.58x |
+| Octane PdfJS (score) | 9726 | 9946 | 9358 | 8804 | 42725 | 6455 | 40419 | 1.02x | 0.96x | 4.30x | 4.06x |
+| Octane Mandreel (score) | 1478 | 1477 | 1522 | 1197 | 46433 | 886 | 55778 | 1.00x | 1.03x | 31.44x | 37.76x |
+| Octane MandreelLatency (score) | 8595 | 8902 | 9301 | 7021 | 67368 | 3668 | 36388 | 1.04x | 1.08x | 7.57x | 4.09x |
+| Octane Gameboy (score) | 12284 | 12799 | 12004 | 8549 | 96304 | 7067 | 119257 | 1.04x | 0.98x | 7.52x | 9.32x |
+| Octane CodeLoad (score) | 37317 | 36937 | 35251 | 34577 | 34739 | 22462 | 29764 | 0.99x | 0.94x | 0.94x | 0.81x |
+| Octane Box2D (score) | 7063 | 7836 | 7251 | 4822 | 116262 | 6093 | 100507 | 1.11x | 1.03x | 14.84x | 12.83x |
+| Octane zlib (score) | 3286 | 3217 | 3170 | 2470 | 80134 | 1904 | 74038 | 0.98x | 0.96x | 24.91x | 23.01x |
+| Octane Typescript (score) | 14999 | 14488 | 13929 | 18220 | 78610 | 13500 | 77700 | 0.97x | 0.93x | 5.43x | 5.36x |
+| **Octane geomean (score)** | **5763** | **5829** | **5287** | **4464** | **52964** | **3385** | **51590** | 1.01x | 0.92x | 9.09x | 8.85x |
 
 Same host and versions. Branch merges integration `34c3ae88` (`d235d8d`) and adds a
 `silkjs-jit-calls` column: `silkjs-jit-shell --jit --jit-calls` (harness, `jit_kernels.py`;
@@ -354,6 +484,38 @@ call (needs `--jit-calls`) 74, `get_array_el2` 41, `get_array_el` 38, `get_var_r
 global read (`get_var`).
 
 ## 2026-11-17 10:37 UTC: integration 4e5e3dba (K round 2, I OSR, J objects, H native nested calls)
+
+### Table
+
+| Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 5.42 | 1.03 | 1.05 | 10.49 | 0.49 | 5.39 | 0.62 | 5.27x | 5.18x | 2.12x | 1.66x |
+| kernel sum-long (ns/iter) | 9.86 | 2.24 | 2.52 | 14.27 | 0.90 | 6.59 | 0.54 | 4.41x | 3.91x | 2.47x | 4.13x |
+| kernel nested (ns/iter) | 9.21 | 1.59 | 1.52 | 12.45 | 0.57 | 7.73 | 1.37 | 5.79x | 6.08x | 2.77x | 1.16x |
+| kernel calls (ns/iter) | 20.73 | 19.95 | 18.66 | 22.77 | 0.60 | 22.74 | 0.96 | 1.04x | 1.11x | 33.43x | 20.79x |
+| kernel method (ns/iter) | 27.06 | 25.63 | 26.98 | 33.08 | 0.84 | 33.50 | 1.40 | 1.06x | 1.00x | 30.53x | 18.36x |
+| kernel doubles (ns/iter) | 13.98 | 2.10 | 2.32 | 21.26 | 1.70 | 10.54 | 1.71 | 6.65x | 6.02x | 1.24x | 1.23x |
+| kernel array-sum (ns/iter) | 9.31 | 5.39 | 4.67 | 15.83 | 0.59 | 9.66 | 0.63 | 1.73x | 1.99x | 9.13x | 8.55x |
+| kernel typed-array (ns/iter) | 33.48 | 36.86 | 35.06 | 49.43 | 0.96 | 47.40 | 0.94 | 0.91x | 0.95x | 38.20x | 39.32x |
+| **kernels geomean (ns/iter)** | **13.65** | **5.45** | **5.44** | **19.77** | **0.77** | **13.35** | **0.94** | 2.50x | 2.51x | 7.09x | 5.78x |
+| Octane Richards (score) | 2038 | 2095 | 1860 | 1755 | 47209 | 1643 | 53218 | 1.03x | 0.91x | 22.53x | 25.40x |
+| Octane DeltaBlue (score) | 2503 | 2470 | 1017 | 2010 | 105597 | 1193 | 73497 | 0.99x | 0.41x | 42.75x | 29.76x |
+| Octane Crypto (score) | 2957 | 2782 | 2802 | 1753 | 52535 | 2194 | 65852 | 0.94x | 0.95x | 18.88x | 23.67x |
+| Octane RayTrace (score) | 6406 | 6480 | 6700 | 5091 | 113884 | 2809 | 140228 | 1.01x | 1.05x | 17.57x | 21.64x |
+| Octane EarleyBoyer (score) | 7901 | 7948 | 7905 | 7694 | 60613 | 3612 | 87380 | 1.01x | 1.00x | 7.63x | 10.99x |
+| Octane RegExp (score) | 3257 | 3476 | 3434 | 3138 | 9910 | 749 | 9738 | 1.07x | 1.05x | 2.85x | 2.80x |
+| Octane Splay (score) | 7758 | 7130 | 7042 | 5916 | 28473 | 4694 | 29100 | 0.92x | 0.91x | 3.99x | 4.08x |
+| Octane SplayLatency (score) | 19147 | 19994 | 18460 | 8275 | 64157 | 16454 | 52511 | 1.04x | 0.96x | 3.21x | 2.63x |
+| Octane NavierStokes (score) | 4579 | 5072 | 4619 | 2201 | 55205 | 3356 | 47346 | 1.11x | 1.01x | 10.88x | 9.33x |
+| Octane PdfJS (score) | 12347 | 11671 | 10597 | 10792 | 46930 | 8043 | 46159 | 0.95x | 0.86x | 4.02x | 3.96x |
+| Octane Mandreel (score) | 1957 | 1464 | 1383 | 1511 | 51816 | 1159 | 64930 | 0.75x | 0.71x | 35.39x | 44.35x |
+| Octane MandreelLatency (score) | 11103 | 6271 | 5595 | 9388 | 80406 | 4812 | 42976 | 0.56x | 0.50x | 12.82x | 6.85x |
+| Octane Gameboy (score) | 14838 | 12284 | 11400 | 9208 | 104423 | 8339 | 136155 | 0.83x | 0.77x | 8.50x | 11.08x |
+| Octane CodeLoad (score) | 34515 | 34889 | 36478 | 40287 | 42423 | 24208 | 32176 | 1.01x | 1.06x | 1.22x | 0.92x |
+| Octane Box2D (score) | 9287 | 8021 | 6305 | 5394 | 134733 | 6846 | 131473 | 0.86x | 0.68x | 16.80x | 16.39x |
+| Octane zlib (score) | 4196 | 3473 | 3440 | 3016 | 99749 | 2303 | 82917 | 0.83x | 0.82x | 28.72x | 23.87x |
+| Octane Typescript (score) | 16994 | 17369 | 16617 | 22520 | 83392 | 16232 | 59778 | 1.02x | 0.98x | 4.80x | 3.44x |
+| **Octane geomean (score)** | **6832** | **6324** | **5702** | **5242** | **60125** | **4032** | **57486** | 0.93x | 0.83x | 9.51x | 9.09x |
 
 Same host and versions. Branch merges integration `4e5e3dba` (`20785a3b`, keeping J's versions
 of `jit_coverage.py`, with `--calls` and deopt-site sums, and `jit_kernels.py`). The deopt-site
@@ -451,6 +613,38 @@ last time) are out of the top twelve. Compiled share rose most on deltablue with
 unlinked by default, 5,156 and 642 with `--jit-calls`.
 
 ## 2026-11-17 12:08 UTC: integration ea9965d0 (H constructors and cheaper entry, J inline field reads and transition stores)
+
+### Table
+
+| Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 5.23 | 1.04 | 1.03 | 10.78 | 0.46 | 5.29 | 0.60 | 5.02x | 5.07x | 2.27x | 1.75x |
+| kernel sum-long (ns/iter) | 8.29 | 2.21 | 2.20 | 14.93 | 0.97 | 6.56 | 0.55 | 3.75x | 3.76x | 2.28x | 4.01x |
+| kernel nested (ns/iter) | 9.24 | 1.76 | 1.76 | 12.45 | 0.58 | 7.77 | 1.11 | 5.24x | 5.24x | 3.03x | 1.59x |
+| kernel calls (ns/iter) | 19.13 | 18.75 | 18.19 | 22.57 | 0.66 | 23.36 | 0.80 | 1.02x | 1.05x | 28.35x | 23.59x |
+| kernel method (ns/iter) | 26.29 | 27.16 | 19.75 | 37.77 | 0.81 | 32.59 | 1.29 | 0.97x | 1.33x | 33.41x | 21.04x |
+| kernel doubles (ns/iter) | 12.41 | 2.11 | 2.08 | 21.26 | 1.68 | 12.99 | 1.71 | 5.89x | 5.96x | 1.26x | 1.23x |
+| kernel array-sum (ns/iter) | 9.56 | 3.06 | 3.28 | 15.64 | 0.58 | 9.77 | 0.61 | 3.12x | 2.91x | 5.26x | 5.03x |
+| kernel typed-array (ns/iter) | 34.24 | 32.53 | 32.47 | 47.03 | 0.97 | 49.82 | 0.90 | 1.05x | 1.05x | 33.48x | 36.21x |
+| **kernels geomean (ns/iter)** | **13.01** | **5.07** | **4.88** | **20.11** | **0.78** | **13.78** | **0.88** | 2.57x | 2.67x | 6.52x | 5.78x |
+| Octane Richards (score) | 2081 | 2125 | 1936 | 1765 | 47764 | 1702 | 47499 | 1.02x | 0.93x | 22.48x | 22.35x |
+| Octane DeltaBlue (score) | 2592 | 2585 | 1217 | 2039 | 111217 | 1355 | 70436 | 1.00x | 0.47x | 43.02x | 27.25x |
+| Octane Crypto (score) | 2824 | 2797 | 2895 | 1781 | 53790 | 2256 | 66214 | 0.99x | 1.03x | 19.23x | 23.67x |
+| Octane RayTrace (score) | 6438 | 6412 | 5794 | 4894 | 103524 | 2816 | 167682 | 1.00x | 0.90x | 16.15x | 26.15x |
+| Octane EarleyBoyer (score) | 7860 | 7591 | 7150 | 7657 | 71873 | 3861 | 89768 | 0.97x | 0.91x | 9.47x | 11.83x |
+| Octane RegExp (score) | 3179 | 3276 | 3441 | 3064 | 10001 | 735 | 9991 | 1.03x | 1.08x | 3.05x | 3.05x |
+| Octane Splay (score) | 7147 | 7538 | 7359 | 6700 | 27299 | 4726 | 28286 | 1.05x | 1.03x | 3.62x | 3.75x |
+| Octane SplayLatency (score) | 16739 | 20690 | 18322 | 9167 | 63933 | 16600 | 48011 | 1.24x | 1.09x | 3.09x | 2.32x |
+| Octane NavierStokes (score) | 5163 | 4981 | 4854 | 2236 | 55539 | 3627 | 44875 | 0.96x | 0.94x | 11.15x | 9.01x |
+| Octane PdfJS (score) | 12126 | 11376 | 11115 | 11198 | 46884 | 8352 | 45381 | 0.94x | 0.92x | 4.12x | 3.99x |
+| Octane Mandreel (score) | 1901 | 1649 | 1471 | 1577 | 59465 | 1214 | 69104 | 0.87x | 0.77x | 36.06x | 41.91x |
+| Octane MandreelLatency (score) | 11621 | 6603 | 6014 | 9737 | 87460 | 5051 | 48875 | 0.57x | 0.52x | 13.25x | 7.40x |
+| Octane Gameboy (score) | 15710 | 12700 | 12319 | 10800 | 101209 | 8763 | 143155 | 0.81x | 0.78x | 7.97x | 11.27x |
+| Octane CodeLoad (score) | 39184 | 41185 | 43713 | 43263 | 43638 | 26583 | 35651 | 1.05x | 1.12x | 1.06x | 0.87x |
+| Octane Box2D (score) | 9208 | 8255 | 6329 | 5611 | 139079 | 7501 | 124411 | 0.90x | 0.69x | 16.85x | 15.07x |
+| Octane zlib (score) | 3909 | 3713 | 3709 | 3065 | 102492 | 2395 | 89366 | 0.95x | 0.95x | 27.60x | 24.07x |
+| Octane Typescript (score) | 17830 | 18119 | 15420 | 22941 | 94100 | 16353 | 72323 | 1.02x | 0.86x | 5.19x | 3.99x |
+| **Octane geomean (score)** | **6848** | **6514** | **5885** | **5440** | **62027** | **4213** | **59014** | 0.95x | 0.86x | 9.52x | 9.06x |
 
 Same host and versions. New in the tools: `jit_coverage.py` prints a compile-cost line per
 benchmark (compile time from `--jit-stats`, code bytes, OSR compilations, runs and deopts, and
@@ -566,6 +760,38 @@ of recompiled functions, by opcode: `put_array_el` 116, `call_method` 80, `call2
 `put_field` 29, `mul` 26.
 
 ## 2026-11-17 13:18 UTC: integration da86b81c (H machine-code leaf calls, J stores to a second shape and array appends)
+
+### Table
+
+| Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kernel sum-calls (ns/iter) | 5.74 | 1.04 | 1.05 | 10.78 | 0.45 | 5.28 | 0.59 | 5.51x | 5.48x | 2.32x | 1.76x |
+| kernel sum-long (ns/iter) | 7.97 | 2.23 | 2.20 | 14.46 | 0.90 | 6.69 | 0.54 | 3.57x | 3.62x | 2.48x | 4.17x |
+| kernel nested (ns/iter) | 8.36 | 1.75 | 1.75 | 12.67 | 0.58 | 7.75 | 1.35 | 4.78x | 4.78x | 3.04x | 1.29x |
+| kernel calls (ns/iter) | 19.22 | 18.65 | 13.15 | 21.22 | 0.59 | 22.38 | 0.79 | 1.03x | 1.46x | 31.82x | 23.71x |
+| kernel method (ns/iter) | 25.53 | 25.83 | 16.94 | 32.77 | 0.95 | 33.34 | 1.27 | 0.99x | 1.51x | 27.05x | 20.29x |
+| kernel doubles (ns/iter) | 12.55 | 2.12 | 2.12 | 20.80 | 1.60 | 10.15 | 1.70 | 5.92x | 5.93x | 1.33x | 1.25x |
+| kernel array-sum (ns/iter) | 8.35 | 3.09 | 3.13 | 15.48 | 0.61 | 9.86 | 0.68 | 2.70x | 2.67x | 5.10x | 4.55x |
+| kernel typed-array (ns/iter) | 34.88 | 33.47 | 33.28 | 47.15 | 1.02 | 48.97 | 0.94 | 1.04x | 1.05x | 32.83x | 35.46x |
+| **kernels geomean (ns/iter)** | **12.72** | **5.06** | **4.59** | **19.49** | **0.77** | **13.34** | **0.91** | 2.51x | 2.77x | 6.54x | 5.56x |
+| Octane Richards (score) | 2204 | 2150 | 1989 | 1857 | 47432 | 1730 | 54026 | 0.98x | 0.90x | 22.06x | 25.13x |
+| Octane DeltaBlue (score) | 2375 | 2470 | 1324 | 2129 | 110563 | 1367 | 67579 | 1.04x | 0.56x | 44.76x | 27.36x |
+| Octane Crypto (score) | 2979 | 2973 | 2838 | 1820 | 52862 | 2179 | 67075 | 1.00x | 0.95x | 17.78x | 22.56x |
+| Octane RayTrace (score) | 6521 | 6454 | 6882 | 5197 | 96347 | 2684 | 168495 | 0.99x | 1.06x | 14.93x | 26.11x |
+| Octane EarleyBoyer (score) | 8049 | 7885 | 7407 | 7580 | 69977 | 3865 | 91343 | 0.98x | 0.92x | 8.87x | 11.58x |
+| Octane RegExp (score) | 3341 | 3351 | 3270 | 3114 | 10856 | 766 | 10494 | 1.00x | 0.98x | 3.24x | 3.13x |
+| Octane Splay (score) | 7872 | 7196 | 7579 | 6152 | 25922 | 4531 | 31586 | 0.91x | 0.96x | 3.60x | 4.39x |
+| Octane SplayLatency (score) | 18055 | 20482 | 19160 | 8771 | 66704 | 15888 | 51592 | 1.13x | 1.06x | 3.26x | 2.52x |
+| Octane NavierStokes (score) | 4711 | 5041 | 4858 | 2205 | 55650 | 3492 | 47292 | 1.07x | 1.03x | 11.04x | 9.38x |
+| Octane PdfJS (score) | 11638 | 11716 | 11188 | 11005 | 48310 | 8540 | 42517 | 1.01x | 0.96x | 4.12x | 3.63x |
+| Octane Mandreel (score) | 1948 | 1669 | 1519 | 1588 | 56438 | 1218 | 73472 | 0.86x | 0.78x | 33.82x | 44.02x |
+| Octane MandreelLatency (score) | 12129 | 6963 | 6185 | 9680 | 87460 | 5182 | 52476 | 0.57x | 0.51x | 12.56x | 7.54x |
+| Octane Gameboy (score) | 15094 | 13680 | 12700 | 10453 | 110081 | 8662 | 140831 | 0.91x | 0.84x | 8.05x | 10.29x |
+| Octane CodeLoad (score) | 37902 | 44537 | 39678 | 41270 | 41461 | 24971 | 34080 | 1.18x | 1.05x | 0.93x | 0.77x |
+| Octane Box2D (score) | 8967 | 8131 | 6339 | 5549 | 144512 | 7306 | 129584 | 0.91x | 0.71x | 17.77x | 15.94x |
+| Octane zlib (score) | 3948 | 3779 | 3785 | 3096 | 102837 | 2370 | 89313 | 0.96x | 0.96x | 27.21x | 23.63x |
+| Octane Typescript (score) | 17870 | 17256 | 15589 | 23374 | 87094 | 16295 | 81787 | 0.97x | 0.87x | 5.05x | 4.74x |
+| **Octane geomean (score)** | **6900** | **6611** | **6010** | **5428** | **61738** | **4163** | **61045** | 0.96x | 0.87x | 9.34x | 9.23x |
 
 Same host, versions and tools (plus J's "refused after deoptimizing at" table in
 `jit_coverage.py`, empty in this run). Raw files:
