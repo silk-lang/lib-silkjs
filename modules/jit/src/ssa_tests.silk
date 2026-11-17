@@ -9,6 +9,7 @@ import silk.io.writer_native { StderrWriter }
 import silk.text.string { String }
 import silk.num.u8
 import silk.num.u32
+import silk.num.usize
 import ssa
 import silk.testing.testing { Testing, AssertionError }
 import silkjs.runtime_memory { RuntimeAllocator }
@@ -27,7 +28,9 @@ import silkjs.js_intrinsic_install as intrinsics
 import silkjs.native_stack as stack
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, NONE }
 import ssa_input { inputOf }
-import ssa_translate { translate, Refusal }
+import ssa_translate { translate, Refusal, shuffleOf }
+import silkjs.js_opcode_data as op
+import silk.num.usize
 import ssa_verify { verify, VerifyError }
 import ssa_ownership
 
@@ -116,6 +119,17 @@ effect fn expectSsa(source: &[u8], expected: &[u8], message: string<'static>) ->
   }
   run Testing.expect(same(got.asSlice(), expected), message)
 }
+
+const BORROWED_FIELD: &[u8] = b"""b0:
+  v0: value borrowed(arg 0) = arg 0   @0
+  jump b1()   @0
+b1:
+  v1: value borrowed(arg 0) = get.field v0 exit e0   @0
+  v2: value owned = get.field v1 exit e1   @14
+  return v2   @27
+e0: pc 0 locals [] stack []
+e1: pc 14 locals [] stack [dup v1 (arg 0)]
+"""
 
 const SUM: &[u8] = b"""b0:
   v0: value borrowed(arg 0) = arg 0   @0
@@ -285,6 +299,10 @@ test effect fn goldenArithmetic() -> () ! OutOfMemoryError | SynchronizationErro
 
 test effect fn goldenObjectPassThrough() -> () ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
   run expectSsa(b"function id(o){return o} id({}); id", PASS, "returning an argument retains it exactly once")
+}
+
+test effect fn goldenBorrowedField() -> () ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  run expectSsa(b"function ch(p){return p.q.x} ch({q:{x:1}}); ch", BORROWED_FIELD, "p.q is read borrowed: no count, no release")
 }
 
 test effect fn goldenMax() -> () ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
@@ -548,3 +566,157 @@ test effect fn verifierChecksOperandTypes() -> () ! OutOfMemoryError | Assertion
   run expectVerdict(&mut f, b"operand or result types do not fit the instruction", "comparing a boxed value needs an unbox first")
     |> Effect.provideMut<Allocator>(&mut system)
 }
+
+/// js_vm_values.step's shuffles, restated over positions: what each leaves on a stack whose
+/// window holds 0..n-1 (bottom first). Independent of ssa_translate.shuffleOf's table.
+effect fn interpreterShuffle(opcode: u8, n: usize) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut s = List<u8>.make()
+  let mut i: usize = 0
+  while i < n { run s.append(usize.toU8(i)) i = i + 1 }
+  // top(d) is s[len - d]
+  let len = s.length()
+  if opcode == op.OP_nip1 { let mut out = List<u8>.make() run out.append(s.get(1)) run out.append(s.get(2)) return move out }
+  if opcode == op.OP_dup1 { let top = s.get(len - 1) let below = s.get(len - 2) s.set(len - 1, below) run s.append(top) return move s }
+  if opcode == op.OP_dup2 || opcode == op.OP_dup3 {
+    let mut count: usize = 2 if opcode == op.OP_dup3 { count = 3 }
+    let mut k: usize = 0
+    while k < count { let v = s.get(s.length() - count) run s.append(v) k = k + 1 }
+    return move s
+  }
+  if opcode >= op.OP_insert2 && opcode <= op.OP_insert4 {
+    let count = u8.toUsize(opcode - op.OP_insert2) + 2
+    let value = s.get(len - 1)
+    run s.append(value)
+    let mut depth: usize = 2
+    while depth <= count { let l = s.length() copyAt(&mut s, l - depth, l - depth - 1) depth = depth + 1 }
+    let l = s.length() s.set(l - count - 1, value)
+    return move s
+  }
+  if opcode >= op.OP_perm3 && opcode <= op.OP_perm5 {
+    let count = u8.toUsize(opcode - op.OP_perm3) + 3
+    let value = s.get(len - 2)
+    let mut depth: usize = 2
+    while depth < count { copyAt(&mut s, len - depth, len - depth - 1) depth = depth + 1 }
+    s.set(len - count, value)
+    return move s
+  }
+  if opcode == op.OP_swap2 {
+    let a = s.get(len - 4) let b = s.get(len - 3)
+    copyAt(&mut s, len - 4, len - 2) copyAt(&mut s, len - 3, len - 1) s.set(len - 2, a) s.set(len - 1, b)
+    return move s
+  }
+  if opcode == op.OP_rot3r {
+    let value = s.get(len - 1)
+    copyAt(&mut s, len - 1, len - 2) copyAt(&mut s, len - 2, len - 3) s.set(len - 3, value)
+    return move s
+  }
+  let mut depth: usize = 3
+  if opcode == op.OP_rot4l { depth = 4 } else if opcode == op.OP_rot5l { depth = 5 }
+  let value = s.get(len - depth)
+  while depth > 1 { copyAt(&mut s, len - depth, len - depth + 1) depth = depth - 1 }
+  s.set(len - 1, value)
+  return move s
+}
+
+fn copyAt(s: &mut List<u8>, to: usize, from: usize) -> () { let v = s.get(from) s.set(to, v) }
+
+test effect fn shuffleTableMatchesTheInterpreter() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let codes: [u8; 10] = [op.OP_nip1, op.OP_dup1, op.OP_dup2, op.OP_insert2, op.OP_insert3, op.OP_insert4,
+    op.OP_perm3, op.OP_perm4, op.OP_rot3l, op.OP_rot3r]
+  let mut i: usize = 0
+  while i < 10 {
+    let code = codes[i]
+    let table = shuffleOf(code)
+    let n = u8.toUsize(table[0] - 48)
+    let info = op.opcodeInfo(code, true)
+    run Testing.expect(u8.toUsize(info.pops) == n && u8.toUsize(info.pushes) == table.length - 1, "a shuffle's window and result match the opcode table")
+    let expected = run interpreterShuffle(code, n) |> Effect.provideMut<Allocator>(&mut system)
+    let mut same = expected.length() == table.length - 1
+    let mut k: usize = 0
+    while same && k < expected.length() { same = expected.get(k) == table[k + 1] - 48 k = k + 1 }
+    run Testing.expect(same, "a shuffle's table matches js_vm_values.step")
+    i = i + 1
+  }
+}
+
+/// The rewriting work (ssa.Function.work) and bytecode bytes of the function `source`
+/// evaluates to, after translation and the ownership pass; zeros when there is none.
+unsafe effect fn measure<'m>(engine: &mut Engine<'m, NoHostServices>, context: *mut HeapHeader, source: &[u8], out: &mut List<u64>) -> ()
+  ! JsException | OutOfMemoryError ? &mut Allocator {
+  let memory = engine.memory
+  let result = run eval.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), source, b"work.js", 0)
+  match ObjectRef.of(result.borrow()).functionCode() {
+    Option.Some { value: cell } => {
+      let anchor = ()
+      let input = run inputOf(cell.get(&anchor))
+      match move run Effect.result(translate(&input)) {
+        Result.Success { value: translated } => {
+          let mut f = move translated
+          run ssa_ownership.optimize(&mut f)
+          run out.append(f.work)
+          run out.append(usize.toU64(input.code.length()))
+        }
+        Result.Failure { error } => {
+          match move error {
+            Refusal { .. } => ()
+            OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+          }
+        }
+      }
+    }
+    Option.None => ()
+  }
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), Value.intoBits(move result))
+}
+effect fn workOf(source: &[u8]) -> List<u64> ! OutOfMemoryError | SynchronizationError | JsException {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: NoHostServices {} }
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut out = List<u64>.make()
+  let checked = run Effect.result(unsafe measure(&mut engine, context, source, &mut out)) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | OutOfMemoryError>.Success { value: _ } => ()
+    Result<(), JsException | OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+  return move out
+}
+/// A function of eight locals and `statements` statements that each read and write them
+/// through guards: straight-line code whose exits all name every local.
+effect fn longFunction(statements: usize) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut source = List<u8>.make()
+  run source.appendSlice(b"function w(a,b){var c=1,d=2,e=3,f=4,g=5,h=6;")
+  let mut i: usize = 0
+  while i < statements {
+    run source.appendSlice(b"c=c+a;d=d+c;if(e<d){e=e+b}f=f+e;g=g+f;h=h+g;c=c+h;d=d+1;")
+    i = i + 1
+  }
+  run source.appendSlice(b"return a+b+c+d+e+f+g+h} w(1,2); w")
+  return move source
+}
+
+/// Compile cost per bytecode byte must not grow with the function: the ownership pass was
+/// once quadratic (a sweep of the function per replaced value, a compaction per pass), which
+/// cost seconds on Octane's zlib. Four times the code may cost at most six times the work,
+/// and the work per bytecode byte stays under a bound twice what it measured when written.
+test effect fn compileWorkStaysLinear() -> () ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let small = run longFunction(10) |> Effect.provideMut<Allocator>(&mut system)
+  let large = run longFunction(40) |> Effect.provideMut<Allocator>(&mut system)
+  let one = run workOf(small.asSlice())
+  let four = run workOf(large.asSlice())
+  run Testing.expect(one.length() == 2 && four.length() == 2, "both functions translate")
+  if one.length() == 2 && four.length() == 2 {
+    StderrWriter.print("compile work: {} for {} bytes, {} for {} bytes\n", &.(one.get(0), one.get(1), four.get(0), four.get(1)))
+    run Testing.expect(four.get(0) <= one.get(0) * 6, "four times the code costs at most six times the rewriting work")
+    run Testing.expect(four.get(0) <= four.get(1) * WORK_PER_BYTE, "rewriting work per bytecode byte stays under its bound")
+  }
+}
+/// Instructions and exit slots walked per bytecode byte, at most (compileWorkStaysLinear).
+const WORK_PER_BYTE: u64 = 160
