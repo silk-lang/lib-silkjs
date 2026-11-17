@@ -12,11 +12,12 @@ import silk.num.u64
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_core_types { FunctionBytecode, ContextState, RuntimeState, CompiledEntry }
+import js_core_types { FunctionBytecode, ContextState, RuntimeState, CompiledEntry, StackFrame }
 import js_vm_state { Machine }
 import js_core_types { ObjectData, ObjectPayload }
 import js_class_data as classes
 import js_opcode_data as op
+import js_gc as gc
 
 /// What compiled code returned (its u32 result).
 pub const EXIT_RETURNED: u32 = 0
@@ -153,6 +154,38 @@ pub type CompiledCode = extern "C" fn(*const ValueBits, *mut u64, *mut i32, ?*mu
 /// to resume at (word 0), the operand stack depth (word 1), then one ValueBits per local and
 /// per stack slot, bottom first, each owning one count that the frame takes over.
 pub fn stateWords(locals: usize, stackSize: usize) -> usize { return 2 + 2 * (locals + stackSize) + 1 }
+/// The parameter slots a state of a function needs besides its locals: its parameter count
+/// when it may write one (a function that writes a parameter never borrows its arguments,
+/// js_bytecode.CallFacts), else none. Add it to the locals given to stateWords.
+pub fn argumentRoom(parameters: u16, borrowsArguments: bool) -> usize {
+  if borrowsArguments { return 0 }
+  return u16.toUsize(parameters)
+}
+/// In a state's depth word (word 1): the parameter values follow the stack values, one per
+/// parameter (compiled code of a function that writes a parameter, jit_exit_state).
+pub const ARGUMENTS_FOLLOW: u64 = 4294967296
+/// Writes the parameter values of a state (count of them at values) into machine's argument
+/// cells, releasing what each held. Machine is a frame of a function that does not borrow its
+/// arguments: its cells are its own, one per parameter at least (js_vm_activation pads them).
+pub unsafe fn writeArguments(machine: &Machine, values: [*]mut ValueBits, count: usize) -> () {
+  // The cells, not the arguments passed: fewer passed than parameters leaves undefined cells.
+  let frameAnchor = () let frame = unsafe Pointer.borrow<(), StackFrame>(&frameAnchor, machine.frame)
+  let cells = frame.arguments.count
+  drop frame
+  if count > cells { trap() }
+  let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
+  let borrows = bytecode.borrowsArguments
+  drop bytecode
+  if borrows { trap() }
+  let mut position: usize = 0
+  while position < count {
+    let cell = unsafe machine.argumentCell(position)
+    let old = unsafe Pointer.read<ValueBits>(cell)
+    unsafe Pointer.write<ValueBits>(cell, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, position)))
+    unsafe gc.releaseDeferred(old)
+    position = position + 1
+  }
+}
 
 fn trap() -> never { return Intrinsic.trap("compiled code table invariant violated") }
 
@@ -249,10 +282,12 @@ pub unsafe fn restore(machine: &mut Machine, index: u32, exit: u32, state: *mut 
   let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
   let locals = u16.toUsize(bytecode.variableCount)
   let stackSize = u16.toUsize(bytecode.stackSize)
+  let parameters = u16.toUsize(bytecode.argumentCount)
   drop bytecode
   let stateWords = unsafe Pointer.assumeManyMut<u64>(state)
   let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 0)))
-  let depth = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 1)))
+  let depthWord = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 1))
+  let depth = u64.toUsize(depthWord & 4294967295)
   if depth > stackSize { trap() }
   let values = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(stateWords, 2)))
   let localCells = unsafe Pointer.assumeManyMut<ValueBits>(machine.locals)
@@ -266,6 +301,7 @@ pub unsafe fn restore(machine: &mut Machine, index: u32, exit: u32, state: *mut 
     unsafe machine.push(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, locals + position)))
     position = position + 1
   }
+  if (depthWord & ARGUMENTS_FOLLOW) != 0 { unsafe writeArguments(&machine.*, unsafe Pointer.assumeManyMut<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, locals + depth)), parameters) }
   unsafe machine.setPc(pc)
   let mut unlink = false
   let mut frameCells: u32 = 0

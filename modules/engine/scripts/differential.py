@@ -129,7 +129,7 @@ TYPED = ["Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Ar
 # How a generated function's body is built; repeated entries weight the pick.
 FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes", "throws", "catches", "typed",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
-           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "equality"]
+           "calls", "calls", "fields", "elements", "globals", "method", "tests", "shuffles", "instanceof", "equality", "argwrites"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -381,6 +381,14 @@ class Generator:
                     f"var ys = [1, 3, b, a, __eo, 's', undefined, null, NaN, 0, 7.0, 7, 1, __eo]; var c = 0; "
                     f"for (var i = 0; i < xs.length; i++) {{ var x = xs[i]; var y = ys[i]; if ({test}) c = c + i + 1; }} "
                     f"return c;")
+        if flavor == "argwrites":
+            # Parameters written in the function (J2, put_arg and set_arg): defaults, coercion,
+            # a swap, and a write before an add that may leave compiled code.
+            first = self.pick(["if (b === undefined) b = 1;", "a = a | 0;", "b = b + 1;", "a = typeof a === 'number' ? a : 0;", ""])
+            step = self.pick(["var t = a; a = b; b = t;", "a = a + i;", "s = s + (b = i * 2);", "b = s; a = i;",
+                              "if (i & 1) a = b;", "a = a + b;"])
+            return (f"{first} var s = 0; for (var i = 0; i < {self.pick([2, 5, 20])}; i++) {{ {step} s = s + i; }} "
+                    f"return [a, b, s];")
         raise ValueError(flavor)
 
     def function(self) -> str:
