@@ -4,6 +4,22 @@ The service reads a 64-line JSON order over one persistent HTTP connection and r
 
 Unset `SILKJS_BENCH_ABLATE_STRICT_EQUALITY` to exercise the production policy. Set it to `1` to refuse nonnumeric strict comparisons during initial feedback planning. The patch covers strict equality, strict inequality and their immediate forms. Each condition runs with and without `--jit-calls`. The ordinary Node process runs the same service with its default JIT.
 
+## Production results
+
+The clean production build processed a median of 3,606 sequential orders/s with the default JIT, compared with 8,428 for Node v24.19.0. Across paired rounds, SilkJS delivered 38.3% of Node throughput (range 34.1–44.3%) and consumed 4.56× its server CPU per order (range 4.06–5.06×). The client and server ran on separate physical cores of the same x86_64 host.
+
+| Median over five rounds | Production default | Production with compiled calls | Node |
+|---|---:|---:|---:|
+| Sequential orders/s | 3,606 | 2,584 | 8,428 |
+| Server CPU, µs/order | 264.35 | 357.14 | 63.28 |
+| First verified response, ms | 142.82 | 148.13 | 85.14 |
+| Scheduled p99 at 100 orders/s, ms | 5.40 | 5.66 | 6.62 |
+| Peak resident set, KiB | 96,772 | 101,244 | 55,240 |
+
+Compiled calls reduced production throughput in every round, with a median paired rate of 0.712× default and a median CPU cost of 1.392× default. The production calls-on processes recorded 330,412–379,946 direct calls each. Scheduled p99 varied from 2.41–9.33 ms for production default, 2.58–17.31 ms with compiled calls and 2.64–8.65 ms for Node. Ratios are computed per round, so they can differ from ratios of the absolute medians above.
+
+On the single diagnostic executable with calls enabled, admitting strict equality produced a median paired rate of 0.972× the ablated condition (range 0.888–1.043×) and 1.039× the CPU per order (0.969–1.131×). Compilation of the event callback increased coverage while the full service showed no consistent throughput gain.
+
 ## Reproduction
 
 Use the pinned toolchain and native runtime archives specified in the milestone. Start from a worktree at production commit `b52550c71a2d08f4dd89b37163e0c3af07df0836`. Set `RECEIPT` to this directory in the results checkout, `RESULTS` to a fresh output directory and `NODE` to the Node reference executable. Both scripts use the benchmark client from `--repo`.
