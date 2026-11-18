@@ -26,7 +26,7 @@ import silk.num.u8
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
-import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY }
 import ssa
 import value_layout { ValueLayout }
 import x64_backend_float as float
@@ -271,7 +271,8 @@ impl Emitter {
     }
     // An inlined callee's frame is built where a helper needs it (frameInto): the inline
     // paths read its code and runtime without one.
-    if op == Op.InlineFrame { return () }
+    // Each block of the body names the closure again, as the value it is there.
+    if op == Op.InlineFrame { self.inlineClosures.set(i32.toUsize(inst.k), inst.a) return () }
     if op == Op.Arg {
       // The caller's argument cell, copied (borrowed: no count).
       let at = i32.wrappingToU32(inst.k) * SLOT_BYTES
@@ -324,6 +325,11 @@ impl Emitter {
       if (inst.k & 1) != 0 { run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined())) run self.a.setcc(Cond.Equal, Reg.R9) }
       if (inst.k & 2) != 0 { run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null())) run self.a.setcc(Cond.Equal, Reg.R10) }
       run self.a.alu(Alu.Or, Width.W32, Reg.R9, Reg.R10)
+      if (inst.k & 4) != 0 {
+        run self.a.movImm32(Reg.R10, 0)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.uninitialized())) run self.a.setcc(Cond.Equal, Reg.R10)
+        run self.a.alu(Alu.Or, Width.W32, Reg.R9, Reg.R10)
+      }
       let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.R9)
       return ()
     }
@@ -664,6 +670,24 @@ impl Emitter {
         run self.a.jmp(done)
         self.a.bind(slow)
       }
+      if op == Op.GetElem && inst.k == ELEM_TRY {
+        // A miss is Uninitialized, which owns nothing.
+        let miss = run self.a.label()
+        run self.elementSlot(inst.a, inst.b, miss)
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        run self.retainBits(Reg.Rax, Reg.R9)
+        run self.a.jmp(done)
+        self.a.bind(miss)
+        let layout = self.settings.layout
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.uninitialized()))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.storeImm(Width.W64, payloadOf(inst.result), 0)
+        self.a.bind(done)
+        return ()
+      }
       if op == Op.GetElem || op == Op.PutElem {
         let slow = run self.a.label()
         let typed = run self.a.label()
@@ -674,7 +698,10 @@ impl Emitter {
         let mut only: u32 = 0
         if kind >= u8.toU32(feedback.ELEMENT_TYPED) && kind < u8.toU32(feedback.ELEMENT_MIXED) { only = classes.JS_CLASS_UINT8C_ARRAY + kind - u8.toU32(feedback.ELEMENT_TYPED) }
         let mut fast = slow
-        if only != 0 {
+        // A for-of step's miss is the interpreter's (ssa.ELEM_STEP).
+        let step = op == Op.GetElem && inst.k == ELEM_STEP
+        if step { only = 0 let exit = self.exitLabels.get(u32.toUsize(inst.exit)) run self.elementSlot(inst.a, index, exit) }
+        else if only != 0 {
           fast = run self.a.label()
           run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, only, done, fast)
           self.a.bind(fast)
@@ -723,7 +750,7 @@ impl Emitter {
         }
         run self.a.jmp(done)
         self.a.bind(typed)
-        if only == 0 { run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, 0, done, slow) }
+        if only == 0 && !step { run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, 0, done, slow) }
         self.a.bind(slow)
       }
       // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
@@ -837,6 +864,10 @@ impl Emitter {
       let point = self.resumeIndex(&function, inst)
       run self.a.movImm64(Reg.Rax, u64.bitOr(u32.toU64(inst.pc), u64.shiftLeft(u32.toU64(i32.wrappingToU32(inst.k)), 32)))
       run self.a.store(Width.W64, word(Reg.R11, u32.wrappingMultiply(usize.toU32(compiled.CALL_SITE), 8)), Reg.Rax)
+      // A linked callee that makes no calls runs at once (helper CALL_FAST); values live
+      // across the call are in their slots (x64_regalloc), so only the inputs need reloading.
+      // A constructor call (`new`) always leaves: the engine builds the receiver. So does an
+      // apply of a lazy arguments object: the engine passes the frame's own arguments.
       let generic = run self.a.label()
       let done = run self.a.label()
       if calls.kindOf(inst) == compiled.SITE_PUT_FIELD {
@@ -870,7 +901,7 @@ impl Emitter {
         run self.a.store(Width.W64, slotOf(inst.result), Reg.R9)
         run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rax)
         run self.a.jmp(done)
-      } else if (inst.k & calls.CONSTRUCT) == 0 {
+      } else if (inst.k & (calls.CONSTRUCT | calls.GENERIC | calls.LAZY_ARGUMENTS)) == 0 {
         let helper = run self.a.label()
         let count = i32.wrappingToU32(calls.argumentCount(inst.k))
         if count == 1 || count == 2 {
@@ -923,6 +954,10 @@ impl Emitter {
       }
       // Otherwise leave with EXIT_CALL: the resume point and the saved values go to the block.
       self.a.bind(generic)
+      if (inst.k & calls.GENERIC) != 0 {
+        let atE = self.input(INPUT_ENV) run self.a.load(Width.W64, Reg.Rax, atE)
+        run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.Rax, helpers.GENERIC_RUNS_OFFSET), 1)
+      }
       run self.a.movImm32(Reg.Rax, u32.shiftLeft(point + 1, 2))
       run self.a.store(Width.W64, word(Reg.R11, 0), Reg.Rax)
       run self.keep(point, true)
@@ -940,12 +975,25 @@ impl Emitter {
       run self.a.storeImm(Width.W64, slotOf(inst.result), u32.wrappingToI32(EXIT_THROW))
       run self.a.jmp(self.exitLabels.get(u32.toUsize(inst.exit)))
       self.a.bind(returned)
-      let result = u32.wrappingMultiply(usize.toU32(compiled.CALL_RESULT), 8)
+      // A generic instruction's result is where its operands were (js_vm.compiledOp).
+      let mut result = u32.wrappingMultiply(usize.toU32(compiled.CALL_RESULT), 8)
+      if (inst.k & calls.GENERIC) != 0 { result = area + 2 * SLOT_BYTES }
       run self.a.load(Width.W64, Reg.Rax, word(Reg.R11, result))
       run self.a.load(Width.W64, Reg.R9, word(Reg.R11, result + 8))
       run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
       run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
       self.a.bind(done)
+      return ()
+    }
+    if op == Op.CallResult {
+      // Another value the generic call left in its area (js_vm.compiledOp), owned.
+      let area = u32.wrappingMultiply(usize.toU32(compiled.CALL_AREA), 8)
+      let at = area + (2 + i32.wrappingToU32(inst.k)) * SLOT_BYTES
+      run self.callBlock(Reg.R11)
+      run self.a.load(Width.W64, Reg.Rax, word(Reg.R11, at))
+      run self.a.load(Width.W64, Reg.R9, word(Reg.R11, at + 8))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
       return ()
     }
     Intrinsic.trap("x64_backend: unlowered SSA operation")

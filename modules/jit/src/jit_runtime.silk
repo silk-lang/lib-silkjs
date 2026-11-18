@@ -168,7 +168,9 @@ pub struct Jit {
   pub profiled: u64,
   pub learned: u64,
   /// Functions refused because their recording showed a site the code would deoptimize at.
-  pub foreseen: u64
+  pub foreseen: u64,
+  /// Generic instruction exits in installed code (--jit-stats generic-sites).
+  pub genericSites: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
@@ -181,7 +183,7 @@ impl Jit {
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
       history: History.make(), recompiled: 0,
-      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0 }
+      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -205,6 +207,8 @@ impl Jit {
     run line.appendSlice(b" unlinked ") run decimal(&mut line, self.unlinked)
     run line.appendSlice(b" recompiled ") run decimal(&mut line, self.recompiled)
     run line.appendSlice(b" direct-calls ") run decimal(&mut line, self.env.get(0).directCalls)
+    run line.appendSlice(b" generic-sites ") run decimal(&mut line, self.genericSites)
+    run line.appendSlice(b" generic-runs ") run decimal(&mut line, self.env.get(0).genericRuns)
     run line.appendSlice(b" inlined ") run decimal(&mut line, self.inlinedSites)
     run line.appendSlice(b" osr-compiled ") run decimal(&mut line, self.osrCompiled)
     run line.appendSlice(b" osr-refused ") run decimal(&mut line, self.osrRefused)
@@ -582,10 +586,11 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
   }
   let mut callWords: u32 = 0
-  // The inline targets the code names, in symbol order.
+  let mut genericSites: u32 = 0
+    // The inline targets the code names, in symbol order.
   let mut used = List<?*mut HeapHeader>.make()
-  if let Lowered.Code { callWords: words, inlined, .. } = &result {
-    callWords = words
+  if let Lowered.Code { callWords: words, inlined, genericSites: sites, .. } = &result {
+    callWords = words genericSites = sites
     let mut k: usize = 0
     while k < inlined.length() { run used.append(cells.get(u32.toUsize(inlined.get(k)))) k = k + 1 }
   }
@@ -606,6 +611,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   jit.inlinedSites = jit.inlinedSites + usize.toU64(used.length())
   run jit.history.remember(&plan, usize.toU32(jit.entries.length() - 1))
   jit.compiledFunctions = jit.compiledFunctions + 1
+  jit.genericSites = jit.genericSites + u32.toU64(genericSites)
   if jit.options.dump {
     let mut line = List<u8>.make()
     run line.appendSlice(b"jit: compiled entry ") run decimal(&mut line, usize.toU64(jit.entries.length() - 1))
@@ -708,6 +714,7 @@ unsafe effect fn compileHeader(jit: &mut Jit, bytecode: *mut HeapHeader, doubleS
     Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, Slice.view<usize>(&noSymbols, 0, 0))
     Option<CodeMemory>.None => { return refusedHeader(header) }
   }
+  if jit.options.dump { run dumpPlaced(b"jit: osr code at ", Pointer.address<u8>(block.entry()), &code) }
   jit.codeBytes = jit.codeBytes + usize.toU64(code.bytes.length())
   let base = run osrMarkers(&input, header)
   let entry = OsrEntry { pc: header, depth: usize.toU32(base.length()), code: block.entry(), callWords: osrCallWords, start: region.start, end: region.end, deopts: 0, wait: 0, deoptOpcode: 0 }
@@ -797,6 +804,7 @@ unsafe effect fn installLinked(jit: &mut Jit, bytecode: *mut HeapHeader, code: &
   }
   let entry = block.entry()
   jit.codeBytes = jit.codeBytes + usize.toU64(code.bytes.length())
+  if jit.options.dump { run dumpPlaced(b"jit: code at ", Pointer.address<u8>(entry), &code) }
   run jit.blocks.append(move block)
   let mut stress: ?*mut u8 = Pointer.null<u8>()
   if jit.options.stress != 0 {
@@ -917,6 +925,19 @@ effect fn say(prefix: &[u8], text: &[u8]) -> () ! OutOfMemoryError ? &mut Alloca
 }
 
 /// --jit-dump: the machine code before linking, as hex (`llvm-mc --disassemble` reads it).
+/// --jit-dump: where code was published and its bytes as linked there, `<prefix><address>
+/// <hex bytes>` (scripts/jit_hot.py maps a callgrind profile's addresses onto them).
+effect fn dumpPlaced(prefix: &[u8], address: usize, code: &Code) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = List<u8>.make()
+  run line.appendSlice(prefix)
+  run decimal(&mut line, usize.toU64(address))
+  run line.append(32)
+  let bytes = code.bytes.asSlice()
+  let mut index: usize = 0
+  while index < bytes.length { run hex(&mut line, bytes[index]) index = index + 1 }
+  run line.append(10)
+  io.stderr(line.asSlice())
+}
 effect fn dumpMachine(code: &Code) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut line = List<u8>.make()
   run line.appendSlice(b"jit: machine")
