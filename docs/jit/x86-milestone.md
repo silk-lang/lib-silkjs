@@ -138,6 +138,22 @@ On the combined release `c39cc03d`, we warmed the same service with 1,200 orders
 
 Prioritize the interpreted callback chain and JSON materialization on this fixture. Count dispatches and property reads saved, verify the response, then repeat request CPU and p99 measurements on the same offered load. Run a second request size to separate per-request overhead from per-line-item decoding cost. [Profile, measured window and provenance](jit-scorecard-results/2026-11-18-c39cc03d/http-profile.json)
 
+### HTTP on the integrated release
+
+Five interleaved fresh-process rounds on the same 64-line-item service compared the ordinary `b52550c7` release, its compiled-call option and default Node 24.19.0. The table shows the median for each executable and policy. The within-round comparison below preserves the pairing.
+
+| Median, one persistent connection | SilkJS default | SilkJS compiled calls | Node/V8 |
+| --- | ---: | ---: | ---: |
+| Verified orders/s | 3,606 | 2,584 | 8,428 |
+| Server CPU per order | 264 µs | 357 µs | 63.3 µs |
+| Launch to first verified response | 143 ms | 148 ms | 85 ms |
+| Scheduled-arrival p99 at 100 orders/s | 5.40 ms | 5.66 ms | 6.62 ms |
+| Peak RSS | 96,772 KiB | 101,244 KiB | 55,240 KiB |
+
+The median within-round throughput ratio for default SilkJS was 38.3% of Node (range 34.1–44.3%). The median within-round CPU ratio was 4.56×. Enabling compiled calls reduced throughput in every pair, by 28.8% at the median, and raised CPU per order by 39.2%. Tail latency varied across processes. These five rounds give a clearer result on throughput and CPU.
+
+In a diagnostic build, changing only strict-equality admission with calls enabled allowed the native-parser `event` callback to enter compiled code 6,927 times with zero deopts, compared with zero compiled entries when admission was disabled. The same policy gave `parserOnIncoming` 24 compiled entries and eight field-read deopts. `EventEmitter.emit` deoptimized on all 32 compiled entries on an indexed property read. Across five paired diagnostic processes, allowing equality changed median throughput by −2.8% and CPU per order by +3.9%, with individual pairs on both sides of zero. At 4,800 warmup orders, the 400-order profile still showed compilation work and a 3.9% higher instruction count with equality admitted and calls enabled. This service supports keeping compiled calls opt-in. Specializing its repeated indexed property reads or reducing the cost of JSON materialization are the next measurable targets. [Controlled experiment and raw samples](jit-scorecard-results/2026-11-18-b52550c7/http/README.md)
+
 ## Server milestone
 
 1. **Broaden host coverage.** Keep the JSON order service above and add a callback-heavy application using the module loader. Run the same unchanged program in both full runtimes. Verify response contents and request counts. Record wall time to first response in fresh processes, sustained successful requests/s, p99 at the same offered load below saturation, CPU/request and peak RSS. Record concurrency, warmup, client placement, versions, flags and binary identities. Publish the two workloads individually. The runtime bench currently defaults to Bun with its JIT disabled. [Runtime benchmark configuration](../../modules/runtime/bench/README.md)
