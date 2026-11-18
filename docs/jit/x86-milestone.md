@@ -2,6 +2,8 @@
 
 ## Decision
 
+**SilkJS misses the original plan’s 1.3× throughput target on x86-64.** On the handoff candidate, V8 scored 10.28× higher across Octane’s throughput workloads. In the first real HTTP comparison, the embedded SilkJS JIT served 42.8% of Node’s request rate. The cold-shell advantage is real on several commands and disappeared on the embedded service.
+
 Keep the optional JIT and its shared compiler for eventual AOT. Change how we select compiler work. Run the application or CLI workload on which a proposed change should pay for itself, measure its time against default Node/V8, and identify where SilkJS spends the extra time. Use kernels to isolate the mechanism afterwards. Keep correctness and the cost of interpreter-only operation as independent release gates.
 
 The [original plan](https://github.com/silk-lang/lib-silkjs/blob/8237a590/docs/jit/archive/2026-11-12-plan.html) set a first throughput target within 1.3× of V8 and JSC on the suite geometric mean. Its longer-term ambition was parity on the mean with the slowest workload within about 1.3×. For this milestone use the first target on x86-64 with default V8 in a pinned Node release. Report the slowest workload and each suite separately. For the server, propose the same 1.3× budget independently on CPU-bound request time and p99 under agreed load, and report startup and RSS alongside them. Preserve the longer-term ambition. A geometric mean that includes cold startup, request latency and throughput makes it impossible to tell which target the engine met.
@@ -17,9 +19,22 @@ The [original plan](https://github.com/silk-lang/lib-silkjs/blob/8237a590/docs/j
 
 The pause report and the measurement branch contain different kernel runs. Use ratios from a single run, with its own host and configuration. The 31 output comparisons in the historical record span Octane, the V8 benchmark scripts and kernels. [Integration scorecard and preview](https://github.com/silk-lang/lib-silkjs/blob/b3ca2f88/docs/jit/jit-scorecard.md) · [Pause record](pause-2026-11-18.md)
 
+## Candidate gate
+
+The uploaded pause record’s interrupted candidate was `9c7cb585`. On this host, 82/82 JIT tests passed, llvm-mc fixtures matched and the engine and JIT shell built in release mode. The interpreter stayed inside its 0.5% instruction budget on all eight fixed-work V8 comparisons against `1941679d`. Both JIT modes matched plain output on all eight. All 3,000 seeds agreed across ten configurations, with actual native entries under each JIT configuration. The harness detected its planted defects in all eight areas. The full native suite executed 566 tests and reproduced the two recorded `js_for_in_tests` failures. [Gate record and exact failed tests](jit-scorecard-results/2026-11-18-9c7cb585/gate.json)
+
 ## Candidate measurements
 
-We built `9c7cb585` in release mode on Linux x86-64 with the pinned Silk dev.74 and Clang 22.1.8. The host was a KVM guest on AMD EPYC 9V74 with a four-CPU quota. Node was 24.19.0 with V8 13.6.233.17. The table gives the median paired ratio of SilkJS time to Node time over five fresh process pairs. The cold measurement includes process startup and the entire script. The repeated measurement runs two untimed invocations then five timed invocations per process. Every invocation has a checked result. Ratios below 1 favor SilkJS.
+We built `9c7cb585` in release mode on Linux x86-64 with the pinned Silk dev.74 and Clang 22.1.8. The host was a KVM guest on AMD EPYC 9V74 with a four-CPU quota. Node was 24.19.0 with V8 13.6.233.17. The full Octane run used three interleaved rounds of 15 benchmark groups and four engines. All 180 processes exited successfully, producing 204 score samples. Taking the median of each workload before the geometric mean gives the following scores.
+
+| Octane score, higher is better | Interpreter | Default JIT | Compiled calls | Node/V8 |
+| --- | ---: | ---: | ---: | ---: |
+| 15 throughput scores | 5,094 | 5,235 | 5,129 | 53,812 |
+| All 17 scores, including two latency scores | 5,675 | 5,901 | 5,797 | 53,383 |
+
+On throughput alone the default JIT scored 2.77% above the interpreter and compiled calls scored 0.69% above it. V8 scored 10.28× and 10.49× higher respectively. With calls enabled, Richards improved 24.5% over the interpreter, while RegExp fell 23.4% and RayTrace fell 14.0%. The best default-JIT result was CodeLoad, where SilkJS beat V8. The largest gap was DeltaBlue at 50.82×. [Per-workload medians and provenance](jit-scorecard-results/2026-11-18-9c7cb585/comparison.json) · [Raw scores](jit-scorecard-results/2026-11-18-9c7cb585/octane.json) · [Peak memory samples](jit-scorecard-results/2026-11-18-9c7cb585/octane-rss.json)
+
+The CLI table gives the median paired ratio of SilkJS time to Node time over five fresh process pairs. The cold measurement includes process startup and the entire script. The repeated measurement runs two untimed invocations then five timed invocations per process. Every invocation has a checked result. Ratios below 1 favor SilkJS.
 
 | CLI workload | Cold, default JIT | Repeated, default JIT | Cold, compiled calls | Repeated, compiled calls |
 | --- | ---: | ---: | ---: | ---: |
@@ -28,15 +43,45 @@ We built `9c7cb585` in release mode on Linux x86-64 with the pinned Silk dev.74 
 | String/integer Map and Set operations | 0.45× | 0.83× | 0.41× | 1.15× |
 | RegExp matching, replace and split | 0.17× | 1.62× | 0.19× | 1.60× |
 
-The parse workload regenerates the same three 238 KB function bodies on every invocation. In a paired diagnostic, adding a distinct trailing comment to each body changed the repeated default-JIT gap from 14.98× to 1.91×. Median SilkJS time changed from 35.1 to 30.0 ms, and Node time from 2.48 to 16.1 ms. Reusing identical source accounts for much of the gap on this fixture. Investigate reusable compilation data on a real loader workload before treating this result as evidence for a parser rewrite. [Diagnostic samples and exact source change](jit-scorecard-results/2026-11-18-9c7cb585/parse-reuse.json)
+The interpreter-only control also finished ahead of Node on all four cold workloads. Its repeated ratios in table order were 1.03×, 32.25×, 0.70× and 1.14×. These runs used separate Node-paired windows. [Interpreter samples](jit-scorecard-results/2026-11-18-9c7cb585/cli-interpreter.json)
 
-On eight fixed-work kernels (seven fresh processes per engine), the default JIT took 7.99× Node’s time on the geometric mean. Compiled calls brought this to 5.28×. The doubles kernel was 1.33× with calls, the typed-array kernel 44.88×. A typed-array benchmark this far behind earns a separate profile of compilation versus steady-state element access. The earlier preview on a different branch and host reached 7.5× on the typed-array kernel and still needs independent application-level validation.
+The parse workload regenerates the same three 238 KB function bodies on every invocation. In a paired diagnostic, adding a distinct trailing comment to each body changed the repeated default-JIT gap from 14.98× to 1.91×. Median SilkJS time changed from 35.1 to 30.0 ms, and Node time from 2.48 to 16.1 ms. Reusing identical source accounts for much of the gap on this fixture. SilkJS already has an opt-in bytecode cache keyed by source, filename and flags. It admits ordinary global scripts and linked modules after a repeated miss. The Function constructor here takes the indirect-eval path, outside that admission rule. Test reuse on deployed module loads first. A constructor-specific experiment must preserve the calling realm, fresh function identity, prototypes and observable coercions. [Compiler cache rules](../../modules/engine/src/js_eval_compile.silk) · [Function constructor](../../modules/engine/src/js_function_intrinsics.silk) · [Diagnostic samples and exact source change](jit-scorecard-results/2026-11-18-9c7cb585/parse-reuse.json)
+
+On eight fixed-work kernels (seven fresh processes per engine), the default JIT took 7.59× Node’s time on the geometric mean. Compiled calls brought this to 5.08×. The doubles kernel was 1.14× with calls, the typed-array kernel 44.75×. A typed-array benchmark this far behind earns a separate profile of compilation versus steady-state element access. The earlier preview on a different branch and host reached 7.5× on the typed-array kernel and still needs independent application-level validation.
 
 [CLI runner and reproduction](../../modules/engine/bench/README.md) · [Default JIT samples](jit-scorecard-results/2026-11-18-9c7cb585/cli-jit.json) · [Compiled-calls samples](jit-scorecard-results/2026-11-18-9c7cb585/cli-calls.json) · [Kernel samples and counters](jit-scorecard-results/2026-11-18-9c7cb585/candidate-kernels.json)
 
+## Compiler change
+
+The candidate dropped back to the interpreter when a compiled named-property store would replace an own writable slot’s last reference. The field-store change at `d5b0bb73` allows a deferred release at each store where the ownership pass proves it safe. At a store crossed by a live borrowed field, the conservative path reconstructs interpreter state before removing that last owner. This also protects copies borrowed across aliases. Accessors, proxies and other unsupported destinations retain their ordinary behavior. [Ownership rule](ssa.md#borrowed-fields-at-an-overwrite) · [Machine-code helper interface](compiled-entry.md)
+
+On the [overwrite fixture](jit-scorecard-results/2026-11-18-d5b0bb73/last-owner.js), the old and new shells returned 162900000. Fixed-work instructions fell from 481,059,543 to 167,317,837 and deopts from 16 to zero. An initial version that blocked all borrows across a named store added 2.26% on Richards. Limiting the rule to the individual store brought Richards to +0.0013%, DeltaBlue to +0.0057% and RayTrace to +0.0030%.
+
+One fixed TypeScript iteration fell from 13.805 to 13.709 billion instructions (−0.70%). Deopts fell from 1,915 to 1,730 and unlinks from 233 to 210. OSR compilations also changed from 11 to eight. Repeat the wall-time comparison before attributing a TypeScript throughput gain to this change. [Per-workload instruction counts, flags and exit counters](jit-scorecard-results/2026-11-18-d5b0bb73/field-stores.json)
+
+## Embedded host
+
+The opt-in host links the JIT and the Node-compatible runtime. It attaches one JIT on the runtime thread after bootstrap and before loading the application entry point. A separate executable keeps ordinary embedders free to choose interpreter-only operation. An external ES module goes through the runtime module loader, including relative import resolution and exit status propagation.
+
+The x86-64 release host at `0c20dab2` ran a `node:timers` callback and returned checksum 33521664. Its counters recorded 3,535 compiled entries, six OSR entries, zero compiler failures and zero deopts. An external module with a relative import and a filename containing spaces produced the same checksum and propagated exit status 7. This host uses a fresh heap and attaches only to the main runtime. The production CLI bootstrap, snapshot restoration and worker lifecycle need their own validation on main. [Embedding example](../../modules/jit/embed-smoke/src/main.silk) · [Host setup](compiled-entry.md)
+
+### First HTTP comparison
+
+The same ES module ran in the embedded host and Node 24.19.0. It accepted a JSON order with 64 line items, computed a total and replied over a single persistent connection. The client verified every response. Three process pairs alternated order with the server pinned to CPU 0 and the client to CPU 4. Each process served 1,200 warmup requests, a three-second sequential throughput interval, and 400 requests scheduled at 100/s for the latency measurement.
+
+| Median of three processes | Embedded SilkJS JIT | Node/V8 |
+| --- | ---: | ---: |
+| Launch to first validated response | 146 ms | 80 ms |
+| Completed requests/s, one connection | 4,152 | 9,709 |
+| Server CPU per request | 231 µs | 53.9 µs |
+| Scheduled-arrival p99, measured at 100 requests/s | 9.41 ms | 0.82 ms |
+| Peak RSS | 96,984 KiB | 56,044 KiB |
+
+Node sustained 2.34× the throughput. In each SilkJS process the JIT ran more than 50,000 times without compiler failures. These are process-wide counters. The p99 varied from 1.66 to 20.01 ms for SilkJS and 0.63 to 1.23 ms for Node. Attribute latency only after tracing scheduling, request handling, runtime work and collection within the request intervals. This embedded mode bootstraps a fresh heap. Production CLI startup with its image needs a separate measurement. [Fixture and reproduction](../../modules/runtime/bench/README.md) · [Raw timings, counters and executable hashes](jit-scorecard-results/2026-11-18-0c20dab2/http-orders.json)
+
 ## Server milestone
 
-1. **Test the real host.** Run the same unchanged Node-compatible program in both full runtimes. Start with JSON over `node:http` and a callback-heavy application using the module loader. Verify response contents and request counts. Record wall time to first response in fresh processes, sustained successful requests/s, p99 at the same offered load below saturation, CPU/request and peak RSS. Record concurrency, warmup, client placement, versions, flags and binary identities. Publish the two workloads individually. The runtime bench currently defaults to Bun with its JIT disabled. [Runtime benchmark configuration](../../modules/runtime/bench/README.md)
+1. **Broaden host coverage.** Keep the JSON order service above and add a callback-heavy application using the module loader. Run the same unchanged program in both full runtimes. Verify response contents and request counts. Record wall time to first response in fresh processes, sustained successful requests/s, p99 at the same offered load below saturation, CPU/request and peak RSS. Record concurrency, warmup, client placement, versions, flags and binary identities. Publish the two workloads individually. The runtime bench currently defaults to Bun with its JIT disabled. [Runtime benchmark configuration](../../modules/runtime/bench/README.md)
 2. **Spend CPU where it matters.** Profile the hot service interval with diagnostics separate from timing. Distinguish compiled bodies, interpreter, compiler, builtins, allocation/destruction and host I/O. When most excess CPU sits in a builtin, profile that builtin before broadening bytecode coverage. When it sits on call or field exits, group by function and site, and estimate the time recovered after compilation cost. Confirm each change with fixed-work interpreter and JIT A/B runs on the workload that motivated it.
 3. **Use deployment information the host actually has.** The loader already owns module identity, bootstrap and bytecode caching. A stable deployment can seed a profile at restart, specialize a known callee behind an identity guard, or prebuild hot code before serving requests. Measure time-to-first-request, cumulative CPU through warmup and post-warmup throughput with those features independently enabled. Dynamic import, eval, monkey-patching and invalidation still require working fallback paths. [Runtime bytecode cache](../../modules/runtime/src/ext/script_cache.silk)
 4. **Keep production integration close.** Main at `719650d1` has the composable runtime on Silk dev.86. This JIT branch uses dev.74 and forked at `d1973537`. A trial Git merge of the candidate and that main revision reports conflicts in the workspace manifest, engine tasks and benchmark engine registry. A clean textual merge of the VM files still requires compiling the new package graph and rerunning differential and host tests. Move the tested tier seam to main’s embedding API before accumulating another independent runtime.

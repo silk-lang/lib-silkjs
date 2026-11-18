@@ -80,6 +80,21 @@ otherwise extend, and none exists in the subset yet.
 consumes an owned `v` (drops one count, with the interpreter's deferred release,
 `Value.drop`). Neither applies to `i32` or `bool`.
 
+### Borrowed fields at an overwrite
+
+An own field can be the last owner of a string or object. A borrowed read of that field can
+survive a store through an alias, even while the receiver stays rooted. During borrow elimination,
+the ownership pass marks every named store crossed by such a borrow as conservative. At these
+sites, overwriting the last owner exits to the interpreter before changing the slot. A retained
+copy of a borrowed field inherits that constraint. A direct argument or independently owned
+value can keep its own lifetime.
+
+For other sites, the compiled store may take a reference to the incoming value, replace the
+writable own data slot and release the displaced value through `releaseDeferred`. This path
+can queue an object for destruction or free short-lived storage. The helper's site argument
+carries the bytecode offset in its low 32 bits. Bit 32 permits the last release, and a zero
+high word preserves the conservative behavior. [Ownership pass](../../modules/jit/src/ssa_ownership.silk) · [Helper ABI](../../modules/jit/src/jit_helpers.silk)
+
 ## Instructions of the first subset
 
 | Instruction | Result | Notes |
