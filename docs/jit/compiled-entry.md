@@ -42,6 +42,27 @@ Which entries check the slot:
   code. While instructions are observed (`observeInstructions`, the debugger) the compiled
   entry is skipped and the interpreter runs.
 
+### Running compiled JavaScript in an embedded Node runtime
+
+An x86-64 Linux application can link both `silkjs-runtime` and `silkjs-jit`. Its
+`embed.Host.afterBootstrap` can call `jit_runtime.enable` on the realm's runtime before the
+module loader starts the application. The application owns one JIT per runtime, at a stable address from attachment
+through heap destruction. Embedded mode creates a fresh heap and runs bootstrap before attaching the compiler.
+Each worker owns a separate runtime and would need its own JIT.
+
+`modules/jit/embed-smoke/src/main.silk` is a complete host. It imports `node:timers` in an ES
+module and runs a numeric loop in a `setImmediate` callback. Run it from the checkout root:
+
+```sh
+silk run --manifest-path modules/jit/embed-smoke/silk.toml
+```
+
+A successful run prints `timer checksum 33521664` and JIT counters. The executable checks
+the JavaScript exit status, compiler failures and actual entries into compiled code. To run an
+external ES module through the same host, pass its absolute path as the sole argument. The
+runtime loads it as its normal entry point, resolves imports relative to their importing module
+and returns its exit status. JIT counters are printed when the runtime shuts down.
+
 ## 2. Calling convention and where a compiled frame lives
 
 For this milestone the compiled function makes no calls and cannot fail, so a compiled frame is
