@@ -76,6 +76,10 @@ With `--no-jit`, the original and combined hosts used 775,746 and 762,020 instru
 
 The parser now reuses the hash computed while scanning a plain ASCII key and converts exact decimal integers of up to 15 digits without the general-purpose decimal converter. It preserves signed zero, fractional and exponent forms, extended mode and reviver source spans. Isolated 64-line parse-and-total instructions fell 3.80%. Wide integers fell 8.69%, while decimals and strings cost 1.03% and 0.12% more on the control arrays. [Parser controls](json-controls.json)
 
+## Broader x86 throughput
+
+The 15-workload Octane throughput geometric mean was 5,527 for the candidate default JIT, 5,491 for the previous JIT, 5,199 for the candidate interpreter and 56,178 for Node/V8. This puts the candidate 6.3% above its interpreter and 10.16× behind V8. The 0.66% increase over the previous JIT is small relative to variation among workloads. Each engine/workload ran in a fresh process three times. The geometric means use per-workload medians. Two latency scores are reported separately. [Samples, commands and provenance](octane-regression.json) · [Three fixed-work profiles](octane-fixed-work.json)
+
 ## Correctness
 
 All 93 uncached JIT tests passed. All 23 fixed Octane and V8 workloads passed in four modes. Three hundred stratified programs matched in 13 configurations, including under forced deoptimization. The 416 native JSON comparisons covered strict and extended input with source records on and off. The candidate and previous SilkJS produced byte-identical results, including diagnostic positions. All 238 accepted graphs matched the pinned QuickJS reference. Of 178 rejected cases, 164 had pre-existing differences in diagnostic formatting relative to QuickJS. All 104 strict inputs matched Node 24's acceptance and error messages. [JIT and workload gates](gate.json) · [Native JSON oracle](json-oracle.json) · [Node JSON oracle](node-json-oracle.json)
