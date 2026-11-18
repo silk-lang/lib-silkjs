@@ -1157,3 +1157,38 @@ With `--jit-calls`:
 - Refusals with `--jit-calls`: "it calls a function that stays interpreted" 186 (new reason),
   deoptimized again where widened 121, `put_arg` 89, non-number arithmetic operand 77. Deopt sites:
   `call_method` 218 (437 before), `put_field` 194, `call_constructor` 37.
+
+## UNGATED PREVIEW, 2026-11-18 01:08 UTC: O1's 6623564 (claude/project-thread-5supa2, not gated)
+
+**Not an integration head.** It carries O2's 4af041c and hoisting of inlined bodies on top of O1's
+inlining. It has not passed the lead's gate. Measured on the same host as the d82fa5e8 section's
+startup and warmup (after the 00:45 UTC restart), so compare ratios. Kernels with 5 engines;
+the v8 suite (the 8 v8bench scripts, fixed iterations) under callgrind against plain. No Octane run.
+
+Kernels (`perf_table.py --simple`, no Octane):
+
+| What | Slower than V8 | Gain from our JIT (vs our interpreter) | Slower than V8, `--jit-calls` | Gain, `--jit-calls` |
+|---|---:|---:|---:|---:|
+| Simple loops (sum-calls, sum-long, nested, doubles) | 1.0x to 2.6x | 5.3x to 8.3x faster | 0.8x to 2.7x | 5.3x to 9.7x faster |
+| Array loop (array-sum) | 2.3x | 7.1x faster | 2.3x | 7.1x faster |
+| Function and method calls (calls, method) | 31.6x to 37.1x | none yet (1.0x) | 2.2x to 2.3x | 14.1x to 15.4x faster |
+| Typed arrays (typed-array) | 7.4x | 4.6x faster | 7.5x | 4.5x faster |
+| **All 8 kernels (geomean)** | **4.6x** | **3.8x faster** | **2.3x** | **7.6x faster** |
+
+Instructions per plain on the v8 suite (MEASURED, callgrind, one run each), preview against the
+gated d82fa5e8; output check 8 of 8 pass in both configs:
+
+| v8 script | `--jit` preview | `--jit` d82fa5e8 | `--jit-calls` preview | `--jit-calls` d82fa5e8 |
+|---|---:|---:|---:|---:|
+| richards | 1.010 | 1.011 | 0.830 | 0.835 |
+| deltablue | 1.005 | 1.006 | 1.089 | 1.025 |
+| crypto | 1.003 | 1.003 | 0.999 | 1.001 |
+| raytrace | 1.026 | 1.026 | 1.429 | 1.067 |
+| earley-boyer | 1.012 | 1.013 | 1.201 | 1.026 |
+| regexp | 0.991 | 0.975 | 1.073 | 1.193 |
+| splay | 1.002 | 1.002 | 1.050 | 1.026 |
+| navier-stokes | 1.002 | 0.997 | 0.891 | 0.934 |
+
+Reading: with `--jit-calls`, the calls and method kernels reach 2.3x and 2.2x of V8's JIT (5.4x to
+9.6x at d82fa5e8), but on the v8 suite the preview costs more than the gated head on raytrace
+(1.429x plain), earley-boyer (1.201x) and deltablue (1.089x). It gains on navier-stokes and regexp.
