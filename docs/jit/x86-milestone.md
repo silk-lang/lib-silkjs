@@ -2,7 +2,7 @@
 
 ## Decision
 
-**SilkJS misses the original plan’s 1.3× throughput target on x86-64.** On the handoff candidate, V8 scored 10.28× higher across Octane’s throughput workloads. In the first real HTTP comparison, the embedded SilkJS JIT served 42.8% of Node’s request rate. The cold-shell advantage is real on several commands and disappeared on the embedded service.
+**SilkJS misses the original plan’s 1.3× throughput target on x86-64.** On the handoff candidate, V8 scored 10.28× higher across Octane’s throughput workloads. On the JSON order service the embedded SilkJS JIT reached 42.8% of Node’s throughput in the first comparison and 42.9% on the combined release, using the median of paired runs. The cold-shell advantage is real on several commands and disappeared on the embedded service.
 
 Keep the optional JIT and its shared compiler for eventual AOT. Change how we select compiler work. Run the application or CLI workload on which a proposed change should pay for itself, measure its time against default Node/V8, and identify where SilkJS spends the extra time. Use kernels to isolate the mechanism afterwards. Keep correctness and the cost of interpreter-only operation as independent release gates.
 
@@ -22,6 +22,10 @@ The pause report and the measurement branch contain different kernel runs. Use r
 ## Candidate gate
 
 The uploaded pause record’s interrupted candidate was `9c7cb585`. On this host, 82/82 JIT tests passed, llvm-mc fixtures matched and the engine and JIT shell built in release mode. The interpreter stayed inside its 0.5% instruction budget on all eight fixed-work V8 comparisons against `1941679d`. Both JIT modes matched plain output on all eight. All 3,000 seeds agreed across ten configurations, with actual native entries under each JIT configuration. The harness detected its planted defects in all eight areas. The full native suite executed 566 tests and reproduced the two recorded `js_for_in_tests` failures. [Gate record and exact failed tests](jit-scorecard-results/2026-11-18-9c7cb585/gate.json)
+
+### Combined release gate
+
+The combined runtime and field-store changes at `c39cc03d` passed all 83 JIT tests, the x86 encoding checks and all 16 fixed-output comparisons. All 3,000 differential seeds agreed across ten configurations, and all seven JIT configurations entered native code on every seed. The interpreter’s largest instruction-count increase relative to `9c7cb585` was 0.0604% on RayTrace. The full native suite reproduced the same two for-in failures, with 564 passes. [Combined release gate and binary hashes](jit-scorecard-results/2026-11-18-c39cc03d/gate.json)
 
 ## Candidate measurements
 
@@ -51,13 +55,33 @@ On eight fixed-work kernels (seven fresh processes per engine), the default JIT 
 
 [CLI runner and reproduction](../../modules/engine/bench/README.md) · [Default JIT samples](jit-scorecard-results/2026-11-18-9c7cb585/cli-jit.json) · [Compiled-calls samples](jit-scorecard-results/2026-11-18-9c7cb585/cli-calls.json) · [Kernel samples and counters](jit-scorecard-results/2026-11-18-9c7cb585/candidate-kernels.json)
 
+## Why the suite stays near the interpreter
+
+A function can enter machine code thousands of times and still spend most of its work outside that code. Fixed-work profiles on the handoff candidate show how the default compilation policy, the cost of crossing back into the engine and the quality of emitted code affect different workloads. The figures below are guest instructions counted by Callgrind. CPU time per instruction varies, and the generated-code column excludes native helpers called by generated code.
+
+| Workload and JIT configuration | What executed | Consequence |
+| --- | --- | --- |
+| Richards, default JIT versus compiled calls | Default refused 11 hot functions because they make calls and compiled one. Generated code handled 1.11% of instructions. Enabling calls compiled all 13 reported functions and raised the generated share to 59.8%. | Default took 1.011× the interpreter’s instructions. Calls took 0.834×. The benefit came from keeping this call chain together. |
+| RegExp, compiled calls | 284,939 compiled entries, zero direct calls and 10.7% of instructions in generated code. The regexp executor, builtin entry, result construction and compiled-call adapter all appear among the hot native functions. | 1.234× interpreter instructions. A compiler that optimizes the wrapper still has to pay for matching, constructing results and transitions. |
+| Box2D, compiled calls | 15 functions compiled and 35 were refused, including 20 argument-write refusals. The VM dispatch loop alone consumed 54.4% of instructions. Generated code accounted for 1.33%, compiler pass and backend symbols 15.07%, and helper symbols 0.04%. | 1.242× interpreter instructions. Compile work is a large cost on this fixed input and yields little time in generated code. |
+| RayTrace, compiled calls | 98,882 entries, two direct calls, 144 deopts, 18 unlinks and 2.21% of instructions in generated code. Interpreter execution and constructor paths dominate. | 1.099× interpreter instructions. Constructor and call specialization are better candidates here than another numerical lowering. |
+| Float64Array multiply-add, compiled calls | The inner function compiled with zero deopts. Per additional element the code performed about four global lookup calls, three element reads and one write through helpers. Those helpers and their callees cost about 222 instructions per element. V8’s optimized hot loop uses indexed floating-point loads and a store. | SilkJS used about 444 instructions per element versus 528 interpreted, a 16% reduction. Passing the same arrays as arguments removed repeated global lookup and cut the JIT to 280 instructions per element with identical checksums and the same four element helpers. An optimizer can target stable bindings while preserving ordinary JS mutation semantics. |
+
+We tested the queued typed-array and hoisting work on a separate release build at `25e45217`. On the same Float64Array loop and checksums, it used 133.90 instructions per element (69.8% below the handoff candidate). Element read/write helper calls fell to zero. Global lookup calls fell from 4.0005 to 0.0053 per element. With hoisting disabled on this build, element helpers stayed at zero and the cost rose to 253.75 instructions per element. These tests isolate two useful mechanisms on one loop. They give the O2 work priority for an integration gate and an application benchmark. [Checksums, counters, build identities and controls](jit-scorecard-results/2026-11-18-25e45217/receipt.json)
+
+Wall time on the original 10-million-update kernel confirms the effect. In seven interleaved fresh processes per engine the medians were 355.94 ms interpreted, 386.05 ms with compiled calls on the candidate, 74.80 ms with the same flags on O2 and 8.92 ms on default Node. All 28 checksums matched. O2 was 5.16× faster than the candidate here and still took 8.39× as long as V8. The O2 loop still boxes and unboxes numbers and repeats typed-array view checks. Test keeping doubles unboxed across the loop and moving view checks where calls and buffer mutations can safely invalidate them. [Raw elapsed times, checksums and binary hashes](jit-scorecard-results/2026-11-18-25e45217/wall.json)
+
+The compiler and helper percentages count instructions in the named symbols themselves. The earlier scorecard assigned some JIT runtime helpers to the compiler. The new profiler reports their self costs separately and marks missing symbol information. [Fixed-work comparisons and counters](jit-scorecard-results/2026-11-18-9c7cb585/coverage-fixed.json)
+
+On the optimized field branch’s TypeScript run, the interpreter’s `executeLoop` alone accounts for 51.1% of self instructions and emitted code accounts for 4.73%. Richards on the same branch spends 59.8% in emitted code. Increasing an aggregate count of hot functions would give both profiles the same prescription. Measure successful direct calls, repeated exits, the work remaining in helpers and the compiler’s own cost on each workload. [Source-level self-instruction profiles](jit-scorecard-results/2026-11-18-d5b0bb73/hotspots.json)
+
 ## Compiler change
 
 The candidate dropped back to the interpreter when a compiled named-property store would replace an own writable slot’s last reference. The field-store change at `d5b0bb73` allows a deferred release at each store where the ownership pass proves it safe. At a store crossed by a live borrowed field, the conservative path reconstructs interpreter state before removing that last owner. This also protects copies borrowed across aliases. Accessors, proxies and other unsupported destinations retain their ordinary behavior. [Ownership rule](ssa.md#borrowed-fields-at-an-overwrite) · [Machine-code helper interface](compiled-entry.md)
 
 On the [overwrite fixture](jit-scorecard-results/2026-11-18-d5b0bb73/last-owner.js), the old and new shells returned 162900000. Fixed-work instructions fell from 481,059,543 to 167,317,837 and deopts from 16 to zero. An initial version that blocked all borrows across a named store added 2.26% on Richards. Limiting the rule to the individual store brought Richards to +0.0013%, DeltaBlue to +0.0057% and RayTrace to +0.0030%.
 
-One fixed TypeScript iteration fell from 13.805 to 13.709 billion instructions (−0.70%). Deopts fell from 1,915 to 1,730 and unlinks from 233 to 210. OSR compilations also changed from 11 to eight. Repeat the wall-time comparison before attributing a TypeScript throughput gain to this change. [Per-workload instruction counts, flags and exit counters](jit-scorecard-results/2026-11-18-d5b0bb73/field-stores.json)
+One fixed TypeScript iteration fell from 13.805 to 13.709 billion instructions (−0.70%). Deopts fell from 1,915 to 1,730 and unlinks from 233 to 210. OSR compilations also changed from 11 to eight. Seven alternating pairs comparing the combined release to the candidate returned identical output. The median paired wall-time ratio was 1.008× (range 0.915–1.037×), with three of seven pairs faster. An application speedup remains unproven. [Paired wall times](jit-scorecard-results/2026-11-18-c39cc03d/typescript-wall.json) [Per-workload instruction counts, flags and exit counters](jit-scorecard-results/2026-11-18-d5b0bb73/field-stores.json)
 
 ## Embedded host
 
@@ -78,6 +102,14 @@ The same ES module ran in the embedded host and Node 24.19.0. It accepted a JSON
 | Peak RSS | 96,984 KiB | 56,044 KiB |
 
 Node sustained 2.34× the throughput. In each SilkJS process the JIT ran more than 50,000 times without compiler failures. These are process-wide counters. The p99 varied from 1.66 to 20.01 ms for SilkJS and 0.63 to 1.23 ms for Node. Attribute latency only after tracing scheduling, request handling, runtime work and collection within the request intervals. This embedded mode bootstraps a fresh heap. Production CLI startup with its image needs a separate measurement. [Fixture and reproduction](../../modules/runtime/bench/README.md) · [Raw timings, counters and executable hashes](jit-scorecard-results/2026-11-18-0c20dab2/http-orders.json)
+
+On the combined release (`c39cc03d`), a second three-round run used the same application, client, CPU pins and Node executable. The median rate was 4,047 requests/s for SilkJS and 9,665 for Node. The median of paired throughput ratios was 42.9%. Median server CPU per request was 236 µs versus 54.5 µs, first response 151 ms versus 100 ms, and peak RSS 96,352 versus 54,840 KiB. Scheduled-arrival p99 ranged from 3.07 to 8.91 ms for SilkJS and from 1.33 to 8.21 ms for Node. Throughput replicated closely, while the three pairs give limited precision on tail latency. [Combined release samples](jit-scorecard-results/2026-11-18-c39cc03d/http-orders.json)
+
+### Where the warmed service spends its instructions
+
+On the combined release `c39cc03d`, we warmed the same service with 1,200 orders, zeroed the Callgrind counters, ran 400 verified orders over the same connection and dumped the counters before shutdown. Callgrind counted 304,975,643 server instructions in that window. Emitted code accounted for 1.75%, VM modules for 52.96% in their own code (`executeLoop` alone 32.61%) and GC functions for 4.30% in their own code. The native HTTP parsing bridge and llhttp together accounted for 1.03% in their own code. The call into `JSON.parse` accounted for 26.83% **including its callees**, versus 0.17% for stringify. Inclusive and self shares overlap. These are SilkJS instruction counts. They locate work on this service. Attributing the gap to V8 requires a corresponding Node profile.
+
+Prioritize the interpreted callback chain and JSON materialization on this fixture. Count dispatches and property reads saved, verify the response, then repeat request CPU and p99 measurements on the same offered load. Run a second request size to separate per-request overhead from per-line-item decoding cost. [Profile, measured window and provenance](jit-scorecard-results/2026-11-18-c39cc03d/http-profile.json)
 
 ## Server milestone
 
