@@ -2,6 +2,24 @@
 
 The service receives one POST over a persistent connection, decodes its body, parses the order, sums the line items and writes a JSON response. The Python client independently computes the expected response bytes for four alternating orders. It checks every response, including the shutdown request. The application and the runtime's Node-compatible JavaScript modules are identical across these experiments.
 
+## Release decision
+
+Keep `62790abf` as a local experiment. The candidate default used more server CPU and delivered fewer verified orders per second than the previous default in all five paired rounds. The keyed-read change keeps the emitter linked, and the JSON change reduces instructions spent parsing. Neither result establishes a wall-time improvement for the service. Compiled calls remain opt-in.
+
+| 64-item order, median of five processes | Verified orders/s | Server CPU, µs/order | First response, ms | Scheduled p99, ms |
+| --- | ---: | ---: | ---: | ---: |
+| Previous default JIT | 4,196 | 227.11 | 135.15 | 1.64 |
+| Candidate interpreter | 4,295 | 224.27 | 133.19 | 6.44 |
+| Candidate default JIT | 4,034 | 236.31 | 133.30 | 3.10 |
+| Candidate with compiled calls | 2,873 | 330.82 | 127.80 | 4.56 |
+| Node v24.19.0, default V8 | 9,450 | 55.38 | 104.54 | 1.72 |
+
+Across matched rounds, the candidate default delivered 3.9% fewer orders/s (range 2.4–9.8% fewer) and used 3.1% more CPU/order (range 0.7–10.5% more) than the previous default. It delivered 42.8% of Node's throughput at 4.25× its CPU/order. Enabling compiled calls on the candidate increased median paired CPU/order by 42.7%. Against the build with the identical JSON change and compiled calls enabled, adding keyed reads changed CPU/order by +4.8%, with individual pairs spanning −6.6% to +17.9%. This comparison cannot assign the whole-build regression to keyed reads.
+
+The same candidate on four-item orders delivered 4,605/s in interpreter mode, 4,351/s with the default JIT, 3,447/s with compiled calls and 10,569/s with Node. Over three paired rounds the default used 5.5% more CPU/order than the candidate interpreter and 4.74× as much as Node. Reducing the payload retained the throughput gap, consistent with a substantial fixed cost per request.
+
+Both sweeps ran on an AMD EPYC 9V74. The client and server used separate cores. Each fresh server handled one initial order, 1,200 warmups, a three-second sequential throughput interval, 400 scheduled orders at 100/s, then a verified shutdown. The 64-item sweep interleaved nine conditions over five rounds. The four-item sweep interleaved four over three rounds. Instructions, breakpoint counts and wall timing were collected in separate processes. The client verified 869,902 orders in the wall sweeps. [64-item timings](wall-64.json) · [Four-item timings](wall-4.json) · [Concurrent load](wall-quiet.json)
+
 ## Original request path
 
 A debugger followed 1,600 requests on the original production engine with compiled calls enabled. Counts include warmup and shutdown. The debugger did not supply timing data.
@@ -42,6 +60,25 @@ A separate JS function performing a single `table[type]` read used about 939 ins
 After 4,800 warmup orders, a 400-order fixed window took approximately 767,000 x86-64 instructions per order on the original default SilkJS and 217,000–220,000 on Node v24.19.0. The complete call to JSON.parse accounted for about 205,000 on SilkJS and 112,000 on Node. Subtracting these inclusive parser counts from each process total leaves about 83% of the instruction gap outside parsing. Cycles per instruction and operating-system costs can differ between runtimes. Server CPU and throughput come from separate processes running without instrumentation. [Node profiles](node-fixed-work.json)
 
 The original server's default-JIT count fell from 761,000 instructions per 64-line order to 543,000 per four-line order after 1,200 warmup requests. Parsing fell from 205,000 to 16,400 instructions. The line count explains most of the change in parsing work. Roughly 527,000 instructions per small order remained outside the parser.
+
+## Fixed work on matched builds
+
+Three builds used the same application. The original engine is `b52550c7`, `141e0645` has the revised JSON reader, and `62790abf` adds the keyed JIT operation. The interpreter control `8781b74c` adds the host's `--no-jit` switch to the original engine. Each number below is x86-64 instructions per verified order, measured after 1,200 warmup requests over a fixed 400 requests.
+
+| Payload and policy | Original | JSON change only | JSON and keyed reads |
+| --- | ---: | ---: | ---: |
+| 64 items, default JIT | 761,206 | 747,183 | 749,693 |
+| 64 items, compiled calls | 913,609 | 875,446 | 882,905 |
+| 4 items, default JIT | 543,102 | 542,218 | 544,422 |
+| 4 items, compiled calls | 664,497 | 691,356 | 663,757 |
+
+With `--no-jit`, the original and combined hosts used 775,746 and 762,020 instructions per 64-item order. The inclusive cost of parsing fell from 204,626 to 191,234, accounting for 13,392 of the 13,726 instructions saved. For four-item orders, total instructions fell just 0.17%. With calls on and 4,800 warmup orders, the combined build used 924,531 instructions against 931,610 on JSON alone. At 1,200 warmup orders that pair moved in the opposite direction. Compilations during the measured window affect these counts. [Fixed JIT windows](fixed.json) · [Interpreter windows](interpreter.json)
+
+The parser now reuses the hash computed while scanning a plain ASCII key and converts exact decimal integers of up to 15 digits without the general-purpose decimal converter. It preserves signed zero, fractional and exponent forms, extended mode and reviver source spans. Isolated 64-line parse-and-total instructions fell 3.80%. Wide integers fell 8.69%, while decimals and strings cost 1.03% and 0.12% more on the control arrays. [Parser controls](json-controls.json)
+
+## Correctness
+
+All 93 uncached JIT tests passed. All 23 fixed Octane and V8 workloads passed in four modes. Three hundred stratified programs matched in 13 configurations, including under forced deoptimization. The 416 native JSON comparisons covered strict and extended input with source records on and off. The candidate and previous SilkJS produced byte-identical results, including diagnostic positions. All 238 accepted graphs matched the pinned QuickJS reference. Of 178 rejected cases, 164 had pre-existing differences in diagnostic formatting relative to QuickJS. All 104 strict inputs matched Node 24's acceptance and error messages. [JIT and workload gates](gate.json) · [Native JSON oracle](json-oracle.json) · [Node JSON oracle](node-json-oracle.json)
 
 ## Reproducing the Node profile and dispatch count
 
