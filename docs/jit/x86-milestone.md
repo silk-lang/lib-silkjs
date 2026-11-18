@@ -2,11 +2,22 @@
 
 ## Decision
 
-**SilkJS misses the original plan’s 1.3× throughput target on x86-64.** On the handoff candidate, V8 scored 10.28× higher across Octane’s throughput workloads. On the JSON order service the embedded SilkJS JIT reached 42.8% of Node’s throughput in the first comparison and 42.9% on the combined release, using the median of paired runs. The cold-shell advantage is real on several commands and disappeared on the embedded service.
+**The integrated x86-64 JIT at `b52550c7` scores 5.1% above the interpreter on Octane throughput. Node/V8 scores 10.23× higher than SilkJS’s default JIT.** The original plan’s first target was within 1.3×. The handoff candidate was 2.8% above the interpreter and 10.28× behind V8. The largest new wins are in arithmetic and typed-array code. On the JSON order service the integrated default JIT reached 38.3% of Node throughput at the median of five paired runs. Enabling compiled calls raised request CPU in every pair. The standalone shell retains a startup advantage on several commands. The embedded service paid more time to its first verified response than Node.
 
 Keep the optional JIT and its shared compiler for eventual AOT. Change how we select compiler work. Run the application or CLI workload on which a proposed change should pay for itself, measure its time against default Node/V8, and identify where SilkJS spends the extra time. Use kernels to isolate the mechanism afterwards. Keep correctness and the cost of interpreter-only operation as independent release gates.
 
 The [original plan](https://github.com/silk-lang/lib-silkjs/blob/8237a590/docs/jit/archive/2026-11-12-plan.html) set a first throughput target within 1.3× of V8 and JSC on the suite geometric mean. Its longer-term ambition was parity on the mean with the slowest workload within about 1.3×. For this milestone use the first target on x86-64 with default V8 in a pinned Node release. Report the slowest workload and each suite separately. For the server, propose the same 1.3× budget independently on CPU-bound request time and p99 under agreed load, and report startup and RSS alongside them. Preserve the longer-term ambition. A geometric mean that includes cold startup, request latency and throughput makes it impossible to tell which target the engine met.
+
+## Integrated throughput
+
+Three fresh-process rounds of all 15 Octane groups used the same pinned x86-64 toolchain, full release binaries, Octane source and default Node 24.19.0. All 180 processes exited successfully. Each score below takes the median per workload before the geometric mean. The second row also includes the two latency scores and serves as a comparison with the historical all-score headline.
+
+| Octane score, higher is better | Interpreter | Default JIT | Compiled calls | Node/V8 |
+| --- | ---: | ---: | ---: | ---: |
+| 15 throughput scores | 5,155 | 5,419 | 5,441 | 55,419 |
+| All 17 scores | 5,791 | 6,185 | 6,189 | 55,400 |
+
+Compiled calls scored 5.5% above the interpreter and took the V8 throughput-score gap from 10.49× on the handoff candidate to 10.19×. Workload medians show why the aggregate moved so little. With compiled calls, Crypto scored 2.54× the interpreter and Richards 1.35×. RegExp scored 0.72× the interpreter, Box2D 0.78× and TypeScript 0.86×. Keep calls opt-in and use timed application work to guide the next change. [Per-workload scores and build identities](jit-scorecard-results/2026-11-18-b52550c7/comparison.json) · [Raw scores](jit-scorecard-results/2026-11-18-b52550c7/octane.json) · [Memory samples](jit-scorecard-results/2026-11-18-b52550c7/octane-rss.json) · [Process audit](jit-scorecard-results/2026-11-18-b52550c7/octane-processes.json)
 
 ## Validating the O2 integration
 
