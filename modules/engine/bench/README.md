@@ -55,6 +55,29 @@ Scores are wall-clock based and noisy on shared hosts. A score gap that the inst
 counts do not show usually comes from memory traffic, such as larger objects or more GC
 cycles.
 
+## Fixed-work CLI comparison with Node/V8
+
+From `modules/engine`, compare the release JIT shell with Node on JSON round trips, generated
+source parsing, Map/Set operations and regexp matching. These four checked-in macro workloads
+exercise engine paths used by CLI programs. They contain no network, filesystem or server load.
+
+```sh
+SILKJS_JIT=/path/to/silkjs-jit-shell NODE_REFERENCE=/path/to/node \
+  python3 scripts/jit_parity.py --calls --rounds 5 --json /tmp/jit-parity.json
+```
+
+Each round runs both executables on identical work and checks every invocation against
+`macro/expected.json`. The runner alternates which executable goes first. `cold_ms` measures
+process launch through exit for the original script, including Node's CLI initialization.
+`repeated_ms_per_call` times a batch inside a separate process after `--warmup` untimed calls.
+Each call runs the script body in a fresh function scope and prints its result. The default is
+two warmup calls and five timed calls. Report these as measurements at that warmup length.
+
+The ratio is the median of paired SilkJS time divided by Node time for that workload and metric.
+A ratio of 2 means SilkJS took twice as long. JSON records the raw samples, executable paths,
+flags, SHA-256 hashes, host, Node/V8 versions and workload revision. Supply `--only json,parse`
+for a smaller run. Omit `--calls` to compare the default `--jit` configuration.
+
 ## Comparison with other engines
 
 The tables that set silkjs beside V8 jitless (Node 24), JSC without its JIT, QuickJS and the two
