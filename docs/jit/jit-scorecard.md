@@ -9,50 +9,50 @@ compiling functions reported hot. `silkjs` is the plain engine. Every number is 
 host of its section unless it says otherwise. Raw files are in
 [`jit-scorecard-results/`](jit-scorecard-results/), one folder per section.
 
-## Latest: integration 90f03c13 (2026-11-17 20:41 UTC, another host than the sections before it)
+## Latest: integration d82fa5e8 (2026-11-18 00:50 UTC)
 
 Read one column: **Slower than V8**, how many times slower silkjs-jit (`--jit`) is than V8's JIT (1x would be V8's speed; lower is better). JSC's JIT gives nearly the same numbers. The second column is what the JIT gains over our own interpreter.
 
-| What | Slower than V8 | Gain from our JIT (vs our interpreter) |
-|---|---:|---:|
-| Simple loops (sum-calls, sum-long, nested, doubles) | 1.3x to 4.5x | 4.3x to 5.9x faster |
-| Array loop (array-sum) | 5.9x | 3.6x faster |
-| Function and method calls (calls, method) | 40.4x to 42.5x | none yet (0.8x to 1.0x) |
-| Typed arrays (typed-array) | 35.0x | 1.1x faster |
-| **All 8 kernels (geomean)** | **7.6x** | **2.7x faster** |
-| **Octane, the real-world suite (geomean)** | **8.9x** | **none yet (1.0x)** |
+| What | Slower than V8 | Gain from our JIT (vs our interpreter) | Slower than V8, `--jit-calls` | Gain, `--jit-calls` |
+|---|---:|---:|---:|---:|
+| Simple loops (sum-calls, sum-long, nested, doubles) | 1.6x to 3.9x | 4.0x to 6.3x faster | 1.7x to 3.8x | 4.1x to 6.1x faster |
+| Array loop (array-sum) | 6.2x | 2.9x faster | 6.3x | 2.8x faster |
+| Function and method calls (calls, method) | 23.3x to 38.8x | none yet (1.1x) | 5.4x to 9.6x | 4.3x to 4.5x faster |
+| Typed arrays (typed-array) | 34.8x | 1.2x faster | 33.9x | 1.2x faster |
+| **All 8 kernels (geomean)** | **7.3x** | **2.7x faster** | **5.1x** | **3.9x faster** |
+| **Octane, the real-world suite (geomean)** | **9.2x** | **none yet (1.0x)** | **9.3x** | **none yet (1.0x)** |
 
 Full table, every engine and benchmark. Kernel rows: ns per loop iteration, median of 7 processes, lower is better. Octane rows: score, median round, higher is better. Ratio columns: how many times faster the first engine is than the second. From `python3 docs/jit/perf_table.py [--simple] kernels.json octane.json`.
 
 | Benchmark | silkjs (interp) | silkjs-jit | silkjs-jit --jit-calls | V8 jitless | V8 JIT | JSC jitless | JSC JIT | jit / interp | jit-calls / interp | V8 JIT / silkjs-jit | JSC JIT / silkjs-jit |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| kernel sum-calls (ns/iter) | 11.21 | 2.61 | 2.82 | 15.35 | 0.58 | 8.20 | 0.87 | 4.29x | 3.97x | 4.50x | 3.00x |
-| kernel sum-long (ns/iter) | 11.73 | 1.98 | 2.28 | 21.89 | 1.33 | 9.73 | 0.93 | 5.92x | 5.14x | 1.49x | 2.14x |
-| kernel nested (ns/iter) | 15.22 | 2.59 | 2.56 | 19.58 | 0.76 | 10.82 | 1.59 | 5.88x | 5.94x | 3.41x | 1.62x |
-| kernel calls (ns/iter) | 29.08 | 28.57 | 20.51 | 35.87 | 0.71 | 34.37 | 1.07 | 1.02x | 1.42x | 40.39x | 26.60x |
-| kernel method (ns/iter) | 39.42 | 49.16 | 8.88 | 53.52 | 1.16 | 47.92 | 2.38 | 0.80x | 4.44x | 42.49x | 20.61x |
-| kernel doubles (ns/iter) | 18.97 | 3.31 | 3.25 | 34.76 | 2.48 | 15.01 | 2.45 | 5.74x | 5.84x | 1.34x | 1.35x |
-| kernel array-sum (ns/iter) | 17.46 | 4.85 | 5.12 | 25.58 | 0.82 | 14.78 | 0.85 | 3.60x | 3.41x | 5.89x | 5.72x |
-| kernel typed-array (ns/iter) | 49.16 | 42.89 | 43.61 | 73.56 | 1.23 | 74.30 | 1.25 | 1.15x | 1.13x | 34.96x | 34.37x |
-| **kernels geomean (ns/iter)** | **20.97** | **7.74** | **6.20** | **30.88** | **1.02** | **19.78** | **1.31** | 2.71x | 3.38x | 7.57x | 5.92x |
-| Octane Richards (score) | 1373 | 1596 | 1682 | 1274 | 35560 | 1140 | 37078 | 1.16x | 1.23x | 22.28x | 23.23x |
-| Octane DeltaBlue (score) | 1818 | 1845 | 1641 | 1124 | 64115 | 969 | 37165 | 1.01x | 0.90x | 34.75x | 20.14x |
-| Octane Crypto (score) | 1901 | 1910 | 1992 | 1145 | 39143 | 1420 | 46735 | 1.00x | 1.05x | 20.49x | 24.47x |
-| Octane RayTrace (score) | 4456 | 4662 | 4422 | 3638 | 77033 | 2065 | 112256 | 1.05x | 0.99x | 16.52x | 24.08x |
-| Octane EarleyBoyer (score) | 5717 | 5893 | 5379 | 5582 | 51651 | 2732 | 58983 | 1.03x | 0.94x | 8.76x | 10.01x |
-| Octane RegExp (score) | 2347 | 1912 | 1877 | 2052 | 7969 | 537 | 7736 | 0.81x | 0.80x | 4.17x | 4.05x |
-| Octane Splay (score) | 6112 | 6267 | 6120 | 5354 | 23323 | 3529 | 26819 | 1.03x | 1.00x | 3.72x | 4.28x |
-| Octane SplayLatency (score) | 16771 | 17992 | 17905 | 9043 | 59029 | 13801 | 49891 | 1.07x | 1.07x | 3.28x | 2.77x |
-| Octane NavierStokes (score) | 3790 | 4162 | 4058 | 1760 | 37508 | 2459 | 31367 | 1.10x | 1.07x | 9.01x | 7.54x |
-| Octane PdfJS (score) | 8737 | 8269 | 8500 | 7722 | 37943 | 6045 | 32693 | 0.95x | 0.97x | 4.59x | 3.95x |
-| Octane Mandreel (score) | 1339 | 1356 | 1369 | 1121 | 41013 | 840 | 52910 | 1.01x | 1.02x | 30.25x | 39.02x |
-| Octane MandreelLatency (score) | 8350 | 8966 | 8172 | 6838 | 60063 | 3321 | 34145 | 1.07x | 0.98x | 6.70x | 3.81x |
-| Octane Gameboy (score) | 9683 | 10809 | 10034 | 7377 | 79044 | 5886 | 92009 | 1.12x | 1.04x | 7.31x | 8.51x |
-| Octane CodeLoad (score) | 31226 | 30738 | 30532 | 31020 | 30003 | 19958 | 24732 | 0.98x | 0.98x | 0.98x | 0.80x |
-| Octane Box2D (score) | 6070 | 6185 | 4989 | 3951 | 92438 | 5150 | 79544 | 1.02x | 0.82x | 14.95x | 12.86x |
-| Octane zlib (score) | 2859 | 2716 | 2675 | 2146 | 68404 | 1648 | 64533 | 0.95x | 0.94x | 25.19x | 23.76x |
-| Octane Typescript (score) | 12621 | 12928 | 12443 | 16191 | 71034 | 11482 | 63278 | 1.02x | 0.99x | 5.49x | 4.89x |
-| **Octane geomean (score)** | **4980** | **5082** | **4893** | **3893** | **45356** | **2972** | **43072** | 1.02x | 0.98x | 8.92x | 8.48x |
+| kernel sum-calls (ns/iter) | 8.92 | 2.22 | 2.20 | 14.90 | 0.57 | 7.61 | 1.13 | 4.02x | 4.06x | 3.89x | 1.96x |
+| kernel sum-long (ns/iter) | 12.59 | 1.99 | 2.07 | 20.52 | 1.23 | 10.41 | 0.85 | 6.32x | 6.08x | 1.62x | 2.35x |
+| kernel nested (ns/iter) | 13.76 | 2.73 | 2.60 | 17.82 | 0.71 | 10.74 | 1.32 | 5.03x | 5.28x | 3.85x | 2.07x |
+| kernel calls (ns/iter) | 26.92 | 25.50 | 6.33 | 30.42 | 0.66 | 32.53 | 1.08 | 1.06x | 4.25x | 38.81x | 23.53x |
+| kernel method (ns/iter) | 37.54 | 35.71 | 8.29 | 47.81 | 1.53 | 47.32 | 1.70 | 1.05x | 4.53x | 23.27x | 20.99x |
+| kernel doubles (ns/iter) | 18.75 | 3.26 | 3.19 | 30.92 | 1.89 | 14.57 | 2.33 | 5.75x | 5.87x | 1.73x | 1.40x |
+| kernel array-sum (ns/iter) | 13.87 | 4.78 | 4.89 | 22.10 | 0.77 | 14.13 | 0.97 | 2.90x | 2.83x | 6.17x | 4.92x |
+| kernel typed-array (ns/iter) | 49.28 | 42.61 | 41.50 | 66.33 | 1.23 | 68.08 | 1.18 | 1.16x | 1.19x | 34.76x | 35.97x |
+| **kernels geomean (ns/iter)** | **19.39** | **7.21** | **5.02** | **27.83** | **0.99** | **19.18** | **1.26** | 2.69x | 3.86x | 7.30x | 5.73x |
+| Octane Richards (score) | 1465 | 1522 | 1740 | 1293 | 36435 | 1245 | 38719 | 1.04x | 1.19x | 23.94x | 25.44x |
+| Octane DeltaBlue (score) | 1881 | 1887 | 1944 | 1519 | 80618 | 937 | 51486 | 1.00x | 1.03x | 42.72x | 27.28x |
+| Octane Crypto (score) | 2052 | 2093 | 2123 | 1274 | 42472 | 1493 | 46734 | 1.02x | 1.03x | 20.29x | 22.33x |
+| Octane RayTrace (score) | 4483 | 4574 | 4440 | 3820 | 85543 | 2020 | 131200 | 1.02x | 0.99x | 18.70x | 28.68x |
+| Octane EarleyBoyer (score) | 5929 | 5983 | 5417 | 5672 | 64824 | 2743 | 70273 | 1.01x | 0.91x | 10.83x | 11.75x |
+| Octane RegExp (score) | 2315 | 2457 | 1946 | 2244 | 8009 | 536 | 8405 | 1.06x | 0.84x | 3.26x | 3.42x |
+| Octane Splay (score) | 6169 | 6340 | 6307 | 5807 | 25499 | 3887 | 28367 | 1.03x | 1.02x | 4.02x | 4.47x |
+| Octane SplayLatency (score) | 17975 | 18898 | 17428 | 9256 | 62233 | 14761 | 53885 | 1.05x | 0.97x | 3.29x | 2.85x |
+| Octane NavierStokes (score) | 3710 | 3932 | 4830 | 1617 | 39435 | 2352 | 31906 | 1.06x | 1.30x | 10.03x | 8.11x |
+| Octane PdfJS (score) | 9289 | 9247 | 9670 | 8122 | 39330 | 6562 | 36413 | 1.00x | 1.04x | 4.25x | 3.94x |
+| Octane Mandreel (score) | 1423 | 1451 | 1542 | 1146 | 44424 | 865 | 51765 | 1.02x | 1.08x | 30.62x | 35.68x |
+| Octane MandreelLatency (score) | 8839 | 9301 | 8982 | 6895 | 64743 | 3563 | 33684 | 1.05x | 1.02x | 6.96x | 3.62x |
+| Octane Gameboy (score) | 11073 | 11196 | 10908 | 7645 | 78551 | 6381 | 102218 | 1.01x | 0.99x | 7.02x | 9.13x |
+| Octane CodeLoad (score) | 31459 | 31698 | 32432 | 29452 | 30716 | 20474 | 24946 | 1.01x | 1.03x | 0.97x | 0.79x |
+| Octane Box2D (score) | 6619 | 6625 | 6076 | 4381 | 98679 | 5145 | 93257 | 1.00x | 0.92x | 14.89x | 14.08x |
+| Octane zlib (score) | 2994 | 3086 | 3077 | 2247 | 78852 | 1751 | 71044 | 1.03x | 1.03x | 25.55x | 23.02x |
+| Octane Typescript (score) | 15670 | 15206 | 14399 | 17976 | 85402 | 13231 | 76950 | 0.97x | 0.92x | 5.62x | 5.06x |
+| **Octane geomean (score)** | **5261** | **5377** | **5332** | **4108** | **49435** | **3095** | **47240** | 1.02x | 1.01x | 9.19x | 8.79x |
 
 ## How to rerun
 
@@ -1042,3 +1042,118 @@ With `--jit-calls`:
   their deopt limit), by site, with `--jit-calls`: `call_method` 94, `put_field` 38,
   `call_constructor` 31, `put_array_el` 18. Deopt operand kinds with `--jit` (decisive/next):
   `add int/int` 32, `put_field int/object` 31, `put_field object/object` 14, `put_field null/object` 13.
+
+## 2026-11-18 00:50 UTC: integration d82fa5e8 (for-of in OSR code, call recorder with two targets per site, O1 inlining merged on 90f03c13)
+
+**Another host again.** The container restarted at 23:16 UTC (before the kernels, coverage and
+Octane) and again at 00:45 UTC (before startup and warmup). Compare ratios, not absolute numbers,
+with earlier sections. New this time: cold and warm numbers (bench-startup, bench-warmup on six
+Octane benchmarks).
+
+### Table
+
+Short form (`perf_table.py --simple`):
+
+| What | Slower than V8 | Gain from our JIT (vs our interpreter) | Slower than V8, `--jit-calls` | Gain, `--jit-calls` |
+|---|---:|---:|---:|---:|
+| Simple loops (sum-calls, sum-long, nested, doubles) | 1.6x to 3.9x | 4.0x to 6.3x faster | 1.7x to 3.8x | 4.1x to 6.1x faster |
+| Array loop (array-sum) | 6.2x | 2.9x faster | 6.3x | 2.8x faster |
+| Function and method calls (calls, method) | 23.3x to 38.8x | none yet (1.1x) | 5.4x to 9.6x | 4.3x to 4.5x faster |
+| Typed arrays (typed-array) | 34.8x | 1.2x faster | 33.9x | 1.2x faster |
+| **All 8 kernels (geomean)** | **7.3x** | **2.7x faster** | **5.1x** | **3.9x faster** |
+| **Octane, the real-world suite (geomean)** | **9.2x** | **none yet (1.0x)** | **9.3x** | **none yet (1.0x)** |
+
+Change since the 90f03c13 run (ratios only): kernels geomean 7.6x to 7.3x behind V8 with `--jit`,
+6.1x to 5.1x with `--jit-calls`; calls and method with `--jit-calls` 7.7x-29.0x to 5.4x-9.6x behind
+V8 (calls kernel 20.5 ns to 6.3 ns on a slower host); Octane `--jit` 1.02x plain both times,
+`--jit-calls` 0.98x to 1.01x plain.
+
+### Cold and warm
+
+Cold: first iteration in a fresh process. Warm: median of the last third of the iterations
+(`silk task bench-warmup`, 3 processes each, medians). The cold and warm columns compare
+silkjs-jit (`--jit`) with each JIT.
+
+| Benchmark | silkjs cold ms | silkjs-jit cold ms | V8 cold ms | JSC cold ms | cold: slower than V8 | cold: slower than JSC | silkjs warm ms | silkjs-jit warm ms | V8 warm ms | JSC warm ms | warm: slower than V8 | warm: slower than JSC |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| richards | 2.86 | 2.96 | 2.79 | 2.96 | 1.1x | 1.0x | 2.013 | 1.953 | 0.083 | 0.088 | 23.5x | 22.2x |
+| deltablue | 3.61 | 3.72 | 5.11 | 5.53 | 0.7x | 0.7x | 2.909 | 2.876 | 0.118 | 0.148 | 24.4x | 19.4x |
+| crypto | 3.31 | 4.50 | 3.83 | 4.24 | 1.2x | 1.1x | 2.231 | 2.473 | 0.140 | 0.133 | 17.7x | 18.6x |
+| raytrace | 11.78 | 15.80 | 12.63 | 8.94 | 1.3x | 1.8x | 12.523 | 13.335 | 1.078 | 0.584 | 12.4x | 22.8x |
+| navier-stokes | 36.08 | 38.27 | 16.82 | 14.45 | 2.3x | 2.6x | 34.097 | 31.316 | 3.126 | 3.377 | 10.0x | 9.3x |
+| box2d | 76.03 | 80.19 | 55.33 | 47.67 | 1.4x | 1.7x | 67.988 | 69.265 | 3.768 | 3.951 | 18.4x | 17.5x |
+
+Startup of an empty script, wall ms (median): silkjs 3.4, silkjs-jit 3.4, silkjs-jit-calls 3.3, v8-jit 26.0, jsc-jit 8.9
+
+With `--jit-calls`, warm: richards 1.659 ms (20.0x behind V8), navier-stokes 26.7 ms (8.6x),
+crypto 2.49, deltablue 3.11, raytrace 14.0, box2d 69.0; its first iterations are slower (richards
+5.57 ms against 2.96 with `--jit`: compile time lands in iteration one). Iterations to steady
+(median): silkjs-jit 2 to 3, V8 6 to 84, JSC 17 to 129, so V8 and JSC are slow for the first tens
+of iterations and then 10x to 25x faster.
+
+### Output check, instructions per plain, coverage
+
+31 of 31 pass with `--jit` and with `--jit --jit-calls`.
+
+| Benchmark | output | instr / plain | hot / compiled / refused | deopts / unlinked | OSR compiled / runs / deopts | compile ms | code MB | compiled instr | compiler instr | top refusals |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| octane/richards | pass | 1.011 | 17 / 2 / 15 | 8 / 1 | 0 / 0 / 0 | 1.5 | 0.01 | 1.111% | 0.222% | a call (calls from compiled code need --jit-calls) 15 |
+| octane/deltablue | pass | 1.006 | 42 / 2 / 40 | 0 / 0 | 2 / 11 / 11 | 3.7 | 0.01 | 0.076% | 0.244% | a call (calls from compiled code need --jit-calls) 40 |
+| octane/crypto | pass | 1.004 | 38 / 7 / 31 | 32 / 4 | 18 / 529 / 61 | 14.6 | 0.10 | 0.169% | 0.274% | a call (calls from compiled code need --jit-calls) 21; `step_arg8` 2; a constant that is not a number: push_const8 2 |
+| octane/raytrace | pass | 1.022 | 27 / 2 / 25 | 0 / 0 | 1 / 1 / 1 | 2.5 | 0.01 | 0.398% | 0.785% | a call (calls from compiled code need --jit-calls) 23; `special_object` 1; `set_arg` 1 |
+| octane/earley-boyer | pass | 1.013 | 51 / 6 / 45 | 0 / 0 | 2 / 72 / 8 | 3.9 | 0.01 | 0.371% | 0.281% | a call (calls from compiled code need --jit-calls) 23; `fclosure8` 6; `get_scope0_el` 5 |
+| octane/regexp | pass | 0.975 | 10 / 1 / 9 | 0 / 0 | 0 / 0 / 0 | 1.2 | 0.00 | 1.053% | 0.928% | `regexp` 7; `array_from` 1; a call (calls from compiled code need --jit-calls) 1 |
+| octane/splay | pass | 1.002 | 17 / 4 / 13 | 24 / 3 | 1 / 1 / 1 | 2.9 | 0.02 | 0.000% | 0.129% | a call (calls from compiled code need --jit-calls) 12; `object` 1 |
+| octane/navier-stokes | pass | 0.997 | 18 / 3 / 15 | 0 / 0 | 24 / 932 / 74 | 21.3 | 0.21 | 8.302% | 5.251% | a call (calls from compiled code need --jit-calls) 12; recompiled too often 2; `get_scope0_el` 1 |
+| octane/pdfjs | pass | 1.005 | 89 / 11 / 78 | 24 / 3 | 22 / 543 / 71 | 19.9 | 0.10 | 0.763% | 1.678% | a call (calls from compiled code need --jit-calls) 37; `array_from` 13; `get_scope0_el` 4 |
+| octane/mandreel | pass | 0.991 | 75 / 15 / 60 | 40 / 5 | 31 / 2741 / 79 | 79.5 | 0.79 | 6.314% | 7.384% | a call (calls from compiled code need --jit-calls) 52; a boolean operand of a bitwise operator: and_imm 3; `put_arg` 2 |
+| octane/gbemu | pass | 0.975 | 153 / 55 / 98 | 32 / 4 | 31 / 742 / 78 | 46.0 | 0.49 | 7.568% | 7.210% | a call (calls from compiled code need --jit-calls) 77; `array_from` 6; `put_arg` 6 |
+| octane/code-load | pass | 1.000 | 15 / 3 / 12 | 16 / 2 | 2 / 2 / 0 | 2.3 | 0.01 | 0.000% | 0.000% | a call (calls from compiled code need --jit-calls) 5; `special_object` 3; `fclosure8` 2 |
+| octane/box2d | pass | 1.049 | 139 / 21 / 118 | 56 / 7 | 20 / 40 / 25 | 28.2 | 0.30 | 0.715% | 3.045% | a call (calls from compiled code need --jit-calls) 62; `put_arg` 32; `special_object` 16 |
+| octane/zlib | pass | 0.985 | 26 / 0 / 26 | 0 / 0 | 29 / 351 / 56 | 129.9 | 1.08 | 1.192% | 1.154% | `put_arg` 21; deoptimized again where it was already widened 2; `fclosure8` 1 |
+| octane/typescript | pass | 1.017 | 367 / 49 / 318 | 280 / 35 | 8 / 31 / 30 | 51.4 | 0.23 | 0.668% | 0.872% | a call (calls from compiled code need --jit-calls) 252; `array_from` 15; `put_arg` 14 |
+| kernel/sum-calls | pass | 0.168 | 1 / 1 / 0 | 0 / 0 | 1 / 1973 / 0 | 0.6 | 0.00 | 66.455% | 0.220% | - |
+| kernel/sum-long | pass | 0.091 | 1 / 1 / 0 | 0 / 0 | 1 / 1998 / 0 | 0.6 | 0.00 | 97.597% | 0.284% | - |
+| kernel/nested | pass | 0.162 | 1 / 1 / 0 | 0 / 0 | 2 / 1795 / 0 | 1.0 | 0.00 | 95.326% | 0.400% | - |
+| kernel/calls | pass | 1.000 | 2 / 0 / 2 | 0 / 0 | 0 / 0 / 0 | 0.2 | 0.00 | 0.000% | 0.003% | a call (calls from compiled code need --jit-calls) 2 |
+| kernel/method | pass | 1.000 | 2 / 0 / 2 | 0 / 0 | 0 / 0 / 0 | 0.2 | 0.00 | 0.000% | 0.002% | a call (calls from compiled code need --jit-calls) 2 |
+| kernel/doubles | pass | 0.100 | 2 / 1 / 1 | 0 / 0 | 1 / 986 / 0 | 0.7 | 0.00 | 66.824% | 0.465% | a call (calls from compiled code need --jit-calls) 1 |
+| kernel/array-sum | pass | 0.427 | 1 / 1 / 0 | 0 / 0 | 1 / 1996 / 0 | 0.6 | 0.00 | 98.583% | 0.066% | - |
+| kernel/typed-array | pass | 0.842 | 1 / 1 / 0 | 0 / 0 | 1 / 998 / 0 | 1.1 | 0.01 | 49.685% | 49.932% | - |
+
+With `--jit-calls`:
+
+| Benchmark | output | instr / plain | hot / compiled / refused | deopts / unlinked | compile ms | code MB | compiled instr | compiler instr | top refusals |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| octane/richards | pass | 0.835 | 18 / 18 / 0 | 42 / 5 | 7.2 | 0.12 | 59.731% | 6.521% | - |
+| octane/deltablue | pass | 1.021 | 74 / 55 / 19 | 234 / 29 | 27.5 | 0.51 | 38.954% | 5.636% | deoptimized again where it was already widened 9; an operand of arithmetic or a comparison that is not a number 4; it calls a function that stays interpreted 4 |
+| octane/crypto | pass | 1.001 | 42 / 23 / 19 | 128 / 16 | 23.1 | 0.32 | 0.632% | 0.136% | deoptimized again where it was already widened 6; it calls a function that stays interpreted 5; a named property of a value that is not an object 2 |
+| octane/raytrace | pass | 1.063 | 34 / 13 / 21 | 80 / 10 | 5.6 | 0.08 | 1.942% | 0.952% | it calls a function that stays interpreted 15; deoptimized again where it was already widened 3; an operand of arithmetic or a comparison that is not a number 1 |
+| octane/earley-boyer | pass | 1.026 | 54 / 13 / 41 | 26 / 3 | 5.8 | 0.06 | 0.435% | 0.607% | it calls a function that stays interpreted 10; an operand of arithmetic or a comparison that is not a number 10; `fclosure8` 6 |
+| octane/regexp | pass | 1.193 | 16 / 2 / 14 | 0 / 0 | 15.5 | 0.28 | 10.594% | 3.960% | `regexp` 12; `array_from` 1; recompiled too often 1 |
+| octane/splay | pass | 1.026 | 27 / 17 / 10 | 110 / 13 | 11.1 | 0.15 | 0.664% | 1.602% | it calls a function that stays interpreted 5; deoptimized again where it was already widened 3; `object` 1 |
+| octane/navier-stokes | pass | 0.934 | 12 / 11 / 1 | 17 / 2 | 34.6 | 0.36 | 11.751% | 6.583% | `get_scope0_el` 1 |
+| octane/pdfjs | pass | 1.033 | 89 / 36 / 53 | 88 / 11 | 45.1 | 0.65 | 4.607% | 5.444% | `array_from` 15; an operand of arithmetic or a comparison that is not a number 12; `object` 5 |
+| octane/mandreel | pass | 0.897 | 90 / 70 / 20 | 256 / 31 | 247.0 | 4.57 | 36.013% | 33.511% | it calls a function that stays interpreted 5; deoptimized again where it was already widened 4; recompiled too often 4 |
+| octane/gbemu | pass | 1.041 | 163 / 133 / 30 | 251 / 29 | 88.4 | 1.29 | 8.971% | 9.875% | `array_from` 7; it calls a function that stays interpreted 6; `put_arg` 6 |
+| octane/code-load | pass | 1.000 | 15 / 4 / 11 | 24 / 3 | 2.6 | 0.01 | 0.000% | 0.000% | `special_object` 4; `fclosure8` 2; `for_in_start` 2 |
+| octane/box2d | pass | 1.250 | 137 / 46 / 91 | 136 / 17 | 69.2 | 1.04 | 1.328% | 15.387% | `put_arg` 33; it calls a function that stays interpreted 29; `special_object` 15 |
+| octane/zlib | pass | 0.985 | 26 / 0 / 26 | 0 / 0 | 140.8 | 1.26 | 1.165% | 1.174% | `put_arg` 21; deoptimized again where it was already widened 2; `fclosure8` 1 |
+| octane/typescript | pass | 1.095 | 518 / 302 / 216 | 2003 / 246 | 228.4 | 3.98 | 3.103% | 3.744% | it calls a function that stays interpreted 65; deoptimized again where it was already widened 60; an operand of arithmetic or a comparison that is not a number 22 |
+| kernel/sum-calls | pass | 0.168 | 1 / 1 / 0 | 0 / 0 | 0.6 | 0.00 | 66.454% | 0.220% | - |
+| kernel/sum-long | pass | 0.091 | 1 / 1 / 0 | 0 / 0 | 0.6 | 0.00 | 97.597% | 0.284% | - |
+| kernel/nested | pass | 0.162 | 1 / 1 / 0 | 0 / 0 | 0.9 | 0.00 | 95.326% | 0.399% | - |
+| kernel/calls | pass | 0.206 | 3 / 3 / 0 | 0 / 0 | 1.3 | 0.01 | 67.803% | 27.918% | - |
+| kernel/method | pass | 0.289 | 3 / 3 / 0 | 0 / 0 | 1.4 | 0.01 | 94.325% | 0.158% | - |
+| kernel/doubles | pass | 0.100 | 1 / 1 / 0 | 0 / 0 | 0.9 | 0.00 | 66.731% | 0.441% | - |
+| kernel/array-sum | pass | 0.427 | 1 / 1 / 0 | 0 / 0 | 0.5 | 0.00 | 98.583% | 0.066% | - |
+| kernel/typed-array | pass | 0.842 | 1 / 1 / 0 | 0 / 0 | 1.1 | 0.01 | 49.685% | 49.932% | - |
+
+### Reading
+
+- `--jit-calls` costs less than at 90f03c13: box2d 1.544x to 1.250x the instructions of plain,
+  deltablue 1.166x to 1.021x, typescript 1.196x to 1.095x; richards 0.835x, mandreel 0.897x,
+  navier-stokes 0.934x. regexp is still 1.193x.
+- Refusals with `--jit-calls`: "it calls a function that stays interpreted" 186 (new reason),
+  deoptimized again where widened 121, `put_arg` 89, non-number arithmetic operand 77. Deopt sites:
+  `call_method` 218 (437 before), `put_field` 194, `call_constructor` 37.

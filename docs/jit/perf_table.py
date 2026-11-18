@@ -45,20 +45,35 @@ def gain(values):
 
 
 def simple(kernels, octane):
-    """The short table: how many times slower than V8's JIT silkjs-jit is, and what the JIT gains over the interpreter."""
+    """The short table: how many times slower than V8's JIT silkjs-jit is, what the JIT gains over the
+    interpreter, and the same two with --jit-calls when that column was measured."""
     ns = {n: {k: statistics.median(v) * 1e6 / kernels["units"][n] for k, v in per.items() if v} for n, per in kernels["ms"].items()}
-    print("| What | Slower than V8 | Gain from our JIT (vs our interpreter) |")
-    print("|---|---:|---:|")
+    calls = all("silkjs-jit-calls" in ns[n] for n in ns)
+    head = "| What | Slower than V8 | Gain from our JIT (vs our interpreter) |"
+    if calls:
+        head += " Slower than V8, `--jit-calls` | Gain, `--jit-calls` |"
+    print(head)
+    print("|---|" + "---:|" * (4 if calls else 2))
+
+    def cells(slow, gains):
+        return "%s | %s" % (slow, gains)
+
+    def row(label, rows, bold=False):
+        b = "**" if bold else ""
+        out = "| %s%s%s | %s%s%s | %s%s%s |" % (b, label, b, b, span([r["silkjs-jit"] / r["v8-jit"] for r in rows]), b,
+                                               b, gain([r["silkjs"] / r["silkjs-jit"] for r in rows]), b)
+        if calls:
+            out += " %s%s%s | %s%s%s |" % (b, span([r["silkjs-jit-calls"] / r["v8-jit"] for r in rows]), b,
+                                           b, gain([r["silkjs"] / r["silkjs-jit-calls"] for r in rows]), b)
+        print(out)
     for label, names in GROUPS:
-        names = [n for n in names if n in ns]
-        print("| %s | %s | %s |" % (label, span([ns[n]["silkjs-jit"] / ns[n]["v8-jit"] for n in names]),
-                                    gain([ns[n]["silkjs"] / ns[n]["silkjs-jit"] for n in names])))
-    g = {k: geomean([ns[n][k] for n in ns]) for k in ("silkjs", "silkjs-jit", "v8-jit")}
-    print("| **All %d kernels (geomean)** | **%.1fx** | **%s** |" % (len(ns), g["silkjs-jit"] / g["v8-jit"], gain([g["silkjs"] / g["silkjs-jit"]])))
+        row(label, [ns[n] for n in names if n in ns])
+    keys = ("silkjs", "silkjs-jit", "v8-jit") + (("silkjs-jit-calls",) if calls else ())
+    row("All %d kernels (geomean)" % len(ns), [{k: geomean([ns[n][k] for n in ns]) for k in keys}], True)
     if octane:
-        med = {k: geomean([statistics.median(row[k]) for row in octane.values()]) for k in ("silkjs", "silkjs-jit", "v8-jit")}
-        print("| **Octane, the real-world suite (geomean)** | **%.1fx** | **%s** |" % (
-            med["v8-jit"] / med["silkjs-jit"], gain([med["silkjs-jit"] / med["silkjs"]])))
+        # scores: higher is better, so invert to a time-like value for the same formulas
+        med = {k: 1 / geomean([statistics.median(r[k]) for r in octane.values()]) for k in keys}
+        row("Octane, the real-world suite (geomean)", [med], True)
 
 
 def main():
