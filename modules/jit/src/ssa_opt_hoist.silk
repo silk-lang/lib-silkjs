@@ -17,7 +17,12 @@
 //!   release moved too), in a loop without what could change the answer: a call (anything),
 //!   `put.elem` (an append changes a length), `put.field` (a field; a length; a global is a
 //!   property), `put.var` and `put.scope` (bindings);
-//! - arithmetic and comparisons that cannot fail, from anywhere in the loop.
+//! - arithmetic and comparisons that cannot fail, from anywhere in the loop;
+//! - for a `get.elem` of an invariant array whose site recorded one element kind (checkKind),
+//!   when its block runs on every iteration, a `check.elements` of that array; the read stays
+//!   and becomes ELEM_TRUSTED (it checks only the index). A fast Array stays one in a loop
+//!   without a call, `put.elem` or `put.field`; a typed array keeps its class and buffer in a
+//!   loop without a call.
 //!
 //! A loop whose header is among `sites` (the offsets earlier code of this function
 //! deoptimized at, jit_recompile) is left alone: a hoisted guard that failed there says
@@ -27,7 +32,10 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Own, RootKind, Op, SlotMode, NONE, edgeCount, readsK }
+import ssa { Function, Inst, Exit, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount, readsK, ELEM_TRUSTED }
+import silk.num.u8
+import silkjs.js_class_data as classes
+import silkjs.js_feedback as feedback
 import ssa_verify { readsA, readsB }
 import ssa_ownership { fixSlots }
 import ssa_opt_borrow { quiet }
@@ -151,6 +159,9 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
   let mut stack = List<u32>.make()
   let mut paramOf = List<u32>.make()
   let mut entryArgs = List<u32>.make()
+  // The arrays checked in front of the current loop, and the kind each was checked for.
+  let mut checked = List<u32>.make()
+  let mut checkedKinds = List<i32>.make()
   let mut serial: u32 = 0
   let mut changed = false
   // Inner loops first: their headers come later in reverse postorder.
@@ -231,6 +242,8 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
     let mut frontExit = NONE
     let mut order: u32 = 2
     let mut stop = false
+    checked.clear()
+    checkedKinds.clear()
     b = h
     while b <= lastLatch && !stop {
       if member.get(u32.toUsize(b)) != serial { b = b + 1 continue }
@@ -240,6 +253,39 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
       while i < block.firstInst + block.instCount {
         let inst = f.inst(i)
         let op = inst.op
+        if op == Op.GetElem && inst.k == 0 && inst.frame == 0 && inst.block == b && always && !calls {
+          let check = checkKind(&f.*, &inst)
+          let mut fits = check != 0 && outside(&f.*, &member, &moved, serial, inst.a)
+          if check == 1 { fits = fits && !putsElem && !putsField }
+          // Another site may have recorded another kind for the same array: one check each.
+          let mut known = false
+          let mut c: usize = 0
+          while c < checked.length() { if checked.get(c) == inst.a { known = true fits = fits && checkedKinds.get(c) == check } c = c + 1 }
+          if fits && !known {
+            if frontExit == NONE && !run entryState(&f.*, h, entry, state, &member, serial, values, &mut paramOf, &mut entryArgs) { stop = true break }
+            if front == NONE { front = run split(&mut f, entry, h) }
+            drop run f.emit(front, Op.CheckElements, false, Type.I32, Own.Unboxed, inst.a, NONE, check, inst.pc)
+            let at = usize.toU32(f.insts.length() - 1)
+            let mut made = f.inst(at)
+            made.frame = 0
+            f.setInst(at, made)
+            if frontExit == NONE {
+              drop run f.exitFor(at, state.pc, state.stackDepth)
+              frontExit = f.inst(at).exit
+              run exitSlots(&mut f, &entryArgs)
+            } else { made = f.inst(at) made.exit = frontExit f.setInst(at, made) }
+            f.moveInst(at, front, order)
+            order = order + 2
+            run checked.append(inst.a)
+            run checkedKinds.append(check)
+            changed = true
+          }
+          if fits {
+            let mut trusted = f.inst(i)
+            trusted.k = ELEM_TRUSTED
+            f.setInst(i, trusted)
+          }
+        }
         // An inlined body's instruction may read the frame `inline.frame` builds inside the loop.
         let mut ok = inst.block == b && inst.frame == 0
         let mut guard = !pureOp(op)
@@ -261,38 +307,11 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
         if ok && readsB(op) { ok = outside(&f.*, &member, &moved, serial, inst.b) }
         if ok && readsK(op) { ok = outside(&f.*, &member, &moved, serial, i32.wrappingToU32(inst.k)) }
         if ok && guard && frontExit == NONE {
-          // The state at the header as the entry edge carries it: a slot whose parameter
-          // the header kept takes that parameter's argument on the entry edge; any other
-          // slot kept one value around the loop, which the latch's state names.
-          let header = f.blocks.get(u32.toUsize(h))
-          let slots = f.localCount + state.stackDepth
-          paramOf.clear()
-          run paramOf.appendRepeated(NONE, u32.toUsize(slots))
-          let mut p: u32 = 0
-          while p < header.paramCount {
-            let at = f.value(f.paramAt(header, p)).state
-            if at < slots { paramOf.set(u32.toUsize(at), p) } else { ok = false }
-            p = p + 1
-          }
-          let incoming = f.edge(entry)
-          if incoming.argCount != header.paramCount { ok = false }
-          entryArgs.clear()
-          let mut s: u32 = 0
-          while ok && s < slots {
-            let at = paramOf.get(u32.toUsize(s))
-            let mut v = f.slot(state, s).value
-            if at != NONE { v = f.edgeArg(incoming, at) }
-            else if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
-            run entryArgs.append(v)
-            s = s + 1
-          }
-          if !ok { stop = true break }
+          if !run entryState(&f.*, h, entry, state, &member, serial, values, &mut paramOf, &mut entryArgs) { stop = true break }
           if front == NONE { front = run split(&mut f, entry, h) }
           drop run f.exitFor(i, state.pc, state.stackDepth)
           frontExit = f.inst(i).exit
-          s = 0
-          while s < slots { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
-          f.work = f.work + u32.toU64(slots)
+          run exitSlots(&mut f, &entryArgs)
         }
         if ok {
           if front == NONE { front = run split(&mut f, entry, h) }
@@ -313,6 +332,54 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
   }
   if changed { run fixSlots(&mut f) }
   return changed
+}
+
+/// The state at the header as the entry edge carries it, into entryArgs: a slot whose
+/// parameter the header kept takes that parameter's argument on the entry edge; any other slot
+/// kept one value around the loop, which the latch's state names. False when it cannot be told.
+effect fn entryState(f: &Function, h: u32, entry: u32, state: Exit, member: &List<u32>, serial: u32, values: usize, paramOf: &mut List<u32>, entryArgs: &mut List<u32>)
+  -> bool ! OutOfMemoryError ? &mut Allocator {
+  let header = f.blocks.get(u32.toUsize(h))
+  let slots = f.localCount + state.stackDepth
+  paramOf.clear()
+  run paramOf.appendRepeated(NONE, u32.toUsize(slots))
+  let mut p: u32 = 0
+  while p < header.paramCount {
+    let at = f.value(f.paramAt(header, p)).state
+    if at < slots { paramOf.set(u32.toUsize(at), p) } else { return false }
+    p = p + 1
+  }
+  let incoming = f.edge(entry)
+  if incoming.argCount != header.paramCount { return false }
+  entryArgs.clear()
+  let mut s: u32 = 0
+  while s < slots {
+    let at = paramOf.get(u32.toUsize(s))
+    let mut v = f.slot(state, s).value
+    if at != NONE { v = f.edgeArg(incoming, at) }
+    else if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { return false }
+    run entryArgs.append(v)
+    s = s + 1
+  }
+  return true
+}
+/// The slots of the exit just made (exitFor): entryArgs, each a copy.
+effect fn exitSlots(f: &mut Function, entryArgs: &List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut s: usize = 0
+  while s < entryArgs.length() { run f.slotAt(entryArgs.get(s), SlotMode.Dup, NONE) s = s + 1 }
+  f.work = f.work + usize.toU64(entryArgs.length())
+}
+
+/// The `check.elements` k under which a `get.elem` may be trusted (ssa.ELEM_TRUSTED), from its
+/// site's recorded element kind: 1 for a fast Array, a typed array's class (not Float16 or
+/// BigInt, which have no inline arm), else 0.
+pub fn checkKind(f: &Function, inst: &Inst) -> i32 {
+  let kind = f.elementKind(inst)
+  if kind == u8.toU32(feedback.ELEMENT_FAST) { return 1 }
+  if kind < u8.toU32(feedback.ELEMENT_TYPED) || kind >= u8.toU32(feedback.ELEMENT_MIXED) { return 0 }
+  let classId = classes.JS_CLASS_UINT8C_ARRAY + kind - u8.toU32(feedback.ELEMENT_TYPED)
+  if classId == classes.JS_CLASS_FLOAT16_ARRAY || classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY { return 0 }
+  return u32.wrappingToI32(classId)
 }
 
 /// Whether `v` is defined outside the loop `serial` marks, or moved out of it already.

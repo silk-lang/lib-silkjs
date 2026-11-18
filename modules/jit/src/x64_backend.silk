@@ -26,7 +26,7 @@ import silk.num.u8
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
-import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_TRUSTED }
 import ssa
 import value_layout { ValueLayout }
 import x64_backend_float as float
@@ -608,6 +608,12 @@ impl Emitter {
       let out = self.at(inst.result) run putI32(&mut self.a, out, Reg.R9)
       return ()
     }
+    if op == Op.CheckElements {
+      run self.stressGuard(inst.exit)
+      let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+      if inst.k == 1 { run self.elementSlotGuard(inst.a, exit) } else { run self.typedGuard(inst.a, i32.wrappingToU32(inst.k), exit) }
+      return ()
+    }
     if op == Op.CheckTag {
       run self.stressGuard(inst.exit)
       let tag = self.settings.layout.tagOf(inst.k)
@@ -697,18 +703,43 @@ impl Emitter {
         let kind = function.elementKind(&inst)
         let mut only: u32 = 0
         if kind >= u8.toU32(feedback.ELEMENT_TYPED) && kind < u8.toU32(feedback.ELEMENT_MIXED) { only = classes.JS_CLASS_UINT8C_ARRAY + kind - u8.toU32(feedback.ELEMENT_TYPED) }
+        // Float16 and BigInt views have no inline arm: the general one sends them to the helper.
+        if only == classes.JS_CLASS_FLOAT16_ARRAY || only == classes.JS_CLASS_BIG_INT64_ARRAY || only == classes.JS_CLASS_BIG_UINT64_ARRAY { only = 0 }
         let mut fast = slow
         // A for-of step's miss is the interpreter's (ssa.ELEM_STEP).
         let step = op == Op.GetElem && inst.k == ELEM_STEP
+        // A read whose unbox is fused (fusedUnbox) puts a number it loads in the unbox's place
+        // and jumps past the unbox; a store of a box.f64 takes the double from the box's operand.
+        let mut fused = NONE
+        let mut fusedF64 = false
+        if op == Op.GetElem && !step && self.fusedUnbox(&function, inst) {
+          let unbox = function.inst(self.cursor + 1)
+          fused = unbox.result
+          fusedF64 = unbox.op == Op.UnboxF64
+          self.skipLabel = run self.a.label()
+          self.skipAt = self.cursor + 1
+        } else if op == Op.PutElem && self.cursor > 0 && self.defs.get(u32.toUsize(inst.b)) == self.cursor - 1 && function.inst(self.cursor - 1).op == Op.BoxF64 {
+          // Right before the store, so nothing has taken the operand's place since.
+          fused = function.inst(self.defs.get(u32.toUsize(inst.b))).a
+        }
+        // A trusted read (ssa.ELEM_TRUSTED) of the kind its check.elements tested: the index alone.
+        let trusted = op == Op.GetElem && inst.k == ELEM_TRUSTED
         if step { only = 0 let exit = self.exitLabels.get(u32.toUsize(inst.exit)) run self.elementSlot(inst.a, index, exit) }
-        else if only != 0 {
+        else if trusted && only == 0 {
+          run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+          run self.elementIndex(index, slow)
+        } else if trusted {
+          run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+          // It ends in jumps: what follows serves fast Arrays only.
+          run self.typedIndexed(false, index, inst.b, inst.result, only, fused, fusedF64, done, slow)
+        } else if only != 0 {
           fast = run self.a.label()
-          run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, only, done, fast)
+          run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, only, fused, fusedF64, done, fast)
           self.a.bind(fast)
           run self.elementSlot(inst.a, index, slow)
         } else { run self.elementSlot(inst.a, index, typed) }
         if op == Op.GetElem {
-          if borrowed && self.fusedUnbox(&function, inst) {
+          if borrowed && fused != NONE && !fusedF64 {
             // The next instruction unboxes this element and nothing else reads it: an Int
             // goes from the array to the number's place, and the unbox is skipped. Anything
             // else is copied to its slot as usual, for the unbox to refuse.
@@ -721,8 +752,6 @@ impl Emitter {
             let out = self.at(unbox.result)
             if out.kind == GPR { run self.a.load(Width.W32, out.gpr, Mem.at(Reg.R11, 8)) }
             else { run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, 8)) run self.a.store(Width.W64, slotOf(unbox.result), Reg.Rax) }
-            self.skipLabel = run self.a.label()
-            self.skipAt = self.cursor + 1
             run self.a.jmp(self.skipLabel)
             self.a.bind(general)
           }
@@ -750,7 +779,7 @@ impl Emitter {
         }
         run self.a.jmp(done)
         self.a.bind(typed)
-        if only == 0 && !step { run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, 0, done, slow) }
+        if only == 0 && !step && !trusted { run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, 0, fused, fusedF64, done, slow) }
         self.a.bind(slow)
       }
       // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
@@ -1062,7 +1091,7 @@ impl Emitter {
     let block = function.blocks.get(u32.toUsize(read.block))
     if self.cursor + 1 >= block.firstInst + block.instCount { return false }
     let unbox = function.inst(self.cursor + 1)
-    if unbox.op != Op.Unbox || unbox.a != read.result || unbox.result == NONE || unbox.exit == NONE { return false }
+    if (unbox.op != Op.Unbox && unbox.op != Op.UnboxF64) || unbox.a != read.result || unbox.result == NONE || unbox.exit == NONE { return false }
     let exit = function.exit(unbox.exit)
     let mut readers: u32 = 1
     let mut s: u32 = 0
@@ -1323,6 +1352,11 @@ impl Emitter {
   /// or a jump to miss: not a fast Array, or the index is negative or past its elements.
   /// Clobbers R8 and R11.
   effect fn elementSlot(self: &mut Self, value: u32, index: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.elementSlotGuard(value, miss)
+    run self.elementIndex(index, miss)
+  }
+  /// R11 = the payload of value's slot, or a jump to miss unless it is a fast Array. Clobbers R8.
+  effect fn elementSlotGuard(self: &mut Self, value: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let fields = self.fields
     run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(value * SLOT_BYTES + layout.tagOffset)))
@@ -1343,6 +1377,11 @@ impl Emitter {
       run self.a.testImm(Width.W32, Reg.R8, u32.wrappingToI32(fields.fastArray))
       run self.a.jcc(Cond.Equal, miss)
     }
+  }
+  /// R11 = the address of element `index` of the fast Array whose payload is in R11, or a jump
+  /// to miss: the index is negative or past its elements. Clobbers R8.
+  effect fn elementIndex(self: &mut Self, index: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let fields = self.fields
     let place = self.at(index)
     run getI32(&mut self.a, Reg.R8, place)
     run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)))
@@ -1362,8 +1401,18 @@ impl Emitter {
   /// Uint8C (round half to even), and a double out of range, NaN or an infinity go to `slow`.
   /// The count and the data pointer are invariant in a loop with no call and no generic
   /// instruction. Clobbers RAX, R8 to R11, XMM0.
-  effect fn typedElement(self: &mut Self, put: bool, object: u32, index: u32, value: u32, result: u32, only: u32, done: Label, slow: Label)
+  /// `fused`: for a read, the place of the unbox it feeds (fusedF64: an unbox.f64), loaded
+  /// directly and followed by a jump past the unbox; for a store, the double a box.f64 right
+  /// before it boxed, stored without its tag test. NONE otherwise.
+  effect fn typedElement(self: &mut Self, put: bool, object: u32, index: u32, value: u32, result: u32, only: u32, fused: u32, fusedF64: bool, done: Label, slow: Label)
     -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.typedGuard(object, only, slow)
+    run self.typedIndexed(put, index, value, result, only, fused, fusedF64, done, slow)
+  }
+  /// R11 = the payload of object's slot and R8 its class, or a jump to slow unless it is a
+  /// typed array of class `only` (0: any of Uint8C..Float64) with its own payload, not shared.
+  /// Clobbers R10.
+  effect fn typedGuard(self: &mut Self, object: u32, only: u32, slow: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let fields = self.fields
     if fields.typedTagAt == u32.MAX { run self.a.jmp(slow) return () }
@@ -1384,6 +1433,13 @@ impl Emitter {
     run self.a.loadZero8(Reg.R10, Mem.at(Reg.R11, u32.wrappingToI32(fields.typedShared)))
     run self.a.test(Width.W32, Reg.R10, Reg.R10)
     run self.a.jcc(Cond.NotEqual, slow)
+  }
+  /// typedElement past its guard: the typed array's payload in R11, its class in R8 (a store,
+  /// or a read with `only` 0, reads it).
+  effect fn typedIndexed(self: &mut Self, put: bool, index: u32, value: u32, result: u32, only: u32, fused: u32, fusedF64: bool, done: Label, slow: Label)
+    -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    let fields = self.fields
     let place = self.at(index)
     run getI32(&mut self.a, Reg.R9, place)
     // Sign-extended, a negative index is above any count.
@@ -1420,7 +1476,7 @@ impl Emitter {
       self.a.bind(inside)
     }
     run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.typedData)))
-    if put { run self.typedStore(value, only, done, slow) } else { run self.typedLoad(result, only, done, slow) }
+    if put { run self.typedStore(value, only, fused, done, slow) } else { run self.typedLoad(result, only, fused, fusedF64, done, slow) }
   }
   /// Jumps to `next` unless the class in R8 is `classId`.
   effect fn unlessClass(self: &mut Self, classId: u32, next: Label) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -1429,24 +1485,49 @@ impl Emitter {
   }
   /// typedElement's read: element R9 of the data at R11, class in R8 (or `only`), boxed into
   /// `result`.
-  effect fn typedLoad(self: &mut Self, result: u32, only: u32, done: Label, slow: Label) -> () ! OutOfMemoryError ? &mut Allocator {
-    if only != 0 { run self.loadAs(only, result, done) return () }
+  effect fn typedLoad(self: &mut Self, result: u32, only: u32, fused: u32, fusedF64: bool, done: Label, slow: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    if only != 0 { run self.loadAs(only, result, fused, fusedF64, done) return () }
     let order = [classes.JS_CLASS_FLOAT64_ARRAY, classes.JS_CLASS_FLOAT32_ARRAY, classes.JS_CLASS_INT32_ARRAY, classes.JS_CLASS_UINT8_ARRAY,
       classes.JS_CLASS_UINT8C_ARRAY, classes.JS_CLASS_INT8_ARRAY, classes.JS_CLASS_INT16_ARRAY, classes.JS_CLASS_UINT16_ARRAY]
     let mut i: usize = 0
     while i < 8 {
       let next = run self.a.label()
       run self.unlessClass(order[i], next)
-      run self.loadAs(order[i], result, done)
+      run self.loadAs(order[i], result, fused, fusedF64, done)
       self.a.bind(next)
       i = i + 1
     }
     run self.unlessClass(classes.JS_CLASS_UINT32_ARRAY, slow)
-    run self.loadAs(classes.JS_CLASS_UINT32_ARRAY, result, done)
+    run self.loadAs(classes.JS_CLASS_UINT32_ARRAY, result, fused, fusedF64, done)
   }
   /// Element R9 of a typed array of class classId with its data at R11, boxed into `result`.
-  effect fn loadAs(self: &mut Self, classId: u32, result: u32, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn loadAs(self: &mut Self, classId: u32, result: u32, fused: u32, fusedF64: bool, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let at = result * SLOT_BYTES
+    // The number straight to the fused unbox's place: a double for unbox.f64, an Int for an
+    // unbox.i32 of a view whose elements are all int32 (a Uint32 above it boxes as a Float64).
+    if fused != NONE && fusedF64 {
+      let out = self.at(fused)
+      if classId == classes.JS_CLASS_FLOAT64_ARRAY {
+        run self.a.load(Width.W64, Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.Eight, 0))
+        run putBits(&mut self.a, out, Reg.Rax)
+      } else if classId == classes.JS_CLASS_FLOAT32_ARRAY {
+        run self.a.loadFloat(Xmm.Xmm0, Mem.indexed(Reg.R11, Reg.R9, Scale.Four, 0))
+        run putF64(&mut self.a, out, Xmm.Xmm0)
+      } else {
+        run self.loadInt(classId)
+        // Only a Uint32 is zero-extended past 32 bits; the others are signed 32-bit values.
+        if classId == classes.JS_CLASS_UINT32_ARRAY { run self.a.intToDouble(Width.W64, Xmm.Xmm0, Reg.Rax) }
+        else { run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax) }
+        run putF64(&mut self.a, out, Xmm.Xmm0)
+      }
+      run self.a.jmp(self.skipLabel) return ()
+    }
+    if fused != NONE && !isFloatClass(classId) && classId != classes.JS_CLASS_UINT32_ARRAY {
+      run self.loadInt(classId)
+      let out = self.at(fused)
+      run putI32(&mut self.a, out, Reg.Rax)
+      run self.a.jmp(self.skipLabel) return ()
+    }
     if classId == classes.JS_CLASS_FLOAT64_ARRAY {
       run self.a.load(Width.W64, Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.Eight, 0))
       run self.boxDoubleInto(Reg.Rax, Reg.Rsp, at) run self.a.jmp(done) return ()
@@ -1468,19 +1549,25 @@ impl Emitter {
       run self.a.doubleToBits(Reg.Rax, Xmm.Xmm0)
       run self.boxDoubleInto(Reg.Rax, Reg.Rsp, at) run self.a.jmp(done) return ()
     }
-    if classId == classes.JS_CLASS_INT32_ARRAY { run self.a.load(Width.W32, Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.Four, 0)) }
+    run self.loadInt(classId)
+    run self.boxInto(false, Reg.Rax, Reg.Rsp, at) run self.a.jmp(done)
+  }
+  /// RAX = element R9 of an integer view of class classId with its data at R11 (a Uint32
+  /// zero-extended to 64 bits).
+  effect fn loadInt(self: &mut Self, classId: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if classId == classes.JS_CLASS_INT32_ARRAY || classId == classes.JS_CLASS_UINT32_ARRAY { run self.a.load(Width.W32, Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.Four, 0)) }
     else if classId == classes.JS_CLASS_UINT8_ARRAY || classId == classes.JS_CLASS_UINT8C_ARRAY { run self.a.loadZero8(Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.One, 0)) }
     else if classId == classes.JS_CLASS_INT8_ARRAY { run self.a.loadSigned8(Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.One, 0)) }
     else if classId == classes.JS_CLASS_INT16_ARRAY { run self.a.loadSigned16(Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.Two, 0)) }
     else { run self.a.loadZero16(Reg.Rax, Mem.indexed(Reg.R11, Reg.R9, Scale.Two, 0)) }
-    run self.boxInto(false, Reg.Rax, Reg.Rsp, at) run self.a.jmp(done)
   }
   /// typedElement's store of `value` (borrowed: numbers carry no count) at element R9 of the
   /// data at R11, class in R8 (or `only`).
-  effect fn typedStore(self: &mut Self, value: u32, only: u32, done: Label, slow: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn typedStore(self: &mut Self, value: u32, only: u32, fused: u32, done: Label, slow: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let double = run self.a.label()
     let integer = run self.a.label()
+    if fused != NONE { let bits = self.at(fused) run getBits(&mut self.a, Reg.Rax, bits) run self.a.jmp(double) }
     run self.loadTag(Reg.R10, Mem.at(Reg.Rsp, u32.wrappingToI32(value * SLOT_BYTES + layout.tagOffset)))
     run self.a.load(Width.W64, Reg.Rax, payloadOf(value))
     run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, u32.wrappingToI32(layout.float64()))
