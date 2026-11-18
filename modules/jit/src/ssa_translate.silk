@@ -164,7 +164,7 @@ pub fn supported(opcode: u8) -> bool {
     || opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_fuse_prefix
     || objectOpcode(opcode) || callOpcode(opcode) || numberOpcode(opcode) || keepBranch(opcode) || testOpcode(opcode)
     || exceptionOpcode(opcode)
-    || opcode == op.OP_instanceof
+    || opcode == op.OP_instanceof || opcode == op.OP_put_arg || opcode == op.OP_set_arg || opcode == op.OP_step_arg8
 }
 
 /// Stream P's opcodes (docs/jit/compiled-entry.md 3.1): `throw` and `throw_error` leave
@@ -192,6 +192,23 @@ fn osrMayCall(input: &FunctionInput, allowCalls: bool) -> bool {
   return true
 }
 
+/// input.argumentCount when the code writes a parameter, else 0 (Translator.argSlots). 0 too
+/// when an arguments object or direct eval could read the frame's cells, which compiled code
+/// leaves stale; put_arg is then refused. (Frame references refuse the whole function.)
+fn argumentSlots(input: &FunctionInput) -> u32 {
+  let mut writes = false
+  let mut pc: usize = 0
+  while pc < input.code.length() {
+    let o = byteAt(input, pc)
+    if o == op.OP_put_arg || o == op.OP_set_arg || o == op.OP_step_arg8 { writes = true }
+    if o == op.OP_special_object || o == op.OP_eval || o == op.OP_apply_eval { return 0 }
+    let size = sizeAt(input, pc)
+    if size == 0 { return 0 }
+    pc = pc + size
+  }
+  if writes { return input.argumentCount }
+  return 0
+}
 /// Whether one of input's widened sites is an equality.
 fn wideEquality(input: &FunctionInput) -> bool {
   let mut i: usize = 0
@@ -576,6 +593,10 @@ struct Translator {
   /// Whether an equality site of the function deoptimized: then every equality of a boxed
   /// operand goes through Equals (sites of one function tend to meet the same values).
   wideEquality: bool,
+  /// The parameters as mutable slots, in a function that writes one (put_arg, set_arg):
+  /// argumentCount, and `locals` holds them after the real locals; else 0 and parameters are
+  /// read from their argument cells.
+  argSlots: u32,
 }
 
 /// Lexical locals that may be uninitialized (still in their TDZ) on entry to each leader, from a
@@ -701,9 +722,13 @@ impl Translator {
     while before < u32.toUsize(inst) { if !withoutEffect(self.f.insts.get(before).op) { self.broken = true } before = before + 1 }
     drop run self.f.exitFor(inst, self.rootPc, usize.toU32(self.rootStack.length()))
     let mut i: usize = 0
-    while i < self.rootLocals.length() { let v = self.rootLocals.get(i) run self.slot(v) i = i + 1 }
+    // Locals, the stack, then the parameter slots (ssa.Exit), as exitHere.
+    let real = u32.toUsize(self.f.localCount)
+    while i < real { let v = self.rootLocals.get(i) run self.slot(v) i = i + 1 }
     i = 0
     while i < self.rootStack.length() { let v = self.rootStack.get(i) run self.slot(v) i = i + 1 }
+    i = real
+    while i < self.rootLocals.length() { let v = self.rootLocals.get(i) run self.slot(v) i = i + 1 }
     i = 0
     while i < self.held.length() { let v = self.held.get(i) if self.isOwned(v) { run self.f.dropAt(v, SlotMode.Move) } i = i + 1 }
     i = 0
@@ -716,10 +741,14 @@ impl Translator {
   effect fn exitHere(self: &mut Self, inst: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.depth != 0 { run self.inlineExit(inst) return () }
     drop run self.f.exitFor(inst, pc, usize.toU32(self.stack.length()))
+    // Locals, the stack, then the parameter slots (ssa.Exit).
+    let real = u32.toUsize(self.f.localCount)
     let mut i: usize = 0
-    while i < self.locals.length() { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
+    while i < real { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
     i = 0
     while i < self.stack.length() { let v = self.stack.get(i) run self.slot(v) i = i + 1 }
+    i = real
+    while i < self.locals.length() { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
   }
   effect fn slot(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let info = self.f.value(v)
@@ -772,6 +801,12 @@ impl Translator {
     let v = run self.f.emit(self.current, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, u32.wrappingToI32(n), pc)
     self.f.setOwnership(v, Own.Borrowed, RootKind.Argument, n)
     return v
+  }
+  /// Parameter `n`'s current value: its slot when the function writes parameters, else its
+  /// argument cell (borrowed).
+  effect fn parameterValue(self: &mut Self, n: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if self.argSlots != 0 && self.depth == 0 { let slotIndex = u32.toUsize(self.f.localCount + n) return self.locals.get(slotIndex) }
+    return run self.argument(n, pc)
   }
   /// `v` boxed, for a block parameter or a return.
   effect fn boxed(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
@@ -833,7 +868,7 @@ impl Translator {
     let block = self.blockAt.get(pc)
     self.current = block
     let params = run self.f.paramsOf(block)
-    let local = u32.toUsize(self.f.localCount)
+    let local = u32.toUsize(self.f.localCount + self.argSlots)
     self.locals.clear() self.stack.clear()
     let mut i: usize = 0
     while i < params.length() {
@@ -1229,16 +1264,38 @@ impl Translator {
     else if opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3 { index = u8.toUsize(opcode - op.OP_get_loc0) }
     else if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { index = u8.toUsize(opcode - op.OP_put_loc0) }
     else if opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3 { index = u8.toUsize(opcode - op.OP_get_arg0) }
+    else if opcode == op.OP_step_arg8 {
+      // step_loc8 on the parameter's slot (argSlots is set: the scan saw this instruction).
+      if self.depth != 0 { fail refuse(at, opcode, b"a parameter write inside an inlined body") }
+      let n = u8.toU32(byteAt(input, pc + 1))
+      if n >= self.argSlots { fail refuse(at, opcode, b"argument index out of range") }
+      index = u32.toUsize(self.f.localCount + n)
+    }
     let isArgument = opcode == op.OP_get_arg || (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3)
     if index != usize.MAX {
       if isArgument { if index >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") } }
       else if index >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
+    }
+    if isArgument && self.argSlots != 0 && self.depth == 0 {
+      let slotIndex = u32.toUsize(self.f.localCount) + index
+      let l = self.locals.get(slotIndex) let v = run self.share(l, at) run self.push(v) return true
     }
     if isArgument {
       let a = run self.argument(usize.toU32(index), at)
       if self.depth != 0 { let shared = run self.share(a, at) run self.push(shared) return true }
       let r = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, at)
       run self.push(r) return true
+    }
+    if opcode == op.OP_put_arg || opcode == op.OP_set_arg {
+      // A parameter slot (argSlots is set: the scan saw this instruction).
+      if self.depth != 0 { fail refuse(at, opcode, b"a parameter write inside an inlined body") }
+      let n = u16.toUsize(u16At(input, pc + 1))
+      if n >= u32.toUsize(self.argSlots) { fail refuse(at, opcode, b"argument index out of range") }
+      let mut v = NONE
+      if opcode == op.OP_put_arg { v = self.pop() } else { let kept = self.top(1) v = run self.share(kept, at) }
+      let slotIndex = u32.toUsize(self.f.localCount) + n
+      run self.store(slotIndex, v, at)
+      return true
     }
     if opcode == op.OP_get_loc || opcode == op.OP_get_loc8 || (opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3) {
       let l = self.locals.get(index) let v = run self.share(l, at) run self.push(v) return true
@@ -1296,19 +1353,20 @@ impl Translator {
       drop self.pop() run self.release(a, at) run self.push(r)
       return true
     }
-    if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_step_loc8 {
+    if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_step_loc8 || opcode == op.OP_step_arg8 {
+      let stepping = opcode == op.OP_step_loc8 || opcode == op.OP_step_arg8
       let v = self.locals.get(index)
       if self.numberSite(at, v, v) {
         let mut k: f64 = 1.0
         let mut mode: u8 = 1
-        if opcode == op.OP_step_loc8 { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { k = -1.0 } }
+        if stepping { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { k = -1.0 } }
         else if opcode == op.OP_dec_loc { k = -1.0 }
         let x = run self.number(v, at)
         if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
         let c = run self.doubleConstant(k, at)
         let r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, c, 0, at)
         run self.store(index, r, at)
-        if opcode == op.OP_step_loc8 { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
+        if stepping { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
         return true
       }
       let x = run self.int(v, at)
@@ -1316,12 +1374,12 @@ impl Translator {
       let one = run self.constant(1, at)
       let mut operation = Op.Add
       let mut mode: u8 = 0
-      if opcode == op.OP_step_loc8 { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { operation = Op.Sub } }
+      if stepping { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { operation = Op.Sub } }
       else if opcode == op.OP_dec_loc { operation = Op.Sub }
       let r = run self.arith(operation, x, one, at)
       run self.store(index, r, at)
       // step_loc8 pushes the old value (mode bit 0 clear) or the new one.
-      if opcode == op.OP_step_loc8 { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
+      if stepping { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
       return true
     }
     if opcode == op.OP_add_loc {
@@ -1357,7 +1415,7 @@ impl Translator {
       let mut right = NONE
       if opcode >= op.OP_add_top_arg8 {
         if rightIndex >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") }
-        right = run self.argument(usize.toU32(rightIndex), at)
+        right = run self.parameterValue(usize.toU32(rightIndex), at)
       } else {
         if rightIndex >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
         right = self.locals.get(rightIndex)
@@ -1813,7 +1871,7 @@ impl Translator {
   effect fn slotValue(self: &mut Self, argument: bool, index: usize, pc: u32, opcode: u8) -> u32 ! Refusal | OutOfMemoryError ? &mut Allocator {
     if argument {
       if index >= self.argumentLimit() { fail refuse(pc, opcode, b"argument index out of range") }
-      return run self.argument(usize.toU32(index), pc)
+      return run self.parameterValue(usize.toU32(index), pc)
     }
     if index >= self.locals.length() { fail refuse(pc, opcode, b"local index out of range") }
     return self.locals.get(index)
@@ -1861,7 +1919,7 @@ impl Translator {
         o = self.locals.get(index)
       } else {
         if index >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") }
-        o = run self.argument(usize.toU32(index), at)
+        o = run self.parameterValue(usize.toU32(index), at)
       }
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
       let r = run self.getField(o, FIELD_KEYED, at)
@@ -2001,7 +2059,7 @@ impl Translator {
         v = self.locals.get(source)
       } else {
         if source >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") }
-        v = run self.argument(usize.toU32(source), at)
+        v = run self.parameterValue(usize.toU32(source), at)
       }
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
       run self.putField(o, v, at)
@@ -2026,7 +2084,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
-    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", exits: true, wideEquality: wideEquality(input) }
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", exits: true, wideEquality: wideEquality(input), argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   run t.f.elementKinds.appendSlice(input.elementKinds.asSlice())
   let entry = run t.f.block()
@@ -2036,7 +2094,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
       let b = run t.f.block()
       t.blockAt.set(pc, b)
-      let count = input.localCount + i32.wrappingToU32(shapeOf.depth.get(pc))
+      let count = input.localCount + t.argSlots + i32.wrappingToU32(shapeOf.depth.get(pc))
       let mut i: u32 = 0
       while i < count { drop run t.f.addParam(b, Type.Value, Own.Owned) i = i + 1 }
     }
@@ -2047,6 +2105,9 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
   let undefined = run t.imm(Imm.Undefined, 0)
   let mut i: u32 = 0
   while i < input.localCount { run t.locals.append(undefined) i = i + 1 }
+  t.f.argumentSlots = t.argSlots
+  i = 0
+  while i < t.argSlots { let a = run t.argument(i, 0) let r = run t.f.emit(t.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, 0) run t.locals.append(r) i = i + 1 }
   // Not a back edge, though its target is offset 0.
   let first = t.blockAt.get(0)
   let edge = run t.edgeTo(first, 0)
@@ -2256,7 +2317,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(),
     depth: 0, rootPc: 0, rootLocals: List<u32>.make(), rootStack: List<u32>.make(), rootInst: 0, held: List<u32>.make(),
-    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", exits: false, wideEquality: wideEquality(input) }
+    args: List<u32>.make(), receiver: NONE, formals: 0, broken: false, missed: b"", exits: false, wideEquality: wideEquality(input), argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0
@@ -2264,7 +2325,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
       let b = run t.f.block()
       t.blockAt.set(pc, b)
-      let count = input.localCount + i32.wrappingToU32(shapeOf.depth.get(pc))
+      let count = input.localCount + t.argSlots + i32.wrappingToU32(shapeOf.depth.get(pc))
       let mut i: u32 = 0
       while i < count { drop run t.f.addParam(b, Type.Value, Own.Owned) i = i + 1 }
     }
@@ -2279,6 +2340,10 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     run t.locals.append(r)
     i = i + 1
   }
+  // Written parameters: slots after the locals, each a counted copy of the frame's argument.
+  t.f.argumentSlots = t.argSlots
+  i = 0
+  while i < t.argSlots { let a = run t.argument(i, header) let r = run t.f.emit(t.current, Op.Retain, true, Type.Value, Own.Owned, a, NONE, 0, header) run t.locals.append(r) i = i + 1 }
   // The catch markers under the header, as the catch instructions pushed them.
   let mut m: usize = 0
   while m < markers.length() {
@@ -2306,7 +2371,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     }
     i = i + 1
   }
-  if argumentSpeculation.length() > 0 {
+  if argumentSpeculation.length() > 0 && t.argSlots == 0 {
     run t.argNumbers.appendRepeated(NONE, u32.toUsize(input.argumentCount))
     i = 0
     while i < input.argumentCount && u32.toUsize(i) < argumentSpeculation.length() {
