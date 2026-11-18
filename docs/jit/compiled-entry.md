@@ -42,6 +42,27 @@ Which entries check the slot:
   code. While instructions are observed (`observeInstructions`, the debugger) the compiled
   entry is skipped and the interpreter runs.
 
+### Running compiled JavaScript in an embedded Node runtime
+
+An x86-64 Linux application can link both `silkjs-runtime` and `silkjs-jit`. Its
+`embed.Host.afterBootstrap` can call `jit_runtime.enable` on the realm's runtime before the
+module loader starts the application. The application owns one JIT per runtime, at a stable address from attachment
+through heap destruction. Embedded mode creates a fresh heap and runs bootstrap before attaching the compiler.
+Each worker owns a separate runtime and would need its own JIT.
+
+`modules/jit/embed-smoke/src/main.silk` is a complete host. It imports `node:timers` in an ES
+module and runs a numeric loop in a `setImmediate` callback. Run it from the checkout root:
+
+```sh
+silk run --manifest-path modules/jit/embed-smoke/silk.toml
+```
+
+A successful run prints `timer checksum 33521664` and JIT counters. The executable checks
+the JavaScript exit status, compiler failures and actual entries into compiled code. To run an
+external ES module through the same host, pass its absolute path as the sole argument. The
+runtime loads it as its normal entry point, resolves imports relative to their importing module
+and returns its exit status. JIT counters are printed when the runtime shuts down.
+
 ## 2. Calling convention and where a compiled frame lives
 
 For this milestone the compiled function makes no calls and cannot fail, so a compiled frame is
@@ -427,6 +448,13 @@ any call, and the site word carries `SITE_GENERIC` (bit 41).
   the next instruction, or it traps. The result is left owned in the area's first slot
   (undefined when nothing is pushed); a throw is materialized, what is left on the stack is
   released and the exit reports `CALL_THREW`.
+- **Several values.** An instruction that leaves more than one value (for-of and for-in
+  steps, define_array_el, append, check_ctor_return) carries the count R in `k` bits 12-15 and
+  a mask of the operand cells it leaves unchanged in bits 16-23 (`ssa_translate.genericResults`
+  and `genericKeptCells`; site bits 44-55). `compiledOp` checks the stack holds R values and
+  releases its copies of the kept cells. The code keeps its own values for those cells, takes
+  cell 0 from the call and reads every other cell with `call.result c`, right after the call.
+  One mechanism serves streams P and Q.
 - **No `--jit-calls` needed.** `calls.callsFunctions` ignores generic sites, so a function whose
   only calls are generic exits compiles with plain `--jit`.
 - **OSR.** Loops compiled for OSR refuse calls, so they refuse generic sites too.
