@@ -3,6 +3,8 @@
 Updated 2026-11-16. Working branch: `claude/sweet-ptolemy-f5t7na`, based on `main` at `d1973537`.
 It replaces `t3/jit-compiler-plan` (based on the older `86c3e4db`) as the coordination branch.
 
+> **Paused 2026-11-18 01:15 UTC.** The state at the pause, the queue of ungated heads and how to resume are in [pause-2026-11-18.md](pause-2026-11-18.md). Read it before anything below.
+
 ## Objective and standing constraints
 
 Build an optional JIT that competes with V8 and JavaScriptCore on measured throughput, startup,
