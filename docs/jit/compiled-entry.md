@@ -448,6 +448,13 @@ any call, and the site word carries `SITE_GENERIC` (bit 41).
   the next instruction, or it traps. The result is left owned in the area's first slot
   (undefined when nothing is pushed); a throw is materialized, what is left on the stack is
   released and the exit reports `CALL_THREW`.
+- **Several values.** An instruction that leaves more than one value (for-of and for-in
+  steps, define_array_el, append, check_ctor_return) carries the count R in `k` bits 12-15 and
+  a mask of the operand cells it leaves unchanged in bits 16-23 (`ssa_translate.genericResults`
+  and `genericKeptCells`; site bits 44-55). `compiledOp` checks the stack holds R values and
+  releases its copies of the kept cells. The code keeps its own values for those cells, takes
+  cell 0 from the call and reads every other cell with `call.result c`, right after the call.
+  One mechanism serves streams P and Q.
 - **No `--jit-calls` needed.** `calls.callsFunctions` ignores generic sites, so a function whose
   only calls are generic exits compiles with plain `--jit`.
 - **OSR.** Loops compiled for OSR refuse calls, so they refuse generic sites too.
