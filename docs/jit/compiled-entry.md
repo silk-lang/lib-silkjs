@@ -59,7 +59,8 @@ silk run --manifest-path modules/jit/embed-smoke/silk.toml
 
 A successful run prints `timer checksum 33521664` and JIT counters. The executable checks
 the JavaScript exit status, compiler failures and actual entries into compiled code. To run an
-external ES module through the same host, pass its absolute path as the sole argument. The
+external ES module through the same host, pass its path. Place `--jit-calls` before the path to
+include call instructions in compiled functions. The flag also works with the built-in smoke module. The
 runtime loads it as its normal entry point, resolves imports relative to their importing module
 and returns its exit status. JIT counters are printed when the runtime shuts down.
 
