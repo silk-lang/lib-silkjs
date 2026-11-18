@@ -95,6 +95,13 @@ extern "C" fn(arguments: *const ValueBits, state: *mut u64, counter: *mut i32, d
   the count), word 2 the bytecode offset of the `return`. Result 1: deoptimization. Result 2:
   interrupt poll (an exit that is not counted as a deopt).
 
+**Named field stores.** Helper 2 (`PUT_FIELD`) takes the bytecode offset in the low 32 bits
+of its site word. Bit 32 allows a store to replace the last owning reference in a writable
+data property. The emitter clears the bit when a live field borrow could depend on that
+slot. If the store would remove the last reference, the helper leaves the slot intact and the interpreter
+resumes at the store with the exit's saved values. The site word contains no runtime
+address. The borrow rules are described in [ssa.md](ssa.md).
+
 **Values in compiled code.** Every SSA value has a 16-byte slot; a boxed `value` is a
 `ValueBits` in the engine's own layout. Silk does not promise a union layout, so the JIT reads it
 from the engine at compile time (`value_layout.probe`: it writes each variant over zeros and over
