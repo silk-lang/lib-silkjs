@@ -3,7 +3,7 @@
 Updated 2026-11-16. Working branch: `claude/sweet-ptolemy-f5t7na`, based on `main` at `d1973537`.
 It replaces `t3/jit-compiler-plan` (based on the older `86c3e4db`) as the coordination branch.
 
-> **Paused 2026-11-18 01:15 UTC.** The state at the pause, the queue of ungated heads and how to resume are in [pause-2026-11-18.md](pause-2026-11-18.md). Read it before anything below.
+> **Current x86-64 assessment.** The [milestone review](x86-milestone.md) gives the measured gap to Node/V8, the candidate validation record and the next experiments. The [pause record](pause-2026-11-18.md) describes the earlier integration queue. The dated sections below preserve the original decisions and measurements.
 
 ## Objective and standing constraints
 
