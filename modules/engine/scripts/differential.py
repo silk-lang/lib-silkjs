@@ -42,6 +42,8 @@ are compared with.
   jit-calls-stress                              jit-stress with --jit-calls
   jit-inline-stress                             jit-calls with stressed guards after a warm-up, so
                                                 inlined bodies (docs/jit/inlining.md) leave mid-way
+  jit-no-hoist, jit-no-borrow, jit-no-unboxed   jit-calls-eager without one code quality pass
+                                                (docs/jit/code-quality.md), to pin a mismatch on it
 
 Adding a configuration: for a one-off run pass `--config NAME=TEMPLATE` (repeatable; the name is
 appended to --configs). To make it permanent, add NAME: TEMPLATE to BUILTIN in this script, and
@@ -83,6 +85,9 @@ BUILTIN = {
     "jit-calls-eager": "{jit} --jit --jit-calls --jit-profile=0 --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-calls-stress": "{jit} --jit --jit-calls --jit-threshold=1 --jit-stress=3 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "jit-inline-stress": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stress=5 --jit-deopt-limit=0 --jit-stats={stats} {file}",
+    "jit-no-hoist": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-hoist --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-no-borrow": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-borrow --jit-threshold=20 --jit-stats={stats} {file}",
+    "jit-no-unboxed": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-unboxed --jit-threshold=20 --jit-stats={stats} {file}",
 }
 REFERENCES = {"node"}
 
@@ -123,6 +128,20 @@ function __iter(arr, b) {
   var i = 0;
   return { next: function () { i++; if (i === 11000 + (b & 7)) throw new RangeError('next'); return { value: arr[i - 1], done: i > arr.length }; },
     return: function () { __fin = (__fin + 1) | 0; return {}; }, [Symbol.iterator]: function () { return this; } };
+}
+var __h = {x: 3, y: 4};
+function __poke(o, k) {
+  if (k === 0) o.z = 1;
+  else if (k === 1) { delete o.x; o.x = 's'; }
+  else if (k === 2) Object.defineProperty(o, 'x', {get: function () { return 9; }, configurable: true});
+  else o.x = o.x + 0.5;
+  return k;
+}
+function __cut(ta, k) {
+  if (k === 0) ta.buffer.transfer();
+  else if (k === 1 && ta.buffer.resizable) ta.buffer.resize(2 * ta.BYTES_PER_ELEMENT);
+  else if (ta.buffer.resizable) ta.buffer.resize(12 * ta.BYTES_PER_ELEMENT);
+  return k;
 }
 function __P(x, y) { this.x = x; this.y = y; this.n = 0; }
 __P.prototype.getx = function () { return this.x; };
@@ -180,7 +199,8 @@ FLAVORS = ["plain", "loop", "branch", "closure", "closures", "writes", "writes",
            "intloop", "intloop", "intnest", "intbranch", "numloop", "numloop", "intops", "intops", "counters",
             "calls", "calls", "fields", "elements", "globals", "method", "literals", "operators", "classes", "tests", "shuffles", "instanceof",
             "protos", "protos", "protos", "tries", "tries", "tdz", "frames", "frames",
-            "lazyargs", "lazyargs", "equality", "iteration", "iteration", "iteration"]
+            "lazyargs", "lazyargs", "equality", "iteration", "iteration", "iteration",
+            "aliases", "aliases", "hoists", "hoists", "hoists", "conversions", "conversions", "argwrites"]
 
 # Each area of the generator: a pattern that marks a program exercising it, and a source
 # rewrite that stands in for a miscompile there. The self-test runs the rewrite as a broken
@@ -193,6 +213,7 @@ AREAS = {
     "exceptions": (r"\bthrow ", r"\bthrow ", "return "),  # a throw returns instead
     "typed arrays": (r"\bvar ta = new ", r"\bvar ta = new \w+\(", "var ta = new Float64Array("),  # wrong element kind
     "number loops": (r"\bvar d = ", r"\bd = d \+ ", "d = d - "),  # a double add becomes a subtract
+    "loop invariants": (r"\)\) \| 0; [^}]", r"(?<=\)\) \| 0; )(?=[^}])", "if (0) "),  # the change inside the loop is lost
     "int operators": (r"\bvar u = ", r"\bvar u = a \| 0;", "var u = (a | 0) ^ 1;"),  # the first operand is off by one bit
     "iteration": (r"\bfor \(var v of ", r"\bj\+\+; \}", "j = j + 2; }"),  # a step is counted twice
 }
@@ -370,6 +391,51 @@ class Generator:
             return (f"var arr = [a, b, {self.integer()}, 2, 3]; var t = 0; "
                     f"for (var i = 0; i < arr.length; i++) {{ t = t + arr[i]; arr[i] = {self.pick(['t - i', 'i', 'a', 'arr[i] + 1'])}; }} "
                     f"{tail}for (var j = 0; j < {self.pick(['a.length', 'b.length', '2'])}; j++) {{ t = t + a[j]; }} return [t, arr];")
+        if flavor == "aliases":
+            # What an element or length read that keeps no count of its own (ssa_opt_elements)
+            # must survive: the array is the only owner of its strings and arrays, a store
+            # replaces the element read (the same slot or another) before the value is used
+            # again, and the length changes inside the loop that reads it.
+            step = self.pick([1, 2, 3])
+            move = self.pick([f"arr[(i * {step}) % n] = arr[i]; ", "arr[i] = arr[i]; ", "arr[n - 1 - i] = arr[i]; ",
+                              "arr[i] = 's' + i; ", "o.x = arr[i]; arr[i] = i; "])
+            use = self.pick(["arr[i].length", "arr[i][0]", "arr[(i + 1) % n].length", "o.x.length", "arr[i]"])
+            resize = self.pick(["", "", "if (i === 2) arr.length = 3; ", "if (i === 1) arr.length = 7; ",
+                                "if (i === 3) arr[arr.length] = 't' + i; "])
+            return (f"var arr = ['s' + a, [b, 'u' + b], 'q' + b, [a], 'r' + a + b]; var o = {{x: 'w' + a}}; var t = 0; "
+                    f"var n = arr.length; for (var i = 0; i < arr.length && i < 6; i++) {{ {move}t = __clamp(t + {use}); {resize}}} "
+                    f"return [t, arr, o.x];")
+        if flavor == "hoists":
+            # What a guard or a load moved in front of its loop (ssa_opt_hoist) must survive:
+            # the loop reads something that does not change from one iteration to the next,
+            # and then it does, at one iteration or at all of them: the object's shape through
+            # a call or a store, the binding, the array's length, the typed array's buffer
+            # (detached, shrunk, grown).
+            kind = self.pick(TYPED)
+            size = f"{kind}.BYTES_PER_ELEMENT"
+            buffer = self.pick([f"new {kind}(8)", f"new {kind}(new ArrayBuffer(8 * {size}, {{maxByteLength: 16 * {size}}}))"])
+            target = self.pick(["o", "o", "__h"])
+            read = self.pick([f"{target}.x", f"{target}.x + {target}.y", "arr.length", "ta.length", "ta[i & 3]", "ta[i]",
+                              "arr[i % arr.length]", "__g", "a.length", "a.x", "(a | 0)", "a * 2", "__h.y"])
+            defeat = self.pick(["", f"__poke({target}, {self.random.randrange(4)}); ", f"{target}.z = i; ", f"{target}.x = 's' + i; ",
+                                "__h = {y: i, x: i + 1}; ", "__h.x = __h.x + 1; ", f"__cut(ta, {self.random.randrange(3)}); ",
+                                "arr.length = 2; ", "arr[arr.length] = i; ", "arr.pop(); ", "__g = (__g + 1) | 0; ", "ta = arr; ",
+                                "o = __h; ", "ta[i & 3] = i * 1.5; "])
+            when = self.pick(["if (i === 2) { %s}", "if (i === n - 1) { %s}", "%s", "if ((i & 1) === 1) { %s}"]) % defeat
+            before = self.pick(["", "t = (t + a) | 0; ", "var u = a.x; "])
+            return (f"var o = {{x: 1, y: b}}; var ta = {buffer}; ta[1] = 7; ta[2] = 300; var arr = [a, b, 1, 2, 3, 4]; var t = 0; "
+                    f"var n = {self.pick([4, 6, 9])}; __h = {{x: 3, y: 4}}; __g = __g | 0; {before}"
+                    f"for (var i = 0; i < n; i++) {{ t = (t + ({read})) | 0; {when}}} "
+                    f"return [t, o.x, __h.x, arr.length, ta.length, ta[1]];")
+        if flavor == "conversions":
+            # Conversions of values that do not change in the loop, on -0, NaN, doubles and
+            # non-numbers: the sign of a zero and a NaN must come out as the interpreter's.
+            forms = ["a | 0", "a >>> 0", "-a", "a * 0", "a % 2", "a * -1", "0 - a", "a + 0", "Math.floor(a)", "Math.abs(a)",
+                     "Math.sqrt(a)", "a / b", "a * b", "~a", "+a", "b - a", "a % b", "Math.trunc(a)", "Math.fround(a)", "a * 0.5", "a << 1"]
+            first, second, third = self.pick(forms), self.pick(forms), self.pick(forms)
+            return (f"var d = 0; var z = 0; var c = 0; var n = {self.pick([3, 5, 8])}; "
+                    f"for (var i = 0; i < n; i++) {{ d = d + ({first}); z = {second}; if (z === 0) c = c + 1 / z; if (z !== z) c = c - 1; "
+                    f"d = d - ({third}) * i; }} return [d, z, c, 1 / z, {first}, -({second})];")
         if flavor == "globals":
             # A global read and stored in a loop.
             return (f"var t = 0; var n = b; if (n > 20) n = {self.pick([3, 20])}; "
@@ -578,6 +644,14 @@ class Generator:
                     f"var ys = [1, 3, b, a, __eo, 's', undefined, null, NaN, 0, 7.0, 7, 1, __eo]; var c = 0; "
                     f"for (var i = 0; i < xs.length; i++) {{ var x = xs[i]; var y = ys[i]; if ({test}) c = c + i + 1; }} "
                     f"return c;")
+        if flavor == "argwrites":
+            # Parameters written in the function (J2, put_arg and set_arg): defaults, coercion,
+            # a swap, and a write before an add that may leave compiled code.
+            first = self.pick(["if (b === undefined) b = 1;", "a = a | 0;", "b = b + 1;", "a = typeof a === 'number' ? a : 0;", ""])
+            step = self.pick(["var t = a; a = b; b = t;", "a = a + i;", "s = s + (b = i * 2);", "b = s; a = i;",
+                              "if (i & 1) a = b;", "a = a + b;"])
+            return (f"{first} var s = 0; for (var i = 0; i < {self.pick([2, 5, 20])}; i++) {{ {step} s = s + i; }} "
+                    f"return [a, b, s];")
         raise ValueError(flavor)
 
     def function(self) -> str:
@@ -673,8 +747,10 @@ class Generator:
         int32, and statements outside the first subset make side exits (docs/jit/osr.md)."""
         update = self.pick(["t + i", "t - a", "t * 3 + i", "t + a * i", "a - t + i", "t + i * i - b", "t + 3"])
         side = self.pick(["", "", "o.x = o.x + 1; ", "t = t | 0; ", "if ((i & 1023) === 0) s = s + i; ",
-                          "if (i === n - 2) o = [t]; ", "u = u + 0.5; "])
-        lines = [f"function long0(a, b, n) {{ var t = {self.pick(['0', 'a', 'b', '1'])}; var o = {{x: 1}}; var s = 's'; var u = 0; "
+                          "if (i === n - 2) o = [t]; ", "u = u + 0.5; ",
+                          # Loads and guards that do not change in the loop (ssa_opt_hoist), in code entered at the loop.
+                          "t = (t + q.length) | 0; ", "t = (t + (q[1] | 0)) | 0; if (i === n - 3) q.length = 1; ", "t = (t + __h.y) | 0; "])
+        lines = [f"function long0(a, b, n) {{ var t = {self.pick(['0', 'a', 'b', '1'])}; var o = {{x: 1}}; var s = 's'; var u = 0; var q = [a, b, 1]; "
                  f"for (var i = 0; i < n; i++) {{ t = {update}; if (t > 100000 || t < -100000) t = {self.pick(['0', 'b', 't % 7'])}; {side}}} "
                  f"return [t, o.x, o.length, s.length, u]; }}",
                  f"function long1(a, b, n) {{ var r = 0; for (var k = 0; k < 3; k++) {{ r = __clamp(r + long0(a, b, n + k)[0]); }} return r; }}",

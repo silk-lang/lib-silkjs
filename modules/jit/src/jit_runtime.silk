@@ -19,7 +19,6 @@ import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_value { ValueBits }
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_inline as inline
-import silkjs.js_value { ValueBits }
 import ssa_translate { CallTarget }
 import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId }
 import silkjs.js_runtime as runtime
@@ -96,13 +95,17 @@ pub struct Options {
   /// (js_feedback) for N of its instructions, and is compiled at its next report with the
   /// arithmetic sites that saw a double or an overflow as number sites (0: compile at once;
   /// default DEFAULT_PROFILE).
-  pub profile: u32
+  pub profile: u32,
+  /// --jit-foresee=MASK: the FORESEE_* refusals a recording may make (default FORESEE_ALL).
+  pub foresee: u32,
+  /// --jit-no-<pass> clears a bit: the code quality passes that run (ssa_opt.PASS_*).
+  pub passes: u32
 }
 /// The compile budget's default, in bytecode bytes (measured: K-doubles report, "Compile budget").
 pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 impl Options {
   pub fn make() -> Self {
-    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE, inlining: true }
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE, foresee: FORESEE_ALL, passes: 4294967295, inlining: true }
   }
 }
 
@@ -227,6 +230,27 @@ impl Jit {
     run line.appendSlice(b" learned ") run decimal(&mut line, self.learned)
     run line.appendSlice(b" foreseen ") run decimal(&mut line, self.foreseen)
     run line.append(10)
+    return move line
+  }
+  /// --jit-dump at exit: each entry that deoptimized, with its runs and first deopt pcs.
+  pub effect fn deoptLines(self: &Self) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut line = List<u8>.make()
+    let entries = self.entries.asSlice()
+    let mut index: usize = 0
+    while index < entries.length {
+      let entry = &entries[index]
+      if entry.deopts > 0 {
+        run line.appendSlice(b"jit: entry ") run decimal(&mut line, usize.toU64(index))
+        run line.appendSlice(b" runs ") run decimal(&mut line, entry.runs)
+        run line.appendSlice(b" deopts ") run decimal(&mut line, entry.deopts)
+        if entry.deoptLimit != 0 && entry.deopts >= u32.toU64(entry.deoptLimit) { run line.appendSlice(b" unlinked") }
+        run line.appendSlice(b" at")
+        let mut k: usize = 0
+        while k < u8.toUsize(entry.deoptPcCount) { run line.append(32) run decimal(&mut line, u32.toU64(entry.deoptPcs[k])) k = k + 1 }
+        run line.append(10)
+      }
+      index = index + 1
+    }
     return move line
   }
   /// --jit-dump: the opcode each OSR entry last deoptimized at, with its deopts.
@@ -355,9 +379,24 @@ export "C" fn jitHotFunction(rt: *mut HeapHeader, bytecode: *mut HeapHeader, dat
   }
 }
 
-/// Options.profile unless --jit-profile says otherwise. Measured on Octane (compile-cost.md):
-/// 200 misses too many sites, 2000 costs more in the observed loop than it saves.
-pub const DEFAULT_PROFILE: u32 = 500
+/// Options.foresee bits: which sure deopts a recording refuses a function for. Each stands for
+/// an exit compiled code takes today; when that exit becomes a slow path, clear its bit (or
+/// drop it from FORESEE_ALL) and the functions compile again.
+/// A call to a bytecode function that was reported and has no code (js_vm.compiledCall
+/// answers CALL_DEOPT).
+pub const FORESEE_CALLEE: u32 = 1
+/// Arithmetic or a comparison on a string, object or other non-number.
+pub const FORESEE_NUMBERS: u32 = 2
+/// A named property read or store on a value that is not an object.
+pub const FORESEE_RECEIVER: u32 = 4
+/// A named store to objects of five or more shapes (js_compiled_objects.writeField declines).
+pub const FORESEE_STORE: u32 = 8
+pub const FORESEE_ALL: u32 = 15
+/// Options.profile unless --jit-profile says otherwise: the recording is this many
+/// instructions plus two per bytecode byte. Measured on Octane (compile-cost.md): with the
+/// per-byte part, 100 does as well as 500 on the large benchmarks and costs the small ones
+/// (richards, deltablue) a fifth as much.
+pub const DEFAULT_PROFILE: u32 = 100
 /// Recorded instructions from which a site the recording never reached counts as cold.
 const SEEN_ENOUGH: u64 = 100
 /// Entries a function runs while it records feedback before it is reported again.
@@ -369,7 +408,7 @@ const PROFILE_ENTRIES: u32 = 24
 /// recorded reached a bytecode function that was reported and has no code to call (compiled
 /// code deoptimizes at each such call, js_vm.compiledCall), or a property site the helpers
 /// decline.
-unsafe effect fn learn(jit: &mut Jit, rt: *mut HeapHeader, bytecode: *mut HeapHeader, sites: &mut List<u32>) -> &'static [u8] ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn learn(jit: &mut Jit, rt: *mut HeapHeader, bytecode: *mut HeapHeader, sites: &mut List<u32>, elements: &mut List<u32>) -> &'static [u8] ! OutOfMemoryError ? &mut Allocator {
   drop unsafe feedback.stop(rt, bytecode)
   let seen = match run unsafe feedback.snapshot(rt, bytecode) {
     Option<feedback.Snapshot>.Some { value } => move value
@@ -391,19 +430,30 @@ unsafe effect fn learn(jit: &mut Jit, rt: *mut HeapHeader, bytecode: *mut HeapHe
       while k < sites.length() { if sites.get(k) == site.offset { known = true } k = k + 1 }
       if !known { run sites.append(site.offset) jit.learned = jit.learned + 1 }
     }
-    // Arithmetic and comparisons are compiled for numbers only.
+    // Arithmetic and order comparisons are compiled for numbers only; an equality that met
+    // other values is widened instead (ssa_translate's Equals helper call).
+    let equality = site.opcode == op.OP_eq || site.opcode == op.OP_neq || site.opcode == op.OP_strict_eq
+      || site.opcode == op.OP_strict_neq || site.opcode == op.OP_strict_eq_imm8 || site.opcode == op.OP_strict_neq_imm8
     if numeric && site.count != 0 && u8.bitAnd(u8.bitOr(site.left, site.right), u8.bitOr(u8.bitOr(feedback.SEEN_STRING, feedback.SEEN_OBJECT), feedback.SEEN_OTHER)) != 0 {
-      hopeless = true why = b"an operand of arithmetic or a comparison that is not a number"
+      if equality {
+        let mut k: usize = 0
+        let mut known = false
+        while k < sites.length() { if sites.get(k) == site.offset { known = true } k = k + 1 }
+        if !known { run sites.append(site.offset) jit.learned = jit.learned + 1 }
+      } else if u32.bitAnd(jit.options.foresee, FORESEE_NUMBERS) != 0 { hopeless = true why = b"an operand of arithmetic or a comparison that is not a number" }
     }
     // A store whose receivers had too many shapes for its caches, or a named read or store on
     // something that is not an object: the helpers decline those and the code would deoptimize.
     if site.kind == feedback.KIND_PROPERTY && site.count != 0 {
-      if site.left != feedback.SEEN_OBJECT && site.opcode != op.OP_get_length { hopeless = true why = b"a named property of a value that is not an object" }
-      else if site.shapeCount == feedback.MEGAMORPHIC_SHAPES && (site.opcode == op.OP_put_field || site.opcode == op.OP_put_loc_field_loc8 || site.opcode == op.OP_put_loc_field_arg8) {
+      if u32.bitAnd(jit.options.foresee, FORESEE_RECEIVER) != 0 && site.left != feedback.SEEN_OBJECT && site.opcode != op.OP_get_length { hopeless = true why = b"a named property of a value that is not an object" }
+      else if u32.bitAnd(jit.options.foresee, FORESEE_STORE) != 0 && site.shapeCount == feedback.MEGAMORPHIC_SHAPES && (site.opcode == op.OP_put_field || site.opcode == op.OP_put_loc_field_loc8 || site.opcode == op.OP_put_loc_field_arg8) {
         hopeless = true why = b"a store to objects of too many shapes"
       }
     }
-    if site.kind == feedback.KIND_CALL && jit.options.calls {
+    if site.kind == feedback.KIND_ELEMENT && site.right != feedback.ELEMENT_NONE && site.right != feedback.ELEMENT_MIXED {
+      run elements.append(u32.shiftLeft(site.offset, 8) | u8.toU32(site.right))
+    }
+    if site.kind == feedback.KIND_CALL && jit.options.calls && u32.bitAnd(jit.options.foresee, FORESEE_CALLEE) != 0 {
       if site.first != feedback.NO_TARGET && unsafe codeless(rt, &seen.targets.get(u32.toUsize(site.first))) { hopeless = true }
       if site.second != feedback.NO_TARGET && unsafe codeless(rt, &seen.targets.get(u32.toUsize(site.second))) { hopeless = true }
     }
@@ -479,7 +529,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
         return ()
       }
     } else if !plan.recompile {
-      let why = run unsafe learn(&mut jit, attached, bytecode, &mut plan.sites)
+      let why = run unsafe learn(&mut jit, attached, bytecode, &mut plan.sites, &mut plan.elements)
       if why.length != 0 {
         jit.refused = jit.refused + 1
         jit.foreseen = jit.foreseen + 1
@@ -519,12 +569,13 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   }
   let mut cost = Cost.make()
   cost.dump = jit.options.dump
+  cost.passes = jit.options.passes
   // What its method calls called last, to inline (docs/jit/inlining.md): cells[id] is the
   // FunctionBytecode cell of the target a CallTarget names.
   let mut cells = List<?*mut HeapHeader>.make()
   let mut targets = List<CallTarget>.make()
   if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells) }
-  let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &mut cost))
+  let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &plan.elements, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
   drop function
@@ -568,7 +619,12 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   run jit.history.remember(&plan, usize.toU32(jit.entries.length() - 1))
   jit.compiledFunctions = jit.compiledFunctions + 1
   jit.genericSites = jit.genericSites + u32.toU64(genericSites)
-  if jit.options.dump { run say(b"jit: compiled", b"") }
+  if jit.options.dump {
+    let mut line = List<u8>.make()
+    run line.appendSlice(b"jit: compiled entry ") run decimal(&mut line, usize.toU64(jit.entries.length() - 1))
+    run line.append(10)
+    io.stderr(line.asSlice())
+  }
   let last = jit.entries.length() - 1
   run unsafe attachOsr(&mut jit, last, move osr)
 }
@@ -641,6 +697,7 @@ unsafe effect fn compileHeader(jit: &mut Jit, bytecode: *mut HeapHeader, doubleS
   }
   let mut cost = Cost.make()
   cost.dump = jit.options.dump
+  cost.passes = jit.options.passes
   let lowered = run Effect.result(unsafe lower.lowerOsr(&function, jit.options.stress, jit.options.calls, doubleSites, header, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost osr", &cost) }

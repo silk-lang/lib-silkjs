@@ -462,6 +462,14 @@ any call, and the site word carries `SITE_GENERIC` (bit 41).
   releases its copies of the kept cells. The code keeps its own values for those cells, takes
   cell 0 from the call and reads every other cell with `call.result c`, right after the call.
   One mechanism serves streams P and Q.
+- **Widened equality and named stores.** Bits 56–57 of the site word encode the
+  specialized fallback for a named store (2) or equality (3). The operands are the
+  two values at the front of the call area. Generated code first tries the native
+  helper. When that helper declines, the engine runs the bytecode operation with
+  its normal coercion, setter and exception behavior, then returns the result in
+  `CALL_RESULT`. The code generator uses bit 26 of the SSA immediate to distinguish
+  `!=` from `==` on the helper path. The engine reads the original opcode. The
+  multi-result counts, kept-cell mask and call-policy flags use their existing bits.
 - **No `--jit-calls` needed.** `calls.callsFunctions` ignores generic sites, so a function whose
   only calls are generic exits compiles with plain `--jit`.
 - **OSR.** Loops compiled for OSR refuse calls, so they refuse generic sites too.
