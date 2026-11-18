@@ -27,6 +27,19 @@ The uploaded pause record’s interrupted candidate was `9c7cb585`. On this host
 
 The combined runtime and field-store changes at `c39cc03d` passed all 83 JIT tests, the x86 encoding checks and all 16 fixed-output comparisons. All 3,000 differential seeds agreed across ten configurations, and all seven JIT configurations entered native code on every seed. The interpreter’s largest instruction-count increase relative to `9c7cb585` was 0.0604% on RayTrace. The full native suite reproduced the same two for-in failures, with 564 passes. [Combined release gate and binary hashes](jit-scorecard-results/2026-11-18-c39cc03d/gate.json)
 
+### Checking application results
+
+Run the application correctness checks before a timed Octane comparison. The runner
+executes all 15 groups in fresh interpreter, default JIT and compiled-call processes.
+It treats a failed setup, run or teardown, a missing completion marker and a difference
+in output as failures. To repeat one case, append `--only gbemu`.
+
+```sh
+python3 modules/engine/scripts/verify_jit_octane.py \
+  --engine /path/to/silkjs-engine --shell /path/to/silkjs-jit-shell \
+  --octane /path/to/octane
+```
+
 ## Candidate measurements
 
 We built `9c7cb585` in release mode on Linux x86-64 with the pinned Silk dev.74 and Clang 22.1.8. The host was a KVM guest on AMD EPYC 9V74 with a four-CPU quota. Node was 24.19.0 with V8 13.6.233.17. The full Octane run used three interleaved rounds of 15 benchmark groups and four engines. All 180 processes exited successfully, producing 204 score samples. Taking the median of each workload before the geometric mean gives the following scores.

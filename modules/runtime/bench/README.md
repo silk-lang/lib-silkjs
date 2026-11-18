@@ -45,6 +45,9 @@ python3 modules/runtime/bench/jit_http.py --runtime build/llvm/x86_64-unknown-li
   --node /absolute/path/node --json /tmp/http-orders.json
 ```
 
+To measure compiled calls, add `--jit-calls` and use a separate JSON output file.
+The host applies this flag to SilkJS. Node runs with its default JIT settings in both runs.
+
 Each process runs the same `node:http` module. One client sends 64-item JSON orders,
 checks each total and uses a single persistent loopback connection. Server and client
 are pinned to separate CPUs. Each server has a single-CPU budget including its compiler threads.

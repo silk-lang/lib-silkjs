@@ -57,13 +57,16 @@ def jit_counters(log):
     return counters
 
 
-def run_sample(executable, check_jit, server_cpu, settings):
+def run_sample(executable, check_jit, server_cpu, settings, *, jit_calls=False):
     payloads = cases()
     env = {k: v for k, v in os.environ.items() if k not in {"BUN_OPTIONS", "NODE_OPTIONS"}}
     env["SILKJS_PREPARSE_THREADS"] = "0"
     with tempfile.TemporaryFile() as log:
         launch = time.perf_counter()
-        process = subprocess.Popen(["taskset", "-c", str(server_cpu), executable, FIXTURE],
+        command = ["taskset", "-c", str(server_cpu), executable]
+        if jit_calls:
+            command.append("--jit-calls")
+        process = subprocess.Popen([*command, FIXTURE],
                                    stdout=subprocess.PIPE, stderr=log, env=env, start_new_session=True)
         connection = None
         try:
@@ -150,6 +153,7 @@ def sha256(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", required=True, type=Path, help="built JIT embed host")
+    parser.add_argument("--jit-calls", action="store_true", help="enable compiled calls in the SilkJS host")
     parser.add_argument("--node", default=shutil.which("node"), type=Path)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1200, help="untimed orders per process")
@@ -176,7 +180,8 @@ def main():
     for rnd in range(args.rounds):
         names = list(commands) if rnd % 2 == 0 else list(reversed(commands))
         for name in names:
-            sample = run_sample(commands[name], name == "silkjs", cpus[0], args)
+            sample = run_sample(commands[name], name == "silkjs", cpus[0], args,
+                                jit_calls=name == "silkjs" and args.jit_calls)
             results[name].append(sample)
             print(f"{rnd + 1} {name}: {sample['first_response_ms']:.2f} ms to first order,"
                   f" {sample['sequential_requests_per_s']:.0f} sequential req/s,"
