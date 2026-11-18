@@ -46,9 +46,9 @@ python3 modules/runtime/bench/jit_http.py --runtime build/llvm/x86_64-unknown-li
 ```
 
 To measure compiled calls, add `--jit-calls` and use a separate JSON output file.
-The host applies this flag to SilkJS. Node runs with its default JIT settings in both runs.
+Use `--no-jit` for the interpreter baseline in the same host executable. The client verifies that its JIT counters stayed at zero. Node uses its default JIT in each comparison.
 
-Each process runs the same `node:http` module. One client sends 64-item JSON orders,
+Each process runs the same `node:http` module. One client sends JSON orders with 64 line items by default (set `--items` to vary the payload),
 checks each total and uses a single persistent loopback connection. Server and client
 are pinned to separate CPUs. Each server has a single-CPU budget including its compiler threads.
 Each of three rounds launches both engines, alternating order. Launch-to-first-response
@@ -61,7 +61,7 @@ engines on a slower host.
 
 The report includes times for all scheduled orders, per-process p99, CPU/request
 during the throughput interval, high-water RSS before shutdown, binary and workload hashes
-and JIT counters. Each SilkJS process must complete successfully and execute compiled code.
+and JIT counters. Each SilkJS process must complete successfully. In JIT modes the client also verifies that compiled code ran.
 Use a representative service and concurrent clients for a production capacity estimate.
 
 ## What the tasks hold fixed
