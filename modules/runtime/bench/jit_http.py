@@ -88,6 +88,8 @@ def run_sample(executable, check_jit, server_cpu, settings, *, jit_calls=False, 
             ready = re.fullmatch(rb"ready (\d+)\n", marker)
             if not ready:
                 raise ValueError(f"expected a listening port, received {marker[:120]!r}")
+            if os.sched_getaffinity(process.pid) != {server_cpu}:
+                raise RuntimeError(f"server did not start on CPU {server_cpu}")
             connection = http.client.HTTPConnection("127.0.0.1", int(ready[1]), timeout=10)
             post(connection, "/order", *payloads[0])
             first_ms = (time.perf_counter() - launch) * 1000
