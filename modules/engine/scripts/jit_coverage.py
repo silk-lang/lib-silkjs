@@ -10,7 +10,9 @@ script (bench/v8), two runs of the JIT shell:
 2. with --instructions, fixed iterations (as `v8bench.py --instructions`) under callgrind
    with --jit --jit-stats: the fraction of executed machine instructions that ran in compiled
    code. Compiled code lives in an anonymous executable mapping, which callgrind attributes to
-   the object `???`; every other instruction is the engine's own (interpreter, runtime, GC).
+   the object `???`. A matching <shell>.symbols sidecar also identifies self instructions in
+   the SSA/compiler backend and the JIT helper and exit-state modules. Calls into engine
+   builtins, GC, allocators, the compiler driver and other libraries keep their own costs.
    This needs no counter in the engine, so its cost when off is zero by construction.
 
     python3 scripts/jit_coverage.py                       # every benchmark, counters only
@@ -105,31 +107,37 @@ def compiled_fraction(shell, path, cwd, timeout):
                                shell, "--jit", *EXTRA, "--jit-stats", path], capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if done.returncode != 0 or " done" not in done.stdout:
             return {"exit": done.returncode, "error": (done.stdout + done.stderr)[-600:]}
-        total, unknown, compiling = per_object(out.name, compiler_functions(shell))
-    return {"exit": 0, "instructions": total, "compiled": unknown, "fraction": unknown / total if total else 0.0,
-            "compiler": compiling, "compiler_fraction": compiling / total if total else 0.0,
-            "stats": parse_stats(done.stderr)}
+        costs = per_object(out.name, jit_symbol_groups(shell))
+    return {"exit": 0, **costs, "stats": parse_stats(done.stderr)}
 
 
-def compiler_functions(shell):
-    """Hashed symbol names of the JIT compiler's functions (package silkjs-jit), from <shell>.symbols."""
-    found = set()
+def jit_symbol_groups(shell):
+    """Map compiler-pass and runtime-helper symbols from the matching release sidecar."""
+    groups = {}
     try:
         with open(shell + ".symbols", encoding="utf-8", errors="replace") as f:
             for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 3 and "silkjs-jit@" in parts[2] and "jit_runtime.silk" not in parts[2]:
-                    found.add(parts[0])
+                parts = line.rstrip("\n").split("\t", 2)
+                if len(parts) != 3:
+                    continue
+                module = parts[2].partition("::")[0]
+                package, _, source = module.partition(":")
+                if not package.startswith("silkjs-jit@"):
+                    continue
+                if source in ("jit_helpers.silk", "jit_exit_state.silk"):
+                    groups[parts[0]] = "helpers"
+                elif source in ("ssa.silk", "asm_x64.silk") or source.startswith(("ssa_", "x64_")):
+                    groups[parts[0]] = "compiler"
     except OSError:
-        pass
-    return found
+        return {}
+    return groups
 
 
-def per_object(path, compiler=frozenset()):
-    """Total self Ir, self Ir in object ??? (anonymous executable memory, the compiled code), and
-    self Ir in the JIT compiler's own functions (`compiler`, hashed names), of a callgrind file."""
+def per_object(path, groups):
+    """Split Callgrind self Ir by object and named JIT module. Inclusive call costs are skipped."""
     objects, functions = {}, {}
-    total = unknown = compiling = 0
+    total = unknown = 0
+    named = collections.Counter()
     current = function = None
     after_call = False
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -145,8 +153,8 @@ def per_object(path, compiler=frozenset()):
                     total += cost
                     if current == "???":
                         unknown += cost
-                    elif function in compiler:
-                        compiling += cost
+                    elif function in groups:
+                        named[groups[function]] += cost
                 continue
             key, _, value = line.rstrip("\n").partition("=")
             if key in ("ob", "cob", "fn", "cfn"):
@@ -163,7 +171,13 @@ def per_object(path, compiler=frozenset()):
                     function = (name or "").split("'")[0]
             elif key == "calls":
                 after_call = True
-    return total, unknown, compiling
+    result = {"instructions": total, "compiled": unknown, "fraction": unknown / total if total else 0.0}
+    for category, fraction in (("compiler", "compiler_fraction"), ("helpers", "helper_fraction")):
+        # A measured zero requires symbols in this category, even if none ran.
+        available = category in groups.values()
+        result[category] = named[category] if available else None
+        result[fraction] = named[category] / total if available and total else None
+    return result
 
 
 def main():
@@ -233,7 +247,10 @@ def main():
                 "", s.get("compile-ns", 0) / 1e6, s.get("code-bytes"), s.get("osr-compiled"), s.get("osr-runs"), s.get("osr-deopts"))
             if "callgrind" in entry and entry["callgrind"].get("exit") == 0:
                 c = entry["callgrind"]
-                cost += " compiled-instr %.4f%% compiler-instr %.4f%%" % (100 * c["fraction"], 100 * c["compiler_fraction"])
+                cost += " compiled-instr %.4f%%" % (100 * c["fraction"])
+                for label, key in (("compiler-instr", "compiler_fraction"), ("helper-instr", "helper_fraction")):
+                    share = c[key]
+                    cost += " %s %s" % (label, "%.4f%%" % (100 * share) if share is not None else "unavailable")
             print(cost, flush=True)
             top = sorted(entry["counters"]["refused"].items(), key=lambda kv: -kv[1])[:4]
             if top:

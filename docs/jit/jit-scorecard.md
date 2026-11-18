@@ -45,6 +45,14 @@ What the tools measure:
   instructions callgrind attributes to object `???` (the anonymous executable mapping holding
   compiled code). No engine counter is involved, so its cost when off is zero. Floor: code-load
   shows 0.0003% with nothing compiled (other anonymous code), so values below about 0.001% are noise.
+- With the matching release `silkjs-jit-shell.symbols` file, `compiler_fraction` counts self
+  instructions in the SSA modules, x64 assembler and x64 backend modules. `helper_fraction`
+  counts self instructions in `jit_helpers` and `jit_exit_state`. Both divide by all process
+  instructions. Shared allocator, GC and builtin callees retain their own costs. The compiler
+  driver and code-memory management are outside both module groups. A JSON null or a dash in a
+  table indicates missing attribution. A numeric zero means the group had symbols and no self
+  instructions. Historical tables below predate this split. Their compiler column includes
+  generated-code helper calls and exit reconstruction alongside compiler work.
 - `--jit-dump` refusals name the bytecode the translator stopped at
   (`jit: refused: opcode outside the subset: push_this`).
 
