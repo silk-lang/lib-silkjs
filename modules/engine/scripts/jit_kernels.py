@@ -140,6 +140,7 @@ def main():
     times = {k: {c: [] for c in columns} for k in kernels}
     stats = {k: {} for k in kernels}
     results = {k: {} for k in kernels}
+    expected = {}
     failures = []
     for round_index in range(args.rounds):
         for kernel in kernels:
@@ -148,6 +149,10 @@ def main():
                     result, ms, line = run_once(found[column], paths[kernel], args.timeout)
                 except (RuntimeError, subprocess.TimeoutExpired) as error:
                     failures.append("%s %s: %s" % (kernel, column, error))
+                    continue
+                checksum = expected.setdefault(kernel, result)
+                if result != checksum:
+                    failures.append(f"{kernel} {column} round {round_index + 1}: expected {checksum}, got {result}")
                     continue
                 times[kernel][column].append(ms)
                 results[kernel][column] = result
@@ -189,15 +194,13 @@ def main():
         print(line)
     print()
     for kernel in kernels:
-        distinct = set(results[kernel].values())
-        if len(distinct) > 1:
-            failures.append("%s: checksums differ: %s" % (kernel, results[kernel]))
         for column, line in sorted(stats[kernel].items()):
             print("%s %-12s %s" % (column, kernel, line))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"rounds": args.rounds, "commands": {c: found[c] for c in columns}, "omitted": {c: missing[c] for c in chosen if c in missing},
-                       "units": {k: paths[k + "/units"] for k in kernels}, "ms": times, "checksums": results, "jit_stats": stats}, f, indent=1)
+                       "units": {k: paths[k + "/units"] for k in kernels}, "ms": times, "checksums": results, "jit_stats": stats,
+                       "failures": failures}, f, indent=1)
     shutil.rmtree(scripts)
     if failures:
         print("\n".join(failures))
