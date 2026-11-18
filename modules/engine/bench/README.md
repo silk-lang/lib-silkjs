@@ -76,7 +76,8 @@ two warmup calls and five timed calls. Report these as measurements at that warm
 The ratio is the median of paired SilkJS time divided by Node time for that workload and metric.
 A ratio of 2 means SilkJS took twice as long. JSON records the raw samples, executable paths,
 flags, SHA-256 hashes, host, Node/V8 versions and workload revision. Supply `--only json,parse`
-for a smaller run. Omit `--calls` to compare the default `--jit` configuration.
+for a smaller run. Omit `--calls` to compare the default `--jit` configuration. Use
+`--interpreter` and `SILKJS_ENGINE=/path/to/silkjs-engine` for the interpreter-only baseline.
 
 ## Comparison with other engines
 

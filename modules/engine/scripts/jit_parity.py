@@ -105,7 +105,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=2, help="untimed in-process calls")
     parser.add_argument("--iterations", type=int, default=5, help="timed in-process calls")
     parser.add_argument("--timeout", type=int, default=300, help="seconds per process")
-    parser.add_argument("--calls", action="store_true", help="also pass --jit-calls to SilkJS")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--calls", action="store_true", help="also pass --jit-calls to SilkJS")
+    mode.add_argument("--interpreter", action="store_true", help="measure the interpreter-only engine")
     parser.add_argument("--json", type=Path, help="write raw times, ratios and provenance")
     args = parser.parse_args()
     if min(args.rounds, args.iterations, args.timeout) < 1 or args.warmup < 0:
@@ -119,14 +121,18 @@ def main():
         workloads[name] = expected[name]
 
     engine = Path(os.environ.get("SILKJS_ENGINE") or release_engine())
-    shell = shutil.which(os.environ.get("SILKJS_JIT") or str(engine.with_name("silkjs-jit-shell")))
+    binary = str(engine) if args.interpreter else (os.environ.get("SILKJS_JIT") or str(engine.with_name("silkjs-jit-shell")))
+    silkjs = shutil.which(binary)
     node = shutil.which(os.environ.get("NODE_REFERENCE") or "node")
-    if not shell or not node:
-        parser.error("set SILKJS_JIT and NODE_REFERENCE to the JIT shell and Node executables")
+    if not silkjs or not node:
+        variable = "SILKJS_ENGINE" if args.interpreter else "SILKJS_JIT"
+        parser.error(f"set {variable} and NODE_REFERENCE to the SilkJS and Node executables")
     busy = compiler_running()
     if busy:
         parser.error(f"compiler running: {busy[0]}")
-    commands = {"silkjs": [str(Path(shell).resolve()), "--jit"], "v8": [str(Path(node).resolve())]}
+    commands = {"silkjs": [str(Path(silkjs).resolve())], "v8": [str(Path(node).resolve())]}
+    if not args.interpreter:
+        commands["silkjs"].append("--jit")
     if args.calls:
         commands["silkjs"].append("--jit-calls")
     env = environment()
