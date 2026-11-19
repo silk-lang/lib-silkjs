@@ -63,6 +63,12 @@ To measure the cost of forwarding a listener call, a diagnostic version of the s
 
 To repeat the within-process comparison on Linux, run `python3 "$results/listener_cpu.py" --repo . --host "$host" --out /tmp/listener-samples.jsonl` from the repository root, with `results` set to this directory. The driver accepts `--server-cpu` and `--client-cpu` to select two available cores. [Driver](listener_cpu.py) · [Diagnostic service](listener-forwarding.mjs)
 
+## Where compiled calls add work
+
+On the same `62790abf` release, switching on compiled calls added 168,154 instructions per 64-item order after 4,800 warmups. Seven VM functions that enter, dispatch and return from compiled activations accounted for 57,220 of the increase (34.0%), counting only instructions inside each function. The same seven added 67,819 per 64-item order and 70,805 per four-item order after 1,200 warmups.
+
+The activation runner dispatched 113 extra operations per long-warmup order. Roughly 60 were callable dispatches, 52 ran generic bytecodes in the VM, and one invoked a constructor. The object-bytecode handler made 28 additional calls to its fast own-field definition routine. This identifies two costs that persist even when a caller stays compiled: preparing another activation and leaving generated code to execute a frequent individual opcode. [Matched counts and call edges](call-mode-cost.json) · [Callgrind analysis](call_mode_cost.py)
+
 ## Locating the V8 gap
 
 After 4,800 warmup orders, a 400-order fixed window took approximately 767,000 x86-64 instructions per order on the original default SilkJS and 217,000–220,000 on Node v24.19.0. The complete call to JSON.parse accounted for about 205,000 on SilkJS and 112,000 on Node. Subtracting these inclusive parser counts from each process total leaves about 83% of the instruction gap outside parsing. Cycles per instruction and operating-system costs can differ between runtimes. Server CPU and throughput come from separate processes running without instrumentation. [Node profiles](node-fixed-work.json)
