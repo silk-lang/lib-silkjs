@@ -274,9 +274,10 @@ give without making them process-local. Instead the code leaves and the engine m
 
 - `CompiledFrame.calls` (offset 48) points to the frame's *call block*, `u64` words:
   word 0 the resume word, word 1 the site (pc low, argument count high), words 2-3 the result,
-  from word 4 the area (callee, receiver, up to 8 arguments, 2 words each), from word 24 the
-  saved values (value `v` at `24 + 2v`). `CompiledEntry.callWords` is its size, 0 when the code
-  makes no calls.
+  from word 4 the area (callee, receiver, up to 8 arguments, 2 words each). The direct-call
+  exit, state, frame and table index occupy words 24–98. Each resume point packs its live
+  values from word 99, using two words for a boxed value and one for an integer, boolean or
+  double. `CompiledEntry.callWords` is the largest block any point needs, or zero for a leaf.
 - At a call the code writes the area and the site, writes `(point + 1) << 2` to word 0, copies
   the values live after the call (`ssa_liveness.savedAcross`, plus the call exit's values) from
   their frame slots to the saved area, and returns `EXIT_CALL` (4).
