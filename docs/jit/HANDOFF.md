@@ -3,7 +3,7 @@
 Updated 2026-11-16. Working branch: `claude/sweet-ptolemy-f5t7na`, based on `main` at `d1973537`.
 It replaces `t3/jit-compiler-plan` (based on the older `86c3e4db`) as the coordination branch.
 
-> **Current x86-64 assessment.** The [milestone review](x86-milestone.md) gives the measured gap to Node/V8, the integrated `b52550c7` validation record, full Octane rerun, typed-array timings and HTTP callback experiment. The [whole HTTP request experiment](jit-scorecard-results/2026-11-18-http-service/README.md) follows the parser through listener dispatch and JSON to the response, including a same-host interpreter comparison on `62790abf`. The [pause record](pause-2026-11-18.md) describes the earlier integration queue. The dated sections below preserve the original decisions and measurements.
+> **Current x86-64 assessment.** The milestone branch now emits direct x86 loads for statically addressed lexical reads at `aa564dec`. The 64-item order service handles 4,347 verified orders/s under the default JIT, against 4,247 under the interpreter and 9,440 under Node. The milestone review tracks the suite measurements and AOT follow-up. The HTTP experiments trace execution from the parser through the application listeners and measure the CPU cost of enabling compiled calls. [Milestone review](x86-milestone.md) · [HTTP experiments](jit-scorecard-results/2026-11-19-http-calls/README.md) · [Earlier pause record](pause-2026-11-18.md)
 
 ## Objective and standing constraints
 
