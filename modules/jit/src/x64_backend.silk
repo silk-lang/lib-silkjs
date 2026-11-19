@@ -23,6 +23,7 @@ import silk.num.i32
 import silk.num.u32
 import silk.num.u64
 import silk.num.u8
+import silk.num.u16
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
@@ -34,6 +35,7 @@ import x64_regalloc { Allocation, Place, GPR, XMM, getI32, putI32, aluWith, getF
 import x64_regalloc as regalloc
 import ssa_calls as calls
 import jit_helpers as helpers
+import silkjs.js_core_types { SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK }
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_objects { FieldLayout }
 import silkjs.js_compiled_objects as objects
@@ -818,6 +820,14 @@ impl Emitter {
       // get_scope(env, frame, site, out) / put_scope(env, frame, site, value) -> 1 when done;
       // site = slot | checked << 31 | captured << 30 | borrowed << 29.
       let k = i32.wrappingToU32(inst.k)
+      let captured = (k & 0x20000) != 0
+      let operand = k & 0xffff
+      if op == Op.GetScope && (!captured || (operand & u16.toU32(SCOPE_OPERAND)) != 0) {
+        let depth = if captured { u32.shiftRight(operand, u16.toU32(SCOPE_DEPTH_SHIFT)) & 7 } else { 0 }
+        let slot = if captured { operand & u16.toU32(SCOPE_SLOT_MASK) } else { operand }
+        run self.readScope(&inst, depth, slot, captured || (k & 0x10000) != 0, function.value(inst.result).own)
+        return ()
+      }
       let mut site = u32.bitOr(u32.bitOr(k & 0xffff, u32.shiftLeft(u32.shiftRight(k, 16) & 1, 31)), u32.shiftLeft(u32.shiftRight(k, 17) & 1, 30))
       // A borrowed result (ssa_opt_borrow) takes no count: bit 29.
       if op == Op.GetScope && function.value(inst.result).own == Own.Borrowed { site = u32.bitOr(site, 0x20000000) }
@@ -1688,6 +1698,41 @@ impl Emitter {
   }
   /// The frame slot of ABI input k.
   pub fn input(self: &Self, k: u32) -> Mem { return Mem.at(Reg.Rsp, self.inputs + u32.wrappingToI32(k * 8)) }
+  /// Read the lexical slot addressed by the bytecode. Inlined callees use the scope
+  /// captured by their closure, the same pointer frameInto would put in their frame.
+  effect fn readScope(self: &mut Self, inst: &Inst, depth: u32, slot: u32, checked: bool, own: Own) -> () ! OutOfMemoryError ? &mut Allocator {
+    let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+    if self.frameOf == 0 {
+      let frame = self.input(INPUT_FRAME)
+      run self.a.load(Width.W64, Reg.R11, frame)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(self.fields.frameScope)))
+    } else {
+      let closure = self.inlineClosures.get(u32.toUsize(self.frameOf - 1))
+      run self.a.load(Width.W64, Reg.R11, payloadOf(closure))
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, compiled.DIRECT_CLOSURE_SCOPE))
+    }
+    let mut hop: u32 = 0
+    run self.a.test(Width.W64, Reg.R11, Reg.R11)
+    run self.a.jcc(Cond.Equal, exit)
+    while hop < depth {
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(self.fields.scopeParent)))
+      run self.a.test(Width.W64, Reg.R11, Reg.R11)
+      run self.a.jcc(Cond.Equal, exit)
+      hop = hop + 1
+    }
+    let offset = u32.wrappingToI32(self.fields.scopeSlots + slot * SLOT_BYTES)
+    if checked {
+      let layout = self.settings.layout
+      run self.loadTag(Reg.R8, Mem.at(Reg.R11, offset + u32.wrappingToI32(layout.tagOffset)))
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.uninitialized()))
+      run self.a.jcc(Cond.Equal, exit)
+    }
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, offset))
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, offset + 8))
+    run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+    run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+    if own != Own.Borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
+  }
   /// dst = the CompiledFrame the instruction being lowered runs for, to pass to a helper: the
   /// function's own, or an inlined callee's (Inst.frame), which is built here, on the slow
   /// path, as a direct call builds one (directCall): the closure's bytecode, captured cells and
