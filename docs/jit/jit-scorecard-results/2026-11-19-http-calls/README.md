@@ -30,3 +30,23 @@ A second six-round comparison on four-item orders gave the shorter linked-entry 
 ## Compiling the request path selectively
 
 On the unchanged release, the compiler admitted calls only for 15 selected functions along the parser and application path. The emitter completed 4,000 compiled invocations in the 400-order window without deoptimizing. The application request and end listeners remained interpreted. Selecting the path used 769,581 instructions/order against 760,422 at default settings and 926,163 with global calls. An independent run reproduced the ordering. It found a 1.63% increase over default for the selected path and a 22.08% increase for global calls. Both runs verified every response. [Function-level evidence and reproduction](selective/README.md)
+
+## Reading lexical scope slots directly
+
+The fourth trial, `3c265d9a`, is on the milestone branch as `aa564dec`. It generates x86 loads for ordinary lexical reads whose slot and scope depth the compiler knows. Checked reads still exit at the original bytecode for an uninitialized binding. Owned results retain their references, and indirect closure cells still use the helper. A 24-order trace classified 6,175 of 6,223 calls as direct or statically addressed enclosing-scope reads. On a separately measured 400-order window, `--jit-calls` helper invocations fell from 273.93 to 2.00 per order. The default fell from 32.12 to 2.00. All 93 JIT tests passed. The release host also matched Node on closure mutation, object identity and temporal-dead-zone exceptions, including a diagnostic with 4,357 forced deoptimizations. [Site census](scope-census.json) · [Matched instruction counts and correctness](scope-fixed.json) · [JavaScript oracle](scope-edges.mjs)
+
+| 64-item service, six fresh processes per condition | Verified orders/s | Server CPU, µs/order |
+| --- | ---: | ---: |
+| Baseline interpreter | 4,141 | 233.70 |
+| Scope candidate interpreter | 4,247 | 227.30 |
+| Baseline default JIT | 4,172 | 232.55 |
+| Scope candidate default JIT | 4,347 | 221.98 |
+| Baseline with compiled calls | 2,891 | 334.84 |
+| Scope candidate with compiled calls | 2,980 | 320.44 |
+| Node v24.19.0 | 9,440 | 55.65 |
+
+The default candidate used less CPU in five of six paired rounds, a median reduction of 3.0%, and delivered 2.8% more orders/s. With compiled calls enabled, paired CPU fell 7.6% with four pairs improving and two worsening. The two JIT-disabled builds differed by 2.3% paired CPU. The scope helper originally accounted for less than 1% of server instructions, and code placement and compilation during measurement can affect timings. The full timing difference cannot be attributed to removing the helper. [Fresh-process timings, 629,330 verified orders](scope-fresh.json.gz)
+
+A second protocol kept both servers alive on the same core and alternated which one received each 1,000-order block. Every server warmed on 4,800 orders. The default candidate used less CPU in all four process pairs, with a median saving of 2.2%. With compiled calls enabled, the median saving was 3.4%, with individual pairs spanning 0.8–16.0%. The JIT-disabled median reduction was 1.2% with mixed signs. Comparing two instances of the original binary shifted CPU by −1.2% with the default policy and +1.4% with compiled calls enabled in the single control pair for each policy. The client verified 240,000 timed orders across these comparisons. [Raw blocks and counters](scope-pairs.json.gz) · [Driver](paired.py)
+
+Two fixed-work compute controls ran 80 warmup iterations and 400 timed iterations per process. Against the baseline, the scope candidate’s median paired elapsed time with compiled calls enabled fell 2.7% on Richards and 1.3% on DeltaBlue. Both workloads remained substantially behind Node. [Elapsed times, fixture reconstruction and hashes](scope-compute.json.gz)
