@@ -14,7 +14,7 @@ import silk.num.u32
 import silk.num.usize
 import silk.num.u64
 import runtime_memory { AllocationObserver }
-import js_vm_state { Machine }
+import js_vm_state { Machine, cellAt }
 import js_core_types as census
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
@@ -1118,14 +1118,15 @@ pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits, chain: 
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
   let key = unsafe fieldKeyAt(machine.ip)
   if u64.shiftRight(key, 16) != shape.version { return false }
-  let mut found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+  let mut found = unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))
   drop shape drop data
   unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
   if chain {
-    found = unsafe chainFields(&mut machine, found)
-    if unsafe operators.fusedOperand(&mut machine, found) { return true }
+    found = unsafe chainSlots(&mut machine, found)
+    if found.isNumber() && unsafe operators.fusedOperand(&mut machine, found.valueBits()) { return true }
   }
-  unsafe machine.push(unsafe found.retained())
+  unsafe found.writeValue(machine.stackTop, true)
+  machine.stackTop = unsafe cellAt(machine.stackTop, 1)
   return true
 }
 /// `a.b.c`: while the next instruction is a get_field whose inline key holds
@@ -1146,14 +1147,24 @@ pub unsafe fn pushChained(machine: &mut Machine, value: ValueBits) -> () {
 }
 @inlineAlways
 unsafe fn chainFields(machine: &mut Machine, first: ValueBits) -> ValueBits {
+  if unsafe machine.peekU8(0) != op.OP_get_field { return first }
+  match first { ValueBits.Object { .. } => {} _ => { return first } }
+  return (unsafe chainSlots(&mut machine, SlotBits.value(first))).valueBits()
+}
+/// chainFields on slot words: each step tests the Object tag on the word and
+/// follows it, so no value is decoded until the end of the chain.
+@inlineAlways
+unsafe fn chainSlots(machine: &mut Machine, first: SlotBits) -> SlotBits {
   let mut found = first
   while unsafe machine.peekU8(0) == op.OP_get_field {
-    let object = match found { ValueBits.Object { reference } => reference _ => { break } }
+    let pointer = found.objectReference()
+    if Pointer.isNull<HeapHeader>(pointer) { break }
+    let object = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(pointer)
     let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
     let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
     let key = unsafe fieldKeyAt(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(machine.ip), 1))
     if u64.shiftRight(key, 16) != shape.version { break }
-    found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+    found = unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))
     drop shape drop data
     unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
   }
@@ -1291,11 +1302,11 @@ pub unsafe fn readFieldOperand(machine: &mut Machine, chain: bool) -> ?*mut Heap
     let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
     let key = unsafe fieldKeyAt(machine.ip)
     if u64.shiftRight(key, 16) == shape.version {
-      let first = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+      let first = unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))
       drop shape drop data
       unsafe machine.skip(FIELD_OPERAND_BYTES)
-      let found = unsafe chainFields(&mut machine, first)
-      unsafe machine.set(1, unsafe found.retained())
+      let found = unsafe chainSlots(&mut machine, first)
+      unsafe found.writeValue(unsafe machine.topCell(1), true)
       return object
     }
   }
@@ -1980,13 +1991,12 @@ unsafe effect fn writeField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   // writeOwnField's key test.
   if index < 0x10000 { unsafe writeFieldKey(ip, u64.shiftLeft(shape.version, 16) | usize.toU64(index)) }
   drop shape
-  let old = (unsafe data.slotUnchecked(index)).valueBits()
+  let old = unsafe data.slotUnchecked(index)
   // An object has a slot for each record of its shape.
   unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source))) drop data
   // The last reference goes out of line by header, so this function keeps no
   // ValueBits in memory and needs no stack frame.
-  if old.tag() >= 0 { return true }
-  match ValueBits.heapReference(&old) {
+  match old.heapReference() {
     Option<*mut HeapHeader>.Some { value: reference } => {
       let mut headerAnchor = ()
       let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, reference)
@@ -2034,17 +2044,15 @@ pub unsafe fn writeOwnFieldProbe(node: *mut HeapHeader, atom: u32, source: *mut 
 /// last reference to a cell.
 @inlineAlways
 unsafe fn storeOwnSlot(data: &mut ObjectData, index: usize, source: *mut ValueBits) -> bool {
-  let old = (unsafe data.slotUnchecked(index)).valueBits()
-  if old.tag() < 0 {
-    match ValueBits.heapReference(&old) {
-      Option<*mut HeapHeader>.Some { value: reference } => {
-        let mut headerAnchor = ()
-        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, reference)
-        if header.referenceCount <= 1 { return false }
-        header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1)
-      }
-      Option<*mut HeapHeader>.None => ()
+  let old = unsafe data.slotUnchecked(index)
+  match old.heapReference() {
+    Option<*mut HeapHeader>.Some { value: reference } => {
+      let mut headerAnchor = ()
+      let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, reference)
+      if header.referenceCount <= 1 { return false }
+      header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1)
     }
+    Option<*mut HeapHeader>.None => ()
   }
   unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source)))
   return true

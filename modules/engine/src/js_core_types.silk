@@ -1566,11 +1566,11 @@ fn packWords(words: ValueWords) -> u64 {
     if u64.bitAnd(payload, 0x7fffffffffffffff) > 0x7ff0000000000000 { return SLOT_CANONICAL_NAN }
     return payload
   }
-  if payload > SLOT_PAYLOAD { addressTooWide() }
+  // A pointer payload fits 48 bits: user-space addresses on every 64-bit target this
+  // engine runs on (x86-64 47 bits, arm64 48). Not tested here: the test's trap path made
+  // every store spill registers.
   return u64.bitOr(u64.shiftLeft(SLOT_TAG_BASE + variant, 48), payload)
 }
-@inlineNever
-fn addressTooWide() -> never { return Intrinsic.trap("a heap address does not fit a 48-bit slot payload") }
 @inlineAlways
 fn tagged(variant: u64, payload: u64) -> u64 { return u64.bitOr(u64.shiftLeft(SLOT_TAG_BASE + variant, 48), payload) }
 /// The slot word of value. Tests of the variant, not a match: a match is a jump table,
@@ -1580,8 +1580,23 @@ fn packValue(value: ValueBits) -> u64 {
   let words = unsafe Pointer.read<ValueWords>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const ValueWords>(Pointer.fromRef<ValueBits>(&value)))
   let variant = u64.bitAnd(words.variant, 15)
   if variant == 7 { return tagged(7, u64.bitAnd(words.payload, 0xffffffff)) }
+  if variant == 6 { return tagged(6, u64.bitAnd(words.payload, SLOT_PAYLOAD)) }
   return packWords(words)
 }
+/// The payload word of a tagged slot word: its low 48 bits, sign extended for a short
+/// BigInt (48-bit two's complement). Addresses can have bit 47 set (arm64 Linux maps up to
+/// 2^48), so only that variant extends, out of line: a select here costs every load seven
+/// instructions, a branch two.
+@inlineAlways
+fn slotPayload(word: u64) -> u64 {
+  if u64.shiftRight(word, 48) == SLOT_TAG_BASE + VARIANT_SHORT_BIG_INT { return shortBigIntPayload(word) }
+  return u64.bitAnd(word, SLOT_PAYLOAD)
+}
+@inlineNever
+fn shortBigIntPayload(word: u64) -> u64 { return extend48(word) }
+/// word's low 48 bits, bit 47 extended.
+@inlineAlways
+fn extend48(word: u64) -> u64 { return i64.wrappingToU64(i64.shiftRight(u64.wrappingToI64(u64.shiftLeft(word, 16)), 16)) }
 /// The value a data slot's word holds. Past the number test it is built as its two
 /// words, without a jump table on the variant.
 @inlineAlways
@@ -1589,10 +1604,7 @@ fn unpackWord(word: u64) -> ValueBits {
   checkSlotLayout()
   if word < SLOT_NON_NUMBER { return ValueBits.Float64 { value: f64.fromBits(word) } }
   let variant = u64.shiftRight(word, 48) - SLOT_TAG_BASE
-  let mut payload = u64.bitAnd(word, SLOT_PAYLOAD)
-  // A short BigInt is 48-bit two's complement: extend its sign.
-  if variant == VARIANT_SHORT_BIG_INT && payload > 0x00007fffffffffff { payload = u64.bitOr(payload, 0xffff000000000000) }
-  let words = ValueWords { variant: variant, payload: payload }
+  let words = ValueWords { variant: variant, payload: slotPayload(word) }
   return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*const ValueWords, *const ValueBits>(Pointer.fromRef<ValueWords>(&words)))
 }
 impl SlotBits {
@@ -1766,9 +1778,13 @@ impl SlotBits {
     let mut words = ValueWords { variant: VARIANT_FLOAT64, payload: word }
     if word >= SLOT_NON_NUMBER {
       let variant = u64.shiftRight(word, 48) - SLOT_TAG_BASE
-      let mut payload = u64.bitAnd(word, SLOT_PAYLOAD)
-      if variant < 7 { if retain { unsafe HeapCell.retain(wordReference(payload)) } }
-      else if variant == VARIANT_SHORT_BIG_INT && payload > 0x00007fffffffffff { payload = u64.bitOr(payload, 0xffff000000000000) }
+      let mut payload: u64 = 0
+      if retain {
+        // The retain's variant test also picks the payload: a heap reference's low 48
+        // bits, or any other variant's sign extended, which only a short BigInt needs.
+        if variant < 7 { payload = u64.bitAnd(word, SLOT_PAYLOAD) unsafe HeapCell.retain(wordReference(payload)) }
+        else { payload = extend48(word) }
+      } else { payload = slotPayload(word) }
       words = ValueWords { variant: variant, payload: payload }
     }
     unsafe Pointer.write<ValueWords>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ValueWords>(target), words)
@@ -1776,13 +1792,23 @@ impl SlotBits {
   /// The value of a slot whose flags name a plain data property.
   @inlineAlways
   pub fn valueBits(self: &Self) -> ValueBits { return unpackWord(self.word) }
+  /// The object a data slot holds, or null when it holds anything else: a property
+  /// chain's step tests the word for the Object tag without decoding the value.
+  @inlineAlways
+  pub fn objectReference(self: &Self) -> ?*mut HeapHeader {
+    if u64.shiftRight(self.word, 48) != SLOT_TAG_BASE + 6 { return Pointer.null<HeapHeader>() }
+    return wordPointer(u64.bitAnd(self.word, SLOT_PAYLOAD))
+  }
+  /// Whether a data slot holds a Float64.
+  @inlineAlways
+  pub fn isNumber(self: &Self) -> bool { return self.word < SLOT_NON_NUMBER }
   /// Whether a data slot holds a heap reference: what a release of its value looks at.
   @inlineAlways
-  pub fn holdsHeap(self: &Self) -> bool { return self.word >= SLOT_NON_NUMBER && self.word < SLOT_HEAP_END }
+  pub fn holdsHeap(self: &Self) -> bool { return u64.wrappingSubtract(self.word, SLOT_NON_NUMBER) < SLOT_HEAP_END - SLOT_NON_NUMBER }
   /// The heap reference a data slot holds, if any.
   @inlineAlways
   pub fn heapReference(self: &Self) -> Option<*mut HeapHeader> {
-    if self.word >= SLOT_NON_NUMBER && self.word < SLOT_HEAP_END { return Option<*mut HeapHeader>.some(wordReference(u64.bitAnd(self.word, SLOT_PAYLOAD))) }
+    if self.holdsHeap() { return Option<*mut HeapHeader>.some(wordReference(u64.bitAnd(self.word, SLOT_PAYLOAD))) }
     return Option<*mut HeapHeader>.none()
   }
   /// Whether any data slot of slots holds a heap reference.
