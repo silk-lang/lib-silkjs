@@ -1,0 +1,81 @@
+//! Exercises hot code inside a Node-compatible event-loop callback after bootstrap. The host
+//! owns the Jit across embed.start, including while the runtime releases its heap on shutdown.
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_atomics_native { SynchronizationError }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_realm { Realm }
+import silk.system.host_input { HostInput, HostInputError }
+import silkjs.cli_io as io
+import node.runtime.embed { Host, Options as RuntimeOptions }
+import node.runtime.embed as embed
+import node.runtime.session { Runtime, Turn }
+import jit.jit_runtime { Jit, Options }
+import jit.jit_runtime as compiler
+
+const MODULE: &[u8] = b"""import { setImmediate } from 'node:timers';
+process.exitCode = 1;
+function block(base) {
+  let part = 0;
+  for (let j = 0; j < 16; ++j) part += (base + j) & 1023;
+  return part;
+}
+setImmediate(() => {
+  let sum = 0;
+  for (let i = 0; i < 4096; ++i) sum += block(i);
+  if (sum === 33521664) { console.log('timer checksum', sum); process.exitCode = 0; }
+});
+"""
+
+struct App { jit: Jit, smoke: bool }
+impl Host for App {
+  fn afterBootstrap<'r>(self: &mut Self, realm: Realm<'r>) -> () { unsafe compiler.enable(&mut self.jit, realm.runtime()) }
+  effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    if self.smoke { run runtime.evaluateModule(b"/jit-embed-smoke/main.mjs", MODULE) }
+    while true {
+      match run runtime.spin() {
+        Turn.Running => ()
+        Turn.Finished { status } => { return status }
+      }
+    }
+    return 1
+  }
+}
+
+effect fn program() -> i32 ! HostInputError | OutOfMemoryError | SynchronizationError ? &mut Allocator | &mut HostInput {
+  let mut arguments = run HostInput.arguments()
+  let calls = arguments.length() >= 2 && arguments.asSlice()[1].asSlice() == b"--jit-calls"
+  let interpret = arguments.length() >= 2 && arguments.asSlice()[1].asSlice() == b"--no-jit"
+  if calls || interpret { drop arguments.remove(1) }
+  let smoke = arguments.length() == 1
+  let mut valid = smoke
+  if arguments.length() == 2 {
+    let path = arguments.asSlice()[1].asSlice()
+    valid = path.length > 0 && path[0] != 45
+  }
+  if !valid {
+    io.stderr(b"usage: silkjs-jit-embed-smoke [--jit-calls | --no-jit] [module.mjs]\n") return 2
+  }
+  let mut options = Options.make()
+  options.enabled = !interpret
+  options.calls = calls
+  let mut app = App { jit: run Jit.make(move options), smoke: smoke }
+  let runtime = RuntimeOptions { arguments: move arguments, keepAlive: false }
+  let status = run embed.start(move runtime, &mut app)
+  app.jit.collect()
+  let counters = run app.jit.statsLine()
+  io.stderr(counters.asSlice())
+  if !smoke || status != 0 || interpret { return status }
+  if app.jit.failed != 0 || app.jit.compiledFunctions == 0 || app.jit.runs + app.jit.osrRuns == 0 { return 1 }
+  return 0
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut system = Allocator.systemAllocatorProvider()
+  let outcome = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut system)
+  return match move outcome {
+    Result<i32, HostInputError | OutOfMemoryError | SynchronizationError>.Success { value } => value
+    Result<i32, HostInputError | OutOfMemoryError | SynchronizationError>.Failure { .. } => 1
+  }
+}

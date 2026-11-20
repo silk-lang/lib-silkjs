@@ -28,6 +28,8 @@ import js_property_write_host { PropertyWriteHooks }
 import js_coercion_host { CoercionHooks }
 import js_property_get as getters
 import js_property_mutations as mutations
+import js_comparison_operators as comparison
+import js_comparison_operators { Operation as ComparisonOperation }
 import js_property_queries as queries
 import js_property_delete as deletion
 import js_coercions as coercions
@@ -1439,6 +1441,8 @@ pub unsafe fn pushStringFieldOperand(machine: &Machine) -> bool {
   }
   return unsafe readFieldCached(&machine.*, start, machine.stackTop)
 }
+/// denseRead for compiled code (js_compiled_objects): the element, retained, or None.
+pub unsafe fn elementRead(object: ValueBits, key: ValueBits) -> Option<ValueBits> { return unsafe denseRead(object, key) }
 @inlineAlways
 unsafe fn denseRead(object: ValueBits, key: ValueBits) -> Option<ValueBits> {
   let node = match object { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
@@ -1601,7 +1605,7 @@ pub unsafe fn readElementOperand(machine: &mut Machine) -> ?*mut HeapHeader {
 /// strings): the atom it spells, read through quickGet, without interning. A
 /// string no atom spells names no property, so the read is undefined once the
 /// chain is all ordinary objects. None leaves the read to step.
-unsafe fn namedStringRead(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits) -> Option<ValueBits> {
+pub unsafe fn namedStringRead(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits) -> Option<ValueBits> {
   let anchor = ()
   let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).atoms.findString(key)
   if atom == UNKNOWN_STRING_ATOM { return Option<ValueBits>.none() }
@@ -1923,7 +1927,7 @@ unsafe fn appendElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machin
 /// node when at is its count and it has room. It takes no machine: the
 /// register machine's fields stay out of memory across the call.
 @inlineNever
-unsafe fn appendElementAt(node: *mut HeapHeader, at: usize, value: ValueBits) -> bool {
+pub unsafe fn appendElementAt(node: *mut HeapHeader, at: usize, value: ValueBits) -> bool {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   if !data.fastArray() { return false }
   let mut count: usize = 0 let mut capacity: usize = 0
@@ -2242,6 +2246,39 @@ unsafe fn siteAdd(runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader
   let value = unsafe Pointer.read<ValueBits>(source)
   return unsafe shapes.swapAdd(&mut data, target, value) || unsafe shapes.tradeAdd(runtime, &mut data, target, value)
 }
+/// The stores of writeField that need no allocation or finalizers, for compiled code:
+/// the site's own add key (siteAdd), an own writable data property, then the memo
+/// (quickAddFill). When releaseLast is true an overwrite can release the displaced
+/// value's final reference with releaseDeferred.
+/// The store instruction's atom is at ip. Takes the value at source only when it stores;
+/// false changes nothing.
+pub unsafe fn writeFieldInPlace(runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader, source: *mut ValueBits, releaseLast: bool) -> bool {
+  let atom = unsafe fieldAtomAt(ip)
+  if unsafe siteAdd(runtime, ip, node, atom, source) { return true }
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.isExotic() { return false }
+  match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
+      let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags)
+      if (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return false }
+      let version = shape.version
+      drop shape
+      let mut old = ValueBits.Undefined
+      if releaseLast {
+        old = (unsafe data.slotUnchecked(index)).valueBits()
+        unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source)))
+      } else if !unsafe storeOwnSlot(&mut data, index, source) { return false }
+      drop data
+      if index < 0x10000 { unsafe writeFieldKey(ip, u64.shiftLeft(version, 16) | usize.toU64(index)) }
+      unsafe gc.releaseDeferred(old)
+      return true
+    }
+    Option<usize>.None => ()
+  }
+  drop data
+  return unsafe quickAddFill(runtime, node, atom, source) != usize.MAX
+}
 /// putFieldAdd along a verified memo entry (shapes.verifiedAdd), returning its
 /// index (usize.MAX when it declines): the walk was done for this shape and
 /// prototype versions, so the add is a shape swap and a slot append. Declines
@@ -2266,6 +2303,35 @@ unsafe fn quickAddFill(runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u3
 unsafe effect fn putFieldAddStep<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   object: ValueBits, atom: u32, value: ValueBits) -> bool ? &mut Allocator {
   return run unsafe putFieldAdd(&mut hooks, runtime, object, atom, value, false)
+}
+/// put_field of atom for compiled code at a site it widened (js_vm.compiledStep): an ordinary
+/// add, then the full [[Set]] (setters, prototypes, length), as step runs them. Takes value's
+/// count; object is borrowed.
+pub unsafe effect fn putFieldGeneric<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, runtime: *mut HeapHeader, context: *mut HeapHeader, object: ValueBits, atom: u32, value: ValueBits) -> () ! JsException ? &mut Allocator {
+  if run unsafe putFieldAddStep(&mut hooks, runtime, object, atom, value) { return () }
+  let result = run Effect.result(unsafe mutations.setPropertyInternal(&mut hooks, unsafe lendRealm(&context, context), unsafe lendBits(&object, object), atom, value, unsafe lendBits(&object, object), JS_PROP_THROW_STRICT))
+  if run unsafe failed(&mut hooks, context, move result) { fail JsException {} }
+}
+/// == (or != with notEqual) of two values for compiled code at a site it widened
+/// (js_vm.compiledStep), with every coercion: takes both counts, answers a Bool.
+pub unsafe effect fn equalGeneric<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, left: ValueBits, right: ValueBits,
+  notEqual: bool) -> ValueBits ! JsException ? &mut Allocator {
+  let mut a = left let mut b = right
+  let mut operation = ComparisonOperation.Equal
+  if notEqual { operation = ComparisonOperation.NotEqual }
+  let result = run Effect.result(comparison.apply(&mut hooks, unsafe lendRealm(&context, context), &mut a, &mut b, operation))
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => { return a }
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      match move error {
+        OutOfMemoryError _allocation => { drop run hooks.throwOutOfMemory(unsafe lendRealm(&context, context)) }
+        StringLengthError _length => { drop run hooks.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Invalid string length") }
+        JsException signal => { fail move signal }
+      }
+      fail JsException {}
+    }
+  }
 }
 /// put_field fast path for an own writable data property or an ordinary add.
 /// Consumes both operands and the atom on success; false leaves everything to step.
@@ -2332,7 +2398,7 @@ pub unsafe effect fn putLengthOperand<H: HeapHooks>(hooks: &mut H, machine: &mut
 }
 // A non-negative Int key on an object outside the dense paths: an own or
 // inherited plain value found without callbacks, else None for the full path.
-unsafe fn quickIndexRead(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits) -> Option<ValueBits> {
+pub unsafe fn quickIndexRead(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits) -> Option<ValueBits> {
   let node = match object { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
   let index = match key { ValueBits.Int { value: integer } => integer _ => { return Option<ValueBits>.none() } }
   if index < 0 { return Option<ValueBits>.none() }
@@ -2340,7 +2406,7 @@ unsafe fn quickIndexRead(runtime: *mut HeapHeader, object: ValueBits, key: Value
 }
 // A Symbol key (Node's state[kState]) on an object: an own or inherited plain value
 // found without callbacks, else None for the full path. The key stays the caller's.
-unsafe fn quickSymbolRead(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits) -> Option<ValueBits> {
+pub unsafe fn quickSymbolRead(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits) -> Option<ValueBits> {
   let node = match object { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
   if !match key { ValueBits.Symbol { .. } => true _ => false } { return Option<ValueBits>.none() }
   let anchor = () let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).atoms.borrowedSymbolAtom(key)

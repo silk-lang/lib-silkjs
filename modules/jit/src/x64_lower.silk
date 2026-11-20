@@ -1,0 +1,142 @@
+//! From a hot FunctionBytecode to machine code for the compiled-entry ABI
+//! (docs/jit/compiled-entry.md): bytecode -> SSA (ssa_translate, ssa_opt, ssa_verify;
+//! docs/jit/ssa.md) -> x64_backend. A function the translator, the verifier or the backend
+//! does not take is refused with its reason.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silkjs.js_core_types { FunctionBytecode }
+import asm_x64 { Code, UnboundLabelError }
+import ssa { Function }
+import silkjs.js_opcode_data as op
+import ssa_input { inputOf }
+import ssa_translate { translate, translateOsr, CallTarget, Refusal as TranslateRefusal }
+import ssa_verify { verify, VerifyError }
+import ssa_opt
+import ssa_calls as calls
+import x64_backend { Lowering, Settings }
+import x64_backend as backend
+import silk.core.option { Option }
+import value_layout { ValueLayout }
+import value_layout as layouts
+import jit_cost { Cost, now }
+import silk.num.usize
+import silk.num.u8
+import silkjs.cli_io as io
+
+/// opcode is the bytecode the translator stopped at, or 0 with hasOpcode false (--jit-dump names it).
+pub struct Refusal { pub why: &'static [u8], pub opcode: u8, pub hasOpcode: bool }
+impl Refusal {
+  pub fn text(self: &Self) -> &'static [u8] { return self.why }
+}
+/// Code and its call block size (js_core_types.CompiledEntry.callWords: 0 when it makes no
+/// calls), or a refusal. inlined: the CallTarget.id of each inline target the code names, in
+/// symbol order (Code.link's symbol 2k is target k's FunctionBytecode cell, 2k + 1 the first
+/// byte of its code); empty when nothing was inlined.
+pub union Lowered { Code { pub value: Code, pub callWords: u32, pub genericSites: u32, pub inlined: List<u32> }, Refused { pub reason: Refusal } }
+
+/// Bodies shorter than this (in bytecode bytes: `return_undef`, a constant or an argument
+/// returned) gain nothing compiled for interpreted callers: entering compiled code costs more
+/// than the interpreter's inline call that runs them. Code that makes calls needs them
+/// compiled all the same: a call to a hot function without code deoptimizes its caller
+/// (js_vm.reportedWithoutCode), and the interpreter keeps running a leaf frameless once it is
+/// linked (js_runtime.linkCompiled).
+const MIN_CODE_BYTES: usize = 3
+
+pub unsafe effect fn lowerFunction(function: &FunctionBytecode, stress: u32, allowCalls: bool) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let none = List<u32>.make()
+  let mut cost = Cost.make()
+  return run unsafe lowerEntry(function, stress, allowCalls, &none, NO_HEADER, &mut cost, List<CallTarget>.make(), &none)
+}
+/// lowerFunction with `doubleSites` (ssa_translate.FunctionInput.doubleSites) from earlier
+/// compilations' deopts (jit_recompile).
+pub unsafe effect fn lowerWithSites(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let none = List<u32>.make()
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, NO_HEADER, &mut cost, List<CallTarget>.make(), &none)
+}
+/// lowerWithSites that may inline the calls `targets` describes (docs/jit/inlining.md).
+/// elements: FunctionInput.elementKinds.
+pub unsafe effect fn lowerInlining(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, targets: List<CallTarget>, elements: &List<u32>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, NO_HEADER, &mut cost, move targets, elements)
+}
+/// lowerWithSites for an on-stack-replacement entry at loop header pc `header`
+/// (ssa_translate.translateOsr). OSR code makes calls only with allowCalls and when
+/// translateOsr finds that safe; otherwise calls are side exits there.
+pub unsafe effect fn lowerOsr(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, header: u32, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let none = List<u32>.make()
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, header, &mut cost, List<CallTarget>.make(), &none)
+}
+const NO_HEADER: u32 = 4294967295
+unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, header: u32, cost: &mut Cost, targets: List<CallTarget>, elements: &List<u32>) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  if header == NO_HEADER && !allowCalls && (unsafe function.code.asSlice()).length < MIN_CODE_BYTES { return refused(b"a body too short to gain from compiling") }
+  let mut input = run inputOf(function)
+  run input.doubleSites.appendSlice(doubleSites.asSlice())
+  input.targets = move targets
+  run input.elementKinds.appendSlice(elements.asSlice())
+  cost.attempts = cost.attempts + 1
+  cost.bytecodeBytes = cost.bytecodeBytes + usize.toU64(input.code.length())
+  let t0 = now()
+  let translated = if header == NO_HEADER { run Effect.result(translate(&input)) } else { run Effect.result(translateOsr(&input, header, allowCalls)) }
+  // Refused translations count too: a big function refused late costs as much as one accepted.
+  let t1 = now()
+  cost.translate = cost.translate + (t1 - t0)
+  let mut ssa = match move translated {
+    Result<Function, TranslateRefusal | OutOfMemoryError>.Success { value } => move value
+    Result<Function, TranslateRefusal | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        TranslateRefusal { reason, opcode, .. } => { return Lowered.Refused { reason: Refusal { why: reason, opcode: opcode, hasOpcode: true } } }
+        OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+  cost.translated = cost.translated + usize.toU64(ssa.insts.length())
+  if header != NO_HEADER && calls.genericSites(&ssa) != 0 { return refused(b"a generic instruction inside an OSR loop") }
+  if !allowCalls && calls.callsFunctions(&ssa) { return refused(b"a call (calls from compiled code need --jit-calls)") }
+  run ssa_opt.pipeline(&mut ssa, cost.passes, doubleSites)
+  let t2 = now()
+  cost.optimize = cost.optimize + (t2 - t1)
+  cost.optimized = cost.optimized + usize.toU64(ssa.insts.length())
+  let verified = run Effect.result(verify(&ssa))
+  let t3 = now()
+  cost.verify = cost.verify + (t3 - t2)
+  match move verified {
+    Result<(), VerifyError | OutOfMemoryError>.Success { .. } => ()
+    Result<(), VerifyError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        VerifyError { reason, .. } => { return refused(reason) }
+        OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+  if cost.dump {
+    let mut out = List<u8>.make()
+    run out.appendSlice(b"jit: optimized ssa\n")
+    run ssa.print(&mut out)
+    let mut m: usize = 0
+    while m < ssa.inlineMisses.length() {
+      let miss = ssa.inlineMisses.get(m)
+      run out.appendSlice(b"jit: not inlined: ")
+      run out.appendSlice(miss.why)
+      if miss.opcode != 0 { run out.appendSlice(b": ") run out.appendSlice(op.opcodeName(miss.opcode, true)) }
+      run out.append(10)
+      m = m + 1
+    }
+    io.stderr(out.asSlice())
+  }
+  let layout = match layouts.probe() {
+    Option<ValueLayout>.Some { value } => value
+    Option<ValueLayout>.None => { return refused(b"the engine's ValueBits layout is not one compiled code understands") }
+  }
+  let lowering = run backend.lower(&ssa, Settings { stress: stress, layout: layout })
+  cost.backend = cost.backend + (now() - t3)
+  match move lowering {
+    Lowering.Code { value } => {
+      let mut inlined = List<u32>.make()
+      run inlined.appendSlice(ssa.inlineTargets.asSlice())
+      return Lowered.Code { value: move value, callWords: calls.callWords(&ssa), genericSites: calls.genericSites(&ssa), inlined: move inlined }
+    }
+    Lowering.Unsupported { reason } => { return refused(reason.why) }
+  }
+}
+fn refused(why: &'static [u8]) -> Lowered { return Lowered.Refused { reason: Refusal { why: why, opcode: 0, hasOpcode: false } } }
