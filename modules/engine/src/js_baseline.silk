@@ -21,10 +21,11 @@ import silk.num.u64
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_core_types { ByteStorage, FrameSlot, VarRef, VarRefState, FunctionBytecode, FunctionKind, ContextState, RuntimeState, StackFrame, ObjectData, ObjectPayload, BytecodeClosure, KNOWN_NONE,
+import js_core_types { ByteStorage, FrameSlot, FrameSlots, FrameReferences, NO_SP, VarRef, VarRefState, FunctionBytecode, FunctionKind, ContextState, RuntimeState, StackFrame, ObjectData, ObjectPayload, BytecodeClosure, KNOWN_NONE,
   JS_INTERRUPT_COUNTER_INIT }
 import js_class_data as classes
 import js_compiler_finish { STUB_FRAME_CELLS }
+import js_bytecode { LEAF_CREDITS, LEAF_CREDIT_MASK }
 import thin_list { BoxList, BOX_HEADER }
 import js_var_refs as cells
 import js_gc as gc
@@ -32,6 +33,7 @@ import js_vm_property_ops as properties
 import js_vm_operators as operators
 import js_primitives as primitives
 import js_primitives { EqualityMode }
+import js_atoms { AtomTable }
 
 /// The entry into baseline code from the engine, which the embedder emits once per runtime
 /// (CompiledTable.baselineEnter): env is CompiledTable.baselineEnv, function a bytecode
@@ -46,7 +48,7 @@ pub type Enter = extern "C" fn(?*mut u8, *mut HeapHeader, *mut ValueBits, usize,
 pub type ServiceEntry = extern "C" fn(*mut u8, *mut u8, *mut BaselineFrame, u64, *mut ValueBits, usize) -> u64
 
 /// Run the activation to its return in the interpreter, from the record's currentPc with
-/// stackPointer operands on its stack, and release its cells: the owned result goes to
+/// count operands on its stack, and release its cells: the owned result goes to
 /// record.result. With FINISH_THROWING an exception is pending and the frame unwinds first.
 pub const SERVICE_FINISH: u64 = 0
 pub const FINISH_THROWING: u64 = 0x100
@@ -57,11 +59,26 @@ pub const CALL_METHOD: u64 = 0x100
 /// The realm's interrupt counter ran out: deliver hot functions and the host's interrupt.
 pub const SERVICE_POLL: u64 = 2
 /// The native stack has no room for the frame of the function at base (its closure object's
-/// cell, not a value cell; record is null): throws the stack overflow RangeError. Always 1.
+/// cell, not a value cell; record is where its caller's record would be, were the caller
+/// baseline code): throws the stack overflow RangeError. Always 1.
 pub const SERVICE_OVERFLOW: u64 = 3
+/// A construction: base is the constructor's cell, new.target the cell after it, then count
+/// arguments (borrowed). The owned result is in the record's result, or the service returns 1
+/// with the exception pending.
+pub const SERVICE_CONSTRUCT: u64 = 4
 
-/// A baseline frame's record. Its StackFrame is the published frame; the rest is what the
-/// engine needs to take the activation over and room the code uses between instructions.
+/// BaselineFrame.state. The code builds a bare frame: its function, receiver, arguments and
+/// cells, and nothing of the StackFrame that only a reader of the frame chain needs. Before
+/// the engine runs anything on behalf of the code (every SERVICE_*), build completes the bare
+/// frames above it and publishes them. A frame that is not baseline code's (the entry
+/// stub's) holds FRAME_STOP where a record's state would be.
+pub const FRAME_STOP: u64 = 0
+pub const FRAME_BARE: u64 = 1
+pub const FRAME_BUILT: u64 = 2
+
+/// A baseline frame's record, which ends right under the frame pointer (recordBytes below
+/// it). Its StackFrame is the frame the engine sees once built; the rest is what the engine
+/// needs to take the activation over.
 pub struct BaselineFrame {
   pub frame: StackFrame,
   /// The arguments as the caller passed them (StackFrame.arguments names the frame's own
@@ -70,18 +87,84 @@ pub struct BaselineFrame {
   pub argc: usize,
   /// The first byte of the function's bytecode.
   pub code: *const u8,
-  /// The realm's interrupt counter (js_interrupts.counter).
-  pub counter: *mut i32,
-  /// A service's result, and a cell the code may use within one instruction.
+  /// A service's result.
   pub result: ValueBits,
-  pub scratch: ValueBits
+  /// FRAME_BARE or FRAME_BUILT; the record's last word.
+  pub state: u64
+}
+/// The bytes a record takes under the frame pointer: the saved frame pointer of a baseline
+/// frame's caller is at the record's address plus this.
+pub fn recordBytes() -> usize { return (Layout.of<BaselineFrame>().bytes + 15) / 16 * 16 }
+unsafe fn recordAt(address: usize, base: *mut BaselineFrame) -> *mut BaselineFrame {
+  // base + (address - base), so the pointer keeps base's provenance; the distance wraps
+  // for an address below base.
+  let bytes = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut BaselineFrame, *mut u8>(base))
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BaselineFrame>(unsafe Pointer.atMut<u8>(bytes, usize.wrappingSubtract(address, Pointer.address<BaselineFrame>(base))))
+}
+/// Completes and publishes the bare frames from record outwards (FRAME_BARE: the frame of
+/// record, then its callers' while they are bare), in runtime. The code stored each one's
+/// function, receiver, arguments and bytecode position; the rest follows from the function.
+pub unsafe fn build(runtime: *mut HeapHeader, record: *mut BaselineFrame) -> () {
+  let size = recordBytes()
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let published = state.currentStackFrame
+  let mut current = record
+  let mut first = true
+  while true {
+    let mut anchor = ()
+    let running = unsafe Pointer.borrowMut<(), BaselineFrame>(&mut anchor, current)
+    if running.state != FRAME_BARE { break }
+    let bytes = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut BaselineFrame, *mut u8>(current))
+    let callerFrame = unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut usize>(unsafe Pointer.atMut<u8>(bytes, size)))
+    let outer = unsafe recordAt(callerFrame - size, current)
+    let outerAnchor = ()
+    let outerBare = (unsafe Pointer.borrow<(), BaselineFrame>(&outerAnchor, outer)).state == FRAME_BARE
+    let node = match running.frame.currentFunction { ValueBits.Object { reference } => reference _ => { break } }
+    let objectAnchor = ()
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, node)
+    let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { break } }
+    drop data
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&objectAnchor, bytecode)
+    let arguments = u16.toUsize(code.argumentCount)
+    let locals = u16.toUsize(code.variableCount)
+    let stack = u16.toUsize(code.stackSize)
+    let copies = !code.borrowsArguments || running.argc < arguments
+    let mode = u8.toU32(code.mode)
+    drop code
+    // The cells end where the record starts: [arguments][locals][operand stack].
+    let cells = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(
+      unsafe Intrinsic.pointerReinterpret<*mut BaselineFrame, *mut u8>(unsafe recordAt(Pointer.address<BaselineFrame>(current) - (arguments + locals + stack) * 16, current))))
+    if outerBare {
+      let mut linkAnchor = ()
+      let linked = unsafe Pointer.borrowMut<(), BaselineFrame>(&mut linkAnchor, outer)
+      running.frame.previous = unsafe Intrinsic.pointerRequalify<*mut StackFrame, ?*mut StackFrame>(Pointer.fromMutRef<StackFrame>(&mut linked.frame))
+    } else { running.frame.previous = published }
+    running.frame.debuggerId = 0
+    running.frame.asyncOwner = Pointer.null<HeapHeader>()
+    running.frame.newTarget = ValueBits.Undefined
+    if copies { running.frame.arguments.count = arguments running.frame.argumentCount = usize.wrappingToI32(arguments) }
+    else { running.frame.arguments.count = running.argc running.frame.argumentCount = usize.wrappingToI32(running.argc) }
+    running.frame.locals = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments), count: locals }
+    running.frame.stack = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments + locals), count: stack }
+    running.frame.varRefs = FrameReferences { data: unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe Pointer.atMut<ValueBits>(cells, arguments + locals + stack)), count: 0 }
+    running.frame.mode = mode
+    running.frame.stackPointer = NO_SP
+    running.state = FRAME_BUILT
+    if first {
+      state.currentStackFrame = unsafe Intrinsic.pointerRequalify<*mut StackFrame, ?*mut StackFrame>(Pointer.fromMutRef<StackFrame>(&mut running.frame))
+      first = false
+    }
+    if !outerBare { break }
+    current = outer
+  }
 }
 
 /// Where baseline code finds what it reads and writes, in bytes. Frame offsets are from the
 /// BaselineFrame; the others from a cell's header.
 pub struct BaselineLayout {
   pub frameBytes: u32,
-  pub frame: u32, pub argv: u32, pub argc: u32, pub code: u32, pub counter: u32, pub result: u32, pub scratch: u32,
+  pub frame: u32, pub argv: u32, pub argc: u32, pub code: u32, pub result: u32, pub state: u32,
   /// StackFrame fields, from the StackFrame.
   pub previous: u32, pub debuggerId: u32, pub asyncOwner: u32, pub currentFunction: u32, pub thisValue: u32, pub newTarget: u32,
   pub argumentsData: u32, pub argumentsCount: u32, pub localsData: u32, pub localsCount: u32, pub stackData: u32, pub stackCount: u32,
@@ -198,8 +281,7 @@ pub fn layout() -> BaselineLayout {
   return BaselineLayout {
     frameBytes: usize.toU32(Layout.of<BaselineFrame>().bytes),
     frame: distance(record, frame), argv: distance(record, &record.argv), argc: distance(record, &record.argc), code: distance(record, &record.code),
-    counter: distance(record, &record.counter),
-    result: distance(record, &record.result), scratch: distance(record, &record.scratch),
+    result: distance(record, &record.result), state: distance(record, &record.state),
     previous: distance(frame, &frame.previous), debuggerId: distance(frame, &frame.debuggerId), asyncOwner: distance(frame, &frame.asyncOwner),
     currentFunction: distance(frame, &frame.currentFunction), thisValue: distance(frame, &frame.thisValue), newTarget: distance(frame, &frame.newTarget),
     argumentsData: distance(frame, &frame.arguments.data), argumentsCount: distance(frame, &frame.arguments.count),
@@ -306,7 +388,11 @@ pub unsafe fn link(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u
   state.compiled.baselineCount = index + 1
   drop state
   let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
-  if owner.leaf == 0 { owner.frameCells = STUB_FRAME_CELLS }
+  // A leaf the interpreter runs without a frame (js_vm_leaf) keeps that path for interpreted
+  // callers while no run of it was declined: it costs less than any entry into machine code,
+  // and baseline callers reach the code through the index. Every other function is entered
+  // through its code from now on (declined runs are what made such a leaf hot).
+  if (owner.leaf & LEAF_CREDIT_MASK) != LEAF_CREDITS { owner.leaf = 0 owner.frameCells = STUB_FRAME_CELLS }
   owner.baseline = index + 1
 }
 
@@ -431,4 +517,37 @@ pub unsafe fn truthy(cell: *const ValueBits) -> bool {
   let truth = unsafe primitives.toBoolean(value) != 0
   unsafe gc.releaseDeferred(value)
   return truth
+}
+/// ToBoolean of the value in cell, which keeps its count (the keep branches).
+pub unsafe fn truth(cell: *const ValueBits) -> bool {
+  return unsafe primitives.toBoolean(unsafe Pointer.read<ValueBits>(cell)) != 0
+}
+/// ! of the value in cell where no coercion can run JavaScript (js_vm_operators.notFast):
+/// the Bool replaces it and its count drops. False changes nothing.
+pub unsafe fn logicalNot(cell: *mut ValueBits) -> bool {
+  let value = unsafe Pointer.read<ValueBits>(cell)
+  let falsy = unsafe operators.notFast(value)
+  if falsy < 0 { return false }
+  unsafe Pointer.write<ValueBits>(cell, ValueBits.Bool { value: falsy == 1 })
+  unsafe gc.releaseDeferred(value)
+  return true
+}
+/// A binary operator or comparison (opcode) on two numbers, as js_vm_operators.numericFast
+/// answers it: the result replaces left. False, with nothing changed, for any other pair.
+pub unsafe fn arithmetic(left: *mut ValueBits, right: *const ValueBits, opcode: u8) -> bool {
+  let result = operators.numericFast(unsafe Pointer.read<ValueBits>(left), unsafe Pointer.read<ValueBits>(right), opcode)
+  match result { ValueBits.Undefined => { return false } _ => () }
+  unsafe Pointer.write<ValueBits>(left, result)
+  return true
+}
+/// push_atom_value: the string or symbol of atom, retained, into out. False for an integer
+/// atom (js_vm_values.pushAtomString).
+pub unsafe fn atomValue(runtime: *mut HeapHeader, atom: u32, out: *mut ValueBits) -> bool {
+  if AtomTable.isInteger(atom) { return false }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let value = state.atoms.storedAtomValue(atom)
+  drop state
+  unsafe Pointer.write<ValueBits>(out, value)
+  return true
 }

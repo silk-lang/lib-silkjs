@@ -4,8 +4,13 @@
 //! Frame. The code runs on the native stack, addressed from rbp:
 //!   [rbp + 8]              return address
 //!   [rbp]                  the caller's rbp
-//!   [rbp - R, rbp)         the BaselineFrame record (js_baseline), whose StackFrame is published
+//!   [rbp - R, rbp)         the BaselineFrame record (js_baseline); its last word is the state
 //!   below it               the cells [arguments][locals][operand stack], ascending
+//! A frame starts bare: the prologue stores the function, the receiver, the arguments and
+//! the bytecode's address, and nothing else of the record's StackFrame. The engine completes
+//! and publishes the bare frames (js_baseline.build) whenever the code asks it for anything,
+//! so whatever reads the frame chain finds every frame; the code unlinks a built frame when
+//! it returns.
 //! Every value lives in its cell, as the interpreter keeps it: an instruction reads its
 //! operands from their cells into scratch registers and writes its result back. What the
 //! templates do not cover leaves through the engine's service (SERVICE_FINISH): the
@@ -16,8 +21,8 @@
 //! rbx, r14 and r15 are never touched.
 //!
 //! Calls into baseline code (the entry stub and call templates):
-//!   rdi function (the closure object's cell), rsi argv, rdx argc, rcx:r8 `this` (tag word,
-//!   payload). The result returns in rax (tag word) : rdx (payload); the Exception tag means
+//!   rdi function (the closure object's cell), r11 its bytecode object, rsi argv, rdx argc,
+//!   rcx:r8 `this` (tag word, payload). The result returns in rax (tag word) : rdx (payload); the Exception tag means
 //!   the call threw and the exception is pending in the runtime.
 //!
 //! The code holds no address: helpers are reached through the environment, the engine's
@@ -40,6 +45,7 @@ import silkjs.js_baseline as engine
 import silkjs.js_compiled_objects { FieldLayout }
 import silkjs.js_compiled_objects as objects
 import silkjs.js_opcode_data as op
+import silkjs.js_atom_data as atoms
 
 /// What the code is compiled against: facts of one engine build.
 pub struct Settings {
@@ -65,6 +71,10 @@ pub fn probe(count: bool) -> Option<Settings> {
   if layout.tagOf(6) == u32.MAX { return Option<Settings>.none() }
   let frame = engine.layout()
   if (frame.frameBytes & 7) != 0 { return Option<Settings>.none() }
+  // The entry stub keeps two zero words under its frame pointer where a record's state
+  // would be (js_baseline.FRAME_STOP).
+  let record = (frame.frameBytes + 15) / 16 * 16
+  if frame.state + 16 < record || frame.state + 8 > record { return Option<Settings>.none() }
   return Option<Settings>.some(Settings { layout: layout, frame: frame, fields: objects.fieldLayout(), count: count })
 }
 
@@ -75,8 +85,18 @@ pub struct Outcome {
   pub why: &'static [u8],
   /// The opcodes of reachable instructions that have no template: each leaves to the
   /// interpreter when it runs.
-  pub uncovered: List<u8>
+  pub uncovered: List<u8>,
+  /// Where the code's parts start, for profiles: (code offset, bytecode offset, what) triples
+  /// in code order; what is an instruction's opcode or a MARK_*.
+  pub map: List<u32>
 }
+pub const MARK_PROLOGUE: u32 = 0x1000
+pub const MARK_LEAVE: u32 = 0x1001
+pub const MARK_FINISH: u32 = 0x1002
+pub const MARK_OVERFLOW: u32 = 0x1003
+pub const MARK_EXIT: u32 = 0x1004
+/// MARK_SLOW + a slow path's kind.
+pub const MARK_SLOW: u32 = 0x1100
 
 // ---- Bytecode steps -------------------------------------------------------------------
 
@@ -128,7 +148,7 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   let n = bytes.length
   if opcode == op.OP_push_this || (opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3) || (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3)
     || opcode == op.OP_push_0 || opcode == op.OP_push_1 || opcode == op.OP_undefined || opcode == op.OP_null
-    || opcode == op.OP_push_false || opcode == op.OP_push_true {
+    || opcode == op.OP_push_false || opcode == op.OP_push_true || opcode == op.OP_push_empty_string {
     if size != 1 { return departs(size) }
     return plain(1, 0, 1)
   }
@@ -156,15 +176,20 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   if opcode == op.OP_goto8 { if size != 2 { return departs(size) } return branches(2, JUMP, targetOf(pc, 1, i8At(bytes, pc + 1), n), 0, 0, 0) }
   if opcode == op.OP_goto16 { if size != 3 { return departs(size) } return branches(3, JUMP, targetOf(pc, 1, i16At(bytes, pc + 1), n), 0, 0, 0) }
   if opcode == op.OP_goto { if size != 5 { return departs(size) } return branches(5, JUMP, targetOf(pc, 1, i32At(bytes, pc + 1), n), 0, 0, 0) }
-  if opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 {
+  if opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8 {
     if size != 3 { return departs(size) }
     return branches(3, BRANCH, targetOf(pc, 2, i8At(bytes, pc + 2), n), 1, -1, -1)
   }
-  if opcode == op.OP_if_true_keep8 {
+  if opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 {
     if size != 4 { return departs(size) }
     return branches(4, BRANCH, targetOf(pc, 2, i8At(bytes, pc + 2), n), 1, -1, 0)
   }
-  if opcode == op.OP_is_undefined_or_null || opcode == op.OP_inc || opcode == op.OP_dec { if size != 1 { return departs(size) } return plain(1, 1, 0) }
+  if opcode == op.OP_is_undefined_or_null || opcode == op.OP_inc || opcode == op.OP_dec || opcode == op.OP_lnot || opcode == op.OP_get_length {
+    if size != 1 { return departs(size) }
+    return plain(1, 1, 0)
+  }
+  if opcode == op.OP_insert2 { if size != 1 { return departs(size) } return plain(1, 2, 1) }
+  if opcode == op.OP_push_atom_value { if size != 5 { return departs(size) } return plain(5, 0, 1) }
   if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc { if size != 2 { return departs(size) } return plain(2, 0, 0) }
   if opcode == op.OP_add_imm || opcode == op.OP_and_imm || opcode == op.OP_sar_imm { if size != 3 { return departs(size) } return plain(3, 1, 0) }
   if opcode == op.OP_get_loc_field8 || opcode == op.OP_get_arg_field8 { if size != 14 { return departs(size) } return plain(14, 0, 1) }
@@ -173,7 +198,7 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   if opcode == op.OP_put_field { if size != 13 { return departs(size) } return plain(13, 2, -2) }
   if opcode == op.OP_get_array_el { if size != 1 { return departs(size) } return plain(1, 2, -1) }
   if opcode == op.OP_put_array_el { if size != 1 { return departs(size) } return plain(1, 3, -3) }
-  if opcode == op.OP_put_loc_field_loc8 { if size != 15 { return departs(size) } return plain(15, 0, 0) }
+  if opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 { if size != 15 { return departs(size) } return plain(15, 0, 0) }
   if opcode == op.OP_call_method {
     if size != 3 { return departs(size) }
     let argc = u32.wrappingToI32(u16At(bytes, pc + 1))
@@ -184,6 +209,11 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
     let argc = u32.wrappingToI32(u16At(bytes, pc + 1))
     return plain(3, argc + 1, 0 - argc)
   }
+  if opcode == op.OP_call_constructor {
+    if size != 3 { return departs(size) }
+    let argc = u32.wrappingToI32(u16At(bytes, pc + 1))
+    return plain(3, argc + 2, 0 - (argc + 1))
+  }
   if opcode >= op.OP_call0 && opcode <= op.OP_call3 {
     if size != 1 { return departs(size) }
     let argc = u8.toI32(opcode - op.OP_call0)
@@ -191,7 +221,8 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   }
   if opcode == op.OP_eq || opcode == op.OP_neq || opcode == op.OP_strict_eq || opcode == op.OP_strict_neq
     || opcode == op.OP_lt || opcode == op.OP_lte || opcode == op.OP_gt || opcode == op.OP_gte
-    || opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_and || opcode == op.OP_or || opcode == op.OP_xor {
+    || opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_and || opcode == op.OP_or || opcode == op.OP_xor
+    || opcode == op.OP_mul || opcode == op.OP_div || opcode == op.OP_mod {
     if size != 1 { return departs(size) }
     return plain(1, 2, -1)
   }
@@ -213,6 +244,8 @@ struct Plan {
   arguments: u32,
   locals: u32,
   stack: u32,
+  /// The bytecode's first byte, from the word the record's code holds (Shape.codeDelta).
+  codeDelta: i32,
   count: bool
 }
 impl Copy for Plan {}
@@ -223,7 +256,7 @@ impl Plan {
     let cells = (shape.arguments + shape.locals + shape.stack) * 16
     return Plan { layout: settings.layout, f: settings.frame, fields: settings.fields,
       record: 0 - signed(record), cells: 0 - signed(record + cells), below: signed(record + cells),
-      arguments: shape.arguments, locals: shape.locals, stack: shape.stack, count: settings.count }
+      arguments: shape.arguments, locals: shape.locals, stack: shape.stack, codeDelta: signed(shape.codeDelta), count: settings.count }
   }
   /// A field of the record, and of its StackFrame.
   fn rec(self: &Self, offset: u32) -> Mem { return Mem.at(Reg.Rbp, self.record + signed(offset)) }
@@ -256,9 +289,16 @@ const S_EQUAL: u8 = 3
 const S_TRUTHY: u8 = 4
 const S_BACK_EDGE: u8 = 5
 const S_CALL: u8 = 6
-const S_ENTRY_POLL: u8 = 7
 const S_VARIABLE: u8 = 8
 const S_ATTACHED: u8 = 9
+/// S_HELPER whose second cell is an argument (b its offset in the argument area).
+const S_HELPER_ARGUMENT: u8 = 10
+/// arithmetic(a, b, opcode k): the result is in a at back; other when the helper declines.
+const S_ARITHMETIC: u8 = 11
+/// helper k on cell a alone: back when it answered, other when it declines.
+const S_CELL: u8 = 12
+/// S_TRUTHY that leaves the value its count.
+const S_TRUTH: u8 = 13
 /// S_HELPER.b when the helper takes no second cell.
 const NO_CELL: i32 = 1
 /// Code kept out of the straight path: a last release, a cache miss, a poll, a generic call.
@@ -277,7 +317,9 @@ struct Emitter {
   /// Returns rax:rdx: releases the frame's cells and unlinks it.
   leave: Label,
   /// The prologue found no room for the frame.
-  overflow: Label
+  overflow: Label,
+  /// Outcome.map, as the code grows.
+  map: List<u32>
 }
 
 impl Emitter {
@@ -294,6 +336,12 @@ impl Emitter {
     run self.exits.append(Exit { label: label, pc: at, depth: deep, throwing: throwing })
     return label
   }
+  effect fn mark(self: &mut Self, pc: u32, what: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let at = usize.toU32(self.a.offset())
+    run self.map.append(at)
+    run self.map.append(pc)
+    run self.map.append(what)
+  }
   effect fn slow(self: &mut Self, kind: u8, back: Label, other: Label, a: i32, b: i32, k: u32, pc: usize, depth: i32, reg: Reg, flag: bool) -> Label ! OutOfMemoryError ? &mut Allocator {
     let entry = run self.a.label()
     run self.slows.append(Slow { kind: kind, entry: entry, back: back, other: other, a: a, b: b, k: k, pc: usize.toU32(pc), depth: i32.wrappingToU32(depth), reg: reg, flag: flag })
@@ -307,45 +355,65 @@ impl Emitter {
     run self.a.aluImm(Alu.Cmp, Width.W32, reg, signed(self.p.layout.heapHighest - self.p.layout.heapLowest))
     run self.a.jcc(Cond.Above, notHeap)
   }
+  /// The heap variants' tags start at 0: one byte compare tells a heap reference.
+  fn heapFromZero(self: &Self) -> bool { return self.p.layout.heapLowest == 0 }
+  fn heapTop(self: &Self) -> u8 { return u32.wrappingToU8(self.p.layout.heapHighest) }
+  /// Jumps to notHeap unless the value whose tag word is in tagWord is a heap reference.
+  /// Clobbers r10 unless the heap tags start at 0.
+  effect fn unlessHeap(self: &mut Self, tagWord: Reg, notHeap: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.heapFromZero() {
+      let top = self.heapTop()
+      run self.a.cmp8Imm(tagWord, top)
+      run self.a.jcc(Cond.Above, notHeap)
+      return ()
+    }
+    run self.a.zeroExtend8(Reg.R10, tagWord)
+    run self.heapRange(Reg.R10, notHeap)
+  }
+  /// Jumps to notHeap unless the cell whose tag is at tagAt holds a heap reference. Clobbers
+  /// r10 unless the heap tags start at 0.
+  effect fn unlessHeapAt(self: &mut Self, tagAt: Mem, notHeap: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.heapFromZero() {
+      let top = self.heapTop()
+      run self.a.cmp8MemImm(tagAt, top)
+      run self.a.jcc(Cond.Above, notHeap)
+      return ()
+    }
+    run self.a.loadZero8(Reg.R10, tagAt)
+    run self.heapRange(Reg.R10, notHeap)
+  }
   /// Adds a count to the value whose tag word is in tagWord and payload in pointer, when it
   /// is a heap reference. Clobbers r10.
   effect fn retain(self: &mut Self, tagWord: Reg, pointer: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
     let skip = run self.a.label()
-    run self.a.zeroExtend8(Reg.R10, tagWord)
-    run self.heapRange(Reg.R10, skip)
+    run self.unlessHeap(tagWord, skip)
     run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(pointer, 0), 1)
     self.a.bind(skip)
   }
-  /// Drops the count the value in the cell at (tagAt, payloadAt) holds; the cell keeps its
+  /// Drops the count the value in the cell at rbp displacement at holds; the cell keeps its
   /// bits. Clobbers r10 and r11.
-  effect fn release(self: &mut Self, tagAt: Mem, payloadAt: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
-    let skip = run self.a.label()
-    run self.a.loadZero8(Reg.R10, tagAt)
-    run self.heapRange(Reg.R10, skip)
-    run self.a.load(Width.W64, Reg.R11, payloadAt)
-    run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R11, 0), 1)
-    let last = run self.slow(S_RELEASE, skip, skip, 0, 0, 0, 0, 0, Reg.R11, false)
-    run self.a.jcc(Cond.LessOrEqual, last)
-    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R11, 0), 1)
-    self.a.bind(skip)
-  }
   effect fn releaseCell(self: &mut Self, at: i32) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.release(word(at), payload(at))
+    let skip = run self.a.label()
+    run self.unlessHeapAt(word(at), skip)
+    run self.a.load(Width.W64, Reg.R11, payload(at))
+    // The count drops first; the slow path puts it back for the engine's release.
+    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R11, 0), 1)
+    let last = run self.slow(S_RELEASE, skip, skip, at, 0, 0, 0, 0, Reg.R11, false)
+    run self.a.jcc(Cond.LessOrEqual, last)
+    self.a.bind(skip)
   }
   /// Drops a count of the object whose cell address is in reg. Clobbers r10 and r11 on its
   /// slow path only.
   effect fn releaseObject(self: &mut Self, reg: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
     let done = run self.a.label()
-    run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(reg, 0), 1)
+    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(reg, 0), 1)
     let last = run self.slow(S_RELEASE_OBJECT, done, done, 0, 0, 0, 0, 0, reg, false)
     run self.a.jcc(Cond.LessOrEqual, last)
-    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(reg, 0), 1)
     self.a.bind(done)
   }
-  /// Jumps to otherwise unless the cell at tagAt holds a value of tag. Clobbers rax.
+  /// Jumps to otherwise unless the cell at tagAt holds a value of tag.
   effect fn tagIs(self: &mut Self, tagAt: Mem, tag: i32, otherwise: Label) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.a.loadZero8(Reg.Rax, tagAt)
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, tag)
+    run self.a.cmp8MemImm(tagAt, i32.wrappingToU8(tag))
     run self.a.jcc(Cond.NotEqual, otherwise)
   }
   /// Calls helper index (a C function; every scratch register is lost).
@@ -356,12 +424,11 @@ impl Emitter {
   /// reg = the address of the operand of the instruction at pc (what the caches key on).
   effect fn operandInto(self: &mut Self, reg: Reg, pc: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.a.load(Width.W64, reg, self.p.rec(self.p.f.code))
-    run self.a.lea(Width.W64, reg, Mem.at(reg, signed(usize.toU32(pc + 1))))
+    run self.a.lea(Width.W64, reg, Mem.at(reg, self.p.codeDelta + signed(usize.toU32(pc + 1))))
   }
-  /// Writes an Int of the value in the low half of reg, or a Bool of its 0 or 1, into the
-  /// cell at at. Clobbers reg's upper half.
+  /// Writes an Int of the value in reg, zero-extended from its low half, or a Bool of its 0
+  /// or 1, into the cell at at.
   effect fn boxed(self: &mut Self, at: i32, tag: i32, reg: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.a.mov(Width.W32, reg, reg)
     run self.a.storeImm(Width.W64, word(at), tag)
     run self.a.store(Width.W64, payload(at), reg)
   }
@@ -382,20 +449,19 @@ impl Emitter {
     let overflow = self.overflow
     run self.a.push(Reg.Rbp)
     run self.a.mov(Width.W64, Reg.Rbp, Reg.Rsp)
-    run self.a.lea(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, 0 - p.below))
-    run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R13, signed(f.stackLimit)))
+    run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, p.below)
+    run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rsp, Mem.at(Reg.R13, signed(f.stackLimit)))
     run self.a.jcc(Cond.Below, overflow)
-    run self.a.mov(Width.W64, Reg.Rsp, Reg.Rax)
-    // The StackFrame, as js_vm_activation.stackFrame fills it.
-    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R13, signed(f.currentStackFrame)))
-    run self.a.store(Width.W64, p.sf(f.previous), Reg.Rax)
-    run self.a.storeImm(Width.W64, p.sf(f.debuggerId), 0)
-    run self.a.storeImm(Width.W64, p.sf(f.asyncOwner), 0)
+    // The word that leads to the bytecode's first byte, through the bytecode object in r11.
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, signed(shape.codeWord)))
+    run self.a.store(Width.W64, p.rec(f.code), Reg.R9)
+    // A bare frame (js_baseline.FRAME_BARE): what a call needs. The engine completes the
+    // StackFrame when the code asks it for anything (js_baseline.build).
+    run self.a.storeImm(Width.W64, p.rec(f.state), u64.wrappingToI32(engine.FRAME_BARE))
     run self.a.storeImm(Width.W64, p.sf(f.currentFunction), p.object())
     run self.a.store(Width.W64, p.sf(f.currentFunction + 8), Reg.Rdi)
     run self.a.store(Width.W64, p.sf(f.thisValue), Reg.Rcx)
     run self.a.store(Width.W64, p.sf(f.thisValue + 8), Reg.R8)
-    run self.a.storeImm(Width.W64, p.sf(f.newTarget), p.undefined())
     run self.a.store(Width.W64, p.rec(f.argv), Reg.Rsi)
     run self.a.store(Width.W64, p.rec(f.argc), Reg.Rdx)
     // Arguments: the caller's cells, or the frame's own copy when the function writes a
@@ -427,48 +493,16 @@ impl Emitter {
       }
       run self.a.lea(Width.W64, Reg.Rax, word(p.argumentAt(0)))
       run self.a.store(Width.W64, p.sf(f.argumentsData), Reg.Rax)
-      run self.a.storeImm(Width.W64, p.sf(f.argumentsCount), signed(p.arguments))
-      run self.a.storeImm(Width.W32, p.sf(f.argumentCount), signed(p.arguments))
       run self.a.jmp(argumentsDone)
       self.a.bind(borrow)
     }
     run self.a.store(Width.W64, p.sf(f.argumentsData), Reg.Rsi)
-    run self.a.store(Width.W64, p.sf(f.argumentsCount), Reg.Rdx)
-    run self.a.store(Width.W32, p.sf(f.argumentCount), Reg.Rdx)
     self.a.bind(argumentsDone)
-    run self.a.lea(Width.W64, Reg.Rax, word(p.localAt(0)))
-    run self.a.store(Width.W64, p.sf(f.localsData), Reg.Rax)
-    run self.a.storeImm(Width.W64, p.sf(f.localsCount), signed(p.locals))
-    run self.a.lea(Width.W64, Reg.Rax, word(p.operandAt(0)))
-    run self.a.store(Width.W64, p.sf(f.stackData), Reg.Rax)
-    run self.a.storeImm(Width.W64, p.sf(f.stackCount), signed(p.stack))
-    run self.a.lea(Width.W64, Reg.Rax, word(p.operandAt(signed(p.stack))))
-    run self.a.store(Width.W64, p.sf(f.referencesData), Reg.Rax)
-    run self.a.storeImm(Width.W64, p.sf(f.referencesCount), 0)
-    run self.a.storeImm(Width.W64, p.sf(f.currentPc), 0)
-    run self.a.storeImm(Width.W32, p.sf(f.mode), signed(shape.mode))
-    run self.a.storeImm(Width.W64, p.sf(f.stackPointer), -1)
     let mut local: u32 = 0
     while local < p.locals {
       run self.a.storeImm(Width.W64, word(p.localAt(local)), p.undefined())
       local = local + 1
     }
-    // The bytecode's first byte and the realm's interrupt counter, through the closure.
-    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
-    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.Rax, signed(shape.codeWord)))
-    if shape.codeDelta != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.R9, signed(shape.codeDelta)) }
-    run self.a.store(Width.W64, p.rec(f.code), Reg.R9)
-    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.Rax, signed(f.bytecodeRealm)))
-    run self.a.lea(Width.W64, Reg.R9, Mem.at(Reg.R9, signed(f.interruptCounter)))
-    run self.a.store(Width.W64, p.rec(f.counter), Reg.R9)
-    // Publish the frame, then charge the entry to the counter.
-    run self.a.lea(Width.W64, Reg.Rax, p.sf(0))
-    run self.a.store(Width.W64, Mem.at(Reg.R13, signed(f.currentStackFrame)), Reg.Rax)
-    let body = run self.a.label()
-    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R9, 0), 1)
-    let poll = run self.slow(S_ENTRY_POLL, body, body, 0, 0, 0, 0, 0, Reg.R9, false)
-    run self.a.jcc(Cond.LessOrEqual, poll)
-    self.a.bind(body)
   }
 
   /// The shared tails: `leave` (return rax:rdx) and `finish` (the interpreter finishes the
@@ -478,6 +512,7 @@ impl Emitter {
     let p = self.p
     // leave: the frame's own cells drop their counts; rax:rdx pass through (release keeps
     // every register but r10 and r11).
+    run self.mark(0, MARK_LEAVE)
     self.a.bind(self.leave)
     if p.arguments != 0 {
       let borrowed = run self.a.label()
@@ -490,16 +525,25 @@ impl Emitter {
     }
     let mut local: u32 = 0
     while local < p.locals { run self.releaseCell(p.localAt(local)) local = local + 1 }
-    run self.a.load(Width.W64, Reg.Rcx, p.sf(f.previous))
-    run self.a.store(Width.W64, Mem.at(Reg.R13, signed(f.currentStackFrame)), Reg.Rcx)
+    // A frame the engine built is published: unlink it.
+    let built = run self.a.label()
+    let epilogue = run self.a.label()
+    run self.a.aluStoreImm(Alu.Cmp, Width.W64, p.rec(f.state), u64.wrappingToI32(engine.FRAME_BARE))
+    run self.a.jcc(Cond.NotEqual, built)
+    self.a.bind(epilogue)
     run self.a.mov(Width.W64, Reg.Rsp, Reg.Rbp)
     run self.a.pop(Reg.Rbp)
     run self.a.ret()
-    // finish: ecx holds the request; the engine runs the rest and releases the cells.
+    self.a.bind(built)
+    run self.a.load(Width.W64, Reg.Rcx, p.sf(f.previous))
+    run self.a.store(Width.W64, Mem.at(Reg.R13, signed(f.currentStackFrame)), Reg.Rcx)
+    run self.a.jmp(epilogue)
+    // finish: ecx holds the request and r9 the operands on the stack; the engine builds
+    // the frame, runs the rest and releases the cells.
+    run self.mark(0, MARK_FINISH)
     self.a.bind(self.finish)
     run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.DEPARTURES_OFFSET), 1)
     run self.a.movImm32(Reg.R8, 0)
-    run self.a.movImm32(Reg.R9, 0)
     run self.engineCall()
     let threw = run self.a.label()
     run self.a.load(Width.W64, Reg.Rcx, p.sf(f.previous))
@@ -516,12 +560,16 @@ impl Emitter {
     run self.a.mov(Width.W64, Reg.Rsp, Reg.Rbp)
     run self.a.pop(Reg.Rbp)
     run self.a.ret()
-    // No room on the native stack. Nothing is built; the engine throws.
+    // No room on the native stack. The function has no frame; the engine throws.
+    run self.mark(0, MARK_OVERFLOW)
     self.a.bind(self.overflow)
+    run self.a.mov(Width.W64, Reg.Rsp, Reg.Rbp)
     run self.a.mov(Width.W64, Reg.R8, Reg.Rdi)
     run self.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.R13, signed(f.serviceHooks)))
     run self.a.load(Width.W64, Reg.Rsi, Mem.at(Reg.R13, signed(f.serviceAllocator)))
-    run self.a.movImm32(Reg.Rdx, 0)
+    // Where the caller's record is if the caller is baseline code (the engine tells).
+    run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, 0))
+    run self.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rdx, p.record))
     run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_OVERFLOW))
     run self.a.movImm32(Reg.R9, 0)
     run self.a.callMem(Mem.at(Reg.R13, signed(f.serviceEntry)))
@@ -538,9 +586,10 @@ impl Emitter {
     let mut e: usize = 0
     while e < self.exits.length() {
       let item = self.exits.get(e)
+      run self.mark(item.pc, MARK_EXIT)
       self.a.bind(item.label)
       run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(item.pc))
-      run self.a.storeImm(Width.W64, p.sf(f.stackPointer), signed(item.depth))
+      run self.a.movImm32(Reg.R9, item.depth)
       let mut request = engine.SERVICE_FINISH
       if item.throwing { request = request | engine.FINISH_THROWING }
       run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(request))
@@ -573,30 +622,36 @@ impl Emitter {
   effect fn slowPath(self: &mut Self, item: &Slow) -> () ! OutOfMemoryError ? &mut Allocator {
     let f = self.p.f
     let p = self.p
+    run self.mark(item.pc, MARK_SLOW + u8.toU32(item.kind))
     self.a.bind(item.entry)
     if item.kind == S_RELEASE {
-      // r10 holds the tag byte less the lowest heap tag; r11 the cell.
-      let lowest = signed(p.layout.heapLowest)
-      if lowest != 0 { run self.a.aluImm(Alu.Add, Width.W32, Reg.R10, lowest) }
+      // The value of the cell at a, whose payload is in r11, held its last count (or one
+      // that never drops): the count goes back and the engine releases it.
+      run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R11, 0), 1)
+      run self.a.loadZero8(Reg.R10, word(item.a))
       run self.a.callMem(Mem.at(Reg.R12, env.helperOffset(env.RELEASE_STUB)))
       run self.a.jmp(item.back)
       return ()
     }
     if item.kind == S_RELEASE_OBJECT {
+      run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(item.reg, 0), 1)
       run self.a.movImm32(Reg.R10, i32.wrappingToU32(p.object()))
       run self.a.mov(Width.W64, Reg.R11, item.reg)
       run self.a.callMem(Mem.at(Reg.R12, env.helperOffset(env.RELEASE_STUB)))
       run self.a.jmp(item.back)
       return ()
     }
-    if item.kind == S_HELPER {
+    if item.kind == S_HELPER || item.kind == S_HELPER_ARGUMENT {
       // helper(env, operand address, cell a, cell b or none, k) -> 0: the interpreter runs it.
       run self.operandInto(Reg.Rsi, u32.toUsize(item.pc))
       if item.flag {
         run self.a.load(Width.W64, Reg.Rdx, p.sf(f.argumentsData))
         run self.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rdx, item.a))
       } else { run self.a.lea(Width.W64, Reg.Rdx, word(item.a)) }
-      if item.b != NO_CELL { run self.a.lea(Width.W64, Reg.Rcx, word(item.b)) }
+      if item.kind == S_HELPER_ARGUMENT {
+        run self.a.load(Width.W64, Reg.Rcx, p.sf(f.argumentsData))
+        run self.a.lea(Width.W64, Reg.Rcx, Mem.at(Reg.Rcx, item.b))
+      } else if item.b != NO_CELL { run self.a.lea(Width.W64, Reg.Rcx, word(item.b)) }
       run self.a.movImm32(Reg.R8, u32.shiftRight(item.k, 8))
       run self.helper(item.k & 255)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
@@ -604,20 +659,28 @@ impl Emitter {
       run self.a.jmp(item.back)
       return ()
     }
-    if item.kind == S_EQUAL {
+    if item.kind == S_EQUAL || item.kind == S_ARITHMETIC {
       run self.a.lea(Width.W64, Reg.Rsi, word(item.a))
       run self.a.lea(Width.W64, Reg.Rdx, word(item.b))
       run self.a.movImm32(Reg.Rcx, item.k)
-      run self.helper(env.EQUAL)
+      if item.kind == S_EQUAL { run self.helper(env.EQUAL) } else { run self.helper(env.ARITHMETIC) }
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, item.other)
       run self.a.jmp(item.back)
       return ()
     }
-    if item.kind == S_TRUTHY {
-      // The value in cell a, consumed: true goes to other, false to back.
+    if item.kind == S_CELL {
       run self.a.lea(Width.W64, Reg.Rsi, word(item.a))
-      run self.helper(env.TRUTHY)
+      run self.helper(item.k)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, item.other)
+      run self.a.jmp(item.back)
+      return ()
+    }
+    if item.kind == S_TRUTHY || item.kind == S_TRUTH {
+      // The value in cell a, consumed (S_TRUTHY) or kept: true goes to other, false to back.
+      run self.a.lea(Width.W64, Reg.Rsi, word(item.a))
+      if item.kind == S_TRUTHY { run self.helper(env.TRUTHY) } else { run self.helper(env.TRUTH) }
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.NotEqual, item.other)
       run self.a.jmp(item.back)
@@ -625,16 +688,14 @@ impl Emitter {
     }
     if item.kind == S_BACK_EDGE {
       // A taken backward branch to pc (label other): charge the counter, poll when it runs out.
-      run self.a.load(Width.W64, Reg.Rax, p.rec(f.counter))
-      run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rax, 0), 1)
+      // The counter is the function's realm's (js_interrupts.counter).
+      run self.a.load(Width.W64, Reg.Rax, p.sf(f.currentFunction + 8))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.closureBytecode)))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.bytecodeRealm)))
+      run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rax, signed(f.interruptCounter)), 1)
       run self.a.jcc(Cond.Greater, item.other)
-      run self.a.storeImm(Width.W32, Mem.at(Reg.Rax, 0), signed(f.interruptPeriod))
+      run self.a.storeImm(Width.W32, Mem.at(Reg.Rax, signed(f.interruptCounter)), signed(f.interruptPeriod))
       run self.poll(u32.toUsize(item.pc), signed(item.depth), item.other)
-      return ()
-    }
-    if item.kind == S_ENTRY_POLL {
-      run self.a.storeImm(Width.W32, Mem.at(Reg.R9, 0), signed(f.interruptPeriod))
-      run self.poll(0, 0, item.back)
       return ()
     }
     if item.kind == S_VARIABLE {
@@ -723,7 +784,7 @@ impl Emitter {
   /// r11 = the address of the slot the inline key of the field instruction at pc names in
   /// the object of the cell at (tagAt, payloadAt), rsi = that object; or a jump to miss:
   /// not an object, or the key's shape version is not its shape's (js_vm_property_ops
-  /// fieldKeyAt: version << 16 | slot at the operand + 4). Clobbers rax, r8, r9, r10.
+  /// fieldKeyAt: version << 16 | slot at the operand + 4). Clobbers rax and r10.
   effect fn keyedSlot(self: &mut Self, tagAt: Mem, payloadAt: Mem, pc: usize, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let fields = self.p.fields
     let objectTag = self.p.object()
@@ -731,23 +792,22 @@ impl Emitter {
     run self.a.load(Width.W64, Reg.Rsi, payloadAt)
     run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsi, signed(fields.objectShape)))
     run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(fields.shapeVersion)))
+    // version << 16 against the key leaves the slot index, or more when the versions differ
+    // (a version stays far below 2^47: the key's top bits are flags).
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rax, 16)
     run self.a.load(Width.W64, Reg.R10, self.p.rec(self.p.f.code))
-    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R10, signed(usize.toU32(pc + 5))))
-    run self.a.mov(Width.W64, Reg.R8, Reg.R9)
-    run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R8, 16)
-    run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.Rax)
-    run self.a.jcc(Cond.NotEqual, miss)
-    run self.a.aluImm(Alu.And, Width.W32, Reg.R9, 65535)
-    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
+    run self.a.aluLoad(Alu.Xor, Width.W64, Reg.Rax, Mem.at(Reg.R10, self.p.codeDelta + signed(usize.toU32(pc + 5))))
+    run self.a.aluImm(Alu.Cmp, Width.W64, Reg.Rax, 65535)
+    run self.a.jcc(Cond.Above, miss)
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rax, 4)
     run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(fields.objectSlots)))
-    run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
+    run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.Rax)
   }
   /// Drops the count of the value in the slot at r11 before a store over it, or jumps to
   /// miss when it holds the last one (js_vm_property_ops.storeOwnSlot). Clobbers r9, r10.
   effect fn displace(self: &mut Self, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let kept = run self.a.label()
-    run self.a.loadZero8(Reg.R10, Mem.at(Reg.R11, 0))
-    run self.heapRange(Reg.R10, kept)
+    run self.unlessHeapAt(Mem.at(Reg.R11, 0), kept)
     run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
     run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R9, 0), 1)
     run self.a.jcc(Cond.LessOrEqual, miss)
@@ -851,11 +911,11 @@ impl Emitter {
     run self.tagIs(word(callee), p.object(), interpret)
     run self.a.load(Width.W64, Reg.Rdi, payload(callee))
     run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(usize.toU32(pc + 1)))
-    run self.a.loadZero16(Reg.Rax, Mem.at(Reg.Rdi, signed(f.objectClass)))
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, signed(f.bytecodeClass))
+    run self.a.cmp16MemImm(Mem.at(Reg.Rdi, signed(f.objectClass)), u32.wrappingToU16(f.bytecodeClass))
     run self.a.jcc(Cond.NotEqual, generic)
-    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
-    run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.Rax, signed(f.bytecodeBaseline)))
+    // r11, the callee's bytecode object, is part of the call.
+    run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
+    run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
     run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
     run self.a.jcc(Cond.Equal, generic)
     run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R13, signed(f.table)))
@@ -870,17 +930,101 @@ impl Emitter {
     }
     if p.count { run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.DIRECT_CALLS_OFFSET), 1) }
     run self.a.callMem(Mem.indexed(Reg.R10, Reg.Rax, Scale.Eight, -8))
-    run self.a.zeroExtend8(Reg.Rcx, Reg.Rax)
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rcx, p.exception())
+    run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.exception()))
     run self.a.jcc(Cond.Equal, threw)
     self.a.bind(after)
     // The operands were borrowed for the call: drop them, then the result takes their place.
     let mut index: u32 = 0
     while index < argc { run self.releaseCell(callee + 16 + signed(index * 16)) index = index + 1 }
-    run self.releaseCell(callee)
+    // The callee is an object, as checked above.
+    run self.a.load(Width.W64, Reg.R11, payload(callee))
+    run self.releaseObject(Reg.R11)
     if method { run self.releaseCell(first) }
     run self.a.store(Width.W64, word(first), Reg.Rax)
     run self.a.store(Width.W64, payload(first), Reg.Rdx)
+  }
+
+  /// One template for the instruction at pc and the one after it, which no branch reaches and
+  /// which only consumes what the first makes: the second's bytes, or 0 for no such pair.
+  /// entered: a branch reaches the function's first instruction.
+  effect fn fused(self: &mut Self, bytes: &[u8], pc: usize, depth: i32, step: &Step, entered: bool) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let f = self.p.f
+    let p = self.p
+    let opcode = bytes[pc]
+    let second = pc + step.size
+    let then = bytes[second]
+    let follow = stepOf(bytes, second)
+    if follow.size == 0 || follow.kind == DEPART { return 0 }
+    if opcode == op.OP_push_this && ((then >= op.OP_put_loc0 && then <= op.OP_put_loc3) || then == op.OP_put_loc8) {
+      // The receiver goes straight into the local.
+      let mut index: u32 = 0
+      if then == op.OP_put_loc8 { index = u8.toU32(bytes[second + 1]) } else { index = u8.toU32(then) - u8.toU32(op.OP_put_loc0) }
+      if index >= p.locals { return 0 }
+      let at = p.localAt(index)
+      let other = run self.exit(pc, depth, false)
+      run self.tagIs(p.sf(f.thisValue), p.object(), other)
+      run self.a.load(Width.W64, Reg.Rdx, p.sf(f.thisValue + 8))
+      run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+      // At the function's first instruction a local still holds undefined.
+      if pc != 0 || entered { run self.releaseCell(at) }
+      run self.a.storeImm(Width.W64, word(at), p.object())
+      run self.a.store(Width.W64, payload(at), Reg.Rdx)
+      return follow.size
+    }
+    if then != op.OP_if_false8 && then != op.OP_if_true8 && then != op.OP_if_false && then != op.OP_if_true { return 0 }
+    let whenTrue = then == op.OP_if_true8 || then == op.OP_if_true
+    let top = p.operandAt(depth - 1)
+    let under = p.operandAt(depth - 2)
+    if opcode == op.OP_is_undefined_or_null {
+      // The test branches; no Bool is made.
+      let taken = run self.edge(second, follow.target, depth - 1)
+      let after = run self.a.label()
+      let mut nullish = after
+      if whenTrue { nullish = taken }
+      run self.a.cmp8MemImm(word(top), i32.wrappingToU8(p.null()))
+      run self.a.jcc(Cond.Equal, nullish)
+      run self.a.cmp8MemImm(word(top), i32.wrappingToU8(p.undefined()))
+      run self.a.jcc(Cond.Equal, nullish)
+      run self.releaseCell(top)
+      if !whenTrue { run self.a.jmp(taken) }
+      self.a.bind(after)
+      return follow.size
+    }
+    let equality = opcode == op.OP_eq || opcode == op.OP_neq || opcode == op.OP_strict_eq || opcode == op.OP_strict_neq
+    let ordering = opcode == op.OP_lt || opcode == op.OP_lte || opcode == op.OP_gt || opcode == op.OP_gte
+    if !equality && !ordering { return 0 }
+    // Two Ints compare and branch. Anything else is the single templates' work: the
+    // interpreter's, or a helper's Bool (== and != of what needs no coercion, an ordering of
+    // two numbers), which the truthy path branches on.
+    let taken = run self.edge(second, follow.target, depth - 2)
+    let after = run self.a.label()
+    let other = run self.exit(pc, depth, false)
+    let mut mixed = other
+    if opcode == op.OP_eq || opcode == op.OP_neq || ordering {
+      let mut onTrue = after
+      let mut onFalse = taken
+      if whenTrue { onTrue = taken onFalse = after }
+      let test = run self.slow(S_TRUTHY, onFalse, onTrue, under, 0, 0, second, depth - 1, Reg.Rax, false)
+      if ordering { mixed = run self.slow(S_ARITHMETIC, test, other, under, top, u8.toU32(opcode), pc, depth, Reg.Rax, false) }
+      else {
+        let mut k: u32 = 0
+        if opcode == op.OP_neq { k = 1 }
+        mixed = run self.slow(S_EQUAL, test, other, under, top, k, pc, depth, Reg.Rax, false)
+      }
+    }
+    run self.bothInt(under, top, mixed)
+    run self.a.load(Width.W32, Reg.Rax, payload(under))
+    run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.Rax, payload(top))
+    let mut cond = Cond.Equal
+    let mut inverse = Cond.NotEqual
+    if opcode == op.OP_neq || opcode == op.OP_strict_neq { cond = Cond.NotEqual inverse = Cond.Equal }
+    if opcode == op.OP_lt { cond = Cond.Less inverse = Cond.GreaterOrEqual }
+    if opcode == op.OP_lte { cond = Cond.LessOrEqual inverse = Cond.Greater }
+    if opcode == op.OP_gt { cond = Cond.Greater inverse = Cond.LessOrEqual }
+    if opcode == op.OP_gte { cond = Cond.GreaterOrEqual inverse = Cond.Less }
+    if whenTrue { run self.a.jcc(cond, taken) } else { run self.a.jcc(inverse, taken) }
+    self.a.bind(after)
+    return follow.size
   }
 
   /// The template of the instruction at pc, entered with depth operands. False when it has
@@ -980,34 +1124,118 @@ impl Emitter {
       if whenTrue { onTrue = taken onFalse = after }
       let other = run self.slow(S_TRUTHY, onFalse, onTrue, top, 0, 0, pc, depth, Reg.Rax, false)
       run self.tagIs(word(top), p.boolean(), other)
-      run self.a.loadZero8(Reg.Rax, payload(top))
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.cmp8MemImm(payload(top), 0)
       if whenTrue { run self.a.jcc(Cond.NotEqual, taken) } else { run self.a.jcc(Cond.Equal, taken) }
       self.a.bind(after)
       return true
     }
-    if opcode == op.OP_if_true_keep8 {
-      // The taken branch keeps the value; a Bool needs no release on the other.
-      let other = run self.exit(pc, depth, false)
+    if opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 {
+      // The taken branch keeps the value; the other drops it (a Bool has no count).
+      let whenTrue = opcode == op.OP_if_true_keep8
       let taken = run self.edge(pc, step.target, depth)
+      let after = run self.a.label()
+      let dropped = run self.a.label()
+      let mut onTrue = dropped
+      let mut onFalse = taken
+      if whenTrue { onTrue = taken onFalse = dropped }
+      let other = run self.slow(S_TRUTH, onFalse, onTrue, top, 0, 0, pc, depth, Reg.Rax, false)
       run self.tagIs(word(top), p.boolean(), other)
-      run self.a.loadZero8(Reg.Rax, payload(top))
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.NotEqual, taken)
+      run self.a.cmp8MemImm(payload(top), 0)
+      if whenTrue { run self.a.jcc(Cond.NotEqual, taken) } else { run self.a.jcc(Cond.Equal, taken) }
+      run self.a.jmp(after)
+      self.a.bind(dropped)
+      run self.releaseCell(top)
+      self.a.bind(after)
       return true
     }
-    if opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 {
+    if opcode == op.OP_insert2 {
+      // a b -> b a b
+      run self.a.load(Width.W64, Reg.Rax, word(top))
+      run self.a.load(Width.W64, Reg.Rdx, payload(top))
+      run self.a.load(Width.W64, Reg.Rcx, word(under))
+      run self.a.load(Width.W64, Reg.R8, payload(under))
+      run self.a.store(Width.W64, word(next), Reg.Rax)
+      run self.a.store(Width.W64, payload(next), Reg.Rdx)
+      run self.a.store(Width.W64, word(top), Reg.Rcx)
+      run self.a.store(Width.W64, payload(top), Reg.R8)
+      run self.a.store(Width.W64, word(under), Reg.Rax)
+      run self.a.store(Width.W64, payload(under), Reg.Rdx)
+      run self.retain(Reg.Rax, Reg.Rdx)
+      return true
+    }
+    if opcode == op.OP_lnot {
+      let other = run self.exit(pc, depth, false)
+      let done = run self.a.label()
+      let general = run self.slow(S_CELL, done, other, top, 0, env.NOT, pc, depth, Reg.Rax, false)
+      run self.tagIs(word(top), p.boolean(), general)
+      run self.a.aluStoreImm(Alu.Xor, Width.W32, payload(top), 1)
+      self.a.bind(done)
+      return true
+    }
+    if opcode == op.OP_get_length {
+      // An Array's length is its first own property, a plain number (js_vm_property_ops
+      // lengthOperand); any other value's is the interpreter's.
+      let other = run self.exit(pc, depth, false)
+      run self.tagIs(word(top), p.object(), other)
+      run self.a.load(Width.W64, Reg.Rsi, payload(top))
+      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
+      run self.a.jcc(Cond.NotEqual, other)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
+      run self.a.store(Width.W64, word(top), Reg.Rax)
+      run self.a.store(Width.W64, payload(top), Reg.Rdx)
+      run self.releaseObject(Reg.Rsi)
+      return true
+    }
+    if opcode == op.OP_push_atom_value || opcode == op.OP_push_empty_string {
+      let other = run self.exit(pc, depth, false)
+      let mut atom = atoms.JS_ATOM_empty_string
+      if opcode == op.OP_push_atom_value { atom = u32At(bytes, pc + 1) }
+      run self.a.movImm32(Reg.Rsi, atom)
+      run self.a.lea(Width.W64, Reg.Rdx, word(next))
+      run self.helper(env.ATOM_VALUE)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, other)
+      return true
+    }
+    if opcode == op.OP_call_constructor {
+      // Through the engine: function, new.target, arguments; the result replaces them.
+      let argc = u16At(bytes, pc + 1)
+      let callee = p.operandAt(depth - signed(argc) - 2)
+      let threw = run self.exit(pc + 1, depth, true)
+      run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(usize.toU32(pc + 1)))
+      run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1)
+      run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_CONSTRUCT))
+      run self.a.lea(Width.W64, Reg.R8, word(callee))
+      run self.a.movImm32(Reg.R9, argc)
+      run self.engineCall()
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.NotEqual, threw)
+      let mut index: u32 = 0
+      while index < argc + 2 { run self.releaseCell(callee + signed(index * 16)) index = index + 1 }
+      run self.a.load(Width.W64, Reg.Rax, p.rec(f.result))
+      run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
+      run self.a.store(Width.W64, word(callee), Reg.Rax)
+      run self.a.store(Width.W64, payload(callee), Reg.Rdx)
+      return true
+    }
+    if opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8 {
+      // null (and undefined, for the nullish pair) against everything else, which has a count.
+      let negated = opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_not_null8
       let taken = run self.edge(pc, step.target, depth - 1)
       let after = run self.a.label()
       let mut nullish = taken
-      if opcode == op.OP_if_not_nullish8 { nullish = after }
+      if negated { nullish = after }
       run self.a.loadZero8(Reg.Rax, word(top))
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, p.null())
       run self.a.jcc(Cond.Equal, nullish)
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, p.undefined())
-      run self.a.jcc(Cond.Equal, nullish)
+      if opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 {
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, p.undefined())
+        run self.a.jcc(Cond.Equal, nullish)
+      }
       run self.releaseCell(top)
-      if opcode == op.OP_if_not_nullish8 { run self.a.jmp(taken) }
+      if negated { run self.a.jmp(taken) }
       self.a.bind(after)
       return true
     }
@@ -1097,13 +1325,11 @@ impl Emitter {
       let newPlain = run self.a.label()
       let miss = run self.slow(S_HELPER, done, other, target, NO_CELL, env.PUT_ELEMENT, pc, depth, Reg.Rax, false)
       run self.elementSlot(target, under, miss)
-      run self.a.loadZero8(Reg.R10, Mem.at(Reg.R11, 0))
-      run self.heapRange(Reg.R10, oldPlain)
+      run self.unlessHeapAt(Mem.at(Reg.R11, 0), oldPlain)
       run self.a.jmp(miss)
       self.a.bind(oldPlain)
       run self.a.load(Width.W64, Reg.Rax, word(top))
-      run self.a.zeroExtend8(Reg.R10, Reg.Rax)
-      run self.heapRange(Reg.R10, newPlain)
+      run self.unlessHeap(Reg.Rax, newPlain)
       run self.a.jmp(miss)
       self.a.bind(newPlain)
       run self.a.load(Width.W64, Reg.Rdx, payload(top))
@@ -1125,6 +1351,25 @@ impl Emitter {
       run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
       run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rdx)
       run self.releaseObject(Reg.Rsi)
+      self.a.bind(done)
+      return true
+    }
+    if opcode == op.OP_put_loc_field_arg8 {
+      let target = u8.toU32(bytes[pc + 13])
+      let source = u8.toU32(bytes[pc + 14])
+      if target >= p.locals || source >= p.arguments { return false }
+      let other = run self.exit(pc, depth, false)
+      let done = run self.a.label()
+      let at = p.localAt(target)
+      let miss = run self.slow(S_HELPER_ARGUMENT, done, other, at, signed(source * 16), env.PUT_FIELD, pc, depth, Reg.Rax, false)
+      run self.keyedSlot(word(at), payload(at), pc, miss)
+      run self.displace(miss)
+      run self.a.load(Width.W64, Reg.Rcx, p.sf(f.argumentsData))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rcx, signed(source * 16)))
+      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rcx, signed(source * 16 + 8)))
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rdx)
+      run self.retain(Reg.Rax, Reg.Rdx)
       self.a.bind(done)
       return true
     }
@@ -1169,8 +1414,7 @@ impl Emitter {
       // A binding still in its dead zone throws: the interpreter's.
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
       run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
-      run self.a.zeroExtend8(Reg.R10, Reg.Rax)
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, p.tag(4))
+      run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.tag(4)))
       run self.a.jcc(Cond.Equal, miss)
       run self.a.store(Width.W64, word(next), Reg.Rax)
       run self.a.store(Width.W64, payload(next), Reg.Rdx)
@@ -1202,7 +1446,9 @@ impl Emitter {
     }
     if opcode == op.OP_lt || opcode == op.OP_lte || opcode == op.OP_gt || opcode == op.OP_gte {
       let other = run self.exit(pc, depth, false)
-      run self.bothInt(under, top, other)
+      let done = run self.a.label()
+      let mixed = run self.slow(S_ARITHMETIC, done, other, under, top, u8.toU32(opcode), pc, depth, Reg.Rax, false)
+      run self.bothInt(under, top, mixed)
       run self.a.load(Width.W32, Reg.Rax, payload(under))
       run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.Rax, payload(top))
       let mut cond = Cond.Less
@@ -1212,11 +1458,15 @@ impl Emitter {
       run self.a.setcc(cond, Reg.Rax)
       run self.a.zeroExtend8(Reg.Rax, Reg.Rax)
       run self.boxed(under, p.boolean(), Reg.Rax)
+      self.a.bind(done)
       return true
     }
     if opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_and || opcode == op.OP_or || opcode == op.OP_xor {
-      // Ints whose result is an Int; an overflow or another operand is the interpreter's.
-      let other = run self.exit(pc, depth, false)
+      // Ints whose result is an Int; an overflow or another pair of numbers is the helper's,
+      // anything else the interpreter's.
+      let exit = run self.exit(pc, depth, false)
+      let done = run self.a.label()
+      let other = run self.slow(S_ARITHMETIC, done, exit, under, top, u8.toU32(opcode), pc, depth, Reg.Rax, false)
       run self.bothInt(under, top, other)
       run self.a.load(Width.W32, Reg.Rax, payload(under))
       let mut operation = Alu.Add
@@ -1227,6 +1477,24 @@ impl Emitter {
       run self.a.aluLoad(operation, Width.W32, Reg.Rax, payload(top))
       if opcode == op.OP_add || opcode == op.OP_sub { run self.a.jcc(Cond.Overflow, other) }
       run self.a.store(Width.W64, payload(under), Reg.Rax)
+      self.a.bind(done)
+      return true
+    }
+    if opcode == op.OP_mul || opcode == op.OP_div || opcode == op.OP_mod {
+      let exit = run self.exit(pc, depth, false)
+      let done = run self.a.label()
+      let other = run self.slow(S_ARITHMETIC, done, exit, under, top, u8.toU32(opcode), pc, depth, Reg.Rax, false)
+      if opcode != op.OP_mul { run self.a.jmp(other) self.a.bind(done) return true }
+      // An Int product that is not 0 (which may be -0: the helper tells).
+      run self.bothInt(under, top, other)
+      run self.a.load(Width.W32, Reg.Rax, payload(under))
+      run self.a.load(Width.W32, Reg.Rcx, payload(top))
+      run self.a.imul(Width.W32, Reg.Rax, Reg.Rcx)
+      run self.a.jcc(Cond.Overflow, other)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, other)
+      run self.a.store(Width.W64, payload(under), Reg.Rax)
+      self.a.bind(done)
       return true
     }
     if opcode == op.OP_inc || opcode == op.OP_dec || opcode == op.OP_add_imm || opcode == op.OP_and_imm || opcode == op.OP_sar_imm {
@@ -1263,14 +1531,16 @@ impl Emitter {
 /// Compiles bytes, the bytecode of a function of shape, or refuses it.
 pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outcome ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
   let mut uncovered = List<u8>.make()
-  if !shape.plain { return Outcome { code: Option<Code>.none(), why: b"not a plain function", uncovered: move uncovered } }
-  if shape.codeWord == u32.MAX || shape.codeWord > 2040 { return Outcome { code: Option<Code>.none(), why: b"no word holds the code's address", uncovered: move uncovered } }
-  if bytes.length == 0 || bytes.length > 1048576 { return Outcome { code: Option<Code>.none(), why: b"no code, or too much", uncovered: move uncovered } }
-  if shape.arguments + shape.locals + shape.stack > 4096 { return Outcome { code: Option<Code>.none(), why: b"too many cells", uncovered: move uncovered } }
+  if !shape.plain { return Outcome { code: Option<Code>.none(), why: b"not a plain function", uncovered: move uncovered, map: List<u32>.make() } }
+  if shape.codeWord == u32.MAX || shape.codeWord > 2040 { return Outcome { code: Option<Code>.none(), why: b"no word holds the code's address", uncovered: move uncovered, map: List<u32>.make() } }
+  if bytes.length == 0 || bytes.length > 1048576 { return Outcome { code: Option<Code>.none(), why: b"no code, or too much", uncovered: move uncovered, map: List<u32>.make() } }
+  if shape.arguments + shape.locals + shape.stack > 4096 { return Outcome { code: Option<Code>.none(), why: b"too many cells", uncovered: move uncovered, map: List<u32>.make() } }
   // Depths: every instruction a template can reach, with the operands on its stack there.
   let mut depths = List<i32>.make()
+  // The instructions a branch reaches.
+  let mut targets = List<bool>.make()
   let mut fill: usize = 0
-  while fill < bytes.length { run depths.append(-1) fill = fill + 1 }
+  while fill < bytes.length { run depths.append(-1) run targets.append(false) fill = fill + 1 }
   let mut work = List<usize>.make()
   depths.set(0, 0)
   run work.append(0)
@@ -1280,27 +1550,28 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
     drop work.remove(last)
     let depth = depths.get(pc)
     let step = stepOf(bytes, pc)
-    if step.size == 0 { return Outcome { code: Option<Code>.none(), why: b"bytes that are no instruction", uncovered: move uncovered } }
+    if step.size == 0 { return Outcome { code: Option<Code>.none(), why: b"bytes that are no instruction", uncovered: move uncovered, map: List<u32>.make() } }
     if step.kind == DEPART { continue }
-    if depth < step.needs { return Outcome { code: Option<Code>.none(), why: b"an operand stack underflow", uncovered: move uncovered } }
+    if depth < step.needs { return Outcome { code: Option<Code>.none(), why: b"an operand stack underflow", uncovered: move uncovered, map: List<u32>.make() } }
     let mut successors: [usize; 2] = [usize.MAX; 2]
     let mut entering: [i32; 2] = [0; 2]
     if step.kind == FALL || step.kind == BRANCH { successors[0] = pc + step.size entering[0] = depth + step.fall }
     if step.kind == BRANCH || step.kind == JUMP {
-      if step.target == usize.MAX { return Outcome { code: Option<Code>.none(), why: b"a branch out of the code", uncovered: move uncovered } }
+      if step.target == usize.MAX { return Outcome { code: Option<Code>.none(), why: b"a branch out of the code", uncovered: move uncovered, map: List<u32>.make() } }
       successors[1] = step.target entering[1] = depth + step.taken
+      if step.target < bytes.length { targets.set(step.target, true) }
     }
     let mut k: usize = 0
     while k < 2 {
       let successor = successors[k]
       k = k + 1
       if successor == usize.MAX { continue }
-      if successor >= bytes.length { return Outcome { code: Option<Code>.none(), why: b"code that runs off its end", uncovered: move uncovered } }
+      if successor >= bytes.length { return Outcome { code: Option<Code>.none(), why: b"code that runs off its end", uncovered: move uncovered, map: List<u32>.make() } }
       let entered = entering[k - 1]
-      if entered < 0 || entered > u32.wrappingToI32(shape.stack) { return Outcome { code: Option<Code>.none(), why: b"an operand stack out of bounds", uncovered: move uncovered } }
+      if entered < 0 || entered > u32.wrappingToI32(shape.stack) { return Outcome { code: Option<Code>.none(), why: b"an operand stack out of bounds", uncovered: move uncovered, map: List<u32>.make() } }
       let known = depths.get(successor)
       if known == -1 { depths.set(successor, entered) run work.append(successor) }
-      else if known != entered { return Outcome { code: Option<Code>.none(), why: b"two depths at one instruction", uncovered: move uncovered } }
+      else if known != entered { return Outcome { code: Option<Code>.none(), why: b"two depths at one instruction", uncovered: move uncovered, map: List<u32>.make() } }
     }
   }
   let mut a = Assembler.make()
@@ -1314,7 +1585,8 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
     if depths.get(at) >= 0 { let label = run a.label() run labels.append(label) } else { run labels.append(unused) }
     at = at + 1
   }
-  let mut emitter = Emitter { a: move a, p: Plan.of(settings, shape), exits: List<Exit>.make(), slows: List<Slow>.make(), labels: move labels, finish: finish, leave: leave, overflow: overflow }
+  let mut emitter = Emitter { a: move a, p: Plan.of(settings, shape), exits: List<Exit>.make(), slows: List<Slow>.make(), labels: move labels, finish: finish, leave: leave, overflow: overflow, map: List<u32>.make() }
+  run emitter.mark(0, MARK_PROLOGUE)
   run emitter.prologue(shape)
   let mut pc: usize = 0
   let mut falls = true
@@ -1326,16 +1598,23 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
       continue
     }
     let step = stepOf(bytes, pc)
+    run emitter.mark(usize.toU32(pc), u8.toU32(bytes[pc]))
     emitter.a.bind(emitter.labels.get(pc))
     let mut covered = false
-    if step.kind != DEPART { covered = run emitter.template(bytes, pc, depth, &step) }
+    let mut extra: usize = 0
+    if step.kind == FALL {
+      let second = pc + step.size
+      if second < bytes.length && !targets.get(second) { extra = run emitter.fused(bytes, pc, depth, &step, targets.get(0)) }
+    }
+    if extra != 0 { covered = true }
+    else if step.kind != DEPART { covered = run emitter.template(bytes, pc, depth, &step) }
     if !covered {
       let other = run emitter.exit(pc, depth, false)
       run emitter.a.jmp(other)
       run uncovered.append(bytes[pc])
     }
     falls = covered && (step.kind == FALL || step.kind == BRANCH)
-    pc = pc + step.size
+    pc = pc + step.size + extra
   }
   // Verified bytecode never runs off its end; a template that fell through here would.
   if falls { run emitter.a.ud2() }
@@ -1343,9 +1622,10 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
   run emitter.a.ud2()
   run emitter.tails()
   match move emitter {
-    Emitter { a: assembler, .. } => {
-      let code = run assembler.finish()
-      return Outcome { code: Option<Code>.some(move code), why: b"", uncovered: move uncovered }
+    Emitter { a: assembler, map: places, .. } => {
+      let mut map = move places
+      let code = run assembler.finishPlaced(&mut map, 3)
+      return Outcome { code: Option<Code>.some(move code), why: b"", uncovered: move uncovered, map: move map }
     }
   }
 }
@@ -1360,6 +1640,10 @@ pub effect fn entryStub(settings: &Settings) -> Code ! OutOfMemoryError | Unboun
   // env rdi, function rsi, argv rdx, argc rcx, receiver r8, out r9.
   run a.push(Reg.Rbp)
   run a.mov(Width.W64, Reg.Rbp, Reg.Rsp)
+  // FRAME_STOP where a baseline frame keeps its state: the frames above are not the code's.
+  run a.movImm32(Reg.Rax, 0)
+  run a.push(Reg.Rax)
+  run a.push(Reg.Rax)
   run a.push(Reg.R12)
   run a.push(Reg.R13)
   run a.push(Reg.Rbx)
@@ -1367,8 +1651,8 @@ pub effect fn entryStub(settings: &Settings) -> Code ! OutOfMemoryError | Unboun
   run a.mov(Width.W64, Reg.R12, Reg.Rdi)
   run a.load(Width.W64, Reg.R13, Mem.at(Reg.R12, 0))
   run a.mov(Width.W64, Reg.Rbx, Reg.R9)
-  run a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsi, signed(f.closureBytecode)))
-  run a.load(Width.W32, Reg.Rax, Mem.at(Reg.Rax, signed(f.bytecodeBaseline)))
+  run a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(f.closureBytecode)))
+  run a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
   run a.load(Width.W64, Reg.R10, Mem.at(Reg.R13, signed(f.table)))
   run a.mov(Width.W64, Reg.Rdi, Reg.Rsi)
   run a.mov(Width.W64, Reg.Rsi, Reg.Rdx)
@@ -1387,6 +1671,7 @@ pub effect fn entryStub(settings: &Settings) -> Code ! OutOfMemoryError | Unboun
   run a.pop(Reg.Rbx)
   run a.pop(Reg.R13)
   run a.pop(Reg.R12)
+  run a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 16)
   run a.pop(Reg.Rbp)
   run a.ret()
   a.bind(threw)
