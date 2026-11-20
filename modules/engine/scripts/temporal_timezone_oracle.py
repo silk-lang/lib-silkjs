@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Generate or run the complete pinned C/native timezone contrast.
+"""Generate or run the pinned C/native contrast of time zone names.
 
 Generate: python3 scripts/temporal_timezone_oracle.py QUICKJS_ROOT OUTPUT.silk
 Verify:   python3 scripts/temporal_timezone_oracle.py QUICKJS_ROOT [--silk COMPILER] [--stdlib SDK]
 
-All name/alias assertions and every transition's gap/overlap/subsecond assertions
-come from executing unmodified C. Numeric expectations are packed in readonly
-records to avoid compiling hundreds of thousands of duplicated assertion bodies.
-The verification mode also compares every generated table as logical bytes,
+All name, alias and equality assertions come from executing unmodified C. The
+verification mode also compares every generated table as logical bytes,
 including the full available-name database and NUL-separated region lists.
-INT64_MIN with negative nanoseconds is excluded only for next-transition: C reads
-before its sentinel array. The native kernel deliberately avoids that undefined
-read. No host timezone data or C implementation is linked into native programs.
+The rules of each zone (offsets and transitions) are not part of this contrast:
+the engine reads them from `silk.time`, and tests/silkjs/temporal_zone_rules.js
+checks them through Temporal.
 """
 import argparse
 import hashlib
@@ -39,8 +37,7 @@ int main(void) {
  if(countof(region_lengths)!=ti_tz_region_count)return 2;
  word(ti_tz_zone_count);word(ti_tz_alias_count);word(ti_tz_name_count);word(ti_tz_region_count);
  for(int i=0;i<ti_tz_zone_count;i++) {
-  const TZData *z=&ti_tz_zone_data[i];blob(z->canonical_name,strlen(z->canonical_name));word(z->transition_count);
-  for(int j=0;j<z->transition_count;j++) {word(z->transitions[j].start_sec);word(z->transitions[j].offset_sec);}
+  const TZData *z=&ti_tz_zone_data[i];blob(z->canonical_name,strlen(z->canonical_name));
  }
  for(int i=0;i<ti_tz_alias_count;i++) {blob(ti_tz_aliases[i].alias,strlen(ti_tz_aliases[i].alias));word(ti_tz_aliases[i].canonical_id);}
  for(int i=0;i<ti_tz_name_count;i++)blob(ti_tz_names[i],strlen(ti_tz_names[i]));
@@ -70,8 +67,7 @@ effect fn tables() -> () ! WriterError ? &mut Writer {
  run word(i32.toI64(data.ti_tz_name_count)) run word(i32.toI64(data.ti_tz_region_count))
  let mut i:i32=0
  while i<data.ti_tz_zone_count {
-  run blob(data.tzZoneName(i)) let count=data.tzTransitionCount(i) run word(i32.toI64(count))
-  let mut j:i32=0 while j<count { run word(data.tzTransitionStart(i,j)) run word(i32.toI64(data.tzTransitionOffset(i,j))) j=j+1 }
+  run blob(data.tzZoneName(i))
   i=i+1
  }
  i=0 while i<data.ti_tz_alias_count { run blob(data.tzAliasName(i)) run word(i32.toI64(data.tzAliasCanonicalId(i))) i=i+1 }
@@ -112,7 +108,7 @@ def main():
         if not args.silk:
             return
         (temp / 'src').mkdir()
-        for module in ('temporal_timezone.silk', 'temporal_timezone_data.silk'):
+        for module in ('temporal_timezone.silk', 'temporal_timezone_data.silk', 'temporal_zone.silk', 'temporal_zones.silk'):
             shutil.copyfile(ROOT / 'src' / module, temp / 'src' / module)
         version = tomllib.loads((ROOT / 'silk.toml').read_text())['package']['silk-version']
         (temp / 'silk.toml').write_text(f'[package]\nname="temporal-timezone-oracle"\nversion="0.0.0"\nsilk-version="{version}"\n')
@@ -121,14 +117,9 @@ def main():
             command += ['--stdlib', str(args.stdlib.resolve())]
         (temp / 'src/main.silk').write_text(source)
         process(command, 1800, owner='Native timezone behavioral assertions', cwd=temp)
-        counts = re.search(r'// Records: instant=(\d+) local=(\d+) start_of_day=(\d+)', source)
-        instant, local, day = map(int, counts.groups())
         names = source.count('assert(tz.ti_tz_find_id(')
         equalities = source.count('assert(tz.ti_timezones_are_equal(')
-        numeric = bytes.fromhex(re.search(r'let cases = b"([^"]+)"', source).group(1).replace('\\x', ''))
-        if len(numeric) != (instant + local + day) * 72:
-            raise SystemExit('Timezone numeric record count differs')
-        print(f'PASS timezone behavior: {instant} instant, {local} local/disambiguation, {day} start-of-day records; {names} name/alias probes, {equalities} equality probes; {instant*5+local*3+day+names*3+equalities} C-derived assertions; {pins} pinned sources; numeric SHA256={hashlib.sha256(numeric).hexdigest()}', flush=True)
+        print(f'PASS timezone names: {names} name/alias probes, {equalities} equality probes; {names*3+equalities} C-derived assertions; {pins} pinned sources', flush=True)
         # C computes sizeof on the original string literals. Python does not
         # interpret octal escapes or supply the expected region-list contents.
         original = tzdata.read_text()
@@ -144,15 +135,7 @@ def main():
             at = next((i for i, (a, b) in enumerate(zip(expected, actual)) if a != b), min(len(expected), len(actual)))
             raise SystemExit(f'Timezone complete table mismatch at byte {at}: C={len(expected)} bytes Silk={len(actual)} bytes')
         zones, aliases, available, regions = struct.unpack_from('<4q', actual)
-        at, transitions = 32, 0
-        for _ in range(zones):
-            length = struct.unpack_from('<q', actual, at)[0]
-            at += 8 + length
-            count = struct.unpack_from('<q', actual, at)[0]
-            transitions += count
-            at += 8 + 16 * count
-        print(f'PASS timezone tables: {zones} canonical zones, {transitions} transitions, {aliases} aliases, {available} available names, {regions} regions; {len(actual)} logical bytes; SHA256={hashlib.sha256(actual).hexdigest()}')
-        print('UNDEFINED C input excluded: next_transition_at(valid_id, INT64_MIN, negative_nsec); no native out-of-bounds emulation.')
+        print(f'PASS timezone tables: {zones} canonical zones, {aliases} aliases, {available} available names, {regions} regions; {len(actual)} logical bytes; SHA256={hashlib.sha256(actual).hexdigest()}')
 
 
 if __name__ == '__main__':

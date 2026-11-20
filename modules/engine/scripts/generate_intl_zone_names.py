@@ -16,10 +16,12 @@ marker for a name that must not be used, counts as missing. Rerun it when CLDR i
 """
 import argparse
 import calendar
+import datetime
 import hashlib
 import json
 import sys
 import zlib
+import zoneinfo
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -82,7 +84,7 @@ def generate(core, bcp47, dates, localenames, zoneTab):
         cids.append(spellings[0])
         for spelling in spellings:
             cidOf.setdefault(spelling.lower(), index)
-    tzZones, tzTransitions, tzAliases, tzNames, _ = timezone_tables.tables()
+    tzZones, _, tzAliases, tzNames, _ = timezone_tables.tables()
     nameZones = bytearray()
     for name in tzNames:
         cid = cidOf.get(name.lower(), 0xFFFF)
@@ -161,14 +163,19 @@ def generate(core, bcp47, dates, localenames, zoneTab):
     for alias, target in tzAliases:
         zoneIds.setdefault(alias.lower(), target)
 
+    # The checked-in tables hold names only, so offsets come from the time zone database of the
+    # host (Python's zoneinfo). Run this with the IANA release the tables name.
+    opened = {}
+
     def offsetAt(cid, sec):
-        rows = tzTransitions[zoneIds.get(cids[cid].lower(), 0)]
-        offset = rows[0][1]
-        for start, value in rows:
-            if start > sec:
-                break
-            offset = value
-        return offset
+        name = tzZones[zoneIds.get(cids[cid].lower(), 0)]
+        if name not in opened:
+            try:
+                opened[name] = zoneinfo.ZoneInfo(name)
+            except zoneinfo.ZoneInfoNotFoundError:
+                opened[name] = datetime.timezone.utc
+        moment = datetime.datetime.fromtimestamp(sec, datetime.timezone.utc).astimezone(opened[name])
+        return int(moment.utcoffset().total_seconds())
 
     def keepsGolden(cid):
         for usage in usages.get(cid, []):

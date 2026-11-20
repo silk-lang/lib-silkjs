@@ -2,7 +2,8 @@
 as a QuickJS `temporal/tzdata_generated.c`.
 
 The C oracles compile QuickJS's pinned timezone.c against this file, so the C and native kernels
-run on the same IANA data (scripts/generate_timezones.py writes the Silk side).
+know the same zone names, aliases and regions (scripts/generate_timezones.py writes the Silk
+side). The tables hold no rules: the engine reads those from `silk.time`.
 """
 import re
 import struct
@@ -20,10 +21,6 @@ def tables(root=ROOT):
     def literal(function, name):
         return decode(re.search(r'pub fn ' + function + r'\(.*?let ' + name + r' = b"(.*?)"', source, re.S).group(1))
 
-    blob = decode(re.search(r'fn transitions\(\).*?return b"(.*?)"', source, re.S).group(1))
-    size = int(re.search(r'Transition starts \(i(\d+)', source)[1]) // 8
-    sentinel = -(1 << (8 * size - 1))
-
     def strings(function):
         offsets, data = literal(function, 'offsets'), literal(function, 'data')
         bounds = [struct.unpack_from('<H', offsets, at)[0] for at in range(0, len(offsets), 2)]
@@ -33,19 +30,10 @@ def tables(root=ROOT):
         data = literal(function, 'data')
         return [struct.unpack_from('<H', data, at)[0] for at in range(0, len(data), 2)]
 
-    total = int(re.search(r'const TRANSITION_COUNT: usize = (\d+)', source)[1])
     zones = strings('tzZoneName')
-    counts, bases = ints('tzTransitionCount'), ints('transitionBase')
-    transitions = []
-    for count, base in zip(counts, bases):
-        rows = []
-        for index in range(base, base + count):
-            start = int.from_bytes(blob[index * size:(index + 1) * size], 'little', signed=True)
-            if start == sentinel:
-                start = -(1 << 63)
-            slot = struct.unpack_from('<H', blob, total * size + index * 2)[0]
-            rows.append((start, struct.unpack_from('<l', blob, total * (size + 2) + slot * 4)[0]))
-        transitions.append(rows)
+    # The checked-in tables hold names only. The C tables still need a transition list for each
+    # zone, so each gets the one sentinel row, with offset zero.
+    transitions = [[(-(1 << 63), 0)] for _ in zones]
     aliases = list(zip(strings('tzAliasName'), ints('tzAliasCanonicalId')))
     regions = list(zip(strings('tzRegionName'), strings('tzRegionZones')))
     return zones, transitions, aliases, strings('tzName'), regions
