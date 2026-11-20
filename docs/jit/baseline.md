@@ -6,6 +6,13 @@ compiles every bytecode instruction to a fixed template, on the interpreter's ow
 better base than the SSA compiler's separate frame world? Both gates of that step are measured
 below: Richards first, then all eight benchmarks.
 
+Both gates count instructions. On the clock the tier is worth 1.4x to 1.8x on numeric code,
+loses on call-heavy code and is 1.23x slower than the interpreter on the HTTP order service
+(On the clock, below). It stays opt-in: its job is the frame and the generic operations under
+the optimizing tier. The instruction tables of the two gates are from the inline-template
+build (8fa76e9b); the shared stubs that came after trade some of those instructions for a
+third of the code.
+
 Everything here was measured on the JIT shell (`modules/jit/shell`) in release mode unless it
 says otherwise. Code: `modules/jit/src/baseline.silk` (the compiler), `baseline_env.silk` (what
 the code reaches at run time), `modules/engine/src/js_baseline.silk` (the engine's side) and
@@ -100,6 +107,118 @@ work is in the runtime (allocation, collection, natives, the regular expression 
 this tier calls exactly as the interpreter does. There a template can only remove dispatch and
 operand traffic, and each call that still goes through the engine (a native, a construction, a
 callee that is not hot yet) and each step (about 450 instructions) gives some of that back.
+
+## On the clock
+
+Both gates above count instructions, and both were met. Time was measured afterwards, and it
+says something else: **fewer instructions did not mean less time.** From here on the tier is
+judged by CPU time, interleaved with the interpreter on one core
+(`jit-scorecard-results/2026-11-20-http-baseline/paired_modes.py` for the order service,
+`jit-scorecard-results/2026-11-20-baseline-time/four_engines.py` for the benchmarks).
+
+### The HTTP order service
+
+CPU per verified order, interpreter against baseline code, paired medians:
+
+| Build | Code | Touched per order | Instructions per order | Baseline against interpreter |
+| --- | ---: | ---: | ---: | ---: |
+| Inline templates (8fa76e9b) | 2.93 MB | 600 KB | 688K against 789K | 1.69x slower |
+| Shared stubs | 1.47 MB | 424 KB | | 1.37x slower |
+| Stubs, cell base, known calls in the call stub | 0.95 MB | 238 KB | 732K against 791K | 1.35x slower |
+| The same with the slot index from the key (below) | 0.95 MB | 238 KB | | 1.23x slower |
+
+The first row was a code size problem. Every function sat on pages of its own, an order ran
+81,000 distinct instructions about once each, and the simulated second-level cache
+(`--LL=2097152,16,64`) missed 1,078 instruction lines per order where the interpreter misses 4.
+The stubs and the cell base (Design, below) fixed that: the same simulation now gives 112, and
+fewer first-level instruction misses than the interpreter has (21,281 against 25,561).
+
+The time did not follow all the way. What is left, from a program-counter sampler over
+30,000 orders (µs per order):
+
+| Where | Interpreter | Baseline |
+| --- | ---: | ---: |
+| Interpreter loop and the VM's call and property code | 142 | 15 |
+| Baseline code | | 122 |
+| of that, shared stubs | | 74 |
+| of that, the first instruction of a function | | 17 |
+| Helpers and services baseline code calls | | 42 |
+| Kernel and libc (the same three system calls) | 32 | 49 |
+| Everything else (natives, JSON, collection, runtime) | 110 | 150 |
+| Whole process | 284 | 377 |
+
+Three things are in that table.
+
+1. **Baseline code and its helpers take 164 µs for the work the interpreter does in 127.** The
+   stubs run about 110,000 instructions per order at 0.67 ns each, where the interpreter loop
+   averages 0.43 (275,000 instructions in 117 µs). Their samples sit after the loads both tiers make: the site cache line of
+   `get_field2`, the count of the value just read, the callee's bytecode object. The
+   interpreter makes the same loads but has several times more instructions to run while it
+   waits, so removing those instructions removes little time.
+2. **Entering a function costs about 60 ns before its first instruction retires.** Each
+   function starts on its own page, reached by an indirect call. With all code on one 2 MB
+   page (an experiment on the dev host: `MADV_HUGEPAGE`, no per-page protection) those samples
+   halve and baseline code as a whole takes 13% fewer samples. Packed pages are worth doing;
+   a huge page needs write protection for the whole region at once.
+3. **Everything else runs slower beside baseline code**, the kernel included (17 µs more for
+   the same system calls). The cache simulation does not show it, so it is state the
+   simulation does not model: translation and branch prediction entries for 38,000 distinct
+   instructions per order where the interpreter needs a few thousand.
+
+Compiling less does not fix it. With the threshold raised so that only what an order calls 20
+times or more has code (22 functions), baseline code is still 1.07x slower: 17 µs of code and
+12 of helpers replace 8 µs of the interpreter loop, because 66 calls per order now cross
+between baseline code and the interpreter through the engine, and 13 instructions step.
+Thresholds of 10,000, 30,000 and 100,000 entries gave 1.27x, 1.28x and 1.14x slower.
+
+### The eight benchmarks, four engines
+
+CPU time of a fixed run (the fixed-count runner at 20 times `v8bench.FIXED`), all four engines
+interleaved on one core, Node 22.23.5 for V8:
+
+| Benchmark | Interpreter | Baseline | V8 | V8 jitless | Interpreter / baseline | Interpreter / V8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Richards | 785 ms | 564 ms | 79 ms | 869 ms | 1.39x | 9.9x |
+| DeltaBlue | 1242 ms | 1557 ms | 143 ms | 1560 ms | 0.80x | 8.7x |
+| Crypto | 3962 ms | 2194 ms | 328 ms | 5548 ms | 1.81x | 12.1x |
+| RayTrace | 2134 ms | 2235 ms | 297 ms | 2482 ms | 0.95x | 7.2x |
+| EarleyBoyer | 1806 ms | 1897 ms | 346 ms | 1674 ms | 0.95x | 5.2x |
+| RegExp | 1248 ms | 1201 ms | 573 ms | 1294 ms | 1.04x | 2.2x |
+| Splay | 303 ms | 390 ms | 307 ms | 550 ms | 0.78x | 1.0x |
+| NavierStokes | 1321 ms | 938 ms | 204 ms | 2410 ms | 1.41x | 6.5x |
+
+The geometric mean of interpreter over baseline is 1.10x. Single benchmarks move by up to
+10% between builds of equal instruction counts (DeltaBlue and Crypto did between the two
+runs of this table), so read a row as that coarse.
+
+Inline templates were faster on three of them. The same run for the two builds of the tier,
+baseline code against baseline code, five rounds: the stub build takes 1.25x the time on
+DeltaBlue, 1.27x on NavierStokes and 1.11x on Crypto, the same on Richards and EarleyBoyer,
+and 12% less on RayTrace and Splay; 1.05x over the eight. A stub call adds about eight
+instructions to a field or element read of twenty, and in a hot loop instructions are time.
+
+One change came out of the Richards profile and stays: a keyed field read took the slot index
+from the difference of shape version and key, so the slot's load waited for the object, its
+shape and the shape's version. It now takes the index from the key's low word, the load waits
+for the object alone, and the shape feeds only the branch (3% to 4% on Richards and
+DeltaBlue on a dev build, and the order service went from 1.35x to 1.23x slower). A count without a branch (the count goes to the value or to a dead word) was
+tried in the stubs and was 13% slower on Richards: the branch predicts well there, and the
+conditional move holds the store's address back.
+
+### What it means
+
+- A tier that only removes dispatch and operand decoding from this interpreter is worth 1.4x
+  to 1.8x on numeric and tight code, nothing on call-heavy code, and less than nothing on
+  code a server runs once per request. The interpreter's site caches, fused instructions and
+  inline frames already took what a baseline tier usually takes.
+- Dense code is the right form for the tier all the same. It is what the order service needs,
+  it compiles faster, and the stubs are the generic operations an optimizing tier calls
+  instead of leaving its code. Hot loops are the optimizer's to win, not this tier's.
+- Baseline code stays opt-in (`--jit-baseline`). It should run where a function is on its way
+  to the optimizer, or is the frame an optimized function falls back to, not for everything
+  that gets warm.
+- The gap to V8 with its JIT is 5x to 12x on six of the eight. That is type-specialized code
+  in registers with inlined calls, which is step 3 of the plan.
 
 ## How to run it
 
@@ -204,7 +323,8 @@ never leaves baseline code pays for none of it.
 ### Registers and calls
 
 r12 is the `BaselineEnv` and r13 the runtime for the whole run of baseline code. rbp is the
-frame. Everything else is scratch; rbx, r14 and r15 are never touched.
+frame and rbx its cell base (below). r14 and r15 belong to the shared stubs; everything else
+is scratch.
 
 A call passes rdi the function (the closure object's cell), r11 its bytecode object, rsi argv,
 rdx argc and rcx:r8 the receiver. Arguments stay in the caller's operand cells and are borrowed:
@@ -223,7 +343,7 @@ generator or under an instruction observer (debugger, coverage, profiler).
 
 A known local function (`js_compiler_known`) has no closure object. Its frame names its
 bytecode as the function, and the caller passes the scope it runs in where a closure's caller
-passes the object (rdi). A call site reaches one out of line (`S_KNOWN`). The interpreter runs
+passes the object (rdi). The call stub finds that scope on the caller's chain. The interpreter runs
 a small one without a frame (`js_vm_leaf`) and counts no entry for it, so a function that only
 baseline code calls would never be hot: a call site that finds no code counts the entry itself
 (`js_baseline.countLeaf`) before it hands the call to the interpreter.
@@ -237,6 +357,45 @@ does. The request has a path of its own in the service, apart from the one that 
 finishes and calls of bytecode: that one is 113 instructions long before it reaches a native,
 and a native is the most frequent thing baseline code asks the engine for (135 of 163 requests
 per HTTP order).
+
+### Shared stubs
+
+The heavy templates are not copied into every function. They are assembled once per JIT
+runtime into one block of code (`baseline.stubs`, 31 stubs in 5.6 KB), and a function's code
+calls them with a rel32 call. A site is three instructions, about 17 bytes:
+
+```
+lea  r14, [the operand cell at the site's depth]
+mov  eax, the instruction's bytecode offset        ; or the value the stub's comment names
+call stub
+```
+
+The stub finds its operands under r14 (`[r14-16]` is the top of the operand stack) and the
+instruction's inline operands and cache key through the frame's code address plus eax. It
+keeps rbp, rbx, r12 and r13 and nothing else. It returns with the zero flag clear when it did
+the instruction and set when it declined with nothing changed, so a site that can decline
+follows the call with one `je` to the path the template had before (a getter, a helper, a
+step). A stub that had to ask a helper returns the helper's answer the same way.
+
+Stubs: field reads (`get_field2`, the top-of-stack form, the cell form the slot variants use),
+scope reads with and without the initialization check, calls and method calls (bytecode
+callees with code directly, known local functions, natives and everything else through the
+engine), the step request, truthiness and the four equalities, element reads and stores,
+field stores, getter and setter calls, the prologue's frame setup and the release of a frame's
+cells at its end.
+
+What stays inline is what is short: loads and stores of locals and arguments, constants,
+integer and double arithmetic, comparisons with a branch, the count of a value.
+
+**The cell base.** rbx points 128 bytes above the frame's first local, so the first sixteen
+cells of locals and operands are reached with a one-byte displacement where rbp needs four.
+The assembler rewrites every `[rbp + d]` in that window (`Assembler.alias`). The prologue
+stub saves the caller's rbx in the record and the function's end restores it.
+
+Together these took the order service's code from 2.93 MB to 0.95 MB (87 to 28 bytes of code
+per bytecode byte; a template from 74 to 27 bytes on average) and what one order touches from
+600 KB to 238 KB. Half of what is left is cold: step requests (169 KB), resume tables
+(136 KB), exits, the arithmetic helper calls and the finish tails.
 
 ### What the code asks the engine for
 
@@ -415,6 +574,8 @@ so every unbounded run passes a backward branch or interpreted code.
 The code holds no process-local address. Helpers are reached by index through the environment,
 the engine's service and the code table through the runtime, bytecode and caches through the
 frame. Inline caches stay in the bytecode and the runtime, where the interpreter keeps them.
+A call of a shared stub is a rel32 relocation against the stub's index (`callSymbol`), which
+the publisher resolves, as a linker would for code compiled ahead of time.
 This is what ahead-of-time compilation needs.
 
 ### What the interpreter pays
@@ -501,7 +662,7 @@ closely, so there is no single stall to remove; the code is bound by loads that 
 
 - `scripts/differential.py --configs plain,baseline,baseline-eager`: generated programs agree
   with the interpreter at thresholds 20 and 1. 1,500 of 1,500 agree on the final state, with
-  3.8M resumes through the resume table, 158M steps and 0.7M departures among them (generated
+  11.6M resumes through the resume table, 112M steps and 0.5M departures among them (generated
   programs use what the benchmarks do not: generators, `for-of`, private fields, `try`).
 - `silk test` in `modules/jit`: 94 of 94. `hotFunctionsRunBaselineCode` runs a linked list,
   field stores, a throw through two baseline frames, deep recursion, operators, keep branches,
@@ -550,6 +711,11 @@ opcode, service calls and direct calls per order.
   handle. The benchmarks step most on the `regexp` literal (RegExp), on `get_length`,
   `special_object` and element reads (EarleyBoyer), on element reads and stores outside the
   fast case (Crypto) and on `mod` (RayTrace).
+- Each function's code starts on a page of its own, and the cold half of it (step requests,
+  resume tables, exits, finish tails) sits between the templates' pages. Packed pages and a
+  cold region would cut what an order touches further (On the clock).
+- A call between baseline code and an interpreted function goes through the engine in both
+  directions, about 240 ns, so a program that is half compiled pays for the seam.
 - A call that leaves baseline code for a native, a construction or a callee without code
   goes through the engine. RayTrace and EarleyBoyer make half a million of those per run. A
   native with no frameless answer still gets a native frame there, as it does from the

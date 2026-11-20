@@ -30,15 +30,22 @@ import argparse, collections, os, re, subprocess, sys, tempfile
 
 MARKS = {0x1000: "@prologue", 0x1001: "@leave", 0x1002: "@finish", 0x1003: "@overflow", 0x1004: "@exit",
          0x1005: "@construct", 0x1006: "@table", 0x1007: "@resume"}
-SLOW = {0: "release", 1: "release-object", 2: "helper", 3: "equal", 4: "truthy", 5: "back-edge", 6: "call",
+SLOW = {0: "release", 1: "release-object", 2: "helper", 3: "equal", 4: "truthy", 5: "back-edge", 6: "called",
         8: "variable", 9: "attached", 10: "helper-argument", 11: "arithmetic", 12: "cell", 13: "truth", 14: "step",
-        15: "release-at", 16: "quick", 17: "known", 18: "length", 19: "truncate", 20: "native"}
+        15: "release-at", 16: "quick", 18: "length", 19: "truncate", 22: "getter", 23: "setter"}
+# The shared stubs (baseline.silk STUB_*), which the dump lists as one more block of code.
+STUBS = ["field2", "field-top", "field-cell", "scope", "scope-own", "scope-check", "scope-check-own", "call",
+         "call-method", "step", "truthy", "truth", "equal", "not-equal", "strict-equal", "strict-not-equal",
+         "element", "element-keep", "element-over", "scope-element", "scope-element-own", "element-cells",
+         "put-element", "put-field", "put-field-cells", "getter", "setter", "prologue", "prologue-known",
+         "leave-cells", "leave"]
 
 
 def what_name(text):
     if not text.startswith("@"): return text
     value = int(text[1:])
     if value in MARKS: return MARKS[value]
+    if value >= 0x1200: return "@stub:" + (STUBS[value - 0x1200] if value - 0x1200 < len(STUBS) else str(value - 0x1200))
     if value >= 0x1100: return "@slow:" + SLOW.get(value - 0x1100, str(value - 0x1100))
     return text
 

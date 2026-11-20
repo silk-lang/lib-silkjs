@@ -27,13 +27,14 @@ import jit_http  # noqa: E402
 
 FLAGS = {"default": [], "calls": ["--jit-calls"], "baseline": ["--jit-baseline"], "interpret": ["--no-jit"]}
 # Where an instruction is charged, by the name callgrind gives its function.
+SERVICES = ("baselineHeavy|baselineLight|baselineCallNative|baselineNative|baselineStep|baselineService|baselineQuick|baselineConcat"
+            "|baselineConstruct|baselineFinish|baselineLoop|baselineScopeEnd|silkjsEmbedBaselineService|enterBaseline|enterBaselineKnown")
 GROUPS = [
     ("machine code", r"0x0000"),
     ("interpreter loop", r"executeLoop"),
-    ("engine services", r"(baselineHeavy|baselineLight|baselineNative|baselineStep|baselineService|baselineQuick|baselineConcat|baselineConstruct"
-                        r"|baselineFinish|baselineLoop|silkjsEmbedBaselineService|enterBaseline|enterBaselineKnown)\b"),
-    ("helpers", r"baseline(GetElement|PutElement|ElementOf|Equal|TypeofIs|AtomValue|PutField|GetField|GetField2|GetFieldTop|Length|Getter"
-                r"|Truthy|Truth|Not|Unary|Arithmetic|GetVar|PutVar|InstanceOf|Release)$"),
+    ("engine services", r"(%s)\b" % SERVICES),
+    # Everything else named baseline* is a helper of baseline_env.silk.
+    ("helpers", r"(?!(%s)\b)baseline[A-Z]\w*" % SERVICES),
 ]
 
 
