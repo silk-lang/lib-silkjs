@@ -33,6 +33,7 @@ import js_vm_object_ops as objects
 import thin_list { BoxList, BOX_HEADER }
 import js_var_refs as cells
 import js_gc as gc
+import js_scopes as scopes
 import js_vm_property_ops as properties
 import js_vm_operators as operators
 import js_primitives as primitives
@@ -86,8 +87,9 @@ pub const SERVICE_STEP: u64 = 5
 /// its bytecode offset and base is the cell above the operand stack. object leaves the
 /// object there; define_field moves the value under it into the object under that;
 /// array_from leaves the array where the first of its values was; rest leaves the array of
-/// the arguments past the named ones there. 0, or 2 when the engine
-/// declines with nothing changed (a step runs the instruction then).
+/// the arguments past the named ones there; fclosure leaves the closure there, named by the
+/// set_name after it. 0; 1 when a closure's creation threw; 2 when the engine declines with
+/// nothing changed (a step runs the instruction then).
 pub const SERVICE_QUICK: u64 = 6
 /// The + of a string and a string or number: base is the left cell, which the text
 /// replaces, count the address of the right cell. Both values are consumed, the right one
@@ -107,6 +109,10 @@ pub const CONCAT_STACK: u64 = 0x200
 /// and answers js_baseline.moved to where it was (js_baseline.resume).
 pub const SERVICE_RESUME: u64 = 8
 pub const RESUME_VALUE: u64 = 0x100
+/// From the leave tail of a function with a scope of its own (Shape.scoped) whose scope
+/// left the frame for the heap (a closure captured it, js_scopes.promote): the frame's
+/// count of it is dropped. 0.
+pub const SERVICE_SCOPE: u64 = 9
 /// A service's answer that the frame is now at bytecode offset pc with sp operands on its
 /// stack: SERVICE_MOVED in the low byte, pc in bits 8 to 39, sp from bit 40.
 pub const SERVICE_MOVED: u64 = 3
@@ -138,7 +144,9 @@ pub struct BaselineFrame {
   /// The first byte of the function's bytecode.
   pub code: *const u8,
   /// The scope a known local function runs in (js_vm_activation.knownContext): its caller
-  /// passes it, as it has no closure object to hold one. Unused in a closure's frame.
+  /// passes it, as it has no closure object to hold one. In the frame of a function with a
+  /// scope of its own, that scope (beginScope): in the frame's cells, or on the heap once
+  /// a closure captured it. Unused in any other frame.
   pub scope: ?*mut HeapHeader,
   /// Keeps the record a multiple of 16 bytes, so that state is the word under the frame pointer.
   pub spare: usize,
@@ -400,11 +408,17 @@ pub struct Shape {
   pub constantsWord: u32,
   pub constantsDelta: u32,
   pub constants: u32,
-  /// Baseline code can run it: a plain function with no scope of its own and no captured
-  /// variables of its own.
+  /// Baseline code can run it: a plain function with no captured variables of its own.
   pub plain: bool,
+  /// Each activation has a scope of its own, of scopeSlots slots
+  /// (FunctionBytecode.scopeSlots); it starts in scopeCells cells of the frame
+  /// (js_scopes.frameCells), as an inline frame's does.
+  pub scoped: bool,
+  pub scopeSlots: u32,
+  pub scopeCells: u32,
   /// A known local function (js_compiler_known): it has no closure object. Its frame names
-  /// its bytecode as the function, and its caller passes the scope it runs in.
+  /// its bytecode as the function, and its caller passes the scope it runs in, or the one
+  /// its own scope is under.
   pub known: bool,
   /// Why not, as bits: 1 its kind, 2 it reads captured variables, 4 it has a scope of its
   /// own, 8 a known local function, 16 a derived constructor, 32 not finished compiling.
@@ -449,6 +463,9 @@ pub unsafe fn shape(bytecode: *mut HeapHeader) -> Shape {
       word = word + 1
     }
   }
+  let scopeSlots = u16.toU32(code.scopeSlots)
+  let mut scopeCells: u32 = 0
+  if scopeSlots != 0 { scopeCells = usize.toU32(scopes.frameCells(u32.toUsize(scopeSlots))) }
   let mut odd: u32 = 0
   if code.kind != FunctionKind.Normal { odd = odd | 1 }
   if code.varRefCount != 0 { odd = odd | 2 }
@@ -459,7 +476,36 @@ pub unsafe fn shape(bytecode: *mut HeapHeader) -> Shape {
   return Shape { arguments: u16.toU32(code.argumentCount), locals: u16.toU32(code.variableCount), stack: u16.toU32(code.stackSize), mode: u8.toU32(code.mode),
     copies: !code.borrowsArguments, codeWord: codeWord, codeDelta: codeDelta,
     constantsWord: constantsWord, constantsDelta: constantsDelta, constants: usize.toU32(code.constants.length()),
-    plain: odd == 0 || odd == 8, known: odd == 8, odd: odd }
+    plain: (odd & 0xfffffff3) == 0, scoped: scopeSlots != 0, scopeSlots: scopeSlots, scopeCells: scopeCells, known: (odd & 8) != 0, odd: odd }
+}
+
+/// Begins the scope of the activation in record, a bare or built baseline frame of a
+/// function with a scope of its own, in storage (Shape.scopeCells cells of the frame), as
+/// js_vm_activation.beginFrameScope does for an inline frame: under the scope the closure
+/// captured, or the one a known local function's caller passed, borrowed. The frame's
+/// arguments are in place. The record then holds it.
+pub unsafe fn beginScope(record: *mut BaselineFrame, storage: *mut ValueBits) -> () {
+  let mut anchor = ()
+  let running = unsafe Pointer.borrowMut<(), BaselineFrame>(&mut anchor, record)
+  let objectAnchor = ()
+  let mut parent = running.scope
+  let bytecode = match running.frame.currentFunction {
+    ValueBits.FunctionBytecode { reference } => reference
+    ValueBits.Object { reference } => {
+      let data = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, reference)
+      match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => { parent = closure.scope closure.bytecode } _ => { return () } }
+    }
+    _ => { return () }
+  }
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&objectAnchor, bytecode)
+  let slots = u16.toUsize(code.scopeSlots)
+  // The frame's own copy holds every declared parameter; the caller's cells what it passed.
+  let mut arguments = FrameSlots { data: running.frame.arguments.data, count: running.argc }
+  if Pointer.address<ValueBits>(arguments.data) != Pointer.address<ValueBits>(running.argv) { arguments.count = u16.toUsize(code.argumentCount) }
+  drop code
+  let placed = unsafe scopes.placeFrameScope(storage, slots)
+  unsafe scopes.beginScope(placed, parent, bytecode, &arguments)
+  running.scope = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(placed)
 }
 
 /// Lends the runtime the table of baseline code addresses (capacity entries, all null).

@@ -793,7 +793,7 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
 }
 /// baselineService's SERVICE_QUICK and SERVICE_CONCAT.
 @inlineNever
-unsafe effect fn baselineLight<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, record: *mut baseline.BaselineFrame,
+unsafe effect fn baselineLight<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, record: *mut baseline.BaselineFrame,
   request: u64, base: *mut ValueBits, count: usize) -> u64 ? &mut Allocator {
   let anchor = ()
   let running = unsafe Pointer.borrow<(), baseline.BaselineFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut baseline.BaselineFrame, *const baseline.BaselineFrame>(record))
@@ -804,7 +804,31 @@ unsafe effect fn baselineLight<H: HeapHooks + CoercionHooks>(hooks: &mut H, memo
   // An allocation profile attributes what is made now to the frame chain.
   if memory.profiling() { unsafe baseline.build(unsafe runtime.contextRuntime(context), record) }
   if (request & 0xff) == baseline.SERVICE_QUICK { return run unsafe baselineQuick(&mut hooks, memory, context, record, bytecode, u64.toUsize(u64.shiftRight(request, 8)), base) }
+  if (request & 0xff) == baseline.SERVICE_SCOPE {
+    let own = (unsafe Pointer.borrow<(), baseline.BaselineFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut baseline.BaselineFrame, *const baseline.BaselineFrame>(record))).scope
+    unsafe baselineScopeEnd(&mut hooks, unsafe runtime.contextRuntime(context), own)
+    return 0
+  }
   return run unsafe baselineConcat(&mut hooks, context, record, bytecode, base, count, request)
+}
+/// Drops what the frame of an activation that ends holds of own, its scope: the slots of
+/// one still in the frame, or the count of one a closure moved to the heap.
+@inlineNever
+unsafe fn baselineScopeEnd<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, own: ?*mut HeapHeader) -> () {
+  match Pointer.nonNullMut<HeapHeader>(own) {
+    Option<*mut HeapHeader>.Some { value } => {
+      if unsafe scopes.inFrame(value) { unsafe scopes.releaseFrameScope(&mut hooks, runtime, value) } else { unsafe scopes.releaseScope(&mut hooks, runtime, value) }
+    }
+    _ => ()
+  }
+}
+/// The scope the interpreter left record's activation with: a closure it made may have
+/// moved the frame's own to the heap. A frame that reads no scope from its record ignores it.
+@inlineAlways
+unsafe fn baselineKeepScope(record: *mut baseline.BaselineFrame, machine: &Machine) -> () {
+  let mut anchor = ()
+  let running = unsafe Pointer.borrowMut<(), baseline.BaselineFrame>(&mut anchor, record)
+  running.scope = machine.scope
 }
 /// baselineService's other requests.
 @inlineNever
@@ -932,13 +956,14 @@ unsafe effect fn baselineNative<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
 }
 /// SERVICE_QUICK (js_baseline): the allocating instruction at offset pc of bytecode's code,
 /// with top the cell above the frame's operand stack.
-unsafe effect fn baselineQuick<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, record: *mut baseline.BaselineFrame,
+unsafe effect fn baselineQuick<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, record: *mut baseline.BaselineFrame,
   bytecode: *mut HeapHeader, pc: usize, top: *mut ValueBits) -> u64 ? &mut Allocator {
   let anchor = ()
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let bytes = unsafe function.code.asSlice()
   drop function
-  if pc + 5 > bytes.length { return 2 }
+  // Every instruction here has an operand byte or an instruction after it.
+  if pc + 2 > bytes.length { return 2 }
   let opcode = bytes[pc]
   // The address of the instruction's operand, as the interpreter's caches key it.
   let site = Pointer.address<u8>(Pointer.fromRef<u8>(&bytes[pc])) + 1
@@ -952,12 +977,50 @@ unsafe effect fn baselineQuick<H: HeapHooks + CoercionHooks>(hooks: &mut H, memo
     return 2
   }
   if opcode == op.OP_define_field {
+    if pc + 5 > bytes.length { return 2 }
     let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
     let object = unsafe Pointer.read<ValueBits>(unsafe operandCell(top, 2))
     let value = unsafe Pointer.read<ValueBits>(unsafe operandCell(top, 1))
     if run unsafe objects.defineFieldAt(&mut hooks, rt, object, atom, value, site) { return 0 }
     return 2
   }
+  if opcode == op.OP_fclosure8 || opcode == op.OP_fclosure {
+    // The closure of a constant, in the scope the frame runs in: its own (the record's, as
+    // a known local function's is) or the one its closure captured. A set_name after it
+    // names the closure, and the code goes on after both.
+    let mut index = u8.toUsize(bytes[pc + 1])
+    let mut size: usize = 2
+    if opcode == op.OP_fclosure {
+      if pc + 5 > bytes.length { return 2 }
+      index = u32.toUsize(u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24))
+      size = 5
+    }
+    let mut name: u32 = 0
+    if pc + size + 5 <= bytes.length && bytes[pc + size] == op.OP_set_name {
+      name = u8.toU32(bytes[pc + size + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + size + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + size + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + size + 4]), 24)
+    }
+    let codeAnchor = ()
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, bytecode)
+    if index >= code.constants.length() { return 2 }
+    let constant = code.constants.asSlice()[index]
+    let own = code.scopeSlots != 0
+    drop code
+    let mut frameAnchor = ()
+    let running = unsafe Pointer.borrowMut<(), baseline.BaselineFrame>(&mut frameAnchor, record)
+    let function = running.frame.currentFunction
+    let recorded = own || match function { ValueBits.FunctionBytecode { reference: _ } => true _ => false }
+    let mut scope = running.scope
+    if !recorded { scope = (unsafe activation.closureCaptures(function, Pointer.fromRef<?*mut HeapHeader>(&scope))).scope }
+    drop running
+    let answer = run unsafe factories.closureAt(&mut hooks, memory, rt, context, function, &mut scope, constant, name, top)
+    if recorded {
+      let mut keepAnchor = ()
+      let kept = unsafe Pointer.borrowMut<(), baseline.BaselineFrame>(&mut keepAnchor, record)
+      kept.scope = scope
+    }
+    return answer
+  }
+  if pc + 3 > bytes.length { return 2 }
   if opcode == op.OP_rest {
     // The arguments past the named ones, as the caller passed them (the record's, which a
     // bare frame has too).
@@ -1140,22 +1203,28 @@ unsafe effect fn baselineFinish<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
   let pc = running.frame.currentPc if pc == NO_PC { invariant() }
   let receiver = running.frame.thisValue
   let newTarget = running.frame.newTarget
+  let own = running.scope
   drop running
   let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
   let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
   let description = unsafe baselineDescribe(record, empty, emptyRefs)
   let rt = unsafe runtime.contextRuntime(description.realm)
   let mut machine = unsafe activation.machine(&description, rt, description.realm, framePointer, &argv, receiver, newTarget, empty, pc, sp)
+  // A function with a scope of its own runs in the one its prologue began (js_baseline.beginScope).
+  let scoped = unsafe activation.scopeSlotsOf(&description) != 0
+  if scoped { machine.scope = own }
   if throwing {
     // A handler of the frame's own takes the exception: the code goes on there.
     let noted = run Effect.result(unsafe debugger.boundary(&mut hooks, memory, &machine, machine.pc(), true))
     let stands = match move noted { Result<(), JsException>.Success { .. } => true Result<(), JsException>.Failure { .. } => false }
-    if stands && run unsafe unwind(&mut hooks, memory, &mut machine) { return baseline.moved(machine.pc(), machine.sp()) }
+    if stands && run unsafe unwind(&mut hooks, memory, &mut machine) { unsafe baselineKeepScope(record, &machine) return baseline.moved(machine.pc(), machine.sp()) }
     unsafe activation.release(&mut hooks, &description, &machine)
+    if scoped { unsafe baselineScopeEnd(&mut hooks, rt, machine.scope) }
     return 1
   }
   let result = run Effect.result(unsafe dispatch(&mut hooks, memory, &mut machine, false))
   unsafe activation.release(&mut hooks, &description, &machine)
+  if scoped { unsafe baselineScopeEnd(&mut hooks, rt, machine.scope) }
   match move result {
     Result<ValueBits, JsException>.Success { value } => {
       let mut resultAnchor = ()
@@ -1185,12 +1254,15 @@ unsafe effect fn baselineStep<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let pc = running.frame.currentPc if pc == NO_PC { invariant() }
   let receiver = running.frame.thisValue
   let newTarget = running.frame.newTarget
+  let own = running.scope
   drop running
   let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
   let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
   let description = unsafe baselineDescribe(record, empty, emptyRefs)
   let rt = unsafe runtime.contextRuntime(description.realm)
   let mut machine = unsafe activation.machine(&description, rt, description.realm, framePointer, &argv, receiver, newTarget, empty, pc, sp)
+  let scoped = unsafe activation.scopeSlotsOf(&description) != 0
+  if scoped { machine.scope = own }
   let mut handoff = false
   let mut result: Result<ValueBits, JsException> = Result<ValueBits, JsException>.Success { value: ValueBits.Undefined }
   let executed = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(
@@ -1201,6 +1273,7 @@ unsafe effect fn baselineStep<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
         // The frame itself at the next instruction: an inline callee's frame above it is a
         // run the plain loop handed to the observed one.
         if Pointer.address<Machine>(unsafe activation.innermost(&mut machine)) == Pointer.address<Machine>(Pointer.fromMutRef<Machine>(&mut machine)) {
+          unsafe baselineKeepScope(record, &machine)
           if machine.pc() == next && machine.sp() == after { return 0 }
           // An instruction the interpreter ran together with those after it, or a branch.
           return baseline.moved(machine.pc(), machine.sp())
@@ -1214,11 +1287,12 @@ unsafe effect fn baselineStep<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
         run unsafe exceptionBoundary(&mut hooks, memory, &mut machine)
       } else { drop error }
       // A handler of the frame's own: the code goes on there.
-      if run unsafe unwindFrames(&mut hooks, memory, &mut machine) { return baseline.moved(machine.pc(), machine.sp()) }
+      if run unsafe unwindFrames(&mut hooks, memory, &mut machine) { unsafe baselineKeepScope(record, &machine) return baseline.moved(machine.pc(), machine.sp()) }
       result = Result<ValueBits, JsException>.Failure { error: JsException {} }
     }
   }
   unsafe activation.release(&mut hooks, &description, &machine)
+  if scoped { unsafe baselineScopeEnd(&mut hooks, rt, machine.scope) }
   match move result {
     Result<ValueBits, JsException>.Success { value } => {
       let mut resultAnchor = ()

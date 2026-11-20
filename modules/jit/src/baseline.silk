@@ -193,11 +193,13 @@ fn untemplated(bytes: &[u8], pc: usize, opcode: u8, size: usize) -> Step {
     || opcode == op.OP_initial_yield || opcode == op.OP_yield || opcode == op.OP_yield_star || opcode == op.OP_async_yield_star || opcode == op.OP_await
     || opcode == op.OP_using_dispose || opcode == op.OP_using_dispose_async || opcode == op.OP_using_check
     || opcode == op.OP_for_await_of_start || opcode == op.OP_for_await_of_next { return departs(size) }
-  let mut total = size
   // A closure's creation takes the set_name after it (js_vm_factories.pushClosure).
-  if (opcode == op.OP_fclosure || opcode == op.OP_fclosure8) && pc + size + 5 <= bytes.length && bytes[pc + size] == op.OP_set_name { total = size + 5 }
+  if opcode == op.OP_fclosure || opcode == op.OP_fclosure8 {
+    if pc + size + 5 <= bytes.length && bytes[pc + size] == op.OP_set_name { return plain(size + 5, 0, 1) }
+    return plain(size, 0, 1)
+  }
   let pops = u8.toI32(info.pops)
-  return steps(total, pops, u8.toI32(info.pushes) - pops)
+  return steps(size, pops, u8.toI32(info.pushes) - pops)
 }
 fn departs(size: usize) -> Step { return Step { size: size, kind: DEPART, target: 0, needs: 0, fall: 0, taken: 0 } }
 fn branches(size: usize, kind: u8, target: usize, needs: i32, fall: i32, taken: i32) -> Step {
@@ -376,6 +378,11 @@ struct Plan {
   count: bool,
   /// A known local function (Shape.known): no closure object, the scope from its caller.
   known: bool,
+  /// Each activation has a scope of its own (Shape.scoped), of scopeSlots slots, which the
+  /// record holds. It starts in the cells at scopeAt, under the frame's other cells.
+  scoped: bool,
+  scopeSlots: u32,
+  scopeAt: i32,
   /// The code has a lazy arguments slot (engine.LAZY_ARGUMENTS).
   lazy: bool
 }
@@ -385,10 +392,11 @@ impl Plan {
   fn of(settings: &Settings, shape: &Shape) -> Plan {
     let record = (settings.frame.frameBytes + 15) / 16 * 16
     let cells = (shape.arguments + shape.locals + shape.stack) * 16
+    let scope = shape.scopeCells * 16
     return Plan { layout: settings.layout, f: settings.frame, fields: settings.fields,
-      record: 0 - signed(record), cells: 0 - signed(record + cells), below: signed(record + cells),
+      record: 0 - signed(record), cells: 0 - signed(record + cells), below: signed(record + cells + scope),
       arguments: shape.arguments, locals: shape.locals, stack: shape.stack, codeDelta: signed(shape.codeDelta),
-      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, known: shape.known, lazy: false }
+      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - signed(record + cells + scope), lazy: false }
   }
   /// A field of the record, and of its StackFrame.
   fn rec(self: &Self, offset: u32) -> Mem { return Mem.at(Reg.Rbp, self.record + signed(offset)) }
@@ -691,11 +699,12 @@ impl Emitter {
     run self.a.load(Width.W64, reg, self.p.sf(f.currentFunction + 8))
     if !self.p.known { run self.a.load(Width.W64, reg, Mem.at(reg, signed(f.closureBytecode))) }
   }
-  /// The scope the running function's code reads (it has none of its own): the one its
-  /// closure captured, or the one a known local function's caller passed.
+  /// The scope the running function's code reads: its own (the record's, which the prologue
+  /// began), the one a known local function's caller passed (the record's too), or the one
+  /// its closure captured.
   effect fn scopeInto(self: &mut Self, reg: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
     let f = self.p.f
-    if self.p.known { run self.a.load(Width.W64, reg, self.p.rec(f.scope)) return () }
+    if self.p.known || self.p.scoped { run self.a.load(Width.W64, reg, self.p.rec(f.scope)) return () }
     run self.a.load(Width.W64, reg, self.p.sf(f.currentFunction + 8))
     run self.a.load(Width.W64, reg, Mem.at(reg, signed(f.closureScope)))
   }
@@ -772,6 +781,13 @@ impl Emitter {
       run self.a.storeImm(Width.W64, word(p.localAt(local)), p.undefined())
       local = local + 1
     }
+    if p.scoped {
+      // The activation's scope, in the frame's cells, once the arguments it copies are in
+      // place (js_baseline.beginScope).
+      run self.a.lea(Width.W64, Reg.Rsi, p.rec(0))
+      run self.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, p.scopeAt))
+      run self.helper(env.SCOPE)
+    }
   }
 
   /// The shared tails: the construct entry, `leave` (return rax:rdx) and `finish` (the
@@ -843,6 +859,32 @@ impl Emitter {
     }
     let mut local: u32 = 0
     while local < p.locals { run self.releaseCell(p.localAt(local)) local = local + 1 }
+    if p.scoped {
+      // The scope, after the frame's other cells as the interpreter drops it: its slots
+      // while it is in the frame, or the frame's count of the heap scope a closure moved
+      // it to (SERVICE_SCOPE; the result waits in the record). A known local function's
+      // never moves.
+      let ended = run self.a.label()
+      if !p.known {
+        let inFrame = run self.a.label()
+        run self.a.lea(Width.W64, Reg.Rcx, Mem.at(Reg.Rbp, p.scopeAt))
+        run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rcx, p.rec(f.scope))
+        run self.a.jcc(Cond.Equal, inFrame)
+        run self.a.store(Width.W64, p.rec(f.result), Reg.Rax)
+        run self.a.store(Width.W64, p.rec(f.result + 8), Reg.Rdx)
+        run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_SCOPE))
+        run self.a.movImm32(Reg.R8, 0)
+        run self.a.movImm32(Reg.R9, 0)
+        run self.engineCall()
+        run self.a.load(Width.W64, Reg.Rax, p.rec(f.result))
+        run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
+        run self.a.jmp(ended)
+        self.a.bind(inFrame)
+      }
+      let mut slot: u32 = 0
+      while slot < p.scopeSlots { run self.releaseCell(p.scopeAt + signed(f.scopeSlots + slot * 16)) slot = slot + 1 }
+      self.a.bind(ended)
+    }
     // A frame the engine built is published: unlink it.
     let built = run self.a.label()
     let epilogue = run self.a.label()
@@ -2110,6 +2152,21 @@ impl Emitter {
       run self.a.jcc(Cond.NotEqual, other)
       return true
     }
+    if opcode == op.OP_fclosure8 || opcode == op.OP_fclosure {
+      // The closure of a constant through the engine, without the interpreter; the frame's
+      // own scope moves to the heap when it is captured (the record then names it there).
+      let other = run self.bail(pc, depth, step)
+      let threw = run self.exit(pc, depth, true)
+      let done = run self.a.label()
+      run self.quick(usize.toU32(pc), next)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, done)
+      run self.a.cmp8Imm(Reg.Rax, 1)
+      run self.a.jcc(Cond.Equal, threw)
+      run self.a.jmp(other)
+      self.a.bind(done)
+      return true
+    }
     if opcode == op.OP_define_field {
       // A literal born with its final shape takes the value into the slot its site cached;
       // anything else is the engine's.
@@ -3077,7 +3134,9 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
     }
     scan = scan + 1
   }
-  if !resumable { returnPc = u32.MAX }
+  // A function with a scope of its own is entered by calls only: an entered activation's
+  // scope may live in the interpreter's frame, where the code's frame cannot hold it.
+  if !resumable || shape.scoped { returnPc = u32.MAX }
   let mut plan = Plan.of(settings, shape)
   plan.lazy = lazy
   let mut emitter = Emitter { a: move a, p: plan, exits: List<Exit>.make(), slows: List<Slow>.make(), labels: move labels, codes: move codes, finish: finish, stepEnded: stepEnded, leave: leave, overflow: overflow, entered: entered, moved: moved, table: table, returnPc: returnPc, returnsValue: returnsValue, map: List<u32>.make() }
