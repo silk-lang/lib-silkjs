@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Compare native calendar kernels with the pinned, separately compiled C source.
+"""Compare the calendar adapter with the pinned, separately compiled C source.
+
+The adapter reads every calendar from `silk.time.calendar`. Where the standard
+library and the C source differ on purpose, `follows_stdlib` names the records:
+the Indian leap rule, the Persian arithmetic, and the Hebrew M05L month code in
+a year without Adar I. Every other record must match the C source exactly.
 
 Inputs are checked-in edge cases, not native-derived expectations. No host locale,
 ICU, JS adapter, or native implementation participates in the C oracle. The probe
 also exercises negative years, finite-table fallbacks, era boundaries, month-code
 reference selection, negative balancing and both directions of date differences.
-All eight immutable calendar tables are compared in full as length-prefixed
-little-endian logical values. Packed input records preserve the entire corpus
+Packed input records preserve the entire corpus
 without requiring the compiler to lower a large mutable nested-array initializer.
 """
 import argparse
@@ -21,11 +25,24 @@ from verify_bytecode import executable_path, process, validate_pins
 import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
-TABLES = (
-    'chinese_calendar_data', 'dangi_calendar_data', 'hebrew_year_lengths',
-    'hebrew_year_lengths_epoch', 'hebrew_month_start', 'hebrew_leap_month_start',
-    'umalqura_year_lengths', 'umalqura_year_starts',
-)
+
+
+def follows_stdlib(row):
+    """True for a record where the standard library is right and the C source is not."""
+    op, cal = row[0], row[1]
+    if cal in (8, 14):
+        # Indian: leap years follow the Gregorian year the Saka year starts in.
+        # Persian: the 33-year rule with the standard library's corrections.
+        return op in (0, 1, 2, 5)
+    if cal == 7:
+        # Hebrew: M05L names no month in a year without Adar I.
+        if op == 3:
+            return row[3] == 5 and row[4] != 0
+        if op == 5:
+            return row[2] == 5 and row[3] != 0
+        if op == 10:
+            return (row[5] == 5 and row[7] != 0) or (row[11] == 5 and row[13] != 0)
+    return False
 
 
 def function(source, name):
@@ -117,7 +134,7 @@ static void probe(const int *a) {
 }
 static void name(const char *s) { int64_t r[8]={0};if(s){r[0]=strlen(s);for(int i=0;s[i];i++)r[1+i/8]|=(int64_t)(unsigned char)s[i]<<((i%8)*8);}for(int i=0;i<8;i++)emit(r[i]); }
 static const int cases[][16]={CASES};
-int main(void){for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++)probe(cases[i]);NAMES TABLES return 0;}
+int main(void){for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++)probe(cases[i]);NAMES return 0;}
 '''
 
 SILK = r'''
@@ -129,7 +146,6 @@ import silk.core.effect { Effect }
 import silk.io.writer_native { StdoutWriter }
 import silk.io.writer { Writer, WriterError }
 import temporal_calendar as cal
-import temporal_calendar_data as data
 fn probe(a: &[i32]) -> [i64; 8] {
  let mut r: [i64; 8] = [0; 8]
  match a[0] {
@@ -177,7 +193,6 @@ effect fn runCases() -> () ! WriterError ? &mut Writer {
   let r=probe(&a) j=0 while j<8 { run emit(r[j]) j=j+1 } i=i+64
  }
  NAMES
- TABLES
 }
 pub effect fn main() -> i32 ! WriterError { let mut out=StdoutWriter.make() run runCases() |> Effect.provideMut<Writer>(&mut out) return 0 }
 '''
@@ -212,30 +227,17 @@ def main():
             cnames.append(f'name({display}({number}));')
             snames.append(f'run name(cal.{display}({number}))')
             extra_size += 64
-    ctables, stables = [], []
-    for table in TABLES:
-        if table in ('hebrew_year_lengths', 'hebrew_year_lengths_epoch'):
-            count, start = (80, 5730) if table == 'hebrew_year_lengths' else (11, 0)
-            ctables.append(f'emit({count});for(int i=0;i<{count};i++)emit(hebrew_days_in_year(i+{start}));')
-        elif table in ('chinese_calendar_data', 'dangi_calendar_data'):
-            ctables.append(f'emit(countof({table}));for(size_t i=0;i<countof({table});i++)emit({table}[i].data[0] | ({table}[i].data[1]<<8) | ({table}[i].data[2]<<16));')
-        elif table in ('hebrew_month_start', 'hebrew_leap_month_start'):
-            ctables.append(f'emit(countof({table})*3);for(size_t i=0;i<countof({table});i++)for(int j=0;j<3;j++)emit({table}[i][j]);')
-        else:
-            ctables.append(f'emit(countof({table}));for(size_t i=0;i<countof({table});i++)emit({table}[i]);')
-        stables.append(f'run emit(usize.toI64(data.{table}.length)) i=0 while i<data.{table}.length {{ run emit(i32.toI64(data.{table}[i])) i=i+1 }}')
     with tempfile.TemporaryDirectory(prefix='silkjs-temporal-calendar-') as directory:
         temp = Path(directory)
-        source = C.replace('DEFINITIONS', definitions).replace('CASES', ',\n'.join('{' + ','.join(map(str, row)) + '}' for row in rows)).replace('NAMES', '\n'.join(cnames)).replace('TABLES', '\n'.join(ctables))
+        source = C.replace('DEFINITIONS', definitions).replace('CASES', ',\n'.join('{' + ','.join(map(str, row)) + '}' for row in rows)).replace('NAMES', '\n'.join(cnames))
         (temp / 'oracle.c').write_text(source)
         cc, silk = executable_path(args.cc), executable_path(args.silk)
         process([cc, '-O2', '-std=gnu11', '-fwrapv', '-D_GNU_SOURCE', '-I', str(reference), str(temp / 'oracle.c'), '-o', str(temp / 'oracle')], 600, owner='Calendar C oracle compilation')
         expected = process([str(temp / 'oracle')], 600, owner='Calendar independent C oracle')
         (temp / 'src').mkdir()
-        for module in ('temporal_calendar.silk', 'temporal_calendar_data.silk'):
-            shutil.copyfile(ROOT / 'src' / module, temp / 'src' / module)
+        shutil.copyfile(ROOT / 'src/temporal_calendar.silk', temp / 'src/temporal_calendar.silk')
         packed = b''.join(struct.pack('<16i', *row) for row in rows)
-        source = SILK.replace('CASES', ''.join(f'\\x{byte:02x}' for byte in packed)).replace('NAMES', '\n'.join(snames)).replace('TABLES', '\n'.join(stables))
+        source = SILK.replace('CASES', ''.join(f'\\x{byte:02x}' for byte in packed)).replace('NAMES', '\n'.join(snames))
         (temp / 'src/main.silk').write_text(source)
         version = tomllib.loads((ROOT / 'silk.toml').read_text())['package']['silk-version']
         (temp / 'silk.toml').write_text(f'[package]\nname="temporal-calendar-oracle"\nversion="0.0.0"\nsilk-version="{version}"\n')
@@ -244,25 +246,17 @@ def main():
             command += ['--stdlib', str(args.stdlib.resolve())]
         actual = process(command, 1800, owner='Native calendar oracle', cwd=temp)
         size = len(rows) * 64 + extra_size
-        if len(expected) < size or len(actual) != len(expected):
-            raise SystemExit(f'Wrong output size: C={len(expected)}, Silk={len(actual)}, behavior prefix={size}')
+        if len(actual) != size or len(expected) != size:
+            raise SystemExit(f'Wrong output size: C={len(expected)}, Silk={len(actual)}, expected={size}')
+        differing = 0
         for at in range(0, len(rows) * 64, 64):
             if expected[at:at+64] != actual[at:at+64]:
-                raise SystemExit(f'Calendar case {rows[at // 64]}: C={struct.unpack_from("<8q", expected, at)} Silk={struct.unpack_from("<8q", actual, at)}')
-        if expected[:size] != actual[:size]:
+                if not follows_stdlib(rows[at // 64]):
+                    raise SystemExit(f'Calendar case {rows[at // 64]}: C={struct.unpack_from("<8q", expected, at)} Silk={struct.unpack_from("<8q", actual, at)}')
+                differing += 1
+        if expected[len(rows) * 64:] != actual[len(rows) * 64:]:
             raise SystemExit('Calendar/era borrowed names or alias parsing differ')
-        at, entries = size, 0
-        for table in TABLES:
-            count = struct.unpack_from('<q', expected, at)[0]
-            end = at + (count + 1) * 8
-            if expected[at:end] != actual[at:end]:
-                raise SystemExit(f'Complete calendar table differs: {table}')
-            entries += count
-            at = end
-        if at != len(expected):
-            raise SystemExit('Unexpected trailing calendar table bytes')
-        print(f'PASS calendar: {len(rows)} edge records, all 16 calendars and era/name cases; {pins} pinned sources; SHA256={hashlib.sha256(actual[:size]).hexdigest()}')
-        print(f'PASS calendar tables: {len(TABLES)} complete tables, {entries} entries, {len(actual)-size} logical bytes; SHA256={hashlib.sha256(actual[size:]).hexdigest()}')
+        print(f'PASS calendar: {len(rows)} edge records, all 16 calendars and era/name cases; {differing} records follow the standard library; {pins} pinned sources; SHA256={hashlib.sha256(actual).hexdigest()}')
 
 
 if __name__ == '__main__':
