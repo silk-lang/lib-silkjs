@@ -79,11 +79,15 @@ impl Copy for SiteShape {}
 /// the call at `pc` was recorded calling: `input` describes
 /// it and `id` names it to the embedder (`Function.inlineTargets`).
 /// The most blocks (past its first) an inlined body may have.
-const INLINE_BLOCKS: usize = 8
+const INLINE_BLOCKS: usize = 24
 
 pub struct CallTarget { pub pc: u32, pub id: u32, pub input: FunctionInput,
   /// `pc` is the call's own (a recorded call target, any call) rather than its `get_field2`'s.
-  pub atCall: bool }
+  pub atCall: bool,
+  /// The site calls other functions too (the embedder knows several, or not all): its
+  /// targets are tested in turn and a call is made when none is the callee
+  /// (Translator.callChain), where a single target is guarded with an exit.
+  pub chained: bool }
 
 /// The call that began an inlined body: at `pc` of its caller's code with `argc` arguments,
 /// the instruction after it at `after`; the caller's `locals` locals and `stack` operands at
@@ -93,9 +97,9 @@ impl Copy for InlineCall {}
 
 /// Inlined bodies nest at most this deep, and are at most this many bytes of code each.
 const MAX_INLINE_DEPTH: u32 = 3
-const MAX_INLINE_BYTES: usize = 96
+const MAX_INLINE_BYTES: usize = 260
 /// Inlined call sites one function may have (each takes a frame record on the native stack).
-const MAX_INLINE_SITES: usize = 16
+const MAX_INLINE_SITES: usize = 32
 
 /// What an inlined body may be made of, opcode by opcode: straight-line code over constants,
 /// unchecked locals, arguments, numbers, tests, property and element access, globals, calls
@@ -148,7 +152,7 @@ fn withoutEffect(operation: Op) -> bool {
     || operation == Op.Cmp || operation == Op.Retain || operation == Op.Release || operation == Op.CheckTag
     || operation == Op.GetField || operation == Op.AtomValue || operation == Op.GetVar || operation == Op.GetScope
     || operation == Op.GetElem || operation == Op.GetLength || operation == Op.Truthy || operation == Op.TagIs || operation == Op.TypeofAtom
-    || operation == Op.CheckCallee || operation == Op.InlineFrame || operation == Op.Jump || operation == Op.Branch
+    || operation == Op.CheckCallee || operation == Op.IsCallee || operation == Op.InlineFrame || operation == Op.Jump || operation == Op.Branch
     || operation == Op.ConstF64 || ssa.isNumberOp(operation)
 }
 pub const CLOSURE_NONE: u8 = 0
@@ -794,6 +798,9 @@ struct Translator {
   calls: List<InlineCall>,
   /// FunctionInput.leavesBodies.
   leaves: bool,
+  /// How many of the inlined bodies being translated, the current one and those around it,
+  /// have a loop.
+  bodyLoops: u32,
   /// A guard came after an effect: the attempt fails.
   broken: bool,
   /// Why inlineTarget found none.
@@ -944,7 +951,9 @@ impl Translator {
   effect fn inlineExit(self: &mut Self, inst: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut before = self.rootInst
     // A call's exit is also where it leaves when it threw: the body's frame takes that.
-    let mut effects = self.f.insts.get(u32.toUsize(inst)).op == Op.Call
+    // So does a body with a loop around: what ran in an earlier turn is not in front of
+    // the instruction.
+    let mut effects = self.f.insts.get(u32.toUsize(inst)).op == Op.Call || self.bodyLoops != 0
     while before < u32.toUsize(inst) { if !withoutEffect(self.f.insts.get(before).op) { effects = true } before = before + 1 }
     if effects && !self.leaves { self.broken = true }
     drop run self.f.exitFor(inst, self.rootPc, usize.toU32(self.rootDepth))
@@ -1152,12 +1161,20 @@ impl Translator {
     let saved = self.current
     let savedLocals = run copyList(&self.locals)
     let savedStack = run copyList(&self.stack)
-    // The latch's parameters mirror the state; its poll exits at the loop target.
+    let savedHeld = run copyList(&self.held)
+    // The latch's parameters mirror the state (in an inlined body the frames around it
+    // first, as every block of a body has them); its poll exits at the loop target.
     self.current = latch
     let mut i: usize = 0
-    while i < self.locals.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.locals.set(i, p) i = i + 1 }
-    i = 0
-    while i < self.stack.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.stack.set(i, p) i = i + 1 }
+    if self.depth != 0 {
+      let count = self.held.length() + self.locals.length() + self.stack.length()
+      while i < count { drop run self.f.addParam(latch, Type.Value, Own.Owned) i = i + 1 }
+      run self.adopt(latch, 0, pc)
+    } else {
+      while i < self.locals.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.locals.set(i, p) i = i + 1 }
+      i = 0
+      while i < self.stack.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.stack.set(i, p) i = i + 1 }
+    }
     drop run self.f.emit(latch, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, pc)
     let last = self.f.lastInst() run self.exitHere(last, usize.toU32(targetPc))
     let edge = run self.edgeTo(target, pc)
@@ -1165,6 +1182,7 @@ impl Translator {
     self.current = saved
     self.locals = move savedLocals
     self.stack = move savedStack
+    self.held = move savedHeld
     return latch
   }
 
@@ -1983,11 +2001,12 @@ impl Translator {
 
   // ---- finally blocks (stream P) ----
 
-  /// A block whose parameters are the current state (one owned value per local and operand).
+  /// A block whose parameters are the current state (one owned value per local and operand,
+  /// after those of the frames around an inlined body).
   effect fn stateBlock(self: &mut Self) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let block = run self.f.block()
     let mut i: usize = 0
-    while i < self.locals.length() + self.stack.length() { drop run self.f.addParam(block, Type.Value, Own.Owned) i = i + 1 }
+    while i < self.outerCount() + self.locals.length() + self.stack.length() { drop run self.f.addParam(block, Type.Value, Own.Owned) i = i + 1 }
     return block
   }
   /// Continues in `block`, made by stateBlock: its parameters become the state.
@@ -2135,6 +2154,14 @@ impl Translator {
     // A body's own call: code that can leave the body part way through makes it (its exit
     // names the body's frame, ssa.Exit.frames).
     if self.depth != 0 && (construct || !self.leaves || self.lazyApply(method, count)) { fail refuse(at, opcode, b"a call inside an inlined body") }
+    run self.plainCall(function, receiver, method, construct, count, at)
+    return true
+  }
+  /// The call at `pc` of `function` with the `count` operands on the stack as arguments (and
+  /// `receiver`, or new.target for a `new`): the operands go, the result takes their place.
+  effect fn plainCall(self: &mut Self, function: u32, receiver: u32, method: bool, construct: bool, count: usize, at: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut depth = count + 1
+    if method || construct { depth = depth + 1 }
     let mut i: usize = 0
     while i < count {
       let argument = self.top(count - i)
@@ -2151,11 +2178,19 @@ impl Translator {
     i = 0
     while i < depth { let v = self.pop() run self.release(v, at) i = i + 1 }
     run self.push(r)
-    return true
   }
 
   // ---- inlining (docs/jit/inlining.md) ----
 
+  /// The pc of the cached field read of this code that made `function`, or NONE.
+  fn readOf(self: &Self, function: u32) -> u32 {
+    let info = self.f.value(function)
+    if info.def != NONE {
+      let read = self.f.inst(info.def)
+      if read.op == Op.GetField && (read.k & 1) == FIELD_CACHED && read.frame == self.f.frame { return read.pc }
+    }
+    return NONE
+  }
   /// The index in `input.targets` of what the method call of `function` (the value a cached
   /// field read of this code made) may inline, or usize.MAX.
   fn inlineTarget(self: &mut Self, input: &FunctionInput, function: u32, pc: u32) -> usize {
@@ -2168,12 +2203,7 @@ impl Translator {
       while s < self.doubleSites.length() { if self.doubleSites.get(s) == pc { return usize.MAX } s = s + 1 }
     }
     // The recorded target of this call, else what the site cache of its get_field2 names.
-    let mut readPc = NONE
-    let info = self.f.value(function)
-    if info.def != NONE {
-      let read = self.f.inst(info.def)
-      if read.op == Op.GetField && (read.k & 1) == FIELD_CACHED && read.frame == self.f.frame { readPc = read.pc }
-    }
+    let readPc = self.readOf(function)
     let mut pass: u32 = 0
     let mut t: usize = 0
     while pass < 2 {
@@ -2206,6 +2236,101 @@ impl Translator {
     if method && receiver == NONE { return false }
     let t = self.inlineTarget(input, function, pc)
     if t == usize.MAX { run self.f.inlineMisses.append(InlineMiss { pc: pc, opcode: 0, why: self.missed }) return false }
+    if input.targets.asSlice()[t].chained { return run self.callChain(input, method, count, pc) }
+    return run self.inlineOne(input, t, function, receiver, method, count, pc, true)
+  }
+
+  /// A call whose site calls several functions (CallTarget.chained), with the operands on the
+  /// stack: each known target that can be inlined gets a test of the callee's identity and
+  /// its body in a block of its own, and the call itself is made when the callee is none
+  /// of them; the results meet in a new block. False with nothing changed when no target's
+  /// body could be inlined.
+  effect fn callChain(self: &mut Self, input: &FunctionInput, method: bool, count: usize, pc: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+    // The call that is the last arm leaves a body with its frames.
+    if !self.leaves { return false }
+    let readPc = self.readOf(self.top(count + 1))
+    let mut join = NONE
+    let mut t: usize = 0
+    while t < input.targets.length() {
+      let target = &input.targets.asSlice()[t]
+      let here = t
+      t = t + 1
+      if target.atCall || !target.chained || target.pc != readPc { continue }
+      if self.depth >= MAX_INLINE_DEPTH || self.f.inlineTargets.length() >= MAX_INLINE_SITES { break }
+      let callee = &target.input
+      if !callee.normal || callee.closureVars != 0 || callee.scopeSlots != 0 || callee.code.length() == 0 || callee.code.length() > MAX_INLINE_BYTES { continue }
+      let mark = self.f.mark()
+      let savedCurrent = self.current
+      let savedLocals = run copyList(&self.locals)
+      let savedStack = run copyList(&self.stack)
+      let savedHeld = run copyList(&self.held)
+      let k = usize.toI32(self.f.inlineTargets.length())
+      // Boxes first: only the test's flags are between it and the branch then.
+      run self.boxState(pc)
+      let tested = self.top(count + 1)
+      let test = run self.f.emit(self.current, Op.IsCallee, true, Type.Bool, Own.Unboxed, tested, NONE, k, pc)
+      let hit = run self.stateBlock()
+      let miss = run self.stateBlock()
+      let first = run self.edgeTo(hit, pc)
+      drop run self.edgeTo(miss, pc)
+      run self.f.terminate(self.current, Op.Branch, test, first, pc)
+      run self.adoptState(hit, pc)
+      let function = self.top(count + 1)
+      let mut receiver = NONE
+      if method { receiver = self.top(count + 2) } else { receiver = run self.imm(Imm.Undefined, pc) }
+      if run self.inlineOne(input, here, function, receiver, method, count, pc, false) {
+        if join == NONE { join = run self.stateBlock() }
+        run self.jumpInto(join, pc)
+        run self.adoptState(miss, pc)
+      } else {
+        self.f.rollback(mark)
+        self.current = savedCurrent
+        self.locals = move savedLocals
+        self.stack = move savedStack
+        self.held = move savedHeld
+      }
+    }
+    if join == NONE { return false }
+    let function = self.top(count + 1)
+    let mut receiver = NONE
+    if method { receiver = self.top(count + 2) } else { receiver = run self.imm(Imm.Undefined, pc) }
+    run self.plainCall(function, receiver, method, false, count, pc)
+    run self.jumpInto(join, pc)
+    run self.adoptState(join, pc)
+    return true
+  }
+  /// Boxes the state where it is: what an edge would do (edgeTo), ahead of it.
+  effect fn boxState(self: &mut Self, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    if self.depth != 0 { while i < self.held.length() { let v = self.held.get(i) let b = run self.boxed(v, pc) self.held.set(i, b) i = i + 1 } }
+    i = 0
+    while i < self.locals.length() { let v = self.locals.get(i) let b = run self.boxed(v, pc) self.locals.set(i, b) i = i + 1 }
+    i = 0
+    while i < self.stack.length() { let v = self.stack.get(i) let b = run self.boxed(v, pc) self.stack.set(i, b) i = i + 1 }
+  }
+  /// Ends the current block with a jump to `block`, which takes the whole state (stateBlock).
+  effect fn jumpInto(self: &mut Self, block: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let edge = run self.edgeTo(block, pc)
+    run self.f.terminate(self.current, Op.Jump, NONE, edge, pc)
+  }
+  /// Starts filling `block`, which the current block's state is passed to as it is (stateBlock):
+  /// a local that was proven initialized still is.
+  effect fn adoptState(self: &mut Self, block: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut proven = List<bool>.make()
+    let mut i: usize = 0
+    while i < self.locals.length() {
+      let v = u32.toUsize(self.locals.get(i))
+      run proven.append(v < self.initialized.length() && self.initialized.get(v))
+      i = i + 1
+    }
+    run self.adopt(block, 0, pc)
+    i = 0
+    while i < self.locals.length() && i < proven.length() { if proven.get(i) { let v = self.locals.get(i) run self.markInitialized(v) } i = i + 1 }
+  }
+
+  /// inlined for target `t` of `input.targets`. `guard`: the callee's identity is tested here,
+  /// with an exit; otherwise the block is one only that function's calls reach.
+  effect fn inlineOne(self: &mut Self, input: &FunctionInput, t: usize, function: u32, receiver: u32, method: bool, count: usize, pc: u32, guard: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
     let target = &input.targets.asSlice()[t]
     let mark = self.f.mark()
     let outer = self.depth
@@ -2223,8 +2348,10 @@ impl Translator {
     // The guard and the frame run for the caller: its exit is the caller's.
     let k = usize.toI32(self.f.inlineTargets.length())
     run self.f.inlineTargets.append(target.id)
-    drop run self.f.emit(self.current, Op.CheckCallee, false, Type.I32, Own.Unboxed, function, NONE, k, pc)
-    let guard = self.f.lastInst() run self.exitHere(guard, pc)
+    if guard {
+      drop run self.f.emit(self.current, Op.CheckCallee, false, Type.I32, Own.Unboxed, function, NONE, k, pc)
+      let guarded = self.f.lastInst() run self.exitHere(guarded, pc)
+    }
     drop run self.f.emit(self.current, Op.InlineFrame, false, Type.I32, Own.Unboxed, function, NONE, k, pc)
     // Into the body: the caller's state is held, its operands are the arguments.
     let heldBefore = self.held.length()
@@ -2247,7 +2374,9 @@ impl Translator {
     self.f.frame = i32.wrappingToU32(k) + 1
     self.depth = outer + 1
     self.locals.clear() self.stack.clear()
+    let outerLoops = self.bodyLoops
     let outcome = run Effect.result(self.inlineBody(&target.input, pc))
+    self.bodyLoops = outerLoops
     self.depth = outer
     self.f.frame = outerFrame
     self.argsBase = outerBase
@@ -2311,16 +2440,22 @@ impl Translator {
     let length = callee.code.length()
     run self.blockAt.appendRepeated(NONE, length + 1)
     let mut leaders: usize = 0
+    let mut looped = false
     let mut pc: usize = 0
     while pc < length {
       if shapeOf.start.get(pc) {
         let opcode = byteAt(callee, pc)
-        if (isBranch(opcode) || isGoto(opcode)) && targetOf(callee, pc) <= usize.toI64(pc) { fail refuse(usize.toU32(pc), opcode, b"a loop in an inlined body") }
+        if (isBranch(opcode) || isGoto(opcode)) && targetOf(callee, pc) <= usize.toI64(pc) {
+          // A loop's poll and every guard in a body with one leave with the bodies' frames.
+          if !self.leaves { fail refuse(usize.toU32(pc), opcode, b"a loop in an inlined body") }
+          looped = true
+        }
         if pc != 0 && shapeOf.leader.get(pc) { leaders = leaders + 1 }
       }
       pc = pc + 1
     }
     if leaders > INLINE_BLOCKS { fail refuse(0, 0, b"too many branches in an inlined body") }
+    if looped { self.bodyLoops = self.bodyLoops + 1 }
     let mut meet = NONE
     if leaders != 0 {
       pc = 1
@@ -2650,7 +2785,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, bodyLoops: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
   if t.lazySlot != usize.MAX { t.lazyAlias = lazyArgumentsCopy(input, t.lazySlot) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -2895,7 +3030,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, bodyLoops: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0

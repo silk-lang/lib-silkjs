@@ -20,14 +20,21 @@ calls after warm-up, and no function refused for good. Where it stands:
 | with method reads against recorded shapes | 322 | 2.4x |
 | with shorter tag tests and counts, slow paths out of line | 314 | 2.6x |
 | with repeated reads as copies | 308 | 2.8x |
-| with borrows across blocks, copies without code, fused tag tests (this state) | 269 | 3.2x |
-| V8 (node, JIT on) | 85 | 10x |
+| with borrows across blocks, copies without code, fused tag tests | 269 | 3.2x |
+| with exits and calls inside inlined bodies | 237 | 3.2x |
+| with the guarded chain, loops in inlined bodies, bodies up to 260 bytes (this state) | 209 | 3.6x |
+| V8 (node, JIT on) | 75 | 10x |
 
-The rows were measured in different rounds against an interpreter between 774 and 861 ms; the
+The rows were measured in different rounds against an interpreter between 709 and 861 ms; the
 host swings 10 to 15 percent between runs, so only rows of one round compare exactly (the
-last round: interpreter 861, the row before 297, this state 269, V8 85). In this state the
-long run has 23 functions optimized, none refused, no exit and no step after warm-up. The
-exit and refusal parts of the gate hold; the clock does not yet.
+last round, nine interleaved runs: interpreter 709 then 755 over six more, the row before 237,
+this state 209, V8 75). In this state the long run has 23 functions optimized, none refused,
+59 call sites inlined, 2.66 million calls left of 7.95 million, no exit and no step after
+warm-up. The exit and refusal parts of the gate hold; the clock does not yet.
+
+Single runs of optimized code swing more than the interpreter's: 24 runs of this state under
+one address layout took 172 to 288 ms in three clusters, with the same counters and the same
+share of samples in every function. The cause is the host, not the code; rows are medians.
 
 Code: `modules/jit/src/x64_backend.silk` (frame mode: `lowerOnFrame`, `callOnFrame`,
 `stepOnFrame`, `siteSlot`, `stored`), `x64_frame_exit.silk` (the exit helper), `x64_exits.silk`
@@ -35,7 +42,10 @@ Code: `modules/jit/src/x64_backend.silk` (frame mode: `lowerOnFrame`, `callOnFra
 `ssa_ownership.silk` (`borrowFields`), `jit_runtime.silk` (`jitTierUp`, `compileOptimized`,
 `noteLeft`, `siteShapesOf`), `baseline.silk` (the stubs and tails optimized code uses); in the
 engine `js_core_types.silk` (`SiteShapes`, `noteSiteShape`) and `js_compiled_inline.silk`
-(`siteShapes`).
+(`siteShapes`, `methodTargets`). Inlined bodies: `ssa_translate.silk` (`inlineOne`,
+`callChain`, `inlineExit`), `x64_backend.silk` (`callInBody`, `bodyRecords`, `calleeFlags`),
+`x64_frame_exit.silk` (the frames of an exit), and the engine's `js_baseline.Inlined`,
+`callInlined` and `resumeInlined`.
 
 ## Frame mode
 
@@ -143,6 +153,65 @@ of the releases of later reads once those are borrows.
 
 A `tag.is` whose only reader is the branch after it is that branch's flags (`fusedTag`).
 
+## Inlined bodies
+
+A call whose target is known and short (260 bytes of bytecode, 24 blocks, three bodies deep,
+32 sites a function) is its callee's body in the caller's code, behind a test of the callee
+(`check.callee`: an object of the closure class with that bytecode). The body has no frame.
+What makes that sound is what happens when the body has to stop being inlined.
+
+**Leaving.** An exit before the body's first effect restarts the call in baseline code: the
+state of the call instruction is written and nothing is lost. After an effect (a store, a
+count the caller cannot give back, a call) the body must be finished, not restarted. Such an
+exit names its bodies (`ssa.ExitFrame`: the body's method, argument count, locals, operand
+depth and instruction). `jitFrameExit` writes one `js_baseline.Inlined` record per body into
+the frame's leave area and answers `INLINED | depth`; the stub calls the engine's
+`SERVICE_INLINED`, which finishes each body in an interpreter frame from the innermost out
+(`callInlined`, `resumeInlined`), pushing each result where its caller's instruction expects
+it. Baseline code continues the outer function at `SYMBOL_MOVED`.
+
+**Calls.** A call inside a body (`callInBody`) writes a bare frame record per body
+(`FRAME_BARE_INLINED`: closure, receiver, instruction) on the frame chain, so a stack trace,
+a throw and the collector see the frames the interpreter would have, and calls with rbp at the
+innermost record. A throw unwinds through the records to the caller's handler.
+
+**Loops.** A body may loop. Every exit inside a body that loops is a frames exit, since an
+earlier turn may have had an effect; the latch block takes the body's held values, locals and
+stack parameters; the loop's poll writes the body records, with the loop's target as the
+innermost instruction, before it calls `SERVICE_POLL`.
+
+**Shape facts.** `ssa_shapes` finds the recorded shapes, names and keys of a site in a body
+through the chain of inline targets (`inlinedSite`), at any depth. Before that only bodies one
+level deep had them, and reads two levels deep went through the helper: 20 percent of the
+code and a visible share of the time.
+
+## The guarded chain
+
+A method call whose site saw a few receiver shapes with different methods (Richards'
+`this.task.run`, four tasks) is a chain: for each known target a test of the callee and its
+body, then a plain call for anything else, and the paths meet with the result. Nothing leaves
+when the callee is the fifth one.
+
+The targets come from the site's recorded shapes. `SiteShapes` keeps, with each shape pair of
+a prototype property, the holder object and the engine's shape epoch at the time. At compile
+time `inline.methodTargets` reads the method out of each holder whose epoch is still the
+current one and keeps the distinct closures of the function's realm, four at most. The holder
+is not counted by the table. The epoch makes that sound: it moves whenever a prototype object
+is destroyed (`js_gc.destroyObject`, one byte test per destroyed object), so an entry that
+could name freed memory is an entry of an older epoch. An entry the cache refreshed after an
+epoch change is noted again (`noteRefreshed`).
+
+In SSA the test is `is.callee v, k` (a bool; fused into the branch after it), each hit block
+inlines its target without a `check.callee`, and the last miss block makes the call. A target
+that cannot be inlined (too long, or the limits) leaves its callee to the plain call; a chain
+with no arm at all is a plain call. A site with one target and no other shape keeps the single
+`check.callee` form, whose miss is an exit.
+
+Larger bodies without the chain were slower (342 ms against 239): the last target of
+`task.run` was inlined behind a `check.callee` inside `run` inside `schedule`, the test failed
+for three tasks in four, and each failure left `schedule` in baseline code for the rest of its
+activation, which is one loop of ten thousand turns. See on-stack replacement under Open.
+
 ## Leaving too often
 
 `jitFrameLeft` counts guard failures per function and remembers the bytecode offsets
@@ -185,40 +254,52 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (34 scripts) through
+- `modules/jit/tests/baseline/*.js` (38 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
   constructors that keep or throw with object arguments and sites with one to six receiver
-  shapes, `t34` borrowed fields with stores and other owners around them.
+  shapes, `t34` borrowed fields with stores and other owners around them, `t35` exits after effects in
+  inlined bodies, `t36` calls made by inlined methods (throws, stack traces, depth), `t37`
+  loops in inlined methods, `t38` chains of two to four targets, late callees of other kinds,
+  arms that leave or throw, chains two bodies deep.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 
 ## Where the time is
 
-Samples of Richards before the last step (314 ms): 80 percent in optimized code, 17 percent in
-the shared stubs (9 in the method call stub, 4.5 in the prologue, 2.3 in the return), 3 percent
-in the engine. The scheduler's loop with `isHeldOrSuspended` inlined is 30 percent alone: of
-its 213,000 turns in 20 runs, 82,000 only step to the next task and make no call. A run of a
-task makes three calls that are not inlined (`run` of the task control block, `run` of the
-task, one scheduler method) and 0.7 more inside those; with everything it is about 100 ns
-against V8's 32.
+Samples of Richards in this state (24 runs, 209 ms median): 85 percent in optimized code, 5
+percent in baseline code, 9 percent in the engine and the compiler (compiling is 18 ms of a
+run, three times what it was before the bodies grew). `schedule` with its loop, the task
+control block's `run`, three of the four task `run` methods and what they call inlined is 44
+percent; the handler task's `run`, too long to inline and reached through the chain's call, is
+19 percent. A turn of the scheduler's loop is about 49 ns against V8's 18.
 
-The time follows the number of instructions, and the counts more than their share: taking the
-six count updates around the inlined call out of the loop (19 of about 105 instructions on its
-short path) gave 9 percent of the whole run.
+The loop's code is straight but long. Every value read from a field is stored to its slot and
+read back by the next instruction (a tag byte from the slot, the payload from the slot), which
+puts a store and a load on every step of the pointer chains the benchmark is made of. A global
+read is eleven instructions, a method read through the prototype about twenty with its callee
+test, and the four-way read of `task.run` repeats the prototype test in each arm before the
+chain tests the callee three times.
+
+Earlier measurements still hold: the time follows the number of instructions, and the counts
+more than their share (taking six count updates out of the loop's short path gave 9 percent).
 
 ## Open
 
 In the order they are planned:
 
-1. Exits inside inlined bodies after an effect, through the callee's baseline resume entry
-   (`js_baseline.resumeOf`); calls inside inlined bodies; a guarded chain for a call with a few
-   targets (Richards' `task.run`, whose receiver shapes `SiteShapes` now has). Six Richards call
-   sites are not inlined for the first reason alone, seven because the method is too long.
-2. Code volume: values kept in registers between a read and its test (a read stores its value
-   and the test after it loads the tag again), a compare that is also an edge argument, global
-   reads (thirteen instructions each).
-3. The call path: 70 instructions from the site through the stub and the prologue to the body.
-4. On-stack replacement into optimized code; `SERVICE_QUICK` for literals; deeper prototype
-   chains in `SiteShapes`.
+1. Code volume: values kept in registers between a read and its test, a chain that tests the
+   receiver's shape once instead of the shape and then the callee, global reads.
+2. On-stack replacement into optimized code. An exit in a long loop leaves the activation in
+   baseline code until it returns, and a function entered once is optimized only at its next
+   entry.
+3. Feedback for guards inside inlined bodies. A failure is recorded at the outer function's
+   call instruction, so the recompile stops inlining the call instead of widening the one site
+   in the body.
+4. Compile time and code size: `schedule` is 60 KB of code with a 6.5 KB frame, and four
+   functions carry most of 251 KB.
+5. The interpreter's cost of the epoch change in `destroyObject` (a byte test per destroyed
+   object) has to be measured against the 0.5 percent rule.
+6. The call path: 70 instructions from the site through the stub and the prologue to the body.
+7. `SERVICE_QUICK` for literals; deeper prototype chains in `SiteShapes`.

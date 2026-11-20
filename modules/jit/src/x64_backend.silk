@@ -54,6 +54,7 @@ import x64_exits as exits
 import silk.core.ownership { Copy }
 import silkjs.js_baseline { BaselineLayout, Shape }
 import silkjs.js_baseline as frames
+import silkjs.cli_io as io
 import silkjs.js_opcode_data as opcodes
 import baseline as stubs
 import baseline_env
@@ -95,7 +96,10 @@ pub struct Settings {
   /// resetting it to stress (the deopt-stress configuration). 0: off.
   pub stress: u32,
   /// Where the engine keeps a ValueBits' tag and payload.
-  pub layout: ValueLayout
+  pub layout: ValueLayout,
+  /// Print where each instruction's code starts ("jit: optimized map", the offsets in the
+  /// order the SSA text lists the instructions), for joining samples with instructions.
+  pub map: bool
 }
 
 /// The baseline frame that frame mode's code runs on.
@@ -328,14 +332,14 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   if leaveBytes != 0 { raw = leaveAt + leaveBytes }
   // Frame mode's calls inside inlined bodies (callInBody): the call's operand cells (the
   // receiver, the function, the arguments), then a record with a frame pointer word for
-  // each body around the deepest such call (js_baseline.FRAME_BARE_INLINED).
+  // each body around the deepest such call or poll (js_baseline.FRAME_BARE_INLINED).
   let mut bodyCells: u32 = 0
   let mut bodyDepth: u32 = 0
   let mut calling: usize = 0
   while on && calling < function.insts.length() {
     let inst = function.insts.get(calling)
-    if inst.op == Op.Call && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
-      if calls.countOf(inst) + 2 > bodyCells { bodyCells = calls.countOf(inst) + 2 }
+    if (inst.op == Op.Call || inst.op == Op.Poll) && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
+      if inst.op == Op.Call && calls.countOf(inst) + 2 > bodyCells { bodyCells = calls.countOf(inst) + 2 }
       if function.exit(inst.exit).frames > bodyDepth { bodyDepth = function.exit(inst.exit).frames }
     }
     calling = calling + 1
@@ -413,6 +417,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     run emitter.savedStart.append(usize.toU32(emitter.savedValues.length()))
     run emitter.resume()
   }
+  let mut offsets = List<u32>.make()
   b = 0
   while b < function.blockCount() {
     let block = function.blocks.get(u32.toUsize(b))
@@ -421,6 +426,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     let mut i: u32 = 0
     while i < block.instCount {
       emitter.cursor = block.firstInst + i
+      if emitter.settings.map { run offsets.append(usize.toU32(emitter.a.offset())) }
       run emitter.instruction(&function, function.inst(block.firstInst + i))
       if emitter.skipAt == block.firstInst + i { emitter.a.bind(emitter.skipLabel) emitter.skipAt = NONE }
       i = i + 1
@@ -447,8 +453,19 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   if on { run emitter.frameTails(&function) }
   // Exit stubs: the interpreter state at each exit's bytecode boundary.
   emitter.frameOf = 0
+  let map = emitter.settings.map
+  if map { run offsets.append(usize.toU32(emitter.a.offset())) }
   run exits.emit(&mut emitter, &function)
-  return Lowering.Code { value: run emitter.a.finish() }
+  let code = run emitter.a.finishPlaced(&mut offsets, 1)
+  if map {
+    let mut line = List<u8>.make()
+    run line.appendSlice(b"jit: optimized map")
+    let mut m: usize = 0
+    while m < offsets.length() { run line.append(32) run ssa.number(&mut line, offsets.get(m)) m = m + 1 }
+    run line.append(10)
+    io.stderr(line.asSlice())
+  }
+  return Lowering.Code { value: move code }
 }
 
 /// The ABI inputs, in argument order: arguments, state, counter, data, env, frame.
@@ -513,6 +530,15 @@ impl Emitter {
       run self.a.movSymbol(Reg.Rax, target)
       run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R11, compiled.DIRECT_CLOSURE_BYTECODE))
       run self.a.jcc(Cond.NotEqual, leave)
+      return ()
+    }
+    if op == Op.IsCallee {
+      // A test whose only reader is the branch right after it is that branch's flags.
+      if self.fusedCallee(&function, inst) { return () }
+      run self.a.movImm32(Reg.R9, 0)
+      run self.calleeFlags(inst)
+      run self.a.setcc(Cond.Equal, Reg.R9)
+      let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.R9)
       return ()
     }
     // An inlined callee's frame is built where a helper needs it (frameInto): the inline
@@ -777,6 +803,11 @@ impl Emitter {
         let compared = function.inst(def)
         run self.compare(compared)
         taken = condition(compared.k) untaken = condition(opposite(compared.k))
+      } else if def != NONE && self.fusedCallee(&function, function.inst(def)) {
+        let mut test = function.inst(def)
+        test.a = self.storage(test.a)
+        run self.calleeFlags(test)
+        taken = Cond.Equal untaken = Cond.NotEqual
       } else if def != NONE && self.fusedTag(&function, function.inst(def)) {
         let test = function.inst(def)
         let layout = self.settings.layout
@@ -1695,6 +1726,36 @@ impl Emitter {
     i = i + 1
     while i < last { if function.inst(i).op != Op.Release { return false } i = i + 1 }
     return true
+  }
+  /// fusedTag for `is.callee`.
+  fn fusedCallee(self: &Self, function: &Function, test: Inst) -> bool {
+    if !self.on || test.op != Op.IsCallee || test.result == NONE || self.uses.get(u32.toUsize(test.result)) != 1 { return false }
+    let block = function.blocks.get(u32.toUsize(test.block))
+    let last = block.firstInst + block.instCount - 1
+    let branch = function.inst(last)
+    if branch.op != Op.Branch || branch.a != test.result { return false }
+    let mut i = block.firstInst
+    while i < last && function.inst(i).result != test.result { i = i + 1 }
+    i = i + 1
+    while i < last { if function.inst(i).op != Op.Release { return false } i = i + 1 }
+    return true
+  }
+  /// Equal when the value in slot test.a is a bytecode closure (tag, class) whose
+  /// FunctionBytecode cell is inline target test.k's. Clobbers RAX, R8, R11.
+  effect fn calleeFlags(self: &mut Self, test: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    let other = run self.a.label()
+    run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(test.a * SLOT_BYTES + layout.tagOffset)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+    run self.a.jcc(Cond.NotEqual, other)
+    run self.a.load(Width.W64, Reg.R11, payloadOf(test.a))
+    run self.a.loadZero16(Reg.Rax, Mem.at(Reg.R11, compiled.DIRECT_OBJECT_CLASS))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(compiled.DIRECT_BYTECODE_CLASS))
+    run self.a.jcc(Cond.NotEqual, other)
+    let target = self.symbol(i32.wrappingToU32(test.k) * 2)
+    run self.a.movSymbol(Reg.Rax, target)
+    run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R11, compiled.DIRECT_CLOSURE_BYTECODE))
+    self.a.bind(other)
   }
   /// The flags of compare's operands (it stores nothing).
   effect fn compare(self: &mut Self, compare: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -2829,11 +2890,24 @@ impl Emitter {
       let poll = self.polls.get(i)
       self.a.bind(poll.slow)
       run self.a.storeImm(Width.W32, Mem.at(Reg.Rax, signed(p.f.interruptCounter)), signed(p.f.interruptPeriod))
-      run self.a.storeImm(Width.W64, p.sf(p.f.currentPc), signed(poll.pc))
-      run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_POLL))
-      run self.a.movImm32(Reg.R8, 0)
-      run self.a.movImm32(Reg.R9, 0)
-      run self.engineCall()
+      let state = function.exit(poll.exit)
+      if state.frames != 0 {
+        // A loop of an inlined body: the poll runs on the body's record, as a call the body
+        // makes does (callInBody), at the loop's target.
+        let last = run self.bodyRecords(&function, state, function.exitFrame(state, state.frames - 1).pc)
+        run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_POLL))
+        run self.a.movImm32(Reg.R8, 0)
+        run self.a.movImm32(Reg.R9, 0)
+        run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
+        run self.engineCall()
+        run self.bodyRecordsOff(last)
+      } else {
+        run self.a.storeImm(Width.W64, p.sf(p.f.currentPc), signed(poll.pc))
+        run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_POLL))
+        run self.a.movImm32(Reg.R8, 0)
+        run self.a.movImm32(Reg.R9, 0)
+        run self.engineCall()
+      }
       // Nonzero: it threw. Then the interpreter takes the frame when the poll turned
       // instruction observation on.
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
@@ -3026,14 +3100,34 @@ impl Emitter {
   /// names the bodies' frames (ssa.Exit.frames): where it leaves when the stub declines
   /// or the callee threw.
   effect fn callInBody(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
-    let p = self.plan
-    let layout = self.settings.layout
     let exit = function.exit(inst.exit)
     let count = calls.countOf(inst)
     let method = (inst.k & calls.METHOD) != 0
     let callee = self.callAt + SLOT_BYTES
     run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rsp, callee)
     if method { run self.valueInto(&function, inst.b, SlotMode.Imm, Reg.Rsp, callee - SLOT_BYTES) }
+    let last = run self.bodyRecords(&function, exit, NONE)
+    // The stub's site, as callOnFrame's, on the innermost body's record.
+    run self.a.lea(Width.W64, Reg.R14, word(Reg.Rsp, callee))
+    run self.a.movImm32(Reg.Rdx, count)
+    run self.a.movImm32(Reg.Rax, inst.pc + 1)
+    run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
+    if method { run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP) } else { run self.a.callSymbol(stubs.STUB_CALL_KEEP) }
+    run self.bodyRecordsOff(last)
+    // ecx: 0 returned, HOW_DECLINED, HOW_CALL_THREW.
+    run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
+    run self.a.jcc(Cond.NotEqual, self.exitWith.get(u32.toUsize(inst.exit)))
+    run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+    run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rdx)
+  }
+
+  /// Writes the records of the bodies around a call or poll whose exit is `exit` (callInBody)
+  /// and answers where the innermost one's frame pointer word is from rsp: rbp for what
+  /// runs on the chain. `at` is the innermost body's position, or NONE when what is called
+  /// stores it. Clobbers RAX, R9.
+  effect fn bodyRecords(self: &mut Self, function: &Function, exit: ssa.Exit, at: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let p = self.plan
+    let layout = self.settings.layout
     let recordBytes = i32.wrappingToU32(0 - p.record)
     // The function's own frame is at the outermost inlined call.
     run self.a.storeImm(Width.W64, p.sf(p.f.currentPc), u32.wrappingToI32(exit.pc + 1))
@@ -3058,8 +3152,8 @@ impl Emitter {
         run self.a.storeImm(Width.W64, word(Reg.Rsp, stack + p.f.thisValue + 8), 0)
       }
       run self.a.storeImm(Width.W64, word(Reg.Rsp, pointer - recordBytes + p.f.state), u64.wrappingToI32(frames.FRAME_BARE_INLINED))
-      // The innermost body's position is the stub's to store.
       if n + 1 < exit.frames { run self.a.storeImm(Width.W64, word(Reg.Rsp, stack + p.f.currentPc), u32.wrappingToI32(frame.pc + 1)) }
+      else if at != NONE { run self.a.storeImm(Width.W64, word(Reg.Rsp, stack + p.f.currentPc), u32.wrappingToI32(at)) }
       if n == 0 { run self.a.store(Width.W64, word(Reg.Rsp, pointer), Reg.Rbp) }
       else {
         run self.a.lea(Width.W64, Reg.Rax, word(Reg.Rsp, pointer - recordBytes - 16))
@@ -3070,28 +3164,22 @@ impl Emitter {
       inner = inner + frame.locals + frame.depth
       n = n + 1
     }
-    let last = self.bodyAt + (exit.frames - 1) * (recordBytes + 16) + recordBytes
-    // The stub's site, as callOnFrame's, on the innermost body's record.
-    run self.a.lea(Width.W64, Reg.R14, word(Reg.Rsp, callee))
-    run self.a.movImm32(Reg.Rdx, count)
-    run self.a.movImm32(Reg.Rax, inst.pc + 1)
-    run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
-    if method { run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP) } else { run self.a.callSymbol(stubs.STUB_CALL_KEEP) }
+    return self.bodyAt + (exit.frames - 1) * (recordBytes + 16) + recordBytes
+  }
+  /// After what ran on bodyRecords' chain (`last` is its answer): rbp is the frame's again.
+  /// The engine completed the records when something read the frame chain meanwhile (all
+  /// of them: it completes outwards); the chain is then back at what was around the
+  /// outermost. Keeps every register but RBP and R10.
+  effect fn bodyRecordsOff(self: &mut Self, last: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let p = self.plan
+    let recordBytes = i32.wrappingToU32(0 - p.record)
     run self.a.lea(Width.W64, Reg.Rbp, Mem.at(Reg.Rsp, self.frame))
-    // The engine completed the records when something read the frame chain during the
-    // call (all of them: it completes outwards). The chain is then back at what was
-    // around the outermost.
     let bare = run self.a.label()
     run self.a.aluStoreImm(Alu.Cmp, Width.W64, word(Reg.Rsp, last - recordBytes + p.f.state), u64.wrappingToI32(frames.FRAME_BUILT_INLINED))
     run self.a.jcc(Cond.NotEqual, bare)
     run self.a.load(Width.W64, Reg.R10, word(Reg.Rsp, self.bodyAt + p.f.frame + p.f.previous))
     run self.a.store(Width.W64, Mem.at(Reg.R13, signed(p.f.currentStackFrame)), Reg.R10)
     self.a.bind(bare)
-    // ecx: 0 returned, HOW_DECLINED, HOW_CALL_THREW.
-    run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
-    run self.a.jcc(Cond.NotEqual, self.exitWith.get(u32.toUsize(inst.exit)))
-    run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
-    run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rdx)
   }
 
   /// The step entry of the instruction being lowered (Emitter.steps), or 0.
