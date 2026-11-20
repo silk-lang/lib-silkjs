@@ -16,18 +16,26 @@ calls after warm-up, and no function refused for good. Where it stands:
 | Optimizer, first frame mode | 526 | 1.5x |
 | with loop turns counted toward tier-up | 430 | 1.9x |
 | with the shape pass | 348 | 2.3x |
-| with steps and constructor calls on the frame (this state) | 345 | 2.3x |
-| V8 (node, JIT on) | 81 | 9.9x |
+| with steps and constructor calls on the frame | 345 | 2.3x |
+| with method reads against recorded shapes | 322 | 2.4x |
+| with shorter tag tests and counts, slow paths out of line | 314 | 2.6x |
+| with repeated reads as copies | 308 | 2.8x |
+| with borrows across blocks, copies without code, fused tag tests (this state) | 269 | 3.2x |
+| V8 (node, JIT on) | 85 | 10x |
 
-The first three optimizer rows were measured in earlier rounds against an interpreter at 789 to
-801 ms; the host swings 10 to 15 percent between runs, so only rows of one round compare
-exactly. In this state Richards has 16 functions optimized, none refused, no exit and no step
-after warm-up. The exit and refusal parts of the gate hold; the clock does not yet.
+The rows were measured in different rounds against an interpreter between 774 and 861 ms; the
+host swings 10 to 15 percent between runs, so only rows of one round compare exactly (the
+last round: interpreter 861, the row before 297, this state 269, V8 85). In this state the
+long run has 23 functions optimized, none refused, no exit and no step after warm-up. The
+exit and refusal parts of the gate hold; the clock does not yet.
 
 Code: `modules/jit/src/x64_backend.silk` (frame mode: `lowerOnFrame`, `callOnFrame`,
-`stepOnFrame`), `x64_frame_exit.silk` (the exit helper), `x64_exits.silk` (exit records and
-stubs), `ssa_shapes.silk` (shape facts), `jit_runtime.silk` (`jitTierUp`, `compileOptimized`,
-`noteLeft`), `baseline.silk` (the stubs and tails optimized code uses).
+`stepOnFrame`, `siteSlot`, `stored`), `x64_frame_exit.silk` (the exit helper), `x64_exits.silk`
+(exit records and stubs), `ssa_shapes.silk` (shape facts and remembered properties),
+`ssa_ownership.silk` (`borrowFields`), `jit_runtime.silk` (`jitTierUp`, `compileOptimized`,
+`noteLeft`, `siteShapesOf`), `baseline.silk` (the stubs and tails optimized code uses); in the
+engine `js_core_types.silk` (`SiteShapes`, `noteSiteShape`) and `js_compiled_inline.silk`
+(`siteShapes`).
 
 ## Frame mode
 
@@ -42,6 +50,9 @@ code hands the frame over.
   baseline or optimized code directly (or the engine for a native), and the owned result comes
   back in rax:rdx. Only rbx lives across a call.
 - `new` goes through the engine's `SERVICE_CONSTRUCT` on the same cells, as baseline code does.
+  Its arguments own a count in their cells: a planned constructor moves them into the object
+  and leaves the cell undefined, so the code releases the cells after the call on both ways
+  out.
 - Returns go through `STUB_LEAVE`.
 - Helpers of the older ABI (`jit_helpers`) are reused on slow paths through a CompiledFrame
   built on demand.
@@ -87,6 +98,51 @@ that may change a shape (a call, a helper that can run a getter, setter or conve
 loop header starts with none. Richards went from 430 to 371 ms and the optimized code from
 85,001 to 61,943 bytes.
 
+## Recorded shapes
+
+A cached field site (`get_field2`: method reads, reads through the prototype) has no key in the
+bytecode. The engine records, for each such site, the shapes its site cache entries were filled
+for: `SiteShapes` in a table the embedder lends (`CompiledTable.siteShapes`, 2,048 entries, lent
+only with the optimizer on), written where a cache miss fills an entry. An entry holds up to
+four pairs: the receiver's shape version and slot for an own property, or the receiver's
+version and the holder's version and slot for a property of the direct prototype.
+
+`siteSlot` lowers the read against the pairs as constants: the receiver's shape, then for a
+prototype pair the holder's shape (the receiver's shape fixes its prototype, as the
+interpreter's own cached read relies on). A miss is an exit; a site that left once keeps the
+helper and the step behind the tests. Deeper chains, getters and absent properties are not
+recorded, and such a site reads through the helper.
+
+## Remembered properties
+
+`ssa_shapes` also remembers which value holds a property of an object: after a read or a store
+of `o.p`, the value read or stored. A later plain read of the same property of the same object
+is that value again (`Shapes.sameAs`). A store of a property forgets every entry of that name
+and remembers its own value; anything that may run other code clears them all. The pass walks
+the blocks twice: the second walk gives a loop header what the code before the loop and the
+end of every turn agree on.
+
+## Copies and borrows
+
+In frame mode a copy has no slot of its own (`Emitter.stored`). A `retain` and a repeated read
+are read from the slot of their source: the source's definition dominates the copy, and a slot
+is written only where its value is defined, so the source's slot holds the copy's bits wherever
+the copy is read. What the copy owns stays its own: an owned copy is one count on the source's
+slot, a borrowed copy is no code.
+
+`borrowFields` lets a field read or a copy borrow until its release in a later block, at most
+twelve blocks on: the receiver, the method closure and the inlined `this` of an inlined call
+are released where the body's paths meet, and none of the three takes a count now. A call, a
+poll or a way back to the definition ends the attempt. A store crossed by the borrow leaves the
+code before it would take a field's last count, and that alone was not enough: another owner of
+the same object, counted by that test, could let go later inside the borrow. A release of
+another value after such a store now refuses the borrow, unless the value is the one the last
+store put in its field. The pass runs first to last and then last to first while either finds
+any: a read borrows from its object's root once the object borrows, and a read's window is free
+of the releases of later reads once those are borrows.
+
+A `tag.is` whose only reader is the branch after it is that branch's flags (`fusedTag`).
+
 ## Leaving too often
 
 `jitFrameLeft` counts guard failures per function and remembers the bytecode offsets
@@ -129,30 +185,40 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (32 scripts) through
-  `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output under baseline and
-  under the optimizer at three thresholds against the interpreter's. `t30` and `t31` cover
-  shape misses and recompiles, `t32` steps and throws inside them.
+- `modules/jit/tests/baseline/*.js` (34 scripts) through
+  `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
+  baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
+  `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
+  constructors that keep or throw with object arguments and sites with one to six receiver
+  shapes, `t34` borrowed fields with stores and other owners around them.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 
 ## Where the time is
 
-Samples of Richards in this state: 79 percent in optimized code, 13 percent in the shared
-stubs (calls, prologues, returns), 6 percent in the engine's prototype read behind method
-lookups whose shared site cache entry was taken by another site. The hottest body, the
-scheduler's loop with `isHeldOrSuspended` inlined, is flat: its cost is the volume of code per
-operation, not one slow spot.
+Samples of Richards before the last step (314 ms): 80 percent in optimized code, 17 percent in
+the shared stubs (9 in the method call stub, 4.5 in the prologue, 2.3 in the return), 3 percent
+in the engine. The scheduler's loop with `isHeldOrSuspended` inlined is 30 percent alone: of
+its 213,000 turns in 20 runs, 82,000 only step to the next task and make no call. A run of a
+task makes three calls that are not inlined (`run` of the task control block, `run` of the
+task, one scheduler method) and 0.7 more inside those; with everything it is about 100 ns
+against V8's 32.
+
+The time follows the number of instructions, and the counts more than their share: taking the
+six count updates around the inlined call out of the loop (19 of about 105 instructions on its
+short path) gave 9 percent of the whole run.
 
 ## Open
 
 In the order they are planned:
 
-1. Method lookups without the shared site cache: receiver shape and holder shape as constants.
-2. Exits inside inlined bodies after an effect, through the callee's baseline resume entry
+1. Exits inside inlined bodies after an effect, through the callee's baseline resume entry
    (`js_baseline.resumeOf`); calls inside inlined bodies; a guarded chain for a call with a few
-   targets (Richards' `task.run`). Seven Richards call sites are not inlined for the first
-   reason alone.
-3. Code volume: values kept in registers between a read and its test, borrows across blocks,
-   slow paths out of line.
-4. On-stack replacement into optimized code; `SERVICE_QUICK` for literals.
+   targets (Richards' `task.run`, whose receiver shapes `SiteShapes` now has). Six Richards call
+   sites are not inlined for the first reason alone, seven because the method is too long.
+2. Code volume: values kept in registers between a read and its test (a read stores its value
+   and the test after it loads the tag again), a compare that is also an edge argument, global
+   reads (thirteen instructions each).
+3. The call path: 70 instructions from the site through the stub and the prologue to the body.
+4. On-stack replacement into optimized code; `SERVICE_QUICK` for literals; deeper prototype
+   chains in `SiteShapes`.
