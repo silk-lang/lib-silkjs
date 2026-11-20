@@ -23,9 +23,15 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADER = """# Functions the CLI runs to create a runtime and realm and tear them down,
-# grouped so startup touches few code pages. Regenerate with
+# grouped so startup touches few code pages. Every app that links the engine
+# links with this order, so it lists only functions apps have too: none of the
+# CLI program's own files or its script loader's. Regenerate with
 # python3 scripts/function_order.py after a release build.
 """
+
+# Every build that links the engine reads this order, and the compiler notes each entry the
+# build does not have. Functions only the CLI runs are left out, so an app's build has them all.
+CLI_ONLY = re.compile(r'^silkjs-engine@[^:]*:((qjs|qjs_launch|qjs_memory|qjs_repl|qjs_benchmark|qjsc[a-z_]*)\.silk::|js_lexer\.silk::\.?detectModule$)')
 
 
 def main():
@@ -61,7 +67,7 @@ def main():
         # does not list (addresses, runtime helpers) cannot be ordered.
         name = re.sub(r"'\d+$", '', match.group(1))
         name = declarations.get(name, name)
-        if name in known and name not in names:
+        if name in known and name not in names and not CLI_ONLY.match(name):
             names.append(name)
     with open(os.path.join(ROOT, 'startup.order'), 'w') as out:
         out.write(HEADER)
