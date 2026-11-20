@@ -759,46 +759,59 @@ pub effect fn optimize(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocat
   if run borrowFields(&mut f) { run f.compact() }
 }
 
-/// A field read can borrow its value from the object until its release in the same block.
-/// A call may replace the field through an alias. A named store crossed by the borrow
-/// must exit before it would destroy a field's last reference. The object (or its own
-/// root) must stay live throughout the borrow. A `retain` whose copy is
-/// released in its own block is the same case: the copy borrows from the retained value (or
-/// from what that borrows from) and takes no count; a copy of an owned value or of an
-/// argument stays valid across a call, which a field's value does not. Requires compacted
-/// blocks.
-/// Linear in the function: each value's first release and last read are found once.
+/// A field read can borrow its value from the object until its release, in its own block or
+/// in the blocks after it (an inlined method's receiver and closure are released where its
+/// body's paths meet). A call may replace the field through an alias, and so may what a
+/// poll runs. A named store crossed by the borrow must exit before it would destroy a
+/// field's last reference, and no other owner the value had before such a store may let
+/// go after it: the store's test counted that owner. The object (or its own root) must stay
+/// live throughout the borrow. A `retain` whose copy is released the same way is the same case: the copy
+/// borrows from the retained value (or from what that borrows from) and takes no count; a
+/// copy of an owned value or of an argument stays valid across a call, which a field's
+/// value does not. A value others borrow from can borrow too: they then borrow from what
+/// it borrows from, which outlives it. Requires compacted blocks.
+/// Each read looks through at most BORROW_BLOCKS blocks.
 effect fn borrowFields(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
   let count = f.values.length()
-  let mut firstRelease = List<u32>.make() let mut lastRead = List<u32>.make() let mut firstRead = List<u32>.make() let mut escapes = List<bool>.make()
+  let mut released = List<bool>.make() let mut firstRead = List<u32>.make() let mut escapes = List<bool>.make()
   let mut v: usize = 0
-  while v < count { run firstRelease.append(NONE) run lastRead.append(0) run firstRead.append(NONE) run escapes.append(false) v = v + 1 }
+  while v < count { run released.append(false) run firstRead.append(NONE) run escapes.append(false) v = v + 1 }
   let mut i: usize = 0
   while i < f.insts.length() {
     let inst = f.insts.get(i)
     let at = usize.toU32(i)
-    if readsA(inst.op) { noteRead(&mut firstRead, &mut lastRead, inst.a, at) }
-    if readsB(inst.op) { noteRead(&mut firstRead, &mut lastRead, inst.b, at) }
-    if readsK(inst.op) { noteRead(&mut firstRead, &mut lastRead, i32.wrappingToU32(inst.k), at) }
-    if inst.op == Op.Release && inst.a != NONE && firstRelease.get(u32.toUsize(inst.a)) == NONE { firstRelease.set(u32.toUsize(inst.a), at) }
+    if readsA(inst.op) { noteFirst(&mut firstRead, inst.a, at) }
+    if readsB(inst.op) { noteFirst(&mut firstRead, inst.b, at) }
+    if readsK(inst.op) { noteFirst(&mut firstRead, i32.wrappingToU32(inst.k), at) }
+    if inst.op == Op.Release && inst.a != NONE && u32.toUsize(inst.a) < count { released.set(u32.toUsize(inst.a), true) }
     i = i + 1
   }
   i = 0
   while i < f.edgeArgs.length() { let e = f.edgeArgs.get(i) if u32.toUsize(e) < count { escapes.set(u32.toUsize(e), true) } i = i + 1 }
-  i = 0
-  while i < count {
-    let info = f.values.get(i)
-    if info.own == Own.Borrowed && info.rootKind == RootKind.Value && u32.toUsize(info.root) < count { escapes.set(u32.toUsize(info.root), true) }
-    i = i + 1
-  }
+  let blocks = u32.toUsize(f.blockCount())
+  // The attempt that last reached each block, the blocks an attempt still has to walk, and
+  // what it found: the value's releases and the stores it crosses.
+  let mut seen = List<u32>.make() run seen.appendRepeated(0, blocks)
+  let mut work = List<u32>.make()
+  let mut releases = List<u32>.make()
+  let mut stores = List<u32>.make()
+  let mut others = List<u32>.make()
+  let mut attempt: u32 = 0
   let mut changed = false
-  let mut b: u32 = 0
-  while b < f.blockCount() {
-    let block = f.blocks.get(u32.toUsize(b))
-    let end = block.firstInst + block.instCount
-    let mut at = block.firstInst
-    while at < end {
+  // First to last, then last to first, while either finds any: a read whose object became
+  // a borrow just before borrows from that object's root, and a read's window holds the
+  // releases of what was read after it, which are gone once those are borrows.
+  let total = usize.toU32(f.insts.length())
+  let mut round: u32 = 0
+  let mut moved = true
+  while round < BORROW_ROUNDS && (moved || round < 2) {
+    moved = false
+    let mut step: u32 = 0
+    while step < total {
+      let mut at = step
+      if (round & 1) != 0 { at = total - 1 - step }
       let read = f.inst(at)
+      let b = read.block
       // A read that may be stepped yields a value of its own (FIELD_STEPS).
       let stepped = read.op == Op.GetField && (read.k & FIELD_STEPS) != 0
       if (read.op == Op.GetField || read.op == Op.Retain) && !stepped && read.result != NONE && isOwned(&f.*, read.result) {
@@ -806,48 +819,131 @@ effect fn borrowFields(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Alloc
         let mut kind = RootKind.Value
         let mut root = read.a
         let r = read.result
-        let release = firstRelease.get(u32.toUsize(r))
-        let mut ok = object.ty == Type.Value && release != NONE && release > at && release < end && !escapes.get(u32.toUsize(r)) && lastRead.get(u32.toUsize(r)) <= release
+        let mut ok = object.ty == Type.Value && released.get(u32.toUsize(r)) && !escapes.get(u32.toUsize(r))
           && (firstRead.get(u32.toUsize(r)) == NONE || firstRead.get(u32.toUsize(r)) > at)
         if object.own == Own.Borrowed && (object.rootKind == RootKind.Argument || object.rootKind == RootKind.Value) { kind = object.rootKind root = object.root }
         else if object.own != Own.Owned { ok = false }
         // The receiver's argument root keeps the receiver alive, but a store or call
         // can replace its field. Only an owned value or the argument itself is stable.
         let stableCopy = read.op == Op.Retain && (object.own == Own.Owned || defOp(&f.*, read.a) == Op.Arg)
-        let mut firstStore = release
-        let mut j = at + 1
-        while ok && j < release {
-          let inst = f.inst(j)
-          if inst.op == Op.PutField && !stableCopy && j < firstStore { firstStore = j }
-          if (inst.op == Op.Call && !stableCopy) || inst.op == Op.Return || inst.op == Op.Jump || inst.op == Op.Branch { ok = false }
-          if inst.op == Op.Release && kind == RootKind.Value && inst.a == root { ok = false }
-          j = j + 1
-        }
+        let mut walked: u32 = 0
         if ok {
-          j = firstStore
-          while j < release {
-            let mut store = f.inst(j)
-            if store.op == Op.PutField { store.k = 0 f.setInst(j, store) }
-            j = j + 1
+          attempt = attempt + 1
+          releases.truncate(0) stores.truncate(0) others.truncate(0) work.truncate(0)
+          seen.set(u32.toUsize(b), attempt)
+          run work.append(b)
+          let mut first = true
+          while ok && work.length() != 0 {
+            let top = work.length() - 1
+            let w = work.get(top)
+            work.truncate(top)
+            walked = walked + 1
+            if walked > BORROW_BLOCKS { ok = false }
+            let here = f.blocks.get(u32.toUsize(w))
+            let last = here.firstInst + here.instCount
+            let mut j = here.firstInst
+            if first { j = at + 1 first = false }
+            let mut open = true
+            while ok && open && j < last {
+              let inst = f.inst(j)
+              if inst.op == Op.Release && inst.a == r { run releases.append(j) open = false }
+              else if inst.op == Op.Release && kind == RootKind.Value && inst.a == root { ok = false }
+              else if inst.op == Op.Release && !stableCopy { run others.append(j) }
+              else if ((inst.op == Op.Call || inst.op == Op.Poll) && !stableCopy) || inst.op == Op.Return { ok = false }
+              else if inst.op == Op.PutField && !stableCopy { run stores.append(j) }
+              j = j + 1
+            }
+            if ok && open {
+              // The value is still held where the block ends: on to what follows it. A
+              // way back to its definition, or out of the function, is not a borrow's.
+              if here.instCount == 0 { ok = false }
+              else {
+                let leaving = f.inst(last - 1)
+                let edges = edgeCount(leaving.op)
+                if edges == 0 { ok = false }
+                let mut e: u32 = 0
+                while ok && e < edges {
+                  let target = f.edges.get(u32.toUsize(leaving.edge + e)).target
+                  if target == b { ok = false }
+                  else if seen.get(u32.toUsize(target)) != attempt { seen.set(u32.toUsize(target), attempt) run work.append(target) }
+                  e = e + 1
+                }
+              }
+            }
+          }
+        }
+        if ok && stores.length() != 0 && others.length() != 0 {
+          // In one block the order is the instructions': an owner defined before a store
+          // and released after it. Over several blocks any other release is taken to be one.
+          // The value the last store before the release put in its field is no such owner:
+          // that field holds it, and a store never takes a last count.
+          if walked > 1 { ok = false }
+          let mut o: usize = 0
+          while ok && o < others.length() {
+            let j = others.get(o)
+            let owner = f.inst(j).a
+            let def = f.value(owner).def
+            let mut before = false
+            let mut latest: u32 = 0
+            let mut n: usize = 0
+            while n < stores.length() {
+              let at0 = stores.get(n)
+              if at0 < j {
+                if def == NONE || def < at0 { before = true }
+                if at0 >= latest { latest = at0 }
+              }
+              n = n + 1
+            }
+            if before && f.inst(latest).b != owner { ok = false }
+            o = o + 1
+          }
+        }
+        if ok && releases.length() != 0 {
+          let mut n: usize = 0
+          while n < stores.length() {
+            let mut store = f.inst(stores.get(n))
+            store.k = 0
+            f.setInst(stores.get(n), store)
+            n = n + 1
           }
           f.setOwnership(r, Own.Borrowed, kind, root)
-          removeInst(&mut f, u32.toUsize(release))
-          if kind == RootKind.Value && u32.toUsize(root) < count { escapes.set(u32.toUsize(root), true) }
+          n = 0
+          while n < releases.length() { removeInst(&mut f, u32.toUsize(releases.get(n))) n = n + 1 }
           changed = true
+          moved = true
         }
       }
-      at = at + 1
+      step = step + 1
     }
-    b = b + 1
+    round = round + 1
   }
-  if changed { run fixSlots(&mut f) }
-  return changed
+  if !changed { return false }
+  // What borrowed from a value that now borrows itself borrows from that value's root: a
+  // borrow's root is an argument or an owned value.
+  let mut again = true
+  while again {
+    again = false
+    v = 0
+    while v < count {
+      let info = f.values.get(v)
+      if info.own == Own.Borrowed && info.rootKind == RootKind.Value && u32.toUsize(info.root) < count {
+        let from = f.values.get(u32.toUsize(info.root))
+        if from.own == Own.Borrowed { f.setOwnership(usize.toU32(v), Own.Borrowed, from.rootKind, from.root) again = true }
+      }
+      v = v + 1
+    }
+  }
+  run fixSlots(&mut f)
+  return true
 }
-/// Records that instruction at reads value v (first and last reads per value).
-fn noteRead(first: &mut List<u32>, last: &mut List<u32>, v: u32, at: u32) -> () {
-  if u32.toUsize(v) >= last.length() { return () }
+/// How many blocks one borrow may reach through (borrowFields), and how many times the
+/// pass may go over the function.
+const BORROW_BLOCKS: u32 = 12
+const BORROW_ROUNDS: u32 = 4
+/// Records the first instruction that reads value v.
+fn noteFirst(first: &mut List<u32>, v: u32, at: u32) -> () {
+  if u32.toUsize(v) >= first.length() { return () }
   if first.get(u32.toUsize(v)) == NONE { first.set(u32.toUsize(v), at) }
-  last.set(u32.toUsize(v), at)
 }
 
 /// Moves every `const.f64` outside the entry block into it, before its terminator, so a loop

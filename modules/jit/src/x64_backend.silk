@@ -35,6 +35,7 @@ import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
 import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, FIELD_STEPS }
+import ssa_verify { readsA, readsB }
 import ssa
 import value_layout { ValueLayout }
 import x64_backend_float as float
@@ -206,6 +207,11 @@ pub struct Emitter {
   steps: List<u32>,
   /// Frame mode: the slot of the function's realm, from rsp (kept for the polls).
   realmAt: i32,
+  /// Frame mode, by value: the value whose slot holds its bits. A copy (`retain`, a read
+  /// ssa_shapes found to repeat an earlier one) has no slot of its own: its source's def
+  /// dominates it and a slot is written only where its value is defined, so the source's
+  /// slot holds the copy's bits wherever the copy is read. What the copy owns stays its own.
+  pub stored: List<u32>,
 }
 
 pub fn slotOf(v: u32) -> Mem { return Mem.at(Reg.Rsp, u32.wrappingToI32(v * SLOT_BYTES)) }
@@ -307,12 +313,27 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel,
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
-    realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes }
+    realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make() }
   run emitter.inlineClosures.appendRepeated(NONE, u32.toUsize(inlined))
+  let mut own0: u32 = 0
+  while own0 < values { run emitter.stored.append(own0) own0 = own0 + 1 }
   let mut n: usize = 0
+  // Blocks are in an order where a definition comes before what it dominates.
+  while on && n < function.insts.length() {
+    let inst = function.insts.get(n)
+    let mut from = NONE
+    if inst.op == Op.Retain { from = inst.a }
+    else if inst.op == Op.GetField { from = emitter.shapes.sameAs(usize.toU32(n)) }
+    if from != NONE && from < values && inst.result != NONE && inst.result < values {
+      let source = emitter.stored.get(u32.toUsize(from))
+      emitter.stored.set(u32.toUsize(inst.result), source)
+    }
+    n = n + 1
+  }
+  n = 0
   while n < function.insts.length() {
     let inst = function.insts.get(n)
-    if inst.op == Op.InlineFrame { emitter.inlineClosures.set(i32.toUsize(inst.k), inst.a) }
+    if inst.op == Op.InlineFrame { let closure = emitter.storage(inst.a) emitter.inlineClosures.set(i32.toUsize(inst.k), closure) }
     n = n + 1
   }
   run emitter.countUses(&function)
@@ -422,9 +443,17 @@ impl Emitter {
   pub fn saves(self: &Self, index: usize) -> bool { return u32.bitAnd(u32.shiftRight(self.places.savedMask, usize.toU32(index)), 1) != 0 }
   /// Where value v lives.
   fn at(self: &Self, v: u32) -> Place { return self.places.place(v, slotOf(v)) }
-  effect fn instruction(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
-    let op = inst.op
-    self.frameOf = inst.frame
+  effect fn instruction(self: &mut Self, function: &Function, given: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    let op = given.op
+    self.frameOf = given.frame
+    // Operands are read where their bits are (stored). A return asks whose count it hands
+    // over, which is the copy's own: resultInto and valueInto find the bits themselves.
+    let mut inst = given
+    if self.on && op != Op.Return {
+      if readsA(op) { inst.a = self.storage(inst.a) }
+      if readsB(op) { inst.b = self.storage(inst.b) }
+      if readsK(op) { inst.k = u32.wrappingToI32(self.storage(i32.wrappingToU32(inst.k))) }
+    }
     if op == Op.CheckCallee {
       // A bytecode closure (tag, class) whose FunctionBytecode cell is the target's.
       run self.stressGuard(inst.exit)
@@ -507,6 +536,8 @@ impl Emitter {
       return ()
     }
     if op == Op.TagIs {
+      // A test whose only reader is the branch right after it is that branch's flags.
+      if self.fusedTag(&function, inst) { return () }
       let layout = self.settings.layout
       run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES + layout.tagOffset)))
       run self.a.movImm32(Reg.R9, 0)
@@ -612,14 +643,21 @@ impl Emitter {
       return ()
     }
     if op == Op.Retain {
+      // A borrowed copy (ssa_ownership.borrowFields) takes no count.
+      let counted = function.value(inst.result).own != Own.Borrowed
+      // Known to be an object (ssa_shapes): no tag test.
+      let object = (self.shapes.fact(self.cursor) & FACT_OBJECT) != 0
+      if self.storage(inst.result) != inst.result {
+        // The copy is read from its source's slot (stored): only its count is code.
+        if counted { run self.count(inst.a, object) }
+        return ()
+      }
       run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
       run self.a.load(Width.W64, Reg.R9, payloadOf(inst.a))
       run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
       run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
-      // A borrowed copy (ssa_ownership.borrowFields) takes no count.
-      if function.value(inst.result).own != Own.Borrowed {
-        // Known to be an object (ssa_shapes): no tag test.
-        if (self.shapes.fact(self.cursor) & FACT_OBJECT) != 0 { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) }
+      if counted {
+        if object { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) }
         else { run self.retainBits(Reg.Rax, Reg.R9) }
       }
       return ()
@@ -696,6 +734,26 @@ impl Emitter {
         let compared = function.inst(def)
         run self.compare(compared)
         taken = condition(compared.k) untaken = condition(opposite(compared.k))
+      } else if def != NONE && self.fusedTag(&function, function.inst(def)) {
+        let test = function.inst(def)
+        let layout = self.settings.layout
+        let at = Mem.at(Reg.Rsp, u32.wrappingToI32(self.storage(test.a) * SLOT_BYTES + layout.tagOffset))
+        if (test.k & 7) == 3 {
+          // Undefined and null are neighbours: one unsigned compare of the tag less the lower.
+          let mut low = layout.null()
+          if layout.undefined() < low { low = layout.undefined() }
+          run self.loadTag(Reg.R8, at)
+          run self.a.aluImm(Alu.Sub, Width.W32, Reg.R8, u32.wrappingToI32(low))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, 1)
+          taken = Cond.BelowOrEqual untaken = Cond.Above
+        } else {
+          let mut tag = layout.undefined()
+          if (test.k & 7) == 2 { tag = layout.null() }
+          if (test.k & 7) == 4 { tag = layout.uninitialized() }
+          if layout.tagWidth == 1 && tag < 256 { run self.a.cmp8MemImm(at, u32.wrappingToU8(tag)) }
+          else { run self.loadTag(Reg.R8, at) run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(tag)) }
+          taken = Cond.Equal untaken = Cond.NotEqual
+        }
       } else {
         let place = self.at(inst.a)
         if place.kind == GPR { run self.a.test(Width.W32, place.gpr, place.gpr) }
@@ -848,15 +906,11 @@ impl Emitter {
       let borrowed = function.value(inst.result).own == Own.Borrowed
       let same = self.shapes.sameAs(self.cursor)
       if same != NONE {
-        // An earlier value still holds this property's value (ssa_shapes): a copy of it.
-        run self.a.load(Width.W64, Reg.Rax, slotOf(same))
-        run self.a.load(Width.W64, Reg.R9, payloadOf(same))
-        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
-        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
-        if !borrowed {
-          if (self.shapes.fact(self.cursor) & FACT_OBJECT) != 0 { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) }
-          else { run self.retainBits(Reg.Rax, Reg.R9) }
-        }
+        // An earlier value still holds this property's value (ssa_shapes): a copy of it,
+        // read from that value's slot (stored).
+        let object = (self.shapes.fact(self.cursor) & FACT_OBJECT) != 0
+        let source = self.storage(inst.result)
+        if !borrowed { run self.count(source, object) }
         return ()
       }
       let key = self.shapes.key(self.cursor)
@@ -1547,6 +1601,19 @@ impl Emitter {
   fn onlyImmediate(self: &Self, v: u32) -> bool {
     return self.uses.get(u32.toUsize(v)) == self.immediateUses.get(u32.toUsize(v))
   }
+  /// The value whose slot holds v's bits (stored).
+  pub fn storage(self: &Self, v: u32) -> u32 {
+    if u32.toUsize(v) < self.stored.length() { return self.stored.get(u32.toUsize(v)) }
+    return v
+  }
+  /// One more count for the value in v's slot, when it is a heap reference (known to be one
+  /// when object). Clobbers RAX and R9.
+  effect fn count(self: &mut Self, v: u32, object: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.a.load(Width.W64, Reg.R9, payloadOf(v))
+    if object { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) return () }
+    run self.a.load(Width.W64, Reg.Rax, slotOf(v))
+    run self.retainBits(Reg.Rax, Reg.R9)
+  }
   /// Whether compare's only reader is its block's terminator, a branch, with no code between.
   fn fusedCompare(self: &Self, function: &Function, compare: Inst) -> bool {
     if compare.op != Op.Cmp || self.uses.get(u32.toUsize(compare.result)) != 1 { return false }
@@ -1557,6 +1624,25 @@ impl Emitter {
     // Find compare, then only code-free instructions until the branch.
     let mut i = block.firstInst
     while i < last && function.inst(i).result != compare.result { i = i + 1 }
+    i = i + 1
+    while i < last { if function.inst(i).op != Op.Release { return false } i = i + 1 }
+    return true
+  }
+  /// Whether a tag test's only reader is its block's branch, with nothing but releases
+  /// between, and one compare tells its tags: the branch then tests the tag itself (a slot
+  /// keeps its bits after a release). Frame mode.
+  fn fusedTag(self: &Self, function: &Function, test: Inst) -> bool {
+    if !self.on || test.op != Op.TagIs || test.result == NONE || self.uses.get(u32.toUsize(test.result)) != 1 { return false }
+    let layout = self.settings.layout
+    let k = test.k & 7
+    let neighbours = layout.undefined() == layout.null() + 1 || layout.null() == layout.undefined() + 1
+    if k != 1 && k != 2 && k != 4 && !(k == 3 && neighbours) { return false }
+    let block = function.blocks.get(u32.toUsize(test.block))
+    let last = block.firstInst + block.instCount - 1
+    let branch = function.inst(last)
+    if branch.op != Op.Branch || branch.a != test.result { return false }
+    let mut i = block.firstInst
+    while i < last && function.inst(i).result != test.result { i = i + 1 }
     i = i + 1
     while i < last { if function.inst(i).op != Op.Release { return false } i = i + 1 }
     return true
@@ -1581,7 +1667,7 @@ impl Emitter {
     let kind = self.places.kind(v)
     if kind == GPR { return 1000000 + u8.toU32(self.places.register(v)) }
     if kind == XMM { return 2000000 + u8.toU32(self.places.register(v)) }
-    return v
+    return self.storage(v)
   }
   fn readByPending(self: &Self, from: &List<u32>, done: &List<bool>, except: usize, key: u32, parked: u32) -> bool {
     let mut n: usize = 0
@@ -1597,9 +1683,10 @@ impl Emitter {
     let ty = function.value(v).ty
     if ty == Type.F64 { let place10 = self.at(v) run getF64(&mut self.a, Xmm.Xmm0, place10) return () }
     if ty == Type.I32 || ty == Type.Bool { let place11 = self.at(v) run getI32(&mut self.a, Reg.R11, place11) return () }
-    run self.a.load(Width.W64, Reg.Rax, slotOf(v))
+    let held = self.storage(v)
+    run self.a.load(Width.W64, Reg.Rax, slotOf(held))
     run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch), Reg.Rax)
-    run self.a.load(Width.W64, Reg.Rax, payloadOf(v))
+    run self.a.load(Width.W64, Reg.Rax, payloadOf(held))
     run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch + 8), Reg.Rax)
   }
   /// Copies value from's place (or the scratch place, when parked) into value into's.
@@ -1624,8 +1711,9 @@ impl Emitter {
       run self.a.store(Width.W64, target.mem, Reg.Rax)
       return ()
     }
-    let mut tagAt = slotOf(from)
-    let mut payloadAt = payloadOf(from)
+    let held = self.storage(from)
+    let mut tagAt = slotOf(held)
+    let mut payloadAt = payloadOf(held)
     if parked { tagAt = Mem.at(Reg.Rsp, self.scratch) payloadAt = Mem.at(Reg.Rsp, self.scratch + 8) }
     run self.a.load(Width.W64, Reg.Rax, tagAt)
     run self.a.store(Width.W64, slotOf(into), Reg.Rax)
@@ -1694,8 +1782,9 @@ impl Emitter {
       run self.boxDoubleInto(Reg.Rax, base, offset)
       return ()
     }
-    run self.a.load(Width.W64, Reg.Rax, slotOf(v))
-    run self.a.load(Width.W64, Reg.R9, payloadOf(v))
+    let held = self.storage(v)
+    run self.a.load(Width.W64, Reg.Rax, slotOf(held))
+    run self.a.load(Width.W64, Reg.R9, payloadOf(held))
     run self.a.store(Width.W64, word(base, offset), Reg.Rax)
     run self.a.store(Width.W64, word(base, offset + 8), Reg.R9)
     // A move hands its count over; a dup (a borrow) adds the slot's own.
@@ -2737,8 +2826,9 @@ impl Emitter {
       run self.a.movImm64(Reg.Rax, layout.tagWord(layout.float64()))
       return ()
     }
-    run self.a.load(Width.W64, Reg.Rax, slotOf(v))
-    run self.a.load(Width.W64, Reg.Rdx, payloadOf(v))
+    let held = self.storage(v)
+    run self.a.load(Width.W64, Reg.Rax, slotOf(held))
+    run self.a.load(Width.W64, Reg.Rdx, payloadOf(held))
     if info.own == Own.Imm || info.own == Own.Owned { return () }
     run self.retainBits(Reg.Rax, Reg.Rdx)
   }
