@@ -1,0 +1,434 @@
+//! Baseline code: machine code an embedder compiles from a function's bytecode one
+//! instruction at a time, running on a frame laid out as the interpreter's own base frame
+//! (docs/jit/baseline.md). The engine knows the frame record, the entry's C ABI and the
+//! service the code asks the engine for; what compiles the code (modules/jit) is linked by
+//! a separate executable, never imported here.
+//!
+//! A baseline frame lives on the native stack: a BaselineFrame record, whose StackFrame is
+//! published as any base frame's is, over the cells [copied arguments][locals][stack] that
+//! js_vm_activation.prepare lays out. The code keeps every value in those cells, so the
+//! interpreter can take the activation over at any instruction boundary (SERVICE_FINISH):
+//! it builds a Machine from the record and runs it to its return.
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.mem.layout { Layout }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { ByteStorage, FrameSlot, VarRef, VarRefState, FunctionBytecode, FunctionKind, ContextState, RuntimeState, StackFrame, ObjectData, ObjectPayload, BytecodeClosure, KNOWN_NONE,
+  JS_INTERRUPT_COUNTER_INIT }
+import js_class_data as classes
+import js_compiler_finish { STUB_FRAME_CELLS }
+import thin_list { BoxList, BOX_HEADER }
+import js_var_refs as cells
+import js_gc as gc
+import js_vm_property_ops as properties
+import js_vm_operators as operators
+import js_primitives as primitives
+import js_primitives { EqualityMode }
+
+/// The entry into baseline code from the engine, which the embedder emits once per runtime
+/// (CompiledTable.baselineEnter): env is CompiledTable.baselineEnv, function a bytecode
+/// closure whose bytecode is linked, argv and argc its arguments (borrowed for the call),
+/// receiver its `this`. 0 with the owned result in out; 1 when the call threw (the exception
+/// is pending in the runtime).
+pub type Enter = extern "C" fn(?*mut u8, *mut HeapHeader, *mut ValueBits, usize, *const ValueBits, *mut ValueBits) -> u32
+
+/// What baseline code asks the engine for (CompiledTable.serviceEntry): hooks and allocator are
+/// CompiledTable.serviceHooks and serviceAllocator, record the running frame's BaselineFrame,
+/// then the request (SERVICE_*) and its operands. 0, or 1 when it threw.
+pub type ServiceEntry = extern "C" fn(*mut u8, *mut u8, *mut BaselineFrame, u64, *mut ValueBits, usize) -> u64
+
+/// Run the activation to its return in the interpreter, from the record's currentPc with
+/// stackPointer operands on its stack, and release its cells: the owned result goes to
+/// record.result. With FINISH_THROWING an exception is pending and the frame unwinds first.
+pub const SERVICE_FINISH: u64 = 0
+pub const FINISH_THROWING: u64 = 0x100
+/// Call the value at base on count arguments after it (borrowed); with CALL_METHOD the cell
+/// before base is the receiver. The owned result goes to record.result.
+pub const SERVICE_CALL: u64 = 1
+pub const CALL_METHOD: u64 = 0x100
+/// The realm's interrupt counter ran out: deliver hot functions and the host's interrupt.
+pub const SERVICE_POLL: u64 = 2
+/// The native stack has no room for the frame of the function at base (its closure object's
+/// cell, not a value cell; record is null): throws the stack overflow RangeError. Always 1.
+pub const SERVICE_OVERFLOW: u64 = 3
+
+/// A baseline frame's record. Its StackFrame is the published frame; the rest is what the
+/// engine needs to take the activation over and room the code uses between instructions.
+pub struct BaselineFrame {
+  pub frame: StackFrame,
+  /// The arguments as the caller passed them (StackFrame.arguments names the frame's own
+  /// copy when it has one).
+  pub argv: *mut ValueBits,
+  pub argc: usize,
+  /// The first byte of the function's bytecode.
+  pub code: *const u8,
+  /// The realm's interrupt counter (js_interrupts.counter).
+  pub counter: *mut i32,
+  /// A service's result, and a cell the code may use within one instruction.
+  pub result: ValueBits,
+  pub scratch: ValueBits
+}
+
+/// Where baseline code finds what it reads and writes, in bytes. Frame offsets are from the
+/// BaselineFrame; the others from a cell's header.
+pub struct BaselineLayout {
+  pub frameBytes: u32,
+  pub frame: u32, pub argv: u32, pub argc: u32, pub code: u32, pub counter: u32, pub result: u32, pub scratch: u32,
+  /// StackFrame fields, from the StackFrame.
+  pub previous: u32, pub debuggerId: u32, pub asyncOwner: u32, pub currentFunction: u32, pub thisValue: u32, pub newTarget: u32,
+  pub argumentsData: u32, pub argumentsCount: u32, pub localsData: u32, pub localsCount: u32, pub stackData: u32, pub stackCount: u32,
+  pub referencesData: u32, pub referencesCount: u32, pub currentPc: u32, pub argumentCount: u32, pub mode: u32, pub stackPointer: u32,
+  /// A bytecode closure object: its 16-bit class id and its FunctionBytecode cell.
+  pub objectClass: u32, pub bytecodeClass: u32, pub closureBytecode: u32,
+  /// The word of a closure object that leads to its variable cells (a block whose first
+  /// cell pointer is boxHeader bytes in), and a variable cell (js_var_refs): the byte at
+  /// refTag holds refDetached when the cell owns its value, at refValue; otherwise the
+  /// variable lives in the frame at refFrame, in the local the low 32 bits of the word at
+  /// refSlot index unless bit 48 is set (an argument). refTag is u32.MAX when this build's
+  /// cell could not be read that way.
+  pub closureVarRefs: u32, pub boxHeader: u32,
+  pub refTag: u32, pub refDetached: u32, pub refValue: u32, pub refFrame: u32, pub refSlot: u32,
+  /// A FunctionBytecode cell: its baseline index (u32) and realm.
+  pub bytecodeBaseline: u32, pub bytecodeRealm: u32,
+  /// A realm: its interrupt counter (i32) and the value it restarts from.
+  pub interruptCounter: u32, pub interruptPeriod: u32,
+  /// The runtime: the published frame, the native stack limit, observeInstructions (a byte)
+  /// and CompiledTable's baseline table, service entry, hooks and allocator.
+  pub currentStackFrame: u32, pub stackLimit: u32, pub observe: u32,
+  pub table: u32, pub serviceEntry: u32, pub serviceHooks: u32, pub serviceAllocator: u32
+}
+impl Copy for BaselineLayout {}
+
+fn distance<A, B>(base: &A, field: &B) -> u32 {
+  return usize.toU32(Pointer.address<B>(Pointer.fromRef<B>(field)) - Pointer.address<A>(Pointer.fromRef<A>(base)))
+}
+
+/// How a variable cell (VarRef) tells its two states apart and where each keeps its parts, in
+/// bytes from the VarRef; tag is u32.MAX when the samples do not show it.
+struct RefProbe { tag: u32, detached: u32, value: u32, frame: u32, slot: u32 }
+impl Copy for RefProbe {}
+fn refByte(cell: &VarRef, at: usize) -> u8 {
+  let start = unsafe Intrinsic.pointerReinterpret<*const VarRef, *const u8>(Pointer.fromRef<VarRef>(cell))
+  return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(start), at))
+}
+fn refWord(cell: &VarRef, at: usize) -> u64 {
+  let mut word: u64 = 0
+  let mut b: usize = 8
+  while b != 0 { b = b - 1 word = u64.bitOr(u64.shiftLeft(word, 8), u8.toU64(refByte(cell, at + b))) }
+  return word
+}
+/// Reads the layout off four sample cells: two that own an Int and two attached to the
+/// frames a and b (never dereferenced).
+fn refProbe(a: *mut StackFrame, b: *mut StackFrame) -> RefProbe {
+  let d0 = VarRef { isLexical: false, isConst: false, frameIndex: 0, state: VarRefState.Detached { value: ValueBits.Int { value: 0x12345678 } } }
+  let d1 = VarRef { isLexical: false, isConst: false, frameIndex: 0, state: VarRefState.Detached { value: ValueBits.Int { value: 0x0badcafe } } }
+  let a0 = VarRef { isLexical: false, isConst: false, frameIndex: 0, state: VarRefState.Attached { frame: a, slot: FrameSlot.make(0x1111, 0, false) } }
+  let a1 = VarRef { isLexical: false, isConst: false, frameIndex: 0, state: VarRefState.Attached { frame: b, slot: FrameSlot.make(0x2222, 0, false) } }
+  let none = RefProbe { tag: u32.MAX, detached: 0, value: 0, frame: 0, slot: 0 }
+  let size = Layout.of<VarRef>().bytes
+  let start = u32.toUsize(distance(&d0, &d0.state))
+  let wantA = usize.toU64(Pointer.address<StackFrame>(a))
+  let wantB = usize.toU64(Pointer.address<StackFrame>(b))
+  let mut value: usize = usize.MAX
+  let mut frame: usize = usize.MAX
+  let mut slot: usize = usize.MAX
+  let mut at = start
+  while at + 8 <= size {
+    if value == usize.MAX && at + 16 <= size && u64.bitAnd(refWord(&d0, at + 8), 0xffffffff) == 0x12345678 && u64.bitAnd(refWord(&d1, at + 8), 0xffffffff) == 0x0badcafe { value = at }
+    if frame == usize.MAX && refWord(&a0, at) == wantA && refWord(&a1, at) == wantB { frame = at }
+    if slot == usize.MAX && refWord(&a0, at) == 0x1111 && refWord(&a1, at) == 0x2222 { slot = at }
+    at = at + 8
+  }
+  if value == usize.MAX || frame == usize.MAX || slot == usize.MAX { return none }
+  let mut first = value
+  if frame < first { first = frame }
+  if slot < first { first = slot }
+  let mut t = start
+  while t < first {
+    let d = refByte(&d0, t)
+    let s = refByte(&a0, t)
+    if d == refByte(&d1, t) && s == refByte(&a1, t) && d != s {
+      return RefProbe { tag: usize.toU32(t), detached: u8.toU32(d), value: usize.toU32(value), frame: usize.toU32(frame), slot: usize.toU32(slot) }
+    }
+    t = t + 1
+  }
+  return none
+}
+
+/// BaselineLayout of this engine build, from field addresses over a dummy cell: nothing is read or
+/// written there.
+pub fn layout() -> BaselineLayout {
+  let mut cell: [u64; 1024] = [0; 1024]
+  let header = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut HeapHeader>(Pointer.fromMutRef<u64>(&mut cell[0]))
+  let base = Pointer.address<HeapHeader>(header)
+  let anchor = ()
+  let record = unsafe Pointer.borrow<(), BaselineFrame>(&anchor, unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut BaselineFrame>(header))
+  let frame = &record.frame
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, header)
+  let objectStart = Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(object)) - base
+  let payload = Pointer.address<ObjectPayload>(Pointer.fromRef<ObjectPayload>(&object.payload)) - base
+  let sample = ObjectPayload.BytecodeFunction { function: BytecodeClosure { bytecode: header, varRefs: BoxList<?*mut HeapHeader>.make(),
+    homeObject: Pointer.null<HeapHeader>(), scope: Pointer.null<HeapHeader>() } }
+  let mut within: usize = 0
+  let mut withinRefs: usize = 0
+  match &sample {
+    ObjectPayload.BytecodeFunction { function: closure } => {
+      within = Pointer.address<*mut HeapHeader>(Pointer.fromRef<*mut HeapHeader>(&closure.bytecode)) - Pointer.address<ObjectPayload>(Pointer.fromRef<ObjectPayload>(&sample))
+      withinRefs = Pointer.address<BoxList<?*mut HeapHeader>>(Pointer.fromRef<BoxList<?*mut HeapHeader>>(&closure.varRefs)) - Pointer.address<ObjectPayload>(Pointer.fromRef<ObjectPayload>(&sample))
+    }
+    _ => ()
+  }
+  let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, header)
+  let realm = unsafe HeapCell.payload<ContextState, ()>(&anchor, header)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, header)
+  let variable = unsafe HeapCell.payload<VarRef, ()>(&anchor, header)
+  let variableStart = usize.toU32(Pointer.address<VarRef>(Pointer.fromRef<VarRef>(variable)) - base)
+  let refs = refProbe(unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut StackFrame>(header),
+    unsafe Intrinsic.pointerReinterpret<*mut u64, *mut StackFrame>(Pointer.fromMutRef<u64>(&mut cell[64])))
+  let mut refTag: u32 = u32.MAX
+  if refs.tag != u32.MAX { refTag = variableStart + refs.tag }
+  return BaselineLayout {
+    frameBytes: usize.toU32(Layout.of<BaselineFrame>().bytes),
+    frame: distance(record, frame), argv: distance(record, &record.argv), argc: distance(record, &record.argc), code: distance(record, &record.code),
+    counter: distance(record, &record.counter),
+    result: distance(record, &record.result), scratch: distance(record, &record.scratch),
+    previous: distance(frame, &frame.previous), debuggerId: distance(frame, &frame.debuggerId), asyncOwner: distance(frame, &frame.asyncOwner),
+    currentFunction: distance(frame, &frame.currentFunction), thisValue: distance(frame, &frame.thisValue), newTarget: distance(frame, &frame.newTarget),
+    argumentsData: distance(frame, &frame.arguments.data), argumentsCount: distance(frame, &frame.arguments.count),
+    localsData: distance(frame, &frame.locals.data), localsCount: distance(frame, &frame.locals.count),
+    stackData: distance(frame, &frame.stack.data), stackCount: distance(frame, &frame.stack.count),
+    referencesData: distance(frame, &frame.varRefs.data), referencesCount: distance(frame, &frame.varRefs.count),
+    currentPc: distance(frame, &frame.currentPc), argumentCount: distance(frame, &frame.argumentCount), mode: distance(frame, &frame.mode),
+    stackPointer: distance(frame, &frame.stackPointer),
+    objectClass: usize.toU32(objectStart + object.classOffset()), bytecodeClass: classes.JS_CLASS_BYTECODE_FUNCTION, closureBytecode: usize.toU32(payload + within),
+    closureVarRefs: usize.toU32(payload + withinRefs), boxHeader: usize.toU32(BOX_HEADER),
+    refTag: refTag, refDetached: refs.detached, refValue: variableStart + refs.value, refFrame: variableStart + refs.frame, refSlot: variableStart + refs.slot,
+    bytecodeBaseline: usize.toU32(Pointer.address<u32>(Pointer.fromRef<u32>(&bytecode.baseline)) - base),
+    bytecodeRealm: usize.toU32(Pointer.address<*mut HeapHeader>(Pointer.fromRef<*mut HeapHeader>(&bytecode.realm)) - base),
+    interruptCounter: usize.toU32(Pointer.address<i32>(Pointer.fromRef<i32>(&realm.interruptCounter)) - base),
+    interruptPeriod: i32.toU32(JS_INTERRUPT_COUNTER_INIT),
+    currentStackFrame: usize.toU32(Pointer.address<?*mut StackFrame>(Pointer.fromRef<?*mut StackFrame>(&state.currentStackFrame)) - base),
+    stackLimit: usize.toU32(Pointer.address<usize>(Pointer.fromRef<usize>(&state.stackLimit)) - base),
+    observe: usize.toU32(Pointer.address<bool>(Pointer.fromRef<bool>(&state.observeInstructions)) - base),
+    table: usize.toU32(Pointer.address<?*mut ?*const u8>(Pointer.fromRef<?*mut ?*const u8>(&state.compiled.baseline)) - base),
+    serviceEntry: usize.toU32(Pointer.address<?*const u8>(Pointer.fromRef<?*const u8>(&state.compiled.serviceEntry)) - base),
+    serviceHooks: usize.toU32(Pointer.address<?*mut u8>(Pointer.fromRef<?*mut u8>(&state.compiled.serviceHooks)) - base),
+    serviceAllocator: usize.toU32(Pointer.address<?*mut u8>(Pointer.fromRef<?*mut u8>(&state.compiled.serviceAllocator)) - base) }
+}
+
+/// What a compiler needs to know of bytecode, a FunctionBytecode cell, to lay out its frame.
+pub struct Shape {
+  pub arguments: u32, pub locals: u32, pub stack: u32, pub mode: u32,
+  /// The frame copies its arguments on every call (the code writes a parameter).
+  pub copies: bool,
+  /// Where the first code byte is: the word at byte offset codeWord of the bytecode's cell
+  /// plus codeDelta (owned code sits in a block behind one word, after the block's header;
+  /// borrowed code is pointed at directly). codeWord is u32.MAX when no word leads to it.
+  pub codeWord: u32,
+  pub codeDelta: u32,
+  /// Baseline code can run it: a plain function with no scope of its own, no captured
+  /// variables of its own and a closure object (not a known local function).
+  pub plain: bool
+}
+impl Copy for Shape {}
+pub unsafe fn shape(bytecode: *mut HeapHeader) -> Shape {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let start = Pointer.address<u8>(unsafe code.code.start())
+  // The words of the storage itself: the one that leads to the bytes is at most a block
+  // header below them.
+  let storage = Pointer.address<ByteStorage>(Pointer.fromRef<ByteStorage>(&code.code))
+  let cell = Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, *const HeapHeader>(bytecode))
+  let words = unsafe Pointer.assumeMany<usize>(unsafe Intrinsic.pointerReinterpret<*const ByteStorage, *const usize>(Pointer.fromRef<ByteStorage>(&code.code)))
+  let mut codeWord: u32 = u32.MAX
+  let mut codeDelta: u32 = 0
+  let mut index: usize = 0
+  while index < Layout.of<ByteStorage>().bytes / 8 {
+    let held = unsafe Pointer.read<usize>(unsafe Pointer.at<usize>(words, index))
+    if held != 0 && held <= start && start - held <= 64 {
+      codeWord = usize.toU32(storage - cell + index * 8)
+      codeDelta = usize.toU32(start - held)
+      break
+    }
+    index = index + 1
+  }
+  return Shape { arguments: u16.toU32(code.argumentCount), locals: u16.toU32(code.variableCount), stack: u16.toU32(code.stackSize), mode: u8.toU32(code.mode),
+    copies: !code.borrowsArguments, codeWord: codeWord, codeDelta: codeDelta,
+    plain: code.kind == FunctionKind.Normal && code.varRefCount == 0 && code.scopeSlots == 0 && code.known.state == KNOWN_NONE
+      && !code.isDerivedClassConstructor && code.pending.isNone() }
+}
+
+/// Lends the runtime the table of baseline code addresses (capacity entries, all null).
+pub unsafe fn setTable(runtime: *mut HeapHeader, table: ?*mut ?*const u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.compiled.baseline = table
+  state.compiled.baselineCount = 0
+}
+/// The embedder's entry into baseline code and its environment word.
+pub unsafe fn setEntry(runtime: *mut HeapHeader, enter: ?*const u8, env: ?*mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.compiled.baselineEnter = enter
+  state.compiled.baselineEnv = env
+}
+/// The host's service entry and the allocator provider it runs on, lent for the runtime's life.
+pub unsafe fn setService(runtime: *mut HeapHeader, entry: ?*const u8, allocator: ?*mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.compiled.serviceEntry = entry
+  state.compiled.serviceAllocator = allocator
+}
+/// Whether the runtime has a host service and allocator: without them baseline code has no
+/// slow path, and nothing may be linked.
+pub unsafe fn serviced(runtime: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return !Pointer.isNull<u8>(state.compiled.serviceEntry) && !Pointer.isNull<u8>(state.compiled.serviceAllocator)
+}
+/// Links bytecode to baseline code at address code, as table entry index (the next free one).
+/// Interpreted calls of it then leave the inline path and reach the code (js_vm.callInline),
+/// except a leaf's, which stay frameless.
+pub unsafe fn link(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u32, code: *const u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if index != state.compiled.baselineCount { Intrinsic.trap("baseline table invariant violated") }
+  let table = unsafe Pointer.assumeManyMut<?*const u8>(unsafe Intrinsic.pointerRequalify<?*mut ?*const u8, *mut ?*const u8>(state.compiled.baseline))
+  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, u32.toUsize(index)), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(code))
+  state.compiled.baselineCount = index + 1
+  drop state
+  let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
+  if owner.leaf == 0 { owner.frameCells = STUB_FRAME_CELLS }
+  owner.baseline = index + 1
+}
+
+/// get_var and get_var_undef of an initialized binding of function, a bytecode closure: the
+/// value of its closure variable index, retained, into out. False for an uninitialized one
+/// (a TDZ read, or a global not yet defined), which the interpreter resolves or throws for.
+pub unsafe fn readVariable(function: *mut HeapHeader, index: u32, out: *mut ValueBits) -> bool {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let cell = match &data.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => {
+      if u32.toUsize(index) >= closure.varRefs.length() { return false }
+      closure.varRefs.asSlice()[u32.toUsize(index)]
+    }
+    _ => { return false }
+  }
+  drop data
+  let reference = match Pointer.nonNullMut<HeapHeader>(cell) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let value = unsafe cells.read(reference)
+  if match value { ValueBits.Uninitialized => true _ => false } { return false }
+  unsafe Pointer.write<ValueBits>(out, unsafe value.retained())
+  return true
+}
+/// Drops the count value holds; a cell that dies is queued, not freed here (js_gc.releaseDeferred).
+pub unsafe fn release(value: ValueBits) -> () { unsafe gc.releaseDeferred(value) }
+
+/// The object in cell, or null when it holds something else.
+unsafe fn objectIn(cell: *const ValueBits) -> ?*mut HeapHeader {
+  return match unsafe Pointer.read<ValueBits>(cell) { ValueBits.Object { reference } => reference _ => Pointer.null<HeapHeader>() }
+}
+/// get_loc_field8 and get_arg_field8 past their inline key (ip at the atom operand): the
+/// field of the object in cell, retained, into out, through the interpreter's own caches
+/// (js_vm_property_ops.readFieldKeyedAt, which refills the key). False, with nothing changed,
+/// for what only the interpreter answers (a getter, a value that is not an object).
+pub unsafe fn readField(runtime: *mut HeapHeader, ip: *const u8, cell: *const ValueBits, out: *mut ValueBits) -> bool {
+  let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(cell)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  return unsafe properties.readFieldKeyedAt(runtime, ip, object, out, true)
+}
+/// get_field past its inline key: the field replaces the object in cell, whose count drops.
+pub unsafe fn readFieldTop(runtime: *mut HeapHeader, ip: *const u8, cell: *mut ValueBits) -> bool {
+  let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(cell))) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let mut found = ValueBits.Undefined
+  if !unsafe properties.readFieldKeyedAt(runtime, ip, object, Pointer.fromMutRef<ValueBits>(&mut found), true) { return false }
+  unsafe Pointer.write<ValueBits>(cell, found)
+  unsafe gc.releaseDeferred(ValueBits.Object { reference: object })
+  return true
+}
+/// get_field2 (ip at its atom operand): the field of the object in cell, retained, into out,
+/// by the site cache (js_vm_property_ops.readFieldCachedAt).
+pub unsafe fn readFieldCached(runtime: *mut HeapHeader, ip: *const u8, cell: *const ValueBits, out: *mut ValueBits) -> bool {
+  let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(cell)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  return unsafe properties.readFieldCachedAt(runtime, ip, object, out, true)
+}
+/// put_field (pops true: the value's count moves into the object, whose own count drops) and
+/// put_loc_field_loc8 (pops false: the object takes a count of its own) past their inline
+/// key: an own writable data property or an add along a cached transition. False with
+/// nothing changed.
+pub unsafe fn writeField(runtime: *mut HeapHeader, ip: *const u8, target: *const ValueBits, source: *mut ValueBits, pops: bool) -> bool {
+  let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(target)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  if pops {
+    if !(unsafe properties.writeOwnField(ip, object, source) || unsafe properties.writeFieldInPlace(runtime, ip, object, source, true)) { return false }
+    unsafe gc.releaseDeferred(ValueBits.Object { reference: object })
+    return true
+  }
+  let mut copy = unsafe (unsafe Pointer.read<ValueBits>(source)).retained()
+  if unsafe properties.writeOwnField(ip, object, Pointer.fromMutRef<ValueBits>(&mut copy))
+    || unsafe properties.writeFieldInPlace(runtime, ip, object, Pointer.fromMutRef<ValueBits>(&mut copy), true) { return true }
+  unsafe gc.releaseDeferred(copy)
+  return false
+}
+/// == (negate false) or != of the values in left and right where no coercion can run
+/// JavaScript: 1 with both counts dropped and the Bool in left; 0 with nothing changed.
+pub unsafe fn equal(left: *mut ValueBits, right: *const ValueBits, negate: bool) -> bool {
+  let a = unsafe Pointer.read<ValueBits>(left)
+  let b = unsafe Pointer.read<ValueBits>(right)
+  let mut same = unsafe operators.looseIdentity(a, b)
+  if same < 0 {
+    if !((a.isNumber() && b.isNumber()) || (a.isBigInt() && b.isBigInt())) { return false }
+    same = 0
+    if unsafe primitives.equal(a, b, EqualityMode.Strict) { same = 1 }
+  }
+  unsafe gc.releaseDeferred(a)
+  unsafe gc.releaseDeferred(b)
+  unsafe Pointer.write<ValueBits>(left, ValueBits.Bool { value: (same == 1) != negate })
+  return true
+}
+/// get_array_el where no user code runs (js_vm_property_ops.elementRead): the element of the
+/// object in cell under the key in the cell after it replaces the object, whose count drops.
+pub unsafe fn readElement(cell: *mut ValueBits) -> bool {
+  let object = unsafe Pointer.read<ValueBits>(cell)
+  let key = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 1))
+  match unsafe properties.elementRead(object, key) {
+    Option<ValueBits>.Some { value } => {
+      unsafe Pointer.write<ValueBits>(cell, value)
+      unsafe gc.releaseDeferred(object)
+      return true
+    }
+    Option<ValueBits>.None => { return false }
+  }
+}
+/// put_array_el where no user code runs (js_vm_property_ops.storeElementDeferred): the value
+/// in the third cell from cell goes into the object in cell at the Int index in the second,
+/// and all three drop their counts. False changes nothing.
+pub unsafe fn storeElement(cell: *mut ValueBits) -> bool {
+  let object = unsafe Pointer.read<ValueBits>(cell)
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let index = match unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 1)) {
+    ValueBits.Int { value } => value
+    _ => { return false }
+  }
+  if index < 0 { return false }
+  let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 2))
+  if !unsafe properties.storeElementDeferred(node, index, value) { return false }
+  // The store took its own count of the value.
+  unsafe gc.releaseDeferred(value)
+  unsafe gc.releaseDeferred(object)
+  return true
+}
+/// ToBoolean of the value in cell, whose count drops.
+pub unsafe fn truthy(cell: *const ValueBits) -> bool {
+  let value = unsafe Pointer.read<ValueBits>(cell)
+  let truth = unsafe primitives.toBoolean(value) != 0
+  unsafe gc.releaseDeferred(value)
+  return truth
+}

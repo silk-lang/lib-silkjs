@@ -37,6 +37,11 @@ import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers
 import ssa { Function }
 import jit_helpers { CompiledEnv }
 import jit_cost { Cost, now }
+import baseline
+import baseline { Settings as BaselineSettings, Outcome as BaselineOutcome }
+import baseline_env { BaselineEnv }
+import baseline_env
+import silkjs.js_baseline as engineBaseline
 
 struct LoopBook { sites: List<u32>, spent: u64,
   /// With --jit-dump, the function's bytecode, to name the opcodes its code deoptimized at.
@@ -99,13 +104,15 @@ pub struct Options {
   /// --jit-foresee=MASK: the FORESEE_* refusals a recording may make (default FORESEE_ALL).
   pub foresee: u32,
   /// --jit-no-<pass> clears a bit: the code quality passes that run (ssa_opt.PASS_*).
-  pub passes: u32
+  pub passes: u32,
+  /// --jit-baseline: hot functions get baseline code (docs/jit/baseline.md) and nothing else.
+  pub baseline: bool
 }
 /// The compile budget's default, in bytecode bytes (measured: K-doubles report, "Compile budget").
 pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 impl Options {
   pub fn make() -> Self {
-    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE, foresee: FORESEE_ALL, passes: 4294967295, inlining: true }
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE, foresee: FORESEE_ALL, passes: 4294967295, inlining: true, baseline: false }
   }
 }
 
@@ -169,7 +176,19 @@ pub struct Jit {
   /// Functions refused because their recording showed a site the code would deoptimize at.
   pub foreseen: u64,
   /// Generic instruction exits in installed code (--jit-stats generic-sites).
-  pub genericSites: u64
+  pub genericSites: u64,
+  /// Baseline code (Options.baseline): the table lent to the runtime, the environment its
+  /// code runs with (neither ever moves), what it is compiled against, and whether the
+  /// entry and release stubs are in place.
+  baselineTable: List<?*const u8>,
+  pub baselineEnv: List<BaselineEnv>,
+  baselineSettings: Option<BaselineSettings>,
+  baselineReady: bool,
+  pub baselineCompiled: u64,
+  pub baselineRefused: u64,
+  pub baselineBytes: u64,
+  /// Reachable instructions without a template in installed baseline code.
+  pub baselineUncovered: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
@@ -178,11 +197,16 @@ impl Jit {
     let kept = run List<ValueBits>.makeWithCapacity(KEPT_CAPACITY)
     let mut env = run List<CompiledEnv>.makeWithCapacity(1)
     drop env.appendWithinCapacity(CompiledEnv.make())
+    let baselineTable = run List<?*const u8>.makeWithCapacity(CAPACITY)
+    let mut baselineEnv = run List<BaselineEnv>.makeWithCapacity(1)
+    drop baselineEnv.appendWithinCapacity(BaselineEnv.make())
     return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, activations: move activations, kept: move kept, inlinedSites: 0, env: move env, blocks: List<CodeBlock>.make(),
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
       history: History.make(), recompiled: 0,
-      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0 }
+      osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0,
+      baselineTable: move baselineTable, baselineEnv: move baselineEnv, baselineSettings: Option<BaselineSettings>.none(), baselineReady: false,
+      baselineCompiled: 0, baselineRefused: 0, baselineBytes: 0, baselineUncovered: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -229,6 +253,13 @@ impl Jit {
     run line.appendSlice(b" profiled ") run decimal(&mut line, self.profiled)
     run line.appendSlice(b" learned ") run decimal(&mut line, self.learned)
     run line.appendSlice(b" foreseen ") run decimal(&mut line, self.foreseen)
+    run line.appendSlice(b" baseline-compiled ") run decimal(&mut line, self.baselineCompiled)
+    run line.appendSlice(b" baseline-refused ") run decimal(&mut line, self.baselineRefused)
+    run line.appendSlice(b" baseline-bytes ") run decimal(&mut line, self.baselineBytes)
+    run line.appendSlice(b" baseline-uncovered ") run decimal(&mut line, self.baselineUncovered)
+    run line.appendSlice(b" baseline-departures ") run decimal(&mut line, self.baselineEnv.get(0).departures)
+    run line.appendSlice(b" baseline-service-calls ") run decimal(&mut line, self.baselineEnv.get(0).serviceCalls)
+    run line.appendSlice(b" baseline-direct-calls ") run decimal(&mut line, self.baselineEnv.get(0).directCalls)
     run line.append(10)
     return move line
   }
@@ -363,6 +394,109 @@ pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
   unsafe runtime.setActivationStack(rt, unsafe Intrinsic.pointerRequalify<?[*]mut u64, ?*mut u64>(stack), ACTIVATION_WORDS)
   let kept = unsafe jit.kept.storage()
   unsafe inline.setKept(rt, unsafe Intrinsic.pointerRequalify<?[*]mut ValueBits, ?*mut ValueBits>(kept), KEPT_CAPACITY)
+  if jit.options.baseline {
+    let mut baselineEnv = BaselineEnv.make()
+    baselineEnv.runtime = rt
+    jit.baselineEnv.set(0, baselineEnv)
+    jit.baselineSettings = baseline.probe(jit.options.stats)
+    let slots = unsafe jit.baselineTable.storage()
+    unsafe engineBaseline.setTable(rt, unsafe Intrinsic.pointerRequalify<?[*]mut ?*const u8, ?*mut ?*const u8>(slots))
+  }
+}
+
+/// Publishes the entry and release stubs of baseline code and gives the runtime its entry,
+/// once. False when they cannot be made.
+unsafe effect fn baselineStubs(jit: &mut Jit, settings: &BaselineSettings) -> bool ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  if jit.baselineReady { return true }
+  let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
+  let mut entryCode = match move run Effect.result(baseline.entryStub(settings)) {
+    Result<Code, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
+    Result<Code, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { return false }
+  }
+  let mut releaseCode = match move run Effect.result(baseline.releaseStub()) {
+    Result<Code, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
+    Result<Code, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { return false }
+  }
+  if jit.memory.isNone() { jit.memory = Option<CodeMemory>.some(run CodeMemory.reserve(CODE_BYTES)) }
+  let none = List<usize>.make()
+  let entryBlock = match &mut jit.memory {
+    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut entryCode, none.asSlice())
+    Option<CodeMemory>.None => { return false }
+  }
+  let releaseBlock = match &mut jit.memory {
+    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut releaseCode, none.asSlice())
+    Option<CodeMemory>.None => { return false }
+  }
+  let enter = entryBlock.entry()
+  let release = releaseBlock.entry()
+  run jit.blocks.append(move entryBlock)
+  run jit.blocks.append(move releaseBlock)
+  let mut state = jit.baselineEnv.get(0)
+  state.helpers[u32.toUsize(baseline_env.RELEASE_STUB)] = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(release)
+  jit.baselineEnv.set(0, state)
+  let envAddress = unsafe Intrinsic.pointerReinterpret<*mut BaselineEnv, *mut u8>(Pointer.fromMutRef<BaselineEnv>(&mut jit.baselineEnv.asMutSlice()[0]))
+  unsafe engineBaseline.setEntry(rt, unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(enter), unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(envAddress))
+  jit.baselineReady = true
+  return true
+}
+
+/// compileHot with Options.baseline: bytecode gets baseline code, or stays interpreted.
+unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if function.baseline != 0 { return () }
+  jit.reported = jit.reported + 1
+  if jit.options.dump { run unsafe dumpBytecode(&function) }
+  let settings = match jit.baselineSettings {
+    Option<BaselineSettings>.Some { value } => value
+    Option<BaselineSettings>.None => { jit.baselineRefused = jit.baselineRefused + 1 if jit.options.dump { run say(b"jit: baseline refused: ", b"the engine's value layout") } return () }
+  }
+  if !unsafe engineBaseline.serviced(rt) || jit.baselineCompiled >= usize.toU64(CAPACITY) {
+    jit.baselineRefused = jit.baselineRefused + 1
+    if jit.options.dump { run say(b"jit: baseline refused: ", b"no service, or the table is full") }
+    return ()
+  }
+  let shape = unsafe engineBaseline.shape(bytecode)
+  let bytes = unsafe function.code.asSlice()
+  let outcome = match move run Effect.result(baseline.compile(&settings, &shape, bytes)) {
+    Result<BaselineOutcome, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
+    Result<BaselineOutcome, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
+  }
+  drop function
+  match move outcome {
+    BaselineOutcome { code: made, why, uncovered } => {
+      let mut code = match move made {
+        Option<Code>.Some { value } => move value
+        Option<Code>.None => {
+          jit.baselineRefused = jit.baselineRefused + 1
+          if jit.options.dump { run say(b"jit: baseline refused: ", why) }
+          return ()
+        }
+      }
+      if !run unsafe baselineStubs(&mut jit, &settings) { jit.failed = jit.failed + 1 return () }
+      let none = List<usize>.make()
+      let block = match &mut jit.memory {
+        Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, none.asSlice())
+        Option<CodeMemory>.None => { return () }
+      }
+      let entry = block.entry()
+      run jit.blocks.append(move block)
+      unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), entry)
+      jit.baselineCompiled = jit.baselineCompiled + 1
+      jit.baselineBytes = jit.baselineBytes + usize.toU64(code.bytes.length())
+      jit.baselineUncovered = jit.baselineUncovered + usize.toU64(uncovered.length())
+      if jit.options.dump {
+        run dumpPlaced(b"jit: baseline code at ", Pointer.address<u8>(entry), &code)
+        let mut line = List<u8>.make()
+        run line.appendSlice(b"jit: baseline uncovered:")
+        let mut k: usize = 0
+        while k < uncovered.length() { run line.append(32) run line.appendSlice(op.opcodeName(uncovered.get(k), true)) k = k + 1 }
+        run line.append(10)
+        io.stderr(line.asSlice())
+      }
+    }
+  }
 }
 
 /// LibcServices.hotFunction through HotHandler: compile bytecode or refuse it.
@@ -481,6 +615,7 @@ const REPORTED_FLOOR: u32 = 2147483648
 
 /// Compiles bytecode, a FunctionBytecode cell reported hot, and links it, or refuses it.
 pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  if jit.options.baseline { run unsafe compileBaseline(&mut jit, bytecode) return () }
   let attached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
   let loopPc = unsafe runtime.hotLoopPc(attached)
   let anchor = ()
