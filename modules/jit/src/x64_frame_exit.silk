@@ -11,7 +11,8 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_value { ValueBits }
 import silkjs.js_gc as gc
-import silkjs.js_baseline { BaselineFrame }
+import silkjs.js_baseline { BaselineFrame, Inlined }
+import silk.mem.layout { Layout }
 import silkjs.js_baseline as engine
 import baseline_env { BaselineEnv }
 import jit_exit_state as state
@@ -45,12 +46,20 @@ pub const HOW_STEP_LEFT: u32 = 7
 /// not kept, goes to the code; the others not kept stay in their cells for the code to take.
 pub fn stepShape(base: u32, results: u32, kept: u32, after: u32) -> u32 { return base | u32.shiftLeft(results, 8) | u32.shiftLeft(kept, 12) | u32.shiftLeft(after, 20) }
 
+/// In jitFrameExit's answer: the exit left inlined bodies part way through.
+pub const INLINED: u64 = 0x8000000000000000
+
 unsafe fn wordAt(words: [*]mut u32, index: usize) -> u32 { return unsafe Pointer.read<u32>(unsafe Pointer.atMut<u32>(words, index)) }
 
 /// frame_exit(env, record, slots, exit, dump, how) -> u64: writes the state `exit` describes
 /// into the cells of the frame of `record`, from the code's value slots at `slots` and its
 /// registers in `dump`. Returns js_baseline.moved(pc, depth) for HOW_DEOPT and
 /// HOW_DECLINED; for the others sets the frame's pc and returns the operand depth.
+/// An exit that leaves inlined bodies part way through (its record has frames) also writes
+/// their activations into the code's area for them (jit_exit_state), sets the frame's pc
+/// at the outermost inlined call and returns the operand depth with
+/// INLINED set: the stub asks the engine to run them (SERVICE_INLINED). The innermost is at
+/// a call of its own that threw when how is HOW_CALL_THREW.
 /// The local cells hold undefined until now and the operand cells nothing the frame owns
 /// (a call's operands are lent), so both are written over; a parameter's cell owns its
 /// value, which is dropped once every new value has its count.
@@ -68,6 +77,26 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
   let depth = u32.toUsize(depthWord & 0x7fffffff)
   let slotCount = u32.toUsize(unsafe wordAt(words, 3))
   let count = u32.toUsize(unsafe wordAt(words, 4))
+  // The inlined bodies the exit leaves part way through: their words follow the chunks',
+  // their values' entries the slots', and the code's area for them has a
+  // js_baseline.Inlined each, then a cell per value.
+  let frames = u32.toUsize(unsafe wordAt(words, 5))
+  let described = u32.toUsize(state.RECORD_HEAD) + (count + u32.toUsize(state.CHUNK) - 1) / u32.toUsize(state.CHUNK)
+  let mut inner: usize = 0
+  let mut area: usize = 0
+  if frames != 0 {
+    if how != HOW_DEOPT && how != HOW_DECLINED && how != HOW_CALL_THREW { Intrinsic.trap("jitFrameExit: inlined frames at an exit that is no guard's or call's") }
+    if Layout.of<Inlined>().bytes > u32.toUsize(state.INLINED_BYTES) { Intrinsic.trap("jitFrameExit: js_baseline.Inlined outgrew its place") }
+    area = u32.toUsize(unsafe wordAt(words, described))
+    let mut n: usize = 0
+    while n < frames {
+      let at = described + 1 + n * u32.toUsize(state.FRAME_WORDS)
+      inner = inner + u32.toUsize(unsafe wordAt(words, at + 2)) + u32.toUsize(unsafe wordAt(words, at + 3))
+      n = n + 1
+    }
+  }
+  let kept = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(
+    unsafe Pointer.atMut<u8>(bytes, area + frames * u32.toUsize(state.INLINED_BYTES))))
   let frame = unsafe engine.cellsOf(record)
   let cells = unsafe Pointer.assumeManyMut<ValueBits>(frame.cells)
   if slotCount < frame.locals + depth || depth > frame.stack { Intrinsic.trap("jitFrameExit: an exit record that does not fit its frame") }
@@ -86,7 +115,13 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
       let within = index % chunkSize
       let kind = unsafe wordAt(chunk, within * 2)
       let operand = unsafe wordAt(chunk, within * 2 + 1)
-      if index >= slotCount {
+      if index >= slotCount && index < slotCount + inner {
+        if pass == 0 {
+          let mut value = unsafe state.decode(kind, operand, bytes, registers)
+          if kind == state.ENTRY_VALUE_RETAIN { value = unsafe value.retained() }
+          unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(kept, index - slotCount), value)
+        }
+      } else if index >= slotCount {
         if kind != state.ENTRY_RELEASE { Intrinsic.trap("jitFrameExit: an entry after the slots that is no release") }
         if pass == 2 && !lend { unsafe gc.releaseDeferred(unsafe state.decode(state.ENTRY_VALUE, operand, bytes, registers)) }
       } else if index < frame.locals + depth {
@@ -111,6 +146,30 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
   let mut anchor = ()
   let counters = unsafe Pointer.borrowMut<(), BaselineEnv>(&mut anchor, env)
   counters.frameExits = counters.frameExits + 1
+  if frames != 0 {
+    // The activations, innermost first so each names the one inside it. The frame itself is
+    // at the outermost inlined call, past its opcode as baseline code leaves it at a call.
+    let mut next: ?*mut Inlined = Pointer.null<Inlined>()
+    let mut cell = inner
+    let mut n = frames
+    while n > 0 {
+      n = n - 1
+      let at = described + 1 + n * u32.toUsize(state.FRAME_WORDS)
+      let call = unsafe wordAt(words, at + 1)
+      let locals = u32.toUsize(unsafe wordAt(words, at + 2))
+      let operands = u32.toUsize(unsafe wordAt(words, at + 3))
+      cell = cell - locals - operands
+      let place = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Inlined>(unsafe Pointer.atMut<u8>(bytes, area + n * u32.toUsize(state.INLINED_BYTES)))
+      unsafe Pointer.write<Inlined>(place, Inlined { argc: u32.toUsize(call & (state.FRAME_METHOD - 1)), after: u32.toUsize(unsafe wordAt(words, at)),
+        locals: unsafe Pointer.atMut<ValueBits>(kept, cell), count: locals, stack: unsafe Pointer.atMut<ValueBits>(kept, cell + locals), sp: operands,
+        pc: u32.toUsize(unsafe wordAt(words, at + 4)), inner: next, method: (call & state.FRAME_METHOD) != 0, taken: false,
+        threw: how == HOW_CALL_THREW && n + 1 == frames })
+      next = unsafe Intrinsic.pointerRequalify<*mut Inlined, ?*mut Inlined>(place)
+    }
+    counters.inlinedExits = counters.inlinedExits + 1
+    unsafe engine.setPc(record, pc + 1)
+    return INLINED | usize.toU64(depth)
+  }
   if how == HOW_DEOPT || how == HOW_DECLINED { return engine.moved(pc, depth) }
   if how == HOW_CALL_THREW { unsafe engine.setPc(record, pc + 1) } else { unsafe engine.setPc(record, pc) }
   return usize.toU64(depth)

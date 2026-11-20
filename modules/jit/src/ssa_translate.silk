@@ -63,6 +63,10 @@ pub struct FunctionInput {
   /// What the function's cached field sites (get_field2) read from, as far as the embedder
   /// knows (js_compiled_inline.siteShapes). A hint: the code tests each shape it uses.
   pub siteShapes: List<SiteShape>,
+  /// Whether an exit inside an inlined body may leave the body part way through, for the
+  /// engine to go on with in a frame of its own (ssa.Exit.frames): code on a baseline frame
+  /// can. Without it a guard after an effect in a body fails the inlining.
+  pub leavesBodies: bool,
 }
 /// The `count` (1 to 4) shapes the cached field site at `pc` read a data property from:
 /// keys[i] is the shape's version << 16 with the slot (an own property) or
@@ -80,6 +84,12 @@ const INLINE_BLOCKS: usize = 8
 pub struct CallTarget { pub pc: u32, pub id: u32, pub input: FunctionInput,
   /// `pc` is the call's own (a recorded call target, any call) rather than its `get_field2`'s.
   pub atCall: bool }
+
+/// The call that began an inlined body: at `pc` of its caller's code with `argc` arguments,
+/// the instruction after it at `after`; the caller's `locals` locals and `stack` operands at
+/// the call (the call's among them) are in the translator's held values from `start`.
+struct InlineCall { pc: u32, after: u32, argc: u32, method: bool, start: usize, locals: usize, stack: usize }
+impl Copy for InlineCall {}
 
 /// Inlined bodies nest at most this deep, and are at most this many bytes of code each.
 const MAX_INLINE_DEPTH: u32 = 3
@@ -779,6 +789,11 @@ struct Translator {
   /// The inlined bodies around the code being translated, the current one last: each its
   /// target number and its closure's place in held.
   frames: List<usize>,
+  /// The calls that began the bodies around the code being translated, the current body's
+  /// last (depth of them).
+  calls: List<InlineCall>,
+  /// FunctionInput.leavesBodies.
+  leaves: bool,
   /// A guard came after an effect: the attempt fails.
   broken: bool,
   /// Why inlineTarget found none.
@@ -920,12 +935,18 @@ impl Translator {
   /// The parameters of the code being translated: the function's, or an inlined body's.
   fn argumentLimit(self: &Self) -> usize { if self.depth != 0 { return u32.toUsize(self.formals) } return u32.toUsize(self.f.argumentCount) }
 
-  /// The exit of a guard inside an inlined body: the function's state before the outermost
-  /// inlined call, where the interpreter makes that call itself. Sound only while the bodies
-  /// have had no effect; what they own is dropped (Exit.drops).
-  effect fn inlineExit(self: &mut Self, inst: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  /// The exit of a guard inside an inlined body, at `pc` of the body's code: the function's
+  /// state before the outermost inlined call. While the bodies have had no effect the
+  /// interpreter makes that call itself, and what the bodies own is dropped (Exit.drops).
+  /// After an effect the call cannot be made again: the exit names every body's frame
+  /// (Exit.frames), each at the call that began the next and the innermost at `pc`, for the
+  /// engine to go on with (FunctionInput.leavesBodies; the inlining fails without it).
+  effect fn inlineExit(self: &mut Self, inst: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut before = self.rootInst
-    while before < u32.toUsize(inst) { if !withoutEffect(self.f.insts.get(before).op) { self.broken = true } before = before + 1 }
+    // A call's exit is also where it leaves when it threw: the body's frame takes that.
+    let mut effects = self.f.insts.get(u32.toUsize(inst)).op == Op.Call
+    while before < u32.toUsize(inst) { if !withoutEffect(self.f.insts.get(before).op) { effects = true } before = before + 1 }
+    if effects && !self.leaves { self.broken = true }
     drop run self.f.exitFor(inst, self.rootPc, usize.toU32(self.rootDepth))
     let real = u32.toUsize(self.f.localCount)
     let savedLocals = real + u32.toUsize(self.argSlots)
@@ -937,6 +958,28 @@ impl Translator {
     while i < root { let v = self.held.get(i) run self.slot(v) i = i + 1 }
     i = real
     while i < savedLocals { let v = self.held.get(i) run self.slot(v) i = i + 1 }
+    if effects && self.leaves {
+      let depth = u32.toUsize(self.depth)
+      let mut n: usize = 0
+      while n < depth {
+        let call = self.calls.get(n)
+        if n + 1 < depth {
+          // A body around the current one: its state at the call that began the next.
+          let next = self.calls.get(n + 1)
+          run self.f.frameAt(ssa.ExitFrame { after: call.after, argc: call.argc, method: call.method, locals: usize.toU32(next.locals), depth: usize.toU32(next.stack), pc: next.pc })
+          i = next.start
+          while i < next.start + next.locals + next.stack { let v = self.held.get(i) run self.innerSlot(v) i = i + 1 }
+        } else {
+          run self.f.frameAt(ssa.ExitFrame { after: call.after, argc: call.argc, method: call.method, locals: usize.toU32(self.locals.length()), depth: usize.toU32(self.stack.length()), pc: pc })
+          i = 0
+          while i < self.locals.length() { let v = self.locals.get(i) run self.innerSlot(v) i = i + 1 }
+          i = 0
+          while i < self.stack.length() { let v = self.stack.get(i) run self.innerSlot(v) i = i + 1 }
+        }
+        n = n + 1
+      }
+      return ()
+    }
     i = root
     while i < self.held.length() { let v = self.held.get(i) if self.isOwned(v) { run self.f.dropAt(v, SlotMode.Move) } i = i + 1 }
     i = 0
@@ -947,7 +990,7 @@ impl Translator {
 
   /// Gives instruction `inst` an exit at `pc` with the current state.
   effect fn exitHere(self: &mut Self, inst: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
-    if self.depth != 0 { run self.inlineExit(inst) return () }
+    if self.depth != 0 { run self.inlineExit(inst, pc) return () }
     drop run self.f.exitFor(inst, pc, usize.toU32(self.stack.length()))
     // Locals, the stack, then the parameter slots (ssa.Exit).
     let real = u32.toUsize(self.f.localCount)
@@ -969,6 +1012,20 @@ impl Translator {
       let mut root = NONE
       if info.rootKind == RootKind.Argument { root = info.root }
       run self.f.slotAt(v, SlotMode.Dup, root)
+    }
+  }
+  /// `slot` for a slot of an inlined frame (Function.innerAt).
+  effect fn innerSlot(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let info = self.f.value(v)
+    if info.ty == Type.I32 { run self.f.innerAt(v, SlotMode.Int, NONE) }
+    else if info.ty == Type.Bool { run self.f.innerAt(v, SlotMode.Bool, NONE) }
+    else if info.ty == Type.F64 { run self.f.innerAt(v, SlotMode.F64, NONE) }
+    else if info.own == Own.Owned { run self.f.innerAt(v, SlotMode.Move, NONE) }
+    else if info.own == Own.Imm { run self.f.innerAt(v, SlotMode.Imm, NONE) }
+    else {
+      let mut root = NONE
+      if info.rootKind == RootKind.Argument { root = info.root }
+      run self.f.innerAt(v, SlotMode.Dup, root)
     }
   }
 
@@ -2075,7 +2132,9 @@ impl Translator {
     else if construct { let given = self.top(count + 1) receiver = run self.boxed(given, at) }
     else { receiver = run self.imm(Imm.Undefined, at) }
     if !construct && run self.inlined(input, function, receiver, method, count, at) { return true }
-    if self.depth != 0 { fail refuse(at, opcode, b"a call inside an inlined body") }
+    // A body's own call: code that can leave the body part way through makes it (its exit
+    // names the body's frame, ssa.Exit.frames).
+    if self.depth != 0 && (construct || !self.leaves || self.lazyApply(method, count)) { fail refuse(at, opcode, b"a call inside an inlined body") }
     let mut i: usize = 0
     while i < count {
       let argument = self.top(count - i)
@@ -2085,6 +2144,7 @@ impl Translator {
     let mut k = usize.toI32(count)
     if construct { k = k | calls.CONSTRUCT }
     if self.depth == 0 && self.widened(at) { k = k | calls.ALWAYS }
+    if self.depth != 0 && method { k = k | calls.METHOD }
     if self.lazyApply(method, count) { k = k | calls.LAZY_ARGUMENTS }
     let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
@@ -2181,6 +2241,8 @@ impl Translator {
     self.receiverAt = usize.MAX
     if method { self.receiverAt = self.held.length() - count - 2 }
     run self.frames.append(i32.toUsize(k)) run self.frames.append(self.held.length() - count - 1)
+    run self.calls.append(InlineCall { pc: pc, after: pc + usize.toU32(sizeAt(input, u32.toUsize(pc))), argc: usize.toU32(count), method: method,
+      start: heldBefore, locals: savedLocals.length(), stack: savedStack.length() })
     self.formals = target.input.argumentCount
     self.f.frame = i32.wrappingToU32(k) + 1
     self.depth = outer + 1
@@ -2196,6 +2258,7 @@ impl Translator {
     self.blockAt = move outerBlocks
     let frameCount = self.frames.length() - 2
     self.frames.truncate(frameCount)
+    self.calls.truncate(u32.toUsize(outer))
     let mut why: &'static [u8] = b"a guard after an effect in the body"
     let mut stopped: u8 = 0
     let result = match move outcome {
@@ -2587,7 +2650,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
   if t.lazySlot != usize.MAX { t.lazyAlias = lazyArgumentsCopy(input, t.lazySlot) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -2832,7 +2895,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0

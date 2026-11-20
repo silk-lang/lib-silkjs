@@ -280,8 +280,23 @@ impl Copy for Edge {}
 /// them come `drops` more slots the interpreter frame does not receive: values an inlined body
 /// holds when it leaves for the caller's state before the call. The exit releases those whose
 /// mode is `Move` and ignores the others.
-pub struct Exit { pub pc: u32, pub stackDepth: u32, pub firstSlot: u32, pub drops: u32 }
+///
+/// An exit inside inlined bodies that leaves them part way through (after an effect, when
+/// the caller's call cannot be made again) has `frames` frames in `Function.exitFrames` from
+/// `firstFrame`, one per body around the guard, outermost first, and no drops: between the
+/// frame's slots and the drops stand `inner` slots, each such frame's locals and then its
+/// operands. The function's own frame is then at the outermost inlined call, whose callee
+/// goes on from the first of those frames (docs/jit/optimizer.md).
+pub struct Exit { pub pc: u32, pub stackDepth: u32, pub firstSlot: u32, pub drops: u32, pub inner: u32, pub firstFrame: u32, pub frames: u32 }
 impl Copy for Exit {}
+
+/// The activation of an inlined body at an exit that leaves it part way through: the call
+/// that began it has `argc` arguments (and a receiver when `method`) and the instruction
+/// after it is at `after` in its caller's code; the body has `locals` locals and `depth`
+/// operands and goes on at `pc` (for all but the innermost, with the call there that began
+/// the next frame).
+pub struct ExitFrame { pub after: u32, pub argc: u32, pub method: bool, pub locals: u32, pub depth: u32, pub pc: u32 }
+impl Copy for ExitFrame {}
 
 /// One slot of an exit. `root` is the argument index a `Dup` slot's value borrows from, or NONE.
 pub struct Slot { pub value: u32, pub mode: SlotMode, pub root: u32 }
@@ -305,6 +320,8 @@ pub struct Function {
   pub edges: List<Edge>,
   pub edgeArgs: List<u32>,
   pub exits: List<Exit>,
+  /// The inlined activations of exits that leave bodies part way through (Exit.firstFrame).
+  pub exitFrames: List<ExitFrame>,
   pub slots: List<Slot>,
   /// The bits of the doubles `const.f64` names, by index.
   pub numbers: List<u64>,
@@ -334,7 +351,7 @@ fn copySlots(from: &[Slot], to: &mut [Slot], numbers: &[u32], exits: &List<Exit>
     let exit = exits.get(x)
     let source = u32.toUsize(oldFirst.get(x))
     let target = u32.toUsize(exit.firstSlot)
-    let count = u32.toUsize(fixed + exit.stackDepth + exit.drops)
+    let count = u32.toUsize(fixed + exit.stackDepth + exit.inner + exit.drops)
     let mut s: usize = 0
     while s < count {
       let mut slot = from[source + s]
@@ -348,7 +365,7 @@ fn copySlots(from: &[Slot], to: &mut [Slot], numbers: &[u32], exits: &List<Exit>
 
 /// A point in a function being built that `Function.rollback` returns to.
 pub struct Mark { insts: usize, values: usize, exits: usize, slots: usize, targets: usize, order: u32,
-  blocks: usize, params: usize, edges: usize, edgeArgs: usize }
+  blocks: usize, params: usize, edges: usize, edgeArgs: usize, frames: usize }
 impl Copy for Mark {}
 
 pub fn ownOf(ty: Type) -> Own { if ty == Type.Value { return Own.Owned } return Own.Unboxed }
@@ -370,7 +387,7 @@ impl Function {
   pub fn make(argumentCount: u32, localCount: u32) -> Function {
     return Function { argumentCount: argumentCount, localCount: localCount, argumentSlots: 0, blocks: List<Block>.make(),
       params: List<u32>.make(), insts: List<Inst>.make(), values: List<ValueInfo>.make(),
-      edges: List<Edge>.make(), edgeArgs: List<u32>.make(), exits: List<Exit>.make(),
+      edges: List<Edge>.make(), edgeArgs: List<u32>.make(), exits: List<Exit>.make(), exitFrames: List<ExitFrame>.make(),
       slots: List<Slot>.make(), numbers: List<u64>.make(), inlineTargets: List<u32>.make(), inlineMisses: List<InlineMiss>.make(), elementKinds: List<u32>.make(), frame: 0, nextOrder: 0, work: 0 }
   }
 
@@ -506,7 +523,8 @@ impl Function {
   /// with `slotAt`.
   pub effect fn exitFor(self: &mut Self, inst: u32, pc: u32, stackDepth: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let index = usize.toU32(self.exits.length())
-    run self.exits.append(Exit { pc: pc, stackDepth: stackDepth, firstSlot: usize.toU32(self.slots.length()), drops: 0 })
+    run self.exits.append(Exit { pc: pc, stackDepth: stackDepth, firstSlot: usize.toU32(self.slots.length()), drops: 0, inner: 0,
+      firstFrame: usize.toU32(self.exitFrames.length()), frames: 0 })
     let mut at = self.inst(inst)
     at.exit = index
     self.setInst(inst, at)
@@ -524,8 +542,26 @@ impl Function {
     exit.drops = exit.drops + 1
     self.exits.set(last, exit)
   }
-  /// The slots of `exit`: the frame's, then its drops.
-  pub fn slotCount(self: &Self, exit: Exit) -> u32 { return self.localCount + exit.stackDepth + self.argumentSlots + exit.drops }
+  /// Appends a frame to the exit made last (Exit.frames); its slots follow with `innerAt`.
+  pub effect fn frameAt(self: &mut Self, frame: ExitFrame) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.exitFrames.append(frame)
+    let last = self.exits.length() - 1
+    let mut exit = self.exits.get(last)
+    exit.frames = exit.frames + 1
+    self.exits.set(last, exit)
+  }
+  /// Appends a slot of an inlined frame to the exit made last, after its own frame's slots.
+  pub effect fn innerAt(self: &mut Self, value: u32, mode: SlotMode, root: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.slots.append(Slot { value: value, mode: mode, root: root })
+    let last = self.exits.length() - 1
+    let mut exit = self.exits.get(last)
+    exit.inner = exit.inner + 1
+    self.exits.set(last, exit)
+  }
+  /// The slots of `exit`: the frame's, those of the inlined frames it leaves, then its drops.
+  pub fn slotCount(self: &Self, exit: Exit) -> u32 { return self.localCount + exit.stackDepth + self.argumentSlots + exit.inner + exit.drops }
+  /// The frame at `index` of those `exit` leaves part way through.
+  pub fn exitFrame(self: &Self, exit: Exit, index: u32) -> ExitFrame { return self.exitFrames.get(u32.toUsize(exit.firstFrame + index)) }
   /// The index of the instruction appended last.
   pub fn lastInst(self: &Self) -> u32 { return usize.toU32(self.insts.length() - 1) }
 
@@ -556,12 +592,12 @@ impl Function {
   pub fn mark(self: &Self) -> Mark {
     return Mark { insts: self.insts.length(), values: self.values.length(), exits: self.exits.length(), slots: self.slots.length(),
       targets: self.inlineTargets.length(), order: self.nextOrder, blocks: self.blocks.length(), params: self.params.length(),
-      edges: self.edges.length(), edgeArgs: self.edgeArgs.length() }
+      edges: self.edges.length(), edgeArgs: self.edgeArgs.length(), frames: self.exitFrames.length() }
   }
   /// Forgets every instruction, value, exit, inline target, block, parameter and edge added
   /// since `mark` (the blocks made before it got no parameter since).
   pub fn rollback(self: &mut Self, mark: Mark) -> () {
-    self.insts.truncate(mark.insts) self.values.truncate(mark.values) self.exits.truncate(mark.exits)
+    self.insts.truncate(mark.insts) self.values.truncate(mark.values) self.exits.truncate(mark.exits) self.exitFrames.truncate(mark.frames)
     self.slots.truncate(mark.slots) self.inlineTargets.truncate(mark.targets) self.nextOrder = mark.order
     self.blocks.truncate(mark.blocks) self.params.truncate(mark.params) self.edges.truncate(mark.edges) self.edgeArgs.truncate(mark.edgeArgs)
   }
@@ -758,7 +794,8 @@ impl Function {
         let exit = self.exits.get(u32.toUsize(inst.exit))
         inst.exit = usize.toU32(newExits.length())
         run oldFirst.append(exit.firstSlot)
-        run newExits.append(Exit { pc: exit.pc, stackDepth: exit.stackDepth, firstSlot: slotTotal, drops: exit.drops })
+        run newExits.append(Exit { pc: exit.pc, stackDepth: exit.stackDepth, firstSlot: slotTotal, drops: exit.drops, inner: exit.inner,
+          firstFrame: exit.firstFrame, frames: exit.frames })
         slotTotal = slotTotal + self.slotCount(exit)
       }
       newInsts.set(i, inst)
@@ -829,10 +866,28 @@ impl Function {
         while s < self.argumentSlots { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, self.localCount + exit.stackDepth + s)) s = s + 1 }
       }
       run text(&mut out, b"]")
+      let mut at = self.exitSlots(exit)
+      let mut n: u32 = 0
+      while n < exit.frames {
+        let frame = self.exitFrame(exit, n)
+        run text(&mut out, b" in ")
+        if frame.method { run text(&mut out, b"method ") }
+        run text(&mut out, b"call ") run number(&mut out, frame.argc) run text(&mut out, b" then ") run number(&mut out, frame.after)
+        run text(&mut out, b": pc ") run number(&mut out, frame.pc) run text(&mut out, b" locals [")
+        s = 0
+        while s < frame.locals { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, at + s)) s = s + 1 }
+        run text(&mut out, b"] stack [")
+        at = at + frame.locals
+        s = 0
+        while s < frame.depth { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, at + s)) s = s + 1 }
+        at = at + frame.depth
+        run text(&mut out, b"]")
+        n = n + 1
+      }
       if exit.drops > 0 {
         run text(&mut out, b" drops [")
         s = 0
-        while s < exit.drops { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, self.localCount + exit.stackDepth + self.argumentSlots + s)) s = s + 1 }
+        while s < exit.drops { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, at + s)) s = s + 1 }
         run text(&mut out, b"]")
       }
       run text(&mut out, b"\n")

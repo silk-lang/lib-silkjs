@@ -331,9 +331,17 @@ unsafe effect fn callResuming<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let mut value = ValueBits.Undefined
   match Pointer.nonNullMut<u64>(resume.state) {
     Option<*mut u64>.Some { value: state } => {
-      unsafe compiled.restore(&mut machine, resume.index, resume.exit, state)
-      // An activation's code left at a call that threw (runActivations): unwind from there.
-      if resume.exit == compiled.EXIT_THROW { abandoned = !run unsafe compiledThrew(&mut hooks, memory, &mut machine) }
+      if resume.exit == compiled.EXIT_INLINED {
+        // An activation optimized code had inlined: the frame takes its state, and the call
+        // it was in the middle of, if any, is made first.
+        if run unsafe resumeInlined(&mut hooks, memory, &mut machine, unsafe Intrinsic.pointerReinterpret<*mut u64, *mut baseline.Inlined>(state)) {
+          abandoned = !run unsafe compiledThrew(&mut hooks, memory, &mut machine)
+        }
+      } else {
+        unsafe compiled.restore(&mut machine, resume.index, resume.exit, state)
+        // An activation's code left at a call that threw (runActivations): unwind from there.
+        if resume.exit == compiled.EXIT_THROW { abandoned = !run unsafe compiledThrew(&mut hooks, memory, &mut machine) }
+      }
     }
     Option<*mut u64>.None => {
       if description.compiled != 0 {
@@ -755,6 +763,137 @@ unsafe effect fn baselineLoop<H: HeapHooks>(hooks: &mut H, machine: &mut Machine
   if from.returnsValue { unsafe machine.push(value) } else { unsafe gc.release(&mut hooks, rt, value) }
   return true
 }
+/// callResuming's EXIT_INLINED: machine is the fresh frame of an activation that optimized
+/// code had inlined and left part way through (js_baseline.Inlined). Its locals and
+/// operands move into the frame. When the code left inside a function inlined into this one
+/// in turn, the frame is at that call, which is made here with the inner activation's
+/// state; its result then stands where the call's operands were, as after the call
+/// instruction. True when that call threw, or when the code left because a call of the
+/// activation's own threw (Inlined.threw): the exception is pending with machine at the
+/// call, its operands on the stack. The interpreter goes on from machine otherwise.
+@inlineNever
+unsafe effect fn resumeInlined<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, state: *mut baseline.Inlined) -> bool ? &mut Allocator {
+  let mut anchor = ()
+  let from = unsafe Pointer.borrowMut<(), baseline.Inlined>(&mut anchor, state)
+  let codeAnchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, machine.bytecode)
+  if from.count != u16.toUsize(code.variableCount) || from.sp > u16.toUsize(code.stackSize) { invariant() }
+  drop code
+  let locals = unsafe Pointer.assumeManyMut<ValueBits>(from.locals)
+  let mut index: usize = 0
+  while index < from.count {
+    unsafe Pointer.write<ValueBits>(unsafe machine.localCell(index), unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(locals, index)))
+    index = index + 1
+  }
+  let operands = unsafe Pointer.assumeManyMut<ValueBits>(from.stack)
+  index = 0
+  while index < from.sp { unsafe machine.push(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, index))) index = index + 1 }
+  from.taken = true
+  let pc = from.pc
+  let inner = from.inner
+  let threw = from.threw
+  drop from
+  unsafe machine.setPc(pc)
+  // Past the opcode of the call that threw, as the frame of a call that fails stands.
+  if threw { unsafe machine.setPc(pc + 1) unsafe machine.publishPc() return true }
+  let next = match Pointer.nonNullMut<baseline.Inlined>(inner) { Option<*mut baseline.Inlined>.Some { value } => value Option<*mut baseline.Inlined>.None => { return false } }
+  let call = unsafe Pointer.borrow<(), baseline.Inlined>(&anchor, unsafe Intrinsic.pointerRequalify<*mut baseline.Inlined, *const baseline.Inlined>(next))
+  let argc = call.argc
+  let method = call.method
+  let after = call.after
+  drop call
+  let mut extra: usize = 1
+  if method { extra = 2 }
+  if machine.sp() < argc + extra { invariant() }
+  // As the call instruction leaves the frame for whoever reads the frame chain.
+  unsafe machine.setPc(after)
+  unsafe machine.publishPc()
+  let data = unsafe operandCell(machine.stackTop, argc)
+  let function = unsafe machine.top(argc + 1)
+  let mut receiver = ValueBits.Undefined
+  if method { receiver = unsafe machine.top(argc + 2) }
+  let argv = FrameSlots { data: data, count: argc }
+  let called = run Effect.result(unsafe callInlined(&mut hooks, memory, machine.context, function, receiver, &argv, next))
+  match move called {
+    Result<ValueBits, JsException>.Success { value } => {
+      unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
+      unsafe machine.push(value)
+      return false
+    }
+    Result<ValueBits, JsException>.Failure { .. } => { return true }
+  }
+}
+/// The call of function that began the inlined activation of state (js_baseline.Inlined):
+/// callInternal with a frame that goes on from that state. What no frame took (the call
+/// failed before it had one) is released here, so the state holds nothing afterwards.
+@inlineNever
+unsafe effect fn callInlined<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots,
+  state: *mut baseline.Inlined) -> ValueBits ! JsException ? &mut Allocator {
+  let resume = compiled.Resume { state: unsafe Intrinsic.pointerRequalify<*mut u64, ?*mut u64>(unsafe Intrinsic.pointerReinterpret<*mut baseline.Inlined, *mut u64>(state)),
+    exit: compiled.EXIT_INLINED, index: 0 }
+  let called = run Effect.result(unsafe callResuming(&mut hooks, memory, context, function, receiver, ValueBits.Undefined, argv, activation.COPY_ARGUMENTS, resume))
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut left: ?*mut baseline.Inlined = unsafe Intrinsic.pointerRequalify<*mut baseline.Inlined, ?*mut baseline.Inlined>(state)
+  while true {
+    let at = match Pointer.nonNullMut<baseline.Inlined>(left) { Option<*mut baseline.Inlined>.Some { value } => value Option<*mut baseline.Inlined>.None => { break } }
+    let mut anchor = ()
+    let record = unsafe Pointer.borrowMut<(), baseline.Inlined>(&mut anchor, at)
+    left = record.inner
+    if record.taken { continue }
+    record.taken = true
+    let locals = unsafe Pointer.assumeManyMut<ValueBits>(record.locals)
+    let mut index: usize = 0
+    while index < record.count { unsafe gc.release(&mut hooks, rt, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(locals, index))) index = index + 1 }
+    let operands = unsafe Pointer.assumeManyMut<ValueBits>(record.stack)
+    index = 0
+    while index < record.sp { unsafe gc.release(&mut hooks, rt, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, index))) index = index + 1 }
+  }
+  match move called {
+    Result<ValueBits, JsException>.Success { value } => { return value }
+    Result<ValueBits, JsException>.Failure { .. } => { fail JsException {} }
+  }
+}
+/// SERVICE_INLINED: the frame of record, built, is at the call of a function that optimized
+/// code had inlined, with depth operands on its stack and its pc past the call's opcode;
+/// state is the callee's activation. Makes the call with a frame that goes on from that
+/// state (callInlined). js_baseline.moved to the instruction after the call, the result in
+/// place of the call's operands; 1 when it threw, the operands still in their cells.
+@inlineNever
+unsafe effect fn baselineInlined<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, record: *mut baseline.BaselineFrame, state: *mut baseline.Inlined, depth: usize) -> u64 ? &mut Allocator {
+  let anchor = ()
+  let call = unsafe Pointer.borrow<(), baseline.Inlined>(&anchor, unsafe Intrinsic.pointerRequalify<*mut baseline.Inlined, *const baseline.Inlined>(state))
+  let argc = call.argc
+  let method = call.method
+  let after = call.after
+  drop call
+  let mut operands = argc + 1
+  if method { operands = operands + 1 }
+  let frame = unsafe baseline.cellsOf(record)
+  if depth < operands || depth > frame.stack { invariant() }
+  let stack = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(frame.cells), frame.arguments + frame.locals))
+  let first = depth - operands
+  let function = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(stack, depth - argc - 1))
+  let mut receiver = ValueBits.Undefined
+  if method { receiver = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(stack, first)) }
+  let argv = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(stack, depth - argc), count: argc }
+  let called = run Effect.result(unsafe callInlined(&mut hooks, memory, context, function, receiver, &argv, state))
+  match move called {
+    Result<ValueBits, JsException>.Success { value } => {
+      let rt = unsafe runtime.contextRuntime(context)
+      let mut index = first
+      while index < depth { unsafe gc.release(&mut hooks, rt, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(stack, index))) index = index + 1 }
+      unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(stack, first), value)
+      return baseline.moved(after, first + 1)
+    }
+    Result<ValueBits, JsException>.Failure { .. } => { return 1 }
+  }
+}
 /// The Description of the activation in record, a baseline frame: its closure's, or a known
 /// local function's with the scope its caller passed. The empty tables are the caller's
 /// (stack allocated there).
@@ -786,7 +925,7 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
   let kind = request & 0xff
   // What only allocates reads no frame: it leaves the code's bare frames bare, and stays
   // out of the frame the other requests need.
-  if kind >= baseline.SERVICE_QUICK {
+  if kind >= baseline.SERVICE_QUICK && kind != baseline.SERVICE_INLINED {
     if kind == baseline.SERVICE_RESUME { return unsafe baseline.resume(record, request, count) }
     return run unsafe baselineLight(&mut hooks, memory, record, request, base, count)
   }
@@ -860,6 +999,9 @@ unsafe effect fn baselineHeavy<H: HeapHooks + CoercionHooks + OwnPropertyHooks +
   // Whatever runs now may read the frame chain: complete the code's bare frames.
   unsafe baseline.build(unsafe runtime.contextRuntime(context), record)
   if kind == baseline.SERVICE_FINISH { return run unsafe baselineFinish(&mut hooks, memory, record, (request & baseline.FINISH_THROWING) != 0, count) }
+  if kind == baseline.SERVICE_INLINED {
+    return run unsafe baselineInlined(&mut hooks, memory, context, record, unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut baseline.Inlined>(base), count)
+  }
   if kind == baseline.SERVICE_STEP { return run unsafe baselineStep(&mut hooks, memory, record, u64.toUsize(u64.shiftRight(request, 8)), Pointer.address<ValueBits>(base), count) }
   if kind == baseline.SERVICE_POLL {
     let polled = run Effect.result(interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)))

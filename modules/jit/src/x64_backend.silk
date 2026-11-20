@@ -207,6 +207,16 @@ pub struct Emitter {
   steps: List<u32>,
   /// Frame mode: the slot of the function's realm, from rsp (kept for the polls).
   realmAt: i32,
+  /// Frame mode: where the area for exits that leave inlined bodies part way through starts,
+  /// from rsp, and its bytes (0: the function has no such exit).
+  pub leaveAt: i32,
+  pub leaveBytes: u32,
+  /// Frame mode: where the operand cells of a call inside an inlined body are, from rsp
+  /// (the receiver's, the function's, then the arguments'), and where the records of the
+  /// bodies around such a call start, outermost first: each the baseline record's bytes,
+  /// then its frame pointer word and a word of padding.
+  callAt: u32,
+  bodyAt: u32,
   /// Frame mode, by value: the value whose slot holds its bits. A copy (`retain`, a read
   /// ssa_shapes found to repeat an earlier one) has no slot of its own: its source's def
   /// dominates it and a slot is written only where its value is defined, so the source's
@@ -231,7 +241,7 @@ pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FrameP
   let mut i: usize = 0
   while i < function.insts.length() {
     let inst = function.insts.get(i)
-    if inst.op == Op.Call && u32.toUsize(inst.pc) < code.length && code[u32.toUsize(inst.pc)] == opcodes.OP_call_method { run methods.append(inst.pc) }
+    if inst.op == Op.Call && inst.frame == 0 && u32.toUsize(inst.pc) < code.length && code[u32.toUsize(inst.pc)] == opcodes.OP_call_method { run methods.append(inst.pc) }
     i = i + 1
   }
   // What the interpreter may run on the frame for the code: an instruction without a
@@ -300,7 +310,39 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   let inlined = usize.toU32(function.inlineTargets.length())
   let mut own = INPUT_COUNT * 8
   if on { own = INLINE_FRAME_WORDS * 8 }
-  let raw = inputs + own + inlined * INLINE_FRAME_WORDS * 8 + 8 + pushes * 8
+  // Frame mode's exits that leave inlined bodies part way through (ssa.Exit.frames) build
+  // those bodies' activations after the realm's word: a js_baseline.Inlined each, then
+  // their values' cells (x64_frame_exit), 16-byte aligned from rsp.
+  let leaveAt = ((inputs + own + inlined * INLINE_FRAME_WORDS * 8 + 8 + 15) / 16) * 16
+  let mut leaveBytes: u32 = 0
+  let mut leaving: usize = 0
+  while on && leaving < function.exits.length() {
+    let exit = function.exits.get(leaving)
+    if exit.frames != 0 {
+      let bytes = exit.frames * state.INLINED_BYTES + exit.inner * SLOT_BYTES
+      if bytes > leaveBytes { leaveBytes = bytes }
+    }
+    leaving = leaving + 1
+  }
+  let mut raw = inputs + own + inlined * INLINE_FRAME_WORDS * 8 + 8 + pushes * 8
+  if leaveBytes != 0 { raw = leaveAt + leaveBytes }
+  // Frame mode's calls inside inlined bodies (callInBody): the call's operand cells (the
+  // receiver, the function, the arguments), then a record with a frame pointer word for
+  // each body around the deepest such call (js_baseline.FRAME_BARE_INLINED).
+  let mut bodyCells: u32 = 0
+  let mut bodyDepth: u32 = 0
+  let mut calling: usize = 0
+  while on && calling < function.insts.length() {
+    let inst = function.insts.get(calling)
+    if inst.op == Op.Call && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
+      if calls.countOf(inst) + 2 > bodyCells { bodyCells = calls.countOf(inst) + 2 }
+      if function.exit(inst.exit).frames > bodyDepth { bodyDepth = function.exit(inst.exit).frames }
+    }
+    calling = calling + 1
+  }
+  let callAt = ((raw + 15) / 16) * 16
+  let recordBytes = i32.wrappingToU32(0 - plan.record)
+  if bodyDepth != 0 { raw = callAt + bodyCells * SLOT_BYTES + bodyDepth * (recordBytes + 16) }
   let mut frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
   if on { frame = plan.below + u32.wrappingToI32(((raw + 15) / 16) * 16) }
   let mut assembler = Assembler.make()
@@ -313,7 +355,8 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel,
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
-    realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make() }
+    realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
+    leaveAt: u32.wrappingToI32(leaveAt), leaveBytes: leaveBytes, callAt: callAt, bodyAt: callAt + bodyCells * SLOT_BYTES }
   run emitter.inlineClosures.appendRepeated(NONE, u32.toUsize(inlined))
   let mut own0: u32 = 0
   while own0 < values { run emitter.stored.append(own0) own0 = own0 + 1 }
@@ -1301,6 +1344,12 @@ impl Emitter {
       let call = self.callOf(&function)
       // A stepped instruction's operands come with the rest of its state (stepOnFrame).
       if (call.k & calls.GENERIC) != 0 { return () }
+      if function.exit(call.exit).frames != 0 {
+        // A call inside an inlined body has cells of its own (callInBody).
+        let cell = self.callAt + (2 + i32.wrappingToU32(inst.k)) * SLOT_BYTES
+        run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rsp, cell)
+        return ()
+      }
       let depth = function.exit(call.exit).stackDepth
       let at = self.plan.operandAt(depth - calls.countOf(call) + i32.wrappingToU32(inst.k))
       run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rbp, i32.wrappingToU32(at))
@@ -2799,7 +2848,7 @@ impl Emitter {
     }
   }
   /// The engine's service on this frame (baseline.engineCall): request in ecx, r8 and r9.
-  effect fn engineCall(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn engineCall(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let p = self.plan
     run self.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.R13, signed(p.f.serviceHooks)))
     run self.a.load(Width.W64, Reg.Rsi, Mem.at(Reg.R13, signed(p.f.serviceAllocator)))
@@ -2895,6 +2944,7 @@ impl Emitter {
     }
     let count = calls.countOf(inst)
     let depth = function.exit(inst.exit).stackDepth
+    if function.exit(inst.exit).frames != 0 { run self.callInBody(&function, inst) return () }
     if (inst.k & calls.GENERIC) != 0 {
       // An instruction without a template: the interpreter runs it on the frame. Its values
       // are the operand cells from its first operand's up.
@@ -2958,6 +3008,85 @@ impl Emitter {
     run self.a.movImm32(Reg.Rdx, count)
     run self.a.movImm32(Reg.Rax, inst.pc + 1)
     if method { run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP) } else { run self.a.callSymbol(stubs.STUB_CALL_KEEP) }
+    // ecx: 0 returned, HOW_DECLINED, HOW_CALL_THREW.
+    run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
+    run self.a.jcc(Cond.NotEqual, self.exitWith.get(u32.toUsize(inst.exit)))
+    run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+    run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rdx)
+  }
+
+  /// A call that an inlined body makes, in frame mode. The frame chain must show the body's
+  /// activation between the callee's and the function's own, so each body around the call
+  /// gets a record in this frame (js_baseline.FRAME_BARE_INLINED: its function, receiver
+  /// and where it is in its code) whose frame pointer word leads to the record around it,
+  /// and the call is made with rbp at the innermost: the baseline call stub and the callee
+  /// then see a baseline frame that is the body's. The operands are lent to cells of the
+  /// call's own. Afterwards rbp is the frame's again, and records the engine completed
+  /// (it does when something reads the chain) are taken off the chain. The call's exit
+  /// names the bodies' frames (ssa.Exit.frames): where it leaves when the stub declines
+  /// or the callee threw.
+  effect fn callInBody(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    let p = self.plan
+    let layout = self.settings.layout
+    let exit = function.exit(inst.exit)
+    let count = calls.countOf(inst)
+    let method = (inst.k & calls.METHOD) != 0
+    let callee = self.callAt + SLOT_BYTES
+    run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rsp, callee)
+    if method { run self.valueInto(&function, inst.b, SlotMode.Imm, Reg.Rsp, callee - SLOT_BYTES) }
+    let recordBytes = i32.wrappingToU32(0 - p.record)
+    // The function's own frame is at the outermost inlined call.
+    run self.a.storeImm(Width.W64, p.sf(p.f.currentPc), u32.wrappingToI32(exit.pc + 1))
+    // Each body's function and receiver are operands of the call that began it, on the stack
+    // of the frame around it: the function's own first, then each body's in turn.
+    let mut stackAt = function.localCount
+    let mut depth = exit.stackDepth
+    let mut inner = function.exitSlots(exit)
+    let mut n: u32 = 0
+    while n < exit.frames {
+      let frame = function.exitFrame(exit, n)
+      let pointer = self.bodyAt + n * (recordBytes + 16) + recordBytes
+      let stack = pointer - recordBytes + p.f.frame
+      let closure = function.slot(exit, stackAt + depth - frame.argc - 1).value
+      run self.valueInto(&function, closure, SlotMode.Imm, Reg.Rsp, stack + p.f.currentFunction)
+      if frame.method {
+        let receiver = function.slot(exit, stackAt + depth - frame.argc - 2).value
+        run self.valueInto(&function, receiver, SlotMode.Imm, Reg.Rsp, stack + p.f.thisValue)
+      } else {
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.undefined()))
+        run self.a.store(Width.W64, word(Reg.Rsp, stack + p.f.thisValue), Reg.Rax)
+        run self.a.storeImm(Width.W64, word(Reg.Rsp, stack + p.f.thisValue + 8), 0)
+      }
+      run self.a.storeImm(Width.W64, word(Reg.Rsp, pointer - recordBytes + p.f.state), u64.wrappingToI32(frames.FRAME_BARE_INLINED))
+      // The innermost body's position is the stub's to store.
+      if n + 1 < exit.frames { run self.a.storeImm(Width.W64, word(Reg.Rsp, stack + p.f.currentPc), u32.wrappingToI32(frame.pc + 1)) }
+      if n == 0 { run self.a.store(Width.W64, word(Reg.Rsp, pointer), Reg.Rbp) }
+      else {
+        run self.a.lea(Width.W64, Reg.Rax, word(Reg.Rsp, pointer - recordBytes - 16))
+        run self.a.store(Width.W64, word(Reg.Rsp, pointer), Reg.Rax)
+      }
+      stackAt = inner + frame.locals
+      depth = frame.depth
+      inner = inner + frame.locals + frame.depth
+      n = n + 1
+    }
+    let last = self.bodyAt + (exit.frames - 1) * (recordBytes + 16) + recordBytes
+    // The stub's site, as callOnFrame's, on the innermost body's record.
+    run self.a.lea(Width.W64, Reg.R14, word(Reg.Rsp, callee))
+    run self.a.movImm32(Reg.Rdx, count)
+    run self.a.movImm32(Reg.Rax, inst.pc + 1)
+    run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
+    if method { run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP) } else { run self.a.callSymbol(stubs.STUB_CALL_KEEP) }
+    run self.a.lea(Width.W64, Reg.Rbp, Mem.at(Reg.Rsp, self.frame))
+    // The engine completed the records when something read the frame chain during the
+    // call (all of them: it completes outwards). The chain is then back at what was
+    // around the outermost.
+    let bare = run self.a.label()
+    run self.a.aluStoreImm(Alu.Cmp, Width.W64, word(Reg.Rsp, last - recordBytes + p.f.state), u64.wrappingToI32(frames.FRAME_BUILT_INLINED))
+    run self.a.jcc(Cond.NotEqual, bare)
+    run self.a.load(Width.W64, Reg.R10, word(Reg.Rsp, self.bodyAt + p.f.frame + p.f.previous))
+    run self.a.store(Width.W64, Mem.at(Reg.R13, signed(p.f.currentStackFrame)), Reg.R10)
+    self.a.bind(bare)
     // ecx: 0 returned, HOW_DECLINED, HOW_CALL_THREW.
     run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
     run self.a.jcc(Cond.NotEqual, self.exitWith.get(u32.toUsize(inst.exit)))

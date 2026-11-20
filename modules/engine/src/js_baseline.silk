@@ -115,6 +115,14 @@ pub const RESUME_VALUE: u64 = 0x100
 /// left the frame for the heap (a closure captured it, js_scopes.promote): the frame's
 /// count of it is dropped. 0.
 pub const SERVICE_SCOPE: u64 = 9
+/// From optimized code on a baseline frame that left inside a function it had inlined
+/// (docs/jit/optimizer.md, "Leaving inside an inlined body"): the frame of record is at the
+/// call of that function with count operands on its stack, the call's on top, and base is
+/// the Inlined of the callee's activation in place of a cell. The interpreter runs that
+/// activation from where the code left it; its result then takes the place of the call's
+/// operands and the engine answers js_baseline.moved to the instruction after the call.
+/// 1 when it threw: the operands are still on the stack.
+pub const SERVICE_INLINED: u64 = 10
 /// A service's answer that the frame is now at bytecode offset pc with sp operands on its
 /// stack: SERVICE_MOVED in the low byte, pc in bits 8 to 39, sp from bit 40.
 pub const SERVICE_MOVED: u64 = 3
@@ -132,8 +140,17 @@ pub const FRAME_BARE: u64 = 1
 pub const FRAME_BARE_CONSTRUCT: u64 = 2
 pub const FRAME_BUILT: u64 = 3
 pub const FRAME_BUILT_CONSTRUCT: u64 = 4
+/// The record of an activation that optimized code runs inside its caller's frame (an
+/// inlined call), while that activation makes a call (docs/jit/optimizer.md, "Calls inside
+/// inlined bodies"): a record of its own in the code's frame, with a word after it that
+/// stands for its frame pointer and holds the frame pointer of the frame around it, so the
+/// callee's frame links to it as to any baseline frame. The code stored its function,
+/// receiver and bytecode position, and holds its values itself: once built, the frame has
+/// no arguments, locals or operands to read. The code takes it off the chain after the call.
+pub const FRAME_BARE_INLINED: u64 = 5
+pub const FRAME_BUILT_INLINED: u64 = 6
 /// Whether state is one of the bare states: build has the frame to complete.
-pub fn bare(state: u64) -> bool { return state == FRAME_BARE || state == FRAME_BARE_CONSTRUCT }
+pub fn bare(state: u64) -> bool { return state == FRAME_BARE || state == FRAME_BARE_CONSTRUCT || state == FRAME_BARE_INLINED }
 
 /// A baseline frame's record, which ends right under the frame pointer (recordBytes below
 /// it). Its StackFrame is the frame the engine sees once built; the rest is what the engine
@@ -202,7 +219,8 @@ pub unsafe fn build(runtime: *mut HeapHeader, record: *mut BaselineFrame) -> () 
     let arguments = u16.toUsize(code.argumentCount)
     let locals = u16.toUsize(code.variableCount)
     let stack = u16.toUsize(code.stackSize)
-    let copies = !code.borrowsArguments || running.argc < arguments
+    let inlined = running.state == FRAME_BARE_INLINED
+    let copies = !inlined && (!code.borrowsArguments || running.argc < arguments)
     let mode = u8.toU32(code.mode)
     drop code
     // The cells end where the record starts: [arguments][locals][operand stack].
@@ -218,14 +236,23 @@ pub unsafe fn build(runtime: *mut HeapHeader, record: *mut BaselineFrame) -> () 
     // Borrowed, as currentFunction is: the caller holds the function for the call.
     let constructs = running.state == FRAME_BARE_CONSTRUCT
     if constructs { running.frame.newTarget = running.frame.currentFunction } else { running.frame.newTarget = ValueBits.Undefined }
-    if copies { running.frame.arguments.count = arguments running.frame.argumentCount = usize.wrappingToI32(arguments) }
-    else { running.frame.arguments.count = running.argc running.frame.argumentCount = usize.wrappingToI32(running.argc) }
-    running.frame.locals = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments), count: locals }
-    running.frame.stack = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments + locals), count: stack }
+    if inlined {
+      // No cells: the code that inlined the activation holds its values.
+      running.frame.arguments = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments + locals + stack), count: 0 }
+      running.frame.argumentCount = 0
+      running.frame.locals = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments + locals + stack), count: 0 }
+      running.frame.stack = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments + locals + stack), count: 0 }
+    } else {
+      if copies { running.frame.arguments.count = arguments running.frame.argumentCount = usize.wrappingToI32(arguments) }
+      else { running.frame.arguments.count = running.argc running.frame.argumentCount = usize.wrappingToI32(running.argc) }
+      running.frame.locals = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments), count: locals }
+      running.frame.stack = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(cells, arguments + locals), count: stack }
+    }
     running.frame.varRefs = FrameReferences { data: unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe Pointer.atMut<ValueBits>(cells, arguments + locals + stack)), count: 0 }
     running.frame.mode = mode
     running.frame.stackPointer = NO_SP
-    if constructs { running.state = FRAME_BUILT_CONSTRUCT } else { running.state = FRAME_BUILT }
+    if inlined { running.state = FRAME_BUILT_INLINED }
+    else if constructs { running.state = FRAME_BUILT_CONSTRUCT } else { running.state = FRAME_BUILT }
     if first {
       state.currentStackFrame = unsafe Intrinsic.pointerRequalify<*mut StackFrame, ?*mut StackFrame>(Pointer.fromMutRef<StackFrame>(&mut running.frame))
       first = false
@@ -658,6 +685,20 @@ pub struct Resume {
   pub arguments: *mut ValueBits, pub count: usize, pub locals: *mut ValueBits, pub stack: *mut ValueBits, pub sp: usize, pub pc: usize,
   pub returnPc: usize, pub returnsValue: bool, pub taken: bool
 }
+/// An activation that optimized code ran inside its caller's (an inlined call) and left
+/// part way through, for the interpreter to go on with in a frame of its own
+/// (SERVICE_INLINED, js_vm.resumeInlined). The call that began it is in its caller's code:
+/// argc arguments on top of the caller's operand stack, over the function and, for a method
+/// call, the receiver under that, with the instruction after the call at offset after. Its
+/// count locals (all the function has) and its sp operands are owned values that its frame
+/// takes; taken tells that a frame did. It goes on at offset pc, or, when inner is not null,
+/// with the call at pc that began inner. threw: the code left because the call at pc, one
+/// it made itself, threw; the exception is pending and the frame unwinds from that call.
+pub struct Inlined {
+  pub argc: usize, pub after: usize, pub locals: *mut ValueBits, pub count: usize, pub stack: *mut ValueBits, pub sp: usize, pub pc: usize,
+  pub inner: ?*mut Inlined, pub method: bool, pub taken: bool, pub threw: bool
+}
+impl Copy for Inlined {}
 /// The resume entry of the function linked as baseline, or null when it has none: its code
 /// keeps the distance from the construct entry to it in the four bytes before that entry
 /// (0 for none). It is entered as the code is, with a Resume in place of the arguments and
