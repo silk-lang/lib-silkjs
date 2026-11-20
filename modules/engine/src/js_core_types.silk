@@ -30,6 +30,9 @@ import silk.concurrency.atomic { Atomic, MemoryOrder }
 import silk.num.u32
 import silk.num.u8
 import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.f64
 import js_atoms { AtomTable }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellLinks, CellRef }
 import js_value { ValueBits }
@@ -1477,37 +1480,36 @@ impl PropertySlot {
     }
   }
 }
-/// A stored property slot in two words. Its kind is the JS_PROP_TMASK part of the shape
-/// property's flags, as in the source, so the slot carries no tag of its own: read it
-/// with view and those flags, and write it from the PropertySlot it holds.
+/// A stored property slot in one 64-bit word. Its kind is the JS_PROP_TMASK part of the
+/// shape property's flags, as in the source, so the slot carries no tag of its own: read
+/// it with view and those flags, and write it from the PropertySlot it holds.
 ///
-/// A data slot holds its ValueBits. An accessor holds its AccessorBox cell (which owns
-/// its getter and setter; the slot owns the box, freed with retire), and a VarRef its cell. A lazy slot holds its realm's address with the lazy kind in the low
-/// three bits (cells are at least 16-byte aligned), then the module, the builtin
-/// descriptor, the host id, the owned initializer or zero.
-pub struct SlotBits { first: u64, second: u64 }
+/// A data slot holds its ValueBits NaN-boxed. A number is its binary64 bits, with every
+/// NaN stored as the canonical quiet NaN. Any other value is a word whose top 16 bits are
+/// SLOT_TAG_BASE plus the value's variant index (the declaration order of ValueBits) and
+/// whose low 48 bits are its payload: a cell address, an i32, a bool or a short BigInt.
+/// Those tags are NaNs with a payload, which no stored number is, so one compare tells a
+/// number from anything else.
+///
+/// An accessor holds the address of its AccessorBox cell (which owns its getter and
+/// setter; the slot owns the box, freed with retire), and a VarRef its cell's address.
+/// A lazy slot holds its realm's address with the lazy kind in the low three bits and
+/// its descriptor in bits 48 to 62 when that fits: a prototype, a builtin method below
+/// 512 or a host id below 32768, which is nearly every lazy slot. Otherwise (a module
+/// namespace export, an initializer, a captured stack) it holds the address of a LazyBox
+/// cell with LAZY_BOXED (bit 63) set, and the box holds the realm and the descriptor;
+/// retire frees it. Cells are at least 8-byte aligned and below 2^48.
+pub struct SlotBits { word: u64 }
 impl Copy for SlotBits {}
-// Each pointer takes one 64-bit slot word: a 32-bit target pads it with a zero high half.
-static if Intrinsic.targetPointerBits() == 32 {
-  struct SlotPointers { first: ?*mut HeapHeader, firstHigh: u32, second: ?*mut HeapHeader, secondHigh: u32 }
-  @inlineAlways
-  fn onePointer(first: ?*mut HeapHeader) -> SlotPointers {
-    return SlotPointers { first: first, firstHigh: 0, second: Pointer.null<HeapHeader>(), secondHigh: 0 }
-  }
-} else {
-  struct SlotPointers { first: ?*mut HeapHeader, second: ?*mut HeapHeader }
-  @inlineAlways
-  fn onePointer(first: ?*mut HeapHeader) -> SlotPointers {
-    return SlotPointers { first: first, second: Pointer.null<HeapHeader>() }
-  }
-}
-impl Copy for SlotPointers {}
-/// An accessor slot's getter and setter (null when absent), in a cell of its own
-/// so that every slot kind fits one word of the slot.
-pub struct AccessorBox { pub getter: ?*mut HeapHeader, pub setter: ?*mut HeapHeader }
+/// A lazy slot's realm and descriptor when they do not fit the slot word.
+pub struct LazyBox { pub realm: ?*mut HeapHeader, pub second: u64 }
 /// NativeFunctionId.Builtin's fields, read as one word.
 struct BuiltinWord { family: BuiltinFamily, method: u32 }
 impl Copy for BuiltinWord {}
+/// A ValueBits read as its two words: the variant index in the low byte of the first
+/// (the rest is padding), the payload in the second.
+struct ValueWords { variant: u64, payload: u64 }
+impl Copy for ValueWords {}
 const LAZY_PROTOTYPE: u64 = 0
 const LAZY_NAMESPACE: u64 = 1
 const LAZY_BUILTIN: u64 = 2
@@ -1515,19 +1517,84 @@ const LAZY_HOST: u64 = 3
 const LAZY_INITIALIZER: u64 = 4
 const LAZY_STACK: u64 = 5
 const LAZY_MASK: u64 = 7
+const LAZY_BOXED: u64 = 0x8000000000000000
+const LAZY_ADDRESS: u64 = 0x0000fffffffffff8
+/// The descriptor bits of an inline lazy word, above the address and below LAZY_BOXED.
+const LAZY_SMALL: u64 = 0x7fff
+/// The top 16 bits of the first non-number slot word, ValueBits variant 0 (BigInt).
+const SLOT_TAG_BASE: u64 = 0xfff1
+const SLOT_NON_NUMBER: u64 = 0xfff1000000000000
+/// Variants 0 to 6 (BigInt to Object) hold a heap reference: their words lie in
+/// [SLOT_NON_NUMBER, SLOT_HEAP_END).
+const SLOT_HEAP_END: u64 = 0xfff8000000000000
+const SLOT_PAYLOAD: u64 = 0x0000ffffffffffff
+const SLOT_CANONICAL_NAN: u64 = 0x7ff8000000000000
+const VARIANT_SHORT_BIG_INT: u64 = 14
+const VARIANT_FLOAT64: u64 = 15
+static if Intrinsic.targetPointerBits() == 32 {
+  /// A 32-bit target writes a pointer payload's low half only.
+  const POINTER_PAYLOAD: u64 = 0xffffffff
+} else {
+  const POINTER_PAYLOAD: u64 = 0xffffffffffffffff
+}
 @inlineAlways
 fn checkSlotLayout() -> () {
-  if Layout.of<ValueBits>().bytes != 16 || Layout.of<ValueBits>().alignment > 8 || Layout.of<SlotPointers>().bytes != 16 || Layout.of<BuiltinWord>().bytes != 8 {
+  if Layout.of<ValueBits>().bytes != 16 || Layout.of<ValueBits>().alignment > 8 || Layout.of<ValueWords>().bytes != 16 || Layout.of<BuiltinWord>().bytes != 8 || Layout.of<BuiltinFamily>().bytes != 1 {
     Intrinsic.trap("property slot words do not match their views")
   }
 }
 @inlineAlways
-fn slotWords(pointers: SlotPointers) -> SlotBits {
-  checkSlotLayout()
-  return unsafe Pointer.read<SlotBits>(unsafe Intrinsic.pointerReinterpret<*const SlotPointers, *const SlotBits>(Pointer.fromRef<SlotPointers>(&pointers)))
+fn addressWord(pointer: ?*mut HeapHeader) -> u64 { return usize.toU64(Pointer.address<HeapHeader>(pointer)) }
+@inlineAlways
+fn wordPointer(word: u64) -> ?*mut HeapHeader {
+  let address = u64.toUsize(word)
+  return unsafe Pointer.read<?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*const usize, *const ?*mut HeapHeader>(Pointer.fromRef<usize>(&address)))
 }
 @inlineAlways
-fn addressWord(pointer: ?*mut HeapHeader) -> u64 { return usize.toU64(Pointer.address<HeapHeader>(pointer)) }
+fn wordReference(word: u64) -> *mut HeapHeader { return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(wordPointer(word)) }
+/// The payload bits each variant defines, by variant index; the rest of its payload
+/// word is padding. Float64 (15) is packed apart.
+const PAYLOAD_MASKS: [u64; 16] = [POINTER_PAYLOAD, POINTER_PAYLOAD, POINTER_PAYLOAD, POINTER_PAYLOAD, POINTER_PAYLOAD, POINTER_PAYLOAD, POINTER_PAYLOAD,
+  0xffffffff, 0xff, 0, 0, 0, 0xffffffff, 0, SLOT_PAYLOAD, 0xffffffffffffffff]
+/// The slot word of a value given as its two words: the payload mask is a table lookup.
+@inlineAlways
+fn packWords(words: ValueWords) -> u64 {
+  let variant = u64.bitAnd(words.variant, 15)
+  let payload = u64.bitAnd(words.payload, PAYLOAD_MASKS[u64.toUsize(variant)])
+  if variant == VARIANT_FLOAT64 {
+    // Every NaN is stored as one: a NaN with a payload would read as a tagged value.
+    if u64.bitAnd(payload, 0x7fffffffffffffff) > 0x7ff0000000000000 { return SLOT_CANONICAL_NAN }
+    return payload
+  }
+  if payload > SLOT_PAYLOAD { addressTooWide() }
+  return u64.bitOr(u64.shiftLeft(SLOT_TAG_BASE + variant, 48), payload)
+}
+@inlineNever
+fn addressTooWide() -> never { return Intrinsic.trap("a heap address does not fit a 48-bit slot payload") }
+@inlineAlways
+fn tagged(variant: u64, payload: u64) -> u64 { return u64.bitOr(u64.shiftLeft(SLOT_TAG_BASE + variant, 48), payload) }
+/// The slot word of value. Tests of the variant, not a match: a match is a jump table,
+/// an indirect branch that mispredicts far more often than these do.
+@inlineAlways
+fn packValue(value: ValueBits) -> u64 {
+  let words = unsafe Pointer.read<ValueWords>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const ValueWords>(Pointer.fromRef<ValueBits>(&value)))
+  let variant = u64.bitAnd(words.variant, 15)
+  if variant == 7 { return tagged(7, u64.bitAnd(words.payload, 0xffffffff)) }
+  return packWords(words)
+}
+/// The value a data slot's word holds. Past the number test it is built as its two
+/// words, without a jump table on the variant.
+@inlineAlways
+fn unpackWord(word: u64) -> ValueBits {
+  checkSlotLayout()
+  if word < SLOT_NON_NUMBER { return ValueBits.Float64 { value: f64.fromBits(word) } }
+  let variant = u64.shiftRight(word, 48) - SLOT_TAG_BASE
+  let mut payload = u64.bitAnd(word, SLOT_PAYLOAD)
+  // A short BigInt is 48-bit two's complement: extend its sign.
+  if variant == VARIANT_SHORT_BIG_INT && payload > 0x00007fffffffffff { payload = u64.bitOr(payload, 0xffff000000000000) }
+  let words = ValueWords { variant: variant, payload: payload }
+  return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*const ValueWords, *const ValueBits>(Pointer.fromRef<ValueWords>(&words)))
+}
 impl SlotBits {
   /// The value slot for the value in the cell at source, read one word at a time.
   /// The cell is usually an operand the previous instruction pushed with two word
@@ -1539,57 +1606,84 @@ impl SlotBits {
   pub unsafe fn valueAt(source: *const ValueBits) -> SlotBits {
     checkSlotLayout()
     let words = unsafe Pointer.assumeMany<u64>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const u64>(source))
-    return SlotBits {
-      first: unsafe Atomic.load<u64>(unsafe Pointer.at<u64>(words, 0), MemoryOrder.Relaxed),
-      second: unsafe Atomic.load<u64>(unsafe Pointer.at<u64>(words, 1), MemoryOrder.Relaxed)
-    }
+    return SlotBits { word: packWords(ValueWords {
+      variant: unsafe Atomic.load<u64>(unsafe Pointer.at<u64>(words, 0), MemoryOrder.Relaxed),
+      payload: unsafe Atomic.load<u64>(unsafe Pointer.at<u64>(words, 1), MemoryOrder.Relaxed)
+    }) }
   }
-  /// The slot holding slot, taking its references. An accessor gets a new box.
+  /// The slot holding slot, taking its references. An accessor gets a new box, and so
+  /// does a lazy slot whose descriptor does not fit the word.
   @inlineAlways
   pub effect fn from(slot: PropertySlot) -> SlotBits ! OutOfMemoryError ? &mut Allocator {
     return match slot {
       PropertySlot.GetterSetter { getter, setter } => run SlotBits.accessor(getter, setter)
-      _ => SlotBits.plain(slot)
+      PropertySlot.Value { value } => SlotBits.value(value)
+      PropertySlot.VarRef { reference } => SlotBits { word: addressWord(reference) }
+      _ => run SlotBits.lazySlot(slot)
     }
   }
   @inlineNever
   effect fn accessor(getter: ?*mut HeapHeader, setter: ?*mut HeapHeader) -> SlotBits ! OutOfMemoryError ? &mut Allocator {
     let cell = run HeapCell.allocate<AccessorBox>(HeapKind.Auxiliary, AccessorBox { getter: getter, setter: setter })
-    return slotWords(onePointer(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell)))
+    return SlotBits { word: addressWord(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell)) }
   }
-  /// from for any slot but an accessor (traps on one), which needs no allocation.
+  @inlineNever
+  effect fn lazySlot(slot: PropertySlot) -> SlotBits ! OutOfMemoryError ? &mut Allocator {
+    match SlotBits.lazyParts(slot) {
+      LazyParts.Inline { word } => { return SlotBits { word: word } }
+      LazyParts.Boxed { realm, kind, second } => {
+        let cell = run HeapCell.allocate<LazyBox>(HeapKind.Auxiliary, LazyBox { realm: realm, second: second })
+        return SlotBits { word: u64.bitOr(addressWord(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell)), u64.bitOr(LAZY_BOXED, kind)) }
+      }
+    }
+  }
+  /// from for a slot that needs no allocation: a value, a VarRef or a lazy slot whose
+  /// descriptor fits the word (a prototype always does). Traps on any other.
   @inlineAlways
   pub fn plain(slot: PropertySlot) -> SlotBits {
     return match slot {
       PropertySlot.Value { value } => SlotBits.value(value)
       PropertySlot.GetterSetter { .. } => Intrinsic.trap("an accessor slot needs its box")
-      PropertySlot.VarRef { reference } => slotWords(onePointer(reference))
-      PropertySlot.LazyPrototype { realm } => SlotBits.lazy(realm, LAZY_PROTOTYPE, 0)
-      PropertySlot.LazyNamespace { realm, module } => SlotBits.lazy(realm, LAZY_NAMESPACE, addressWord(module))
-      PropertySlot.LazyBuiltin { realm, family, method } => {
-        let word = BuiltinWord { family: family, method: method }
-        SlotBits.lazy(realm, LAZY_BUILTIN, unsafe Pointer.read<u64>(unsafe Intrinsic.pointerReinterpret<*const BuiltinWord, *const u64>(Pointer.fromRef<BuiltinWord>(&word))))
+      PropertySlot.VarRef { reference } => SlotBits { word: addressWord(reference) }
+      _ => match SlotBits.lazyParts(slot) {
+        LazyParts.Inline { word } => SlotBits { word: word }
+        LazyParts.Boxed { .. } => Intrinsic.trap("a lazy slot needs its box")
       }
-      PropertySlot.LazyHost { realm, id } => SlotBits.lazy(realm, LAZY_HOST, u32.toU64(id))
-      PropertySlot.LazyInitializer { realm, reference } => SlotBits.lazy(realm, LAZY_INITIALIZER, addressWord(reference))
-      PropertySlot.LazyStack { realm, capture } => SlotBits.lazy(realm, LAZY_STACK, addressWord(capture))
     }
   }
   @inlineAlways
   pub fn value(value: ValueBits) -> SlotBits {
     checkSlotLayout()
-    return unsafe Pointer.read<SlotBits>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const SlotBits>(Pointer.fromRef<ValueBits>(&value)))
+    return SlotBits { word: packValue(value) }
   }
-  @inlineNever
-  fn lazy(realm: *mut HeapHeader, kind: u64, second: u64) -> SlotBits {
-    let address = addressWord(realm)
-    if u64.bitAnd(address, LAZY_MASK) != 0 { Intrinsic.trap("lazy property realm is not aligned") }
-    return SlotBits { first: u64.bitOr(address, kind), second: second }
+  /// The word of a lazy slot when its descriptor fits, otherwise what its box holds.
+  fn lazyParts(slot: PropertySlot) -> LazyParts {
+    checkSlotLayout()
+    return match slot {
+      PropertySlot.LazyPrototype { realm } => SlotBits.inlineLazy(realm, LAZY_PROTOTYPE, 0)
+      PropertySlot.LazyNamespace { realm, module } => LazyParts.Boxed { realm: realm, kind: LAZY_NAMESPACE, second: addressWord(module) }
+      PropertySlot.LazyBuiltin { realm, family, method } => {
+        let familyIndex = u8.toU64(unsafe Pointer.read<u8>(unsafe Intrinsic.pointerReinterpret<*const BuiltinFamily, *const u8>(Pointer.fromRef<BuiltinFamily>(&family))))
+        if familyIndex < 64 && method < 512 { SlotBits.inlineLazy(realm, LAZY_BUILTIN, u64.bitOr(familyIndex, u64.shiftLeft(u32.toU64(method), 6))) }
+        else {
+          let word = BuiltinWord { family: family, method: method }
+          LazyParts.Boxed { realm: realm, kind: LAZY_BUILTIN, second: unsafe Pointer.read<u64>(unsafe Intrinsic.pointerReinterpret<*const BuiltinWord, *const u64>(Pointer.fromRef<BuiltinWord>(&word))) }
+        }
+      }
+      PropertySlot.LazyHost { realm, id } => {
+        if id < 32768 { SlotBits.inlineLazy(realm, LAZY_HOST, u32.toU64(id)) }
+        else { LazyParts.Boxed { realm: realm, kind: LAZY_HOST, second: u32.toU64(id) } }
+      }
+      PropertySlot.LazyInitializer { realm, reference } => LazyParts.Boxed { realm: realm, kind: LAZY_INITIALIZER, second: addressWord(reference) }
+      PropertySlot.LazyStack { realm, capture } => LazyParts.Boxed { realm: realm, kind: LAZY_STACK, second: addressWord(capture) }
+      _ => Intrinsic.trap("not a lazy property")
+    }
   }
   @inlineAlways
-  fn pointers(self: &Self) -> SlotPointers {
-    checkSlotLayout()
-    return unsafe Pointer.read<SlotPointers>(unsafe Intrinsic.pointerReinterpret<*const SlotBits, *const SlotPointers>(Pointer.fromRef<SlotBits>(self)))
+  fn inlineLazy(realm: *mut HeapHeader, kind: u64, small: u64) -> LazyParts {
+    let address = addressWord(realm)
+    if u64.bitAnd(address, u64.bitNot(LAZY_ADDRESS)) != 0 { Intrinsic.trap("lazy property realm is not an 8-byte aligned 48-bit address") }
+    return LazyParts.Inline { word: u64.bitOr(u64.bitOr(address, kind), u64.shiftLeft(small, 48)) }
   }
   /// The slot, read as the kind flags name.
   @inlineAlways
@@ -1598,64 +1692,132 @@ impl SlotBits {
     if kind == JS_PROP_NORMAL { return PropertySlot.Value { value: self.valueBits() } }
     return self.viewOther(kind)
   }
-  /// Whether a lazy (auto-init) slot owns a cell besides its realm.
+  /// Whether a lazy (auto-init) slot owns a cell besides its realm: its box, and with
+  /// an initializer or a captured stack that cell too. Such a slot leaves through retire.
   @inlineAlways
-  pub fn lazyOwnsCell(self: &Self) -> bool {
-    let lazy = u64.bitAnd(self.first, LAZY_MASK)
-    return lazy == LAZY_INITIALIZER || lazy == LAZY_STACK
-  }
-  /// The realm reference of a lazy (auto-init) slot.
+  pub fn lazyOwnsCell(self: &Self) -> bool { return u64.bitAnd(self.word, LAZY_BOXED) != 0 }
+  /// The realm reference of a lazy (auto-init) slot that keeps it in its word
+  /// (lazyOwnsCell is false).
   @inlineAlways
-  pub fn lazyRealmUnchecked(self: &Self) -> ?*mut HeapHeader {
-    let untagged = SlotBits { first: u64.bitAnd(self.first, u64.bitNot(LAZY_MASK)), second: self.second }
-    return untagged.pointers().first
-  }
+  pub fn lazyRealmUnchecked(self: &Self) -> ?*mut HeapHeader { return wordPointer(u64.bitAnd(self.word, LAZY_ADDRESS)) }
   @inlineNever
   fn viewOther(self: &Self, kind: u32) -> PropertySlot {
-    let words = self.pointers()
     if kind == JS_PROP_GETSET {
-      let anchor = () let pair = unsafe HeapCell.payload<AccessorBox, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(words.first))
+      let anchor = () let pair = unsafe HeapCell.payload<AccessorBox, ()>(&anchor, wordReference(self.word))
       return PropertySlot.GetterSetter { getter: pair.getter, setter: pair.setter }
     }
-    if kind == JS_PROP_VARREF { return PropertySlot.VarRef { reference: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(words.first) } }
-    let lazy = u64.bitAnd(self.first, LAZY_MASK)
-    let untagged = SlotBits { first: u64.bitAnd(self.first, u64.bitNot(LAZY_MASK)), second: self.second }
-    let parts = untagged.pointers()
-    let realm = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.first)
+    if kind == JS_PROP_VARREF { return PropertySlot.VarRef { reference: wordReference(self.word) } }
+    let lazy = u64.bitAnd(self.word, LAZY_MASK)
+    let mut realm = wordReference(u64.bitAnd(self.word, LAZY_ADDRESS))
+    let mut second = u64.bitAnd(u64.shiftRight(self.word, 48), LAZY_SMALL)
+    let boxed = u64.bitAnd(self.word, LAZY_BOXED) != 0
+    if boxed {
+      let anchor = () let held = unsafe HeapCell.payload<LazyBox, ()>(&anchor, realm)
+      second = held.second
+      realm = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(held.realm)
+    }
     if lazy == LAZY_PROTOTYPE { return PropertySlot.LazyPrototype { realm: realm } }
-    if lazy == LAZY_NAMESPACE { return PropertySlot.LazyNamespace { realm: realm, module: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.second) } }
-    if lazy == LAZY_HOST { return PropertySlot.LazyHost { realm: realm, id: u64.toU32(self.second) } }
-    if lazy == LAZY_INITIALIZER { return PropertySlot.LazyInitializer { realm: realm, reference: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.second) } }
-    if lazy == LAZY_STACK { return PropertySlot.LazyStack { realm: realm, capture: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.second) } }
-    let word = unsafe Pointer.read<BuiltinWord>(unsafe Intrinsic.pointerReinterpret<*const u64, *const BuiltinWord>(Pointer.fromRef<u64>(&self.second)))
-    return PropertySlot.LazyBuiltin { realm: realm, family: word.family, method: word.method }
+    if lazy == LAZY_NAMESPACE { return PropertySlot.LazyNamespace { realm: realm, module: wordReference(second) } }
+    if lazy == LAZY_HOST { return PropertySlot.LazyHost { realm: realm, id: u64.toU32(second) } }
+    if lazy == LAZY_INITIALIZER { return PropertySlot.LazyInitializer { realm: realm, reference: wordReference(second) } }
+    if lazy == LAZY_STACK { return PropertySlot.LazyStack { realm: realm, capture: wordReference(second) } }
+    if boxed {
+      let word = unsafe Pointer.read<BuiltinWord>(unsafe Intrinsic.pointerReinterpret<*const u64, *const BuiltinWord>(Pointer.fromRef<u64>(&second)))
+      return PropertySlot.LazyBuiltin { realm: realm, family: word.family, method: word.method }
+    }
+    let familyIndex = u64.toU8(u64.bitAnd(second, 63))
+    let family = unsafe Pointer.read<BuiltinFamily>(unsafe Intrinsic.pointerReinterpret<*const u8, *const BuiltinFamily>(Pointer.fromRef<u8>(&familyIndex)))
+    return PropertySlot.LazyBuiltin { realm: realm, family: family, method: u64.toU32(u64.shiftRight(second, 6)) }
   }
   /// The getter of a slot whose flags name an accessor property.
   @inlineAlways
   pub fn getter(self: &Self) -> ?*mut HeapHeader {
     let anchor = ()
-    return (unsafe HeapCell.payload<AccessorBox, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(self.pointers().first))).getter
+    return (unsafe HeapCell.payload<AccessorBox, ()>(&anchor, wordReference(self.word))).getter
   }
   /// Frees the box of an accessor slot from from that was never stored (its getter
   /// and setter stay with the caller).
   pub unsafe fn discardBox(self: &Self) -> () {
-    unsafe HeapCell.destroy<AccessorBox>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(self.pointers().first))
+    unsafe HeapCell.destroy<AccessorBox>(wordReference(self.word))
+  }
+  /// Frees the box, if any, of a slot from from that was never stored (or whose
+  /// PropertySlot the caller took with view and now overwrites): flags name its kind.
+  /// What the slot held stays with the caller.
+  pub unsafe fn discardStored(self: &Self, flags: u8) -> () {
+    let kind = u32.bitAnd(u8.toU32(flags), JS_PROP_TMASK)
+    if kind == JS_PROP_GETSET { unsafe HeapCell.destroy<AccessorBox>(wordReference(self.word)) }
+    else if kind == JS_PROP_AUTOINIT && self.lazyOwnsCell() { unsafe HeapCell.destroy<LazyBox>(wordReference(u64.bitAnd(self.word, LAZY_ADDRESS))) }
   }
   /// view for a slot leaving its object (overwritten, deleted or destroyed with
-  /// it): the returned slot owns its references, and an accessor's box is freed.
+  /// it): the returned slot owns its references, and a box is freed.
   @inlineAlways
   pub unsafe fn retire(self: &Self, flags: u8) -> PropertySlot {
     let slot = self.view(flags)
-    if u32.bitAnd(u8.toU32(flags), JS_PROP_TMASK) == JS_PROP_GETSET { unsafe HeapCell.destroy<AccessorBox>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(self.pointers().first)) }
+    if u32.bitAnd(u8.toU32(flags), JS_PROP_TMASK) != JS_PROP_NORMAL { unsafe self.discardStored(flags) }
     return slot
+  }
+  /// Writes the value of a slot whose flags name a plain data property to target as its
+  /// two words, retaining a heap reference when retain is set: the VM's property loads,
+  /// which would otherwise build the value only to store it.
+  @inlineAlways
+  pub unsafe fn writeValue(self: &Self, target: *mut ValueBits, retain: bool) -> () {
+    checkSlotLayout()
+    let word = self.word
+    let mut words = ValueWords { variant: VARIANT_FLOAT64, payload: word }
+    if word >= SLOT_NON_NUMBER {
+      let variant = u64.shiftRight(word, 48) - SLOT_TAG_BASE
+      let mut payload = u64.bitAnd(word, SLOT_PAYLOAD)
+      if variant < 7 { if retain { unsafe HeapCell.retain(wordReference(payload)) } }
+      else if variant == VARIANT_SHORT_BIG_INT && payload > 0x00007fffffffffff { payload = u64.bitOr(payload, 0xffff000000000000) }
+      words = ValueWords { variant: variant, payload: payload }
+    }
+    unsafe Pointer.write<ValueWords>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ValueWords>(target), words)
   }
   /// The value of a slot whose flags name a plain data property.
   @inlineAlways
-  pub fn valueBits(self: &Self) -> ValueBits {
-    checkSlotLayout()
-    return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*const SlotBits, *const ValueBits>(Pointer.fromRef<SlotBits>(self)))
+  pub fn valueBits(self: &Self) -> ValueBits { return unpackWord(self.word) }
+  /// Whether a data slot holds a heap reference: what a release of its value looks at.
+  @inlineAlways
+  pub fn holdsHeap(self: &Self) -> bool { return self.word >= SLOT_NON_NUMBER && self.word < SLOT_HEAP_END }
+  /// The heap reference a data slot holds, if any.
+  @inlineAlways
+  pub fn heapReference(self: &Self) -> Option<*mut HeapHeader> {
+    if self.word >= SLOT_NON_NUMBER && self.word < SLOT_HEAP_END { return Option<*mut HeapHeader>.some(wordReference(u64.bitAnd(self.word, SLOT_PAYLOAD))) }
+    return Option<*mut HeapHeader>.none()
+  }
+  /// Whether any data slot of slots holds a heap reference.
+  pub fn anyHeap(slots: &[SlotBits]) -> bool {
+    let count = slots.length
+    let mut i: usize = 0
+    while i < count {
+      let word = slots[i].word
+      if word >= SLOT_NON_NUMBER && word < SLOT_HEAP_END { return true }
+      i = i + 1
+    }
+    return false
+  }
+  /// Copies count data slots from source to the disjoint destination and returns
+  /// anyHeap of them.
+  pub unsafe fn copyScan(destination: [*]mut SlotBits, source: [*]const SlotBits, count: usize) -> bool {
+    let mut heap = false
+    let mut i: usize = 0
+    while i < count {
+      let slot = unsafe Pointer.read<SlotBits>(unsafe Pointer.at<SlotBits>(source, i))
+      unsafe Pointer.write<SlotBits>(unsafe Pointer.atMut<SlotBits>(destination, i), slot)
+      heap = heap || (slot.word >= SLOT_NON_NUMBER && slot.word < SLOT_HEAP_END)
+      i = i + 1
+    }
+    return heap
   }
 }
+union LazyParts {
+  Inline { word: u64 },
+  Boxed { realm: *mut HeapHeader, kind: u64, second: u64 }
+}
+impl Copy for LazyParts {}
+/// An accessor slot's getter and setter (null when absent), in a cell of its own
+/// so that every slot kind fits one word of the slot.
+pub struct AccessorBox { pub getter: ?*mut HeapHeader, pub setter: ?*mut HeapHeader }
 /// An own-property description. Each value field owns its count, so dropping a
 /// descriptor releases all three.
 pub struct PropertyDescriptor {
