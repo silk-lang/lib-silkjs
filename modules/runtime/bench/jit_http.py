@@ -49,19 +49,23 @@ def cpu_ticks(pid):
     return int(fields[11]) + int(fields[12])
 
 
-def jit_counters(log, *, interpret=False):
+def jit_counters(log, *, interpret=False, baseline=False):
     line = next((s for s in log.splitlines() if s.startswith("jit: reported ")), "")
     counters = {k: int(v) for k, v in re.findall(r"([a-z][a-z0-9-]*) ([0-9]+)", line)}
     if interpret:
         if any(counters.get(k) != 0 for k in ("reported", "compiled", "runs", "osr-runs", "failed")):
             raise ValueError(f"expected inactive JIT counters: {line!r}")
         return counters
+    if baseline:
+        if counters.get("failed") != 0 or counters.get("baseline-compiled", 0) == 0:
+            raise ValueError(f"expected baseline code; JIT counters: {line!r}")
+        return counters
     if counters.get("failed") != 0 or counters.get("runs", 0) + counters.get("osr-runs", 0) == 0:
         raise ValueError(f"expected successful compiled execution; JIT counters: {line!r}")
     return counters
 
 
-def run_sample(executable, check_jit, server_cpu, settings, *, jit_calls=False, interpret=False, items=64):
+def run_sample(executable, check_jit, server_cpu, settings, *, jit_calls=False, interpret=False, baseline=False, items=64):
     payloads = cases(items)
     env = {k: v for k, v in os.environ.items() if k not in {"BUN_OPTIONS", "NODE_OPTIONS"}}
     env["SILKJS_PREPARSE_THREADS"] = "0"
@@ -72,6 +76,8 @@ def run_sample(executable, check_jit, server_cpu, settings, *, jit_calls=False, 
             command.append("--no-jit")
         elif jit_calls:
             command.append("--jit-calls")
+        elif baseline:
+            command.append("--jit-baseline")
         process = subprocess.Popen([*command, FIXTURE],
                                    stdout=subprocess.PIPE, stderr=log, env=env, start_new_session=True)
         connection = None
@@ -133,7 +139,7 @@ def run_sample(executable, check_jit, server_cpu, settings, *, jit_calls=False, 
             if process.returncode:
                 raise ValueError(f"server exited with {process.returncode}")
             log.seek(0)
-            counters = jit_counters(log.read().decode(errors="replace"), interpret=interpret) if check_jit else {}
+            counters = jit_counters(log.read().decode(errors="replace"), interpret=interpret, baseline=baseline) if check_jit else {}
             return {"first_response_ms": first_ms, "requests": count, "elapsed_s": elapsed,
                     "sequential_requests_per_s": throughput, "server_cpu_us_per_request": cpu_us,
                     "peak_rss_kib": rss_kib, "scheduled_latency_ms": delays,
@@ -165,6 +171,7 @@ def main():
     policy.add_argument("--no-jit", action="store_true", help="run the SilkJS interpreter in the same embedding host")
     parser.add_argument("--items", type=int, default=64, help="line items per JSON order (default 64)")
     policy.add_argument("--jit-calls", action="store_true", help="enable compiled calls in the SilkJS host")
+    policy.add_argument("--jit-baseline", action="store_true", help="baseline code for hot functions in the SilkJS host")
     parser.add_argument("--node", default=shutil.which("node"), type=Path)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1200, help="untimed orders per process")
@@ -193,7 +200,8 @@ def main():
         for name in names:
             sample = run_sample(commands[name], name == "silkjs", cpus[0], args,
                                 jit_calls=name == "silkjs" and args.jit_calls,
-                                interpret=name == "silkjs" and args.no_jit, items=args.items)
+                                interpret=name == "silkjs" and args.no_jit,
+                                baseline=name == "silkjs" and args.jit_baseline, items=args.items)
             results[name].append(sample)
             print(f"{rnd + 1} {name}: {sample['first_response_ms']:.2f} ms to first order,"
                   f" {sample['sequential_requests_per_s']:.0f} sequential req/s,"

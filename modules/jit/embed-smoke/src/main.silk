@@ -8,9 +8,21 @@ import silkjs.js_exceptions { JsException }
 import silkjs.js_realm { Realm }
 import silk.system.host_input { HostInput, HostInputError }
 import silkjs.cli_io as io
+import silkjs.js_engine as engine
+import silkjs.js_baseline as engineBaseline
+import silkjs.js_baseline { BaselineFrame }
+import silkjs.js_value { ValueBits }
+import silk.mem.pointer { Pointer }
+import node.libs.core.host { Services }
+import node.ext.diagnostics_fatal { RuntimeHeap }
 import node.runtime.embed { Host, Options as RuntimeOptions }
 import node.runtime.embed as embed
 import node.runtime.session { Runtime, Turn }
+import node.libs.core.capabilities { Capabilities, Composition, EmptyWasm, EmptyHostApi, EmptyCompression, EmptyHttp2, EmptyCrypto, EmptyTls, EmptyDatabase, EmptyAddons, OsProcesses, OsNetwork, OsSystemInfo, EmptyTypeStripping, ThreadWorkers, EmptyInspector }
+import node.libs.core.module_sources { NodeResolution }
+import node.libs.core.platforms { OsPlatform }
+import node.libs.core.files { OsFiles }
+import http.llhttp { Llhttp }
 import jit.jit_runtime { Jit, Options }
 import jit.jit_runtime as compiler
 
@@ -28,10 +40,26 @@ setImmediate(() => {
 });
 """
 
+/// What this host's runtime is made of (embed.start below).
+type Parts = Capabilities<OsPlatform, NodeResolution, OsFiles, EmptyCompression, EmptyHttp2, EmptyCrypto, EmptyTls, EmptyDatabase, EmptyAddons, OsProcesses, OsNetwork, Llhttp, OsSystemInfo, EmptyTypeStripping, ThreadWorkers, EmptyInspector, EmptyWasm, EmptyHostApi>
+
+/// js_baseline.ServiceEntry for this host's engine: what baseline code asks the engine for runs
+/// on the hooks that entered it and on the runtime's heap (the runtime lends that allocator).
+export "C" fn silkjsEmbedBaselineService(hooks: *mut u8, allocator: *mut u8, record: *mut BaselineFrame, request: u64, base: *mut ValueBits, count: usize) -> u64 {
+  return unsafe engine.baselineService<Services<Parts>, RuntimeHeap>(hooks, allocator, record, request, base, count)
+}
+fn serviceAddress() -> *const u8 {
+  let entry: extern "C" fn(*mut u8, *mut u8, *mut BaselineFrame, u64, *mut ValueBits, usize) -> u64 = silkjsEmbedBaselineService
+  return unsafe Pointer.read<*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut u8, *mut u8, *mut BaselineFrame, u64, *mut ValueBits, usize) -> u64, *const *const u8>(Pointer.fromRef(&entry)))
+}
+
 struct App { jit: Jit, smoke: bool }
 impl Host for App {
-  fn afterBootstrap<'r>(self: &mut Self, realm: Realm<'r>) -> () { unsafe compiler.enable(&mut self.jit, realm.runtime()) }
-  effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+  fn afterBootstrap<'r>(self: &mut Self, realm: Realm<'r>) -> () {
+    unsafe engineBaseline.setServiceEntry(realm.runtime(), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(serviceAddress()))
+    unsafe compiler.enable(&mut self.jit, realm.runtime())
+  }
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
     if self.smoke { run runtime.evaluateModule(b"/jit-embed-smoke/main.mjs", MODULE) }
     while true {
       match run runtime.spin() {
@@ -47,7 +75,8 @@ effect fn program() -> i32 ! HostInputError | OutOfMemoryError | Synchronization
   let mut arguments = run HostInput.arguments()
   let calls = arguments.length() >= 2 && arguments.asSlice()[1].asSlice() == b"--jit-calls"
   let interpret = arguments.length() >= 2 && arguments.asSlice()[1].asSlice() == b"--no-jit"
-  if calls || interpret { drop arguments.remove(1) }
+  let baseline = arguments.length() >= 2 && arguments.asSlice()[1].asSlice() == b"--jit-baseline"
+  if calls || interpret || baseline { drop arguments.remove(1) }
   let smoke = arguments.length() == 1
   let mut valid = smoke
   if arguments.length() == 2 {
@@ -55,18 +84,25 @@ effect fn program() -> i32 ! HostInputError | OutOfMemoryError | Synchronization
     valid = path.length > 0 && path[0] != 45
   }
   if !valid {
-    io.stderr(b"usage: silkjs-jit-embed-smoke [--jit-calls | --no-jit] [module.mjs]\n") return 2
+    io.stderr(b"usage: silkjs-jit-embed-smoke [--jit-calls | --jit-baseline | --no-jit] [module.mjs]\n") return 2
   }
   let mut options = Options.make()
   options.enabled = !interpret
   options.calls = calls
+  // Baseline code for hot functions instead of the SSA compiler's (docs/jit/baseline.md).
+  options.baseline = baseline
   let mut app = App { jit: run Jit.make(move options), smoke: smoke }
-  let runtime = RuntimeOptions { arguments: move arguments, keepAlive: false }
-  let status = run embed.start(move runtime, &mut app)
+  // The host reads the Jit's counters after the runtime ended, so the process is not the runtime's.
+  let runtime = RuntimeOptions { arguments: move arguments, keepAlive: false, ownsProcess: false }
+  // What a script of the operating system needs, and node:http: the HTTP order service
+  // (modules/runtime/bench/jit_http.py) runs on this host.
+  let capabilities = Capabilities { platform: OsPlatform {}, modules: NodeResolution {}, files: OsFiles {}, compression: EmptyCompression {}, http2: EmptyHttp2 {}, crypto: EmptyCrypto {}, tls: EmptyTls {}, database: EmptyDatabase {}, addons: EmptyAddons {}, processes: OsProcesses {}, network: OsNetwork {}, http: Llhttp.make(), systemInfo: OsSystemInfo {}, typeStripping: EmptyTypeStripping {}, workers: ThreadWorkers {}, inspector: EmptyInspector {}, wasm: EmptyWasm {}, hostApi: EmptyHostApi {} }
+  let status = run embed.start(move runtime, &mut app, move capabilities)
   app.jit.collect()
   let counters = run app.jit.statsLine()
   io.stderr(counters.asSlice())
   if !smoke || status != 0 || interpret { return status }
+  if baseline { return if app.jit.failed != 0 || app.jit.baselineCompiled == 0 { 1 } else { 0 } }
   if app.jit.failed != 0 || app.jit.compiledFunctions == 0 || app.jit.runs + app.jit.osrRuns == 0 { return 1 }
   return 0
 }
