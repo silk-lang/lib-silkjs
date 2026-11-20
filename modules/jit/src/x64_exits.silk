@@ -1,6 +1,8 @@
 //! Exit tables for x64_backend (jit_exit_state has the format and the reason): one record per
 //! exit, chunks shared between records, a two-instruction stub per exit and one common stub
-//! per function that hands the record to the EXIT_STATE helper.
+//! per function that hands the record to the EXIT_STATE helper. In frame mode
+//! (x64_backend.lowerOnFrame) the common stub hands it to FRAME_EXIT, which writes the state
+//! into the baseline frame, and the function's baseline code goes on from there.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.core.option { Option }
@@ -8,10 +10,14 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.i32
 import silk.num.usize
-import asm_x64 { Alu, Label, Mem, Reg, Width }
+import asm_x64 { Alu, Cond, Mem, Reg, Width }
 import ssa { Function, Op, Type, Own, SlotMode, NONE }
-import x64_regalloc { GPR, XMM, gprAt, gprCount, xmmAt }
-import x64_backend { Emitter, SLOT_BYTES, INPUT_ENV }
+import x64_regalloc { GPR, XMM, gprCount, xmmAt }
+import x64_backend { Emitter, SLOT_BYTES, INPUT_ENV, SYMBOL_MOVED, SYMBOL_FINISH }
+import silk.num.u64
+import silkjs.js_baseline as frames
+import baseline_env
+import x64_frame_exit as leaving
 import jit_helpers as helpers
 import jit_exit_state as state
 
@@ -212,12 +218,15 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
   }
   // Stubs: the record's address, then the common stub.
   let common = run e.a.label()
-  let mut recordLabels = List<Label>.make()
   x = 0
   while x < exitCount {
-    let label = run e.a.label()
-    run recordLabels.append(label)
+    let label = e.records.get(x)
     e.a.bind(e.exitLabels.get(x))
+    if e.on {
+      // A plain deopt; a call or a poll comes in past this with how it left in ecx.
+      run e.a.alu(Alu.Xor, Width.W32, Reg.Rcx, Reg.Rcx)
+      e.a.bind(e.exitWith.get(x))
+    }
     run e.a.leaLabel(Reg.Rax, label)
     run e.a.jmp(common)
     x = x + 1
@@ -228,7 +237,7 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
   run e.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, state.DUMP_BYTES)
   let mut r: usize = 0
   while r < gprCount() {
-    if e.saves(r) { run e.a.store(Width.W64, Mem.at(Reg.Rsp, usize.toI32(r) * 8), gprAt(r)) }
+    if e.saves(r) { run e.a.store(Width.W64, Mem.at(Reg.Rsp, usize.toI32(r) * 8), e.places.pool.registers[r]) }
     r = r + 1
   }
   let mut doubles: u32 = 0
@@ -244,21 +253,55 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
     }
     d = d + 1
   }
-  run e.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.Rsp, state.DUMP_BYTES + e.inputs + u32.wrappingToI32(INPUT_ENV * 8)))
-  run e.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, state.DUMP_BYTES))
-  run e.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
-  run e.a.mov(Width.W64, Reg.R8, Reg.Rsp)
-  run e.a.callMem(Mem.at(Reg.Rdi, helpers.helperOffset(helpers.EXIT_STATE)))
-  run e.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, state.DUMP_BYTES)
-  run e.unwind()
-  run e.a.ret()
+  if e.on {
+    // frame_exit(env, record, slots, exit record, dump, how), with how kept in ebx (its
+    // value is in the dump). The answer is where the frame is (js_baseline.moved) for the
+    // baseline code's `moved` tail, or the operand depth for its `finish` tail when the
+    // interpreter takes the frame. Both want the baseline frame: rbx at its cell base and
+    // rsp below its cells.
+    let p = e.plan
+    let finishing = run e.a.label()
+    let throwing = run e.a.label()
+    run e.a.mov(Width.W32, Reg.R9, Reg.Rcx)
+    run e.a.mov(Width.W32, Reg.Rbx, Reg.Rcx)
+    run e.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
+    run e.a.mov(Width.W64, Reg.Rdi, Reg.R12)
+    run e.a.lea(Width.W64, Reg.Rsi, p.rec(0))
+    run e.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, state.DUMP_BYTES))
+    run e.a.mov(Width.W64, Reg.R8, Reg.Rsp)
+    run e.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.FRAME_EXIT)))
+    run e.a.aluImm(Alu.Cmp, Width.W32, Reg.Rbx, u32.wrappingToI32(leaving.HOW_CALL_THREW))
+    run e.a.jcc(Cond.AboveOrEqual, finishing)
+    run e.a.lea(Width.W64, Reg.Rbx, Mem.at(Reg.Rbp, p.localAt(0) + 128))
+    run e.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rbp, 0 - p.below))
+    run e.a.jmpSymbol(SYMBOL_MOVED)
+    e.a.bind(finishing)
+    run e.a.mov(Width.W64, Reg.R9, Reg.Rax)
+    run e.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_FINISH | frames.FINISH_THROWING))
+    run e.a.aluImm(Alu.Cmp, Width.W32, Reg.Rbx, u32.wrappingToI32(leaving.HOW_OBSERVED))
+    run e.a.jcc(Cond.NotEqual, throwing)
+    run e.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_FINISH))
+    e.a.bind(throwing)
+    run e.a.lea(Width.W64, Reg.Rbx, Mem.at(Reg.Rbp, p.localAt(0) + 128))
+    run e.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rbp, 0 - p.below))
+    run e.a.jmpSymbol(SYMBOL_FINISH)
+  } else {
+    run e.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.Rsp, state.DUMP_BYTES + e.inputs + u32.wrappingToI32(INPUT_ENV * 8)))
+    run e.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, state.DUMP_BYTES))
+    run e.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
+    run e.a.mov(Width.W64, Reg.R8, Reg.Rsp)
+    run e.a.callMem(Mem.at(Reg.Rdi, helpers.helperOffset(helpers.EXIT_STATE)))
+    run e.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, state.DUMP_BYTES)
+    run e.unwind()
+    run e.a.ret()
+  }
   // The tables: records, then chunks.
   let recordWords = usize.toU32(tables.records.length())
   x = 0
   let mut word: usize = 0
   while x < exitCount {
     let start = tables.recordAt.get(x)
-    e.a.bind(recordLabels.get(x))
+    e.a.bind(e.records.get(x))
     let mut end = recordWords
     if x + 1 < exitCount { end = tables.recordAt.get(x + 1) }
     while usize.toU32(word) < end {

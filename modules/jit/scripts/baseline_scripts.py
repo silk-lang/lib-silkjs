@@ -4,10 +4,12 @@
     python3 scripts/baseline_scripts.py <silkjs-jit-shell> [script.js ...]
 
 Each script prints what it computes. A script passes when --jit-baseline prints what the
-interpreter prints, at hot thresholds 1, 5 and 60 (docs/jit/baseline.md). The scripts cover what
-the tier does besides straight templates: deep recursion and the stack overflow, exceptions
-through baseline frames and handlers in them, error stacks, closures, `arguments`, getters,
-constructors, natives, mixed operand types, steps, and loops entered while they run.
+interpreter prints, at hot thresholds 1, 5 and 60 (docs/jit/baseline.md), and when --jit-opt
+does at each of those, with the optimizer taking a function after 1, 3 and 40 more entries
+(docs/jit/optimizer.md). The scripts cover what the tiers do besides straight code: deep
+recursion and the stack overflow, exceptions through their frames and handlers in them, error
+stacks, closures, `arguments`, getters, constructors, natives, mixed operand types, steps, and
+loops entered while they run.
 """
 import os
 import subprocess
@@ -15,6 +17,8 @@ import sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 THRESHOLDS = (1, 5, 60)
+# Entries of baseline code before the optimizer takes a function, per threshold.
+OPTIMIZE = (1, 3, 40)
 
 
 def output(command):
@@ -35,11 +39,15 @@ def main():
     failed = 0
     for script in scripts:
         expected = output([shell, script])
-        for threshold in THRESHOLDS:
+        for threshold, entries in zip(THRESHOLDS, OPTIMIZE):
             got = output([shell, "--jit-baseline", "--jit-threshold=%d" % threshold, script])
             if got != expected:
                 failed += 1
                 print("FAIL %s at threshold %d (status %s, interpreter %s)" % (os.path.basename(script), threshold, got[0], expected[0]))
+            got = output([shell, "--jit-opt=%d" % entries, "--jit-threshold=%d" % threshold, script])
+            if got != expected:
+                failed += 1
+                print("FAIL %s optimized at threshold %d + %d (status %s, interpreter %s)" % (os.path.basename(script), threshold, entries, got[0], expected[0]))
     print("%d scripts at thresholds %s: %s" % (len(scripts), ", ".join(map(str, THRESHOLDS)), "%d runs differ" % failed if failed else "all agree"))
     sys.exit(1 if failed else 0)
 

@@ -53,14 +53,17 @@ pub struct Settings {
   pub frame: BaselineLayout,
   pub fields: FieldLayout,
   /// The code counts its direct calls in the environment (--jit-stats).
-  pub count: bool
+  pub count: bool,
+  /// The shared prologue counts each function's entries down (FunctionBytecode.hotness, from
+  /// js_baseline.countFrom) and calls env.TIER when they run out: an optimizer takes it.
+  pub tier: bool
 }
 impl Copy for Settings {}
 
 /// The settings of this engine build, or None when its value layout is not the one the
 /// templates assume: a one-byte tag at offset 0 with small values, the payload in the
 /// second word.
-pub fn probe(count: bool) -> Option<Settings> {
+pub fn probe(count: bool, tier: bool) -> Option<Settings> {
   let layout = match values.probe() { Option<ValueLayout>.Some { value } => value Option<ValueLayout>.None => { return Option<Settings>.none() } }
   if layout.tagOffset != 0 || layout.tagWidth != 1 || layout.payloadOffset != 8 || layout.size != 16 { return Option<Settings>.none() }
   let mut t: usize = 0
@@ -75,7 +78,7 @@ pub fn probe(count: bool) -> Option<Settings> {
   // would be (js_baseline.FRAME_STOP).
   let record = (frame.frameBytes + 15) / 16 * 16
   if frame.state + 16 < record || frame.state + 8 > record { return Option<Settings>.none() }
-  return Option<Settings>.some(Settings { layout: layout, frame: frame, fields: objects.fieldLayout(), count: count })
+  return Option<Settings>.some(Settings { layout: layout, frame: frame, fields: objects.fieldLayout(), count: count, tier: tier })
 }
 
 /// What compile made of a function.
@@ -107,6 +110,12 @@ pub const MARK_CONSTRUCT: u32 = 0x1005
 pub const MARK_TABLE: u32 = 0x1006
 /// The resume entry (js_baseline.resumeOf), when the function has one.
 pub const MARK_RESUME: u32 = 0x1007
+/// The tail that takes the frame on where a service left it (js_baseline.moved in rax):
+/// where optimized code hands the frame over (x64_frame).
+pub const MARK_MOVED: u32 = 0x1008
+/// Where a step's nonzero answer goes (the `moved` tail, or the activation's end): optimized
+/// code on the frame jumps there with the answer in rax after a step of its own.
+pub const MARK_STEP_ENDED: u32 = 0x1009
 /// MARK_SLOW + a slow path's kind.
 pub const MARK_SLOW: u32 = 0x1100
 /// The start of shared stub `pc` (STUB_*), in the map of `stubs`.
@@ -143,6 +152,7 @@ pub const STUB_CALL_METHOD: u32 = 8
 /// SERVICE_STEP of the instruction at eax: ecx the request (with the next instruction's
 /// offset), edx the operands afterwards | the operands before << 16. The zero flag is clear
 /// when the service's answer in rax is not 0 (the step ended the activation, or moved it).
+/// It keeps rbx, r14 and r15 as well: optimized code on the frame steps with values in them.
 pub const STUB_STEP: u32 = 9
 /// The truth of the value in r14's cell, which STUB_TRUTHY consumes and STUB_TRUTH keeps:
 /// the zero flag is clear for true.
@@ -189,7 +199,12 @@ pub const STUB_LEAVE_CELLS: u32 = 29
 /// Jumped to, not called: STUB_LEAVE_CELLS, then the frame is unlinked and the function
 /// returns rax:rdx.
 pub const STUB_LEAVE: u32 = 30
-pub const STUB_COUNT: u32 = 31
+/// STUB_CALL and STUB_CALL_METHOD for code that keeps its values elsewhere (x64_frame): the
+/// operand cells are lent for the call and left as they are, the result comes back in
+/// rax:rdx, and ecx says how it went: 0 returned, 1 declined with nothing changed, 2 threw.
+pub const STUB_CALL_KEEP: u32 = 31
+pub const STUB_CALL_METHOD_KEEP: u32 = 32
+pub const STUB_COUNT: u32 = 33
 
 // ---- Bytecode steps -------------------------------------------------------------------
 
@@ -287,6 +302,17 @@ fn branches(size: usize, kind: u8, target: usize, needs: i32, fall: i32, taken: 
   return Step { size: size, kind: kind, target: target, needs: needs, fall: fall, taken: taken }
 }
 
+/// What SERVICE_STEP of the instruction at pc alone leaves, for code that keeps its values
+/// elsewhere (x64_backend's frame mode): its size | (the change of the operand depth + 128)
+/// << 16 when it falls into the instruction after it, else 0 (a branch, a return, a throw,
+/// bytes that are no instruction).
+pub fn stepAlone(bytes: &[u8], pc: usize) -> u32 {
+  if pc >= bytes.length { return 0 }
+  let step = stepOf(bytes, pc)
+  if step.size == 0 || step.size > 65535 || (step.kind != FALL && step.kind != STEP) || step.fall < -128 || step.fall > 127 { return 0 }
+  if step.kind == STEP && step.target != usize.MAX { return 0 }
+  return usize.toU32(step.size) | u32.shiftLeft(i32.wrappingToU32(step.fall + 128), 16)
+}
 /// The step of the instruction at pc; size 0 for bytes that are not an instruction the
 /// compiler can size.
 fn stepOf(bytes: &[u8], pc: usize) -> Step {
@@ -457,6 +483,7 @@ struct Plan {
   constantsDelta: i32,
   constants: u32,
   count: bool,
+  tier: bool,
   /// A known local function (Shape.known): no closure object, the scope from its caller.
   known: bool,
   /// Each activation has a scope of its own (Shape.scoped), of scopeSlots slots, which the
@@ -471,15 +498,24 @@ struct Plan {
 }
 impl Copy for Plan {}
 fn signed(value: u32) -> i32 { return u32.wrappingToI32(value) }
+/// Where the parts of a function's frame are: the record and the first cell from rbp, and
+/// the bytes of the frame below rbp (record, cells, then the scope's cells). Optimized code
+/// on the same frame (x64_backend.FramePlan) lays it out from this too.
+pub struct Extent { pub record: i32, pub cells: i32, pub below: i32 }
+impl Copy for Extent {}
+pub fn extent(frame: &BaselineLayout, shape: &Shape) -> Extent {
+  let record = (frame.frameBytes + 15) / 16 * 16
+  let cells = (shape.arguments + shape.locals + shape.stack) * 16
+  let scope = shape.scopeCells * 16
+  return Extent { record: 0 - signed(record), cells: 0 - signed(record + cells), below: signed(record + cells + scope) }
+}
 impl Plan {
   fn of(settings: &Settings, shape: &Shape) -> Plan {
-    let record = (settings.frame.frameBytes + 15) / 16 * 16
-    let cells = (shape.arguments + shape.locals + shape.stack) * 16
-    let scope = shape.scopeCells * 16
+    let at = extent(&settings.frame, &shape)
     return Plan { layout: settings.layout, f: settings.frame, fields: settings.fields,
-      record: 0 - signed(record), cells: 0 - signed(record + cells), below: signed(record + cells + scope),
+      record: at.record, cells: at.cells, below: at.below,
       arguments: shape.arguments, locals: shape.locals, stack: shape.stack,
-      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - signed(record + cells + scope), lazy: false, strict: (shape.mode & 1) != 0 }
+      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, tier: settings.tier, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - at.below, lazy: false, strict: (shape.mode & 1) != 0 }
   }
   /// A field of the record, and of its StackFrame.
   fn rec(self: &Self, offset: u32) -> Mem { return Mem.at(Reg.Rbp, self.record + signed(offset)) }
@@ -983,6 +1019,7 @@ impl Emitter {
     run self.a.ret()
     // A step that ended the activation in the interpreter (js_vm.baselineStep: 1 with the
     // result, 2 when it threw): the finish tail's 0 and 1.
+    run self.mark(0, MARK_STEP_ENDED)
     self.a.bind(self.stepEnded)
     run self.a.cmp8Imm(Reg.Rax, u64.wrappingToU8(engine.SERVICE_MOVED))
     run self.a.jcc(Cond.Equal, self.moved)
@@ -995,6 +1032,7 @@ impl Emitter {
     // moved: rax is a service's answer that the frame is at another instruction
     // (js_baseline.moved). The code goes on there when the resume table has that instruction
     // with as many operands; the interpreter finishes the activation otherwise.
+    run self.mark(0, MARK_MOVED)
     self.a.bind(self.moved)
     let none = run self.a.label()
     run self.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
@@ -1435,6 +1473,15 @@ impl Emitter {
       // A taken backward branch to pc (label other): charge the counter, poll when it runs out.
       // The counter is the function's realm's (js_interrupts.counter).
       run self.bytecodeInto(Reg.Rax)
+      if p.tier {
+        // A loop's turns count toward the optimizer as entries do, down to the floor and no
+        // further: the function's next entry is the one that tiers up.
+        let floor = run self.a.label()
+        run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.Rax, signed(f.bytecodeHotness)), -2147483648)
+        run self.a.jcc(Cond.BelowOrEqual, floor)
+        run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rax, signed(f.bytecodeHotness)), 1)
+        self.a.bind(floor)
+      }
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.bytecodeRealm)))
       run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rax, signed(f.interruptCounter)), 1)
       run self.a.jcc(Cond.Greater, item.other)
@@ -1624,8 +1671,9 @@ impl Emitter {
       run self.stubAnswered()
       return ()
     }
-    if index == STUB_CALL || index == STUB_CALL_METHOD {
-      let method = index == STUB_CALL_METHOD
+    if index == STUB_CALL || index == STUB_CALL_METHOD || index == STUB_CALL_KEEP || index == STUB_CALL_METHOD_KEEP {
+      let method = index == STUB_CALL_METHOD || index == STUB_CALL_METHOD_KEEP
+      let keep = index == STUB_CALL_KEEP || index == STUB_CALL_METHOD_KEEP
       let declined = run self.a.label()
       let native = run self.a.label()
       let generic = run self.a.label()
@@ -1674,22 +1722,27 @@ impl Emitter {
       // The result is in rax:rdx and the count in ecx. The operands were borrowed for the
       // call: drop them, then the result takes their place.
       self.a.bind(after)
-      run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.R14, 16))
-      run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
-      run self.a.jcc(Cond.Equal, released)
-      self.a.bind(again)
-      run self.releaseAt(Cell { base: Reg.Rsi, at: 0 })
-      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsi, 16)
-      run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rcx, 1)
-      run self.a.jcc(Cond.NotEqual, again)
-      self.a.bind(released)
-      // The callee's cell holds a count of the closure, or of the known function's bytecode.
-      run self.releaseAt(next)
-      let mut first = next
-      if method { first = top run self.releaseAt(top) }
-      run self.a.store(Width.W64, first.word(), Reg.Rax)
-      run self.a.store(Width.W64, first.payload(), Reg.Rdx)
-      run self.stubDone()
+      if keep {
+        run self.a.alu(Alu.Xor, Width.W32, Reg.Rcx, Reg.Rcx)
+        run self.a.ret()
+      } else {
+        run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.R14, 16))
+        run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
+        run self.a.jcc(Cond.Equal, released)
+        self.a.bind(again)
+        run self.releaseAt(Cell { base: Reg.Rsi, at: 0 })
+        run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsi, 16)
+        run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rcx, 1)
+        run self.a.jcc(Cond.NotEqual, again)
+        self.a.bind(released)
+        // The callee's cell holds a count of the closure, or of the known function's bytecode.
+        run self.releaseAt(next)
+        let mut first = next
+        if method { first = top run self.releaseAt(top) }
+        run self.a.store(Width.W64, first.word(), Reg.Rax)
+        run self.a.store(Width.W64, first.payload(), Reg.Rdx)
+        run self.stubDone()
+      }
       // No baseline code, or no bytecode function (for a native the frameless call the
       // interpreter makes): the engine's call.
       let mut request = engine.SERVICE_CALL
@@ -1712,8 +1765,11 @@ impl Emitter {
       run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
       run self.a.jmp(after)
       self.a.bind(threw)
-      run self.a.movImm32(Reg.Rax, 2)
-      run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.Rax)
+      if keep { run self.a.movImm32(Reg.Rcx, 2) }
+      else {
+        run self.a.movImm32(Reg.Rax, 2)
+        run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.Rax)
+      }
       run self.a.ret()
       if !method {
         // A known local function that has baseline code, in the scope of its level on the
@@ -1762,7 +1818,8 @@ impl Emitter {
         run self.helper(env.HOT)
       }
       self.a.bind(declined)
-      run self.stubDeclined()
+      if keep { run self.a.movImm32(Reg.Rcx, 1) run self.a.ret() }
+      else { run self.stubDeclined() }
       return ()
     }
     if index == STUB_STEP {
@@ -2090,6 +2147,15 @@ impl Emitter {
       let locals = run self.a.label()
       let more = run self.a.label()
       let done = run self.a.label()
+      let ranOut = run self.a.label()
+      let counted = run self.a.label()
+      if p.tier {
+        // The count stays a reported function's (at or above REPORTED_FLOOR, its sign bit)
+        // until it runs out.
+        run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R11, signed(f.bytecodeHotness)), 1)
+        run self.a.jcc(Cond.NoSign, ranOut)
+        self.a.bind(counted)
+      }
       run self.a.store(Width.W64, p.rec(f.code), Reg.R9)
       run self.a.store(Width.W64, p.rec(f.state), Reg.Rax)
       if index == STUB_PROLOGUE_KNOWN {
@@ -2163,6 +2229,18 @@ impl Emitter {
       run self.a.jcc(Cond.NotEqual, more)
       self.a.bind(done)
       run self.a.ret()
+      if p.tier {
+        // tier(env, bytecode), with everything the prologue was given kept. This activation
+        // goes on in the code it entered.
+        self.a.bind(ranOut)
+        run self.a.push(Reg.Rax) run self.a.push(Reg.Rcx) run self.a.push(Reg.Rdx) run self.a.push(Reg.Rsi) run self.a.push(Reg.Rdi)
+        run self.a.push(Reg.R8) run self.a.push(Reg.R9) run self.a.push(Reg.R10) run self.a.push(Reg.R11) run self.a.push(Reg.R14)
+        run self.a.mov(Width.W64, Reg.Rsi, Reg.R11)
+        run self.helper(env.TIER)
+        run self.a.pop(Reg.R14) run self.a.pop(Reg.R11) run self.a.pop(Reg.R10) run self.a.pop(Reg.R9) run self.a.pop(Reg.R8)
+        run self.a.pop(Reg.Rdi) run self.a.pop(Reg.Rsi) run self.a.pop(Reg.Rdx) run self.a.pop(Reg.Rcx) run self.a.pop(Reg.Rax)
+        run self.a.jmp(counted)
+      }
       return ()
     }
     if index == STUB_LEAVE_CELLS {

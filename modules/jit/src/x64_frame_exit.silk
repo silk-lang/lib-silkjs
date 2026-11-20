@@ -1,0 +1,167 @@
+//! An exit of optimized code on a baseline frame (x64_backend's frame mode,
+//! docs/jit/optimizer.md). The code keeps its values in its own slots and registers; at an
+//! exit its common stub calls `jitFrameExit`, which writes the interpreter state the exit's
+//! record describes (jit_exit_state has the format) into the frame's cells: the locals, the
+//! operands on the stack, and the parameters when the function writes them. The frame is
+//! then what baseline code at that instruction has, and the stub goes on there (the
+//! baseline code's `moved` tail) or hands it to the interpreter (its `finish` tail).
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_value { ValueBits }
+import silkjs.js_gc as gc
+import silkjs.js_baseline { BaselineFrame }
+import silkjs.js_baseline as engine
+import baseline_env { BaselineEnv }
+import jit_exit_state as state
+
+/// How the code left, in the stub's ecx and `jitFrameExit`'s last argument.
+/// A guard failed: the baseline code runs the instruction at the exit's pc.
+pub const HOW_DEOPT: u32 = 0
+/// A call the call stub declined, with nothing changed, or an instruction the code always
+/// leaves at (a throw): the baseline code runs it. No guard failed.
+pub const HOW_DECLINED: u32 = 1
+/// A call threw: the frame is past the call's opcode, as the engine's unwinder reads it.
+pub const HOW_CALL_THREW: u32 = 2
+/// A poll threw, with the frame at the loop's target.
+pub const HOW_POLL_THREW: u32 = 3
+/// A poll turned instruction observation on: the interpreter goes on at the loop's target.
+pub const HOW_OBSERVED: u32 = 4
+/// Not an exit: the code is about to have the interpreter run the one instruction at the
+/// exit's pc on the frame (the baseline STUB_STEP). The state is written with a count of the
+/// cells' own for every value; the code keeps what it owns.
+pub const HOW_STEP: u32 = 5
+/// After such a step, when the code goes on: `slots` is where the instruction's first value
+/// goes (or null) and `dump` is no pointer but the step's shape (stepShape). The cells give
+/// their counts back and the locals hold undefined again.
+pub const HOW_STEPPED: u32 = 6
+/// After such a step, when it ended the activation or moved the frame to a handler: the
+/// code drops what it owned, for it does not go on.
+pub const HOW_STEP_LEFT: u32 = 7
+/// The shape of a step for HOW_STEPPED: the instruction's values are `results` operand cells
+/// from depth `base` up, of which the cells in `kept` (bit c: cell base + c) are operands it
+/// left as they were; `after` operands are on the stack when it is done. The first value, if
+/// not kept, goes to the code; the others not kept stay in their cells for the code to take.
+pub fn stepShape(base: u32, results: u32, kept: u32, after: u32) -> u32 { return base | u32.shiftLeft(results, 8) | u32.shiftLeft(kept, 12) | u32.shiftLeft(after, 20) }
+
+unsafe fn wordAt(words: [*]mut u32, index: usize) -> u32 { return unsafe Pointer.read<u32>(unsafe Pointer.atMut<u32>(words, index)) }
+
+/// frame_exit(env, record, slots, exit, dump, how) -> u64: writes the state `exit` describes
+/// into the cells of the frame of `record`, from the code's value slots at `slots` and its
+/// registers in `dump`. Returns js_baseline.moved(pc, depth) for HOW_DEOPT and
+/// HOW_DECLINED; for the others sets the frame's pc and returns the operand depth.
+/// The local cells hold undefined until now and the operand cells nothing the frame owns
+/// (a call's operands are lent), so both are written over; a parameter's cell owns its
+/// value, which is dropped once every new value has its count.
+pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame, slots: *mut u8, exit: *mut u32, dump: *mut u64, how: u32) -> u64 {
+  if how == HOW_STEPPED { unsafe stepped(record, slots, usize.toU32(Pointer.address<u64>(dump))) return 0 }
+  if how == HOW_STEP_LEFT { unsafe stepLeft(slots, exit) return 0 }
+  // A step lends: every value the cells get has a count of their own.
+  let lend = how == HOW_STEP
+  let words = unsafe Pointer.assumeManyMut<u32>(exit)
+  let recordBytes = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(exit))
+  let bytes = unsafe Pointer.assumeManyMut<u8>(slots)
+  let registers = unsafe Pointer.assumeManyMut<u64>(dump)
+  let pc = u32.toUsize(unsafe wordAt(words, 0))
+  let depthWord = unsafe wordAt(words, 1)
+  let depth = u32.toUsize(depthWord & 0x7fffffff)
+  let slotCount = u32.toUsize(unsafe wordAt(words, 3))
+  let count = u32.toUsize(unsafe wordAt(words, 4))
+  let frame = unsafe engine.cellsOf(record)
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(frame.cells)
+  if slotCount < frame.locals + depth || depth > frame.stack { Intrinsic.trap("jitFrameExit: an exit record that does not fit its frame") }
+  let parameters = slotCount - frame.locals - depth
+  if parameters > frame.arguments || (parameters != 0 && !frame.own) { Intrinsic.trap("jitFrameExit: parameters the frame has no cells of its own for") }
+  let chunkSize = u32.toUsize(state.CHUNK)
+  // Three passes over the entries: the locals and operands, written with their counts; the
+  // counts of the parameters' new values; then the parameters, each old value dropped, and
+  // what an inlined body still owned.
+  let mut pass: u32 = 0
+  while pass < 3 {
+    let mut index: usize = 0
+    while index < count {
+      let offset = unsafe wordAt(words, u32.toUsize(state.RECORD_HEAD) + index / chunkSize)
+      let chunk = unsafe Pointer.assumeManyMut<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(unsafe Pointer.atMut<u8>(recordBytes, u32.toUsize(offset))))
+      let within = index % chunkSize
+      let kind = unsafe wordAt(chunk, within * 2)
+      let operand = unsafe wordAt(chunk, within * 2 + 1)
+      if index >= slotCount {
+        if kind != state.ENTRY_RELEASE { Intrinsic.trap("jitFrameExit: an entry after the slots that is no release") }
+        if pass == 2 && !lend { unsafe gc.releaseDeferred(unsafe state.decode(state.ENTRY_VALUE, operand, bytes, registers)) }
+      } else if index < frame.locals + depth {
+        if pass == 0 {
+          let mut value = unsafe state.decode(kind, operand, bytes, registers)
+          if kind == state.ENTRY_VALUE_RETAIN || (lend && kind == state.ENTRY_VALUE) { value = unsafe value.retained() }
+          unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, frame.arguments + index), value)
+        }
+      } else if pass == 1 {
+        if kind == state.ENTRY_VALUE_RETAIN || (lend && kind == state.ENTRY_VALUE) { drop unsafe (unsafe state.decode(kind, operand, bytes, registers)).retained() }
+      } else if pass == 2 {
+        let at = unsafe Pointer.atMut<ValueBits>(cells, index - frame.locals - depth)
+        let old = unsafe Pointer.read<ValueBits>(at)
+        unsafe Pointer.write<ValueBits>(at, unsafe state.decode(kind, operand, bytes, registers))
+        unsafe gc.releaseDeferred(old)
+      }
+      index = index + 1
+    }
+    pass = pass + 1
+  }
+  if lend { return usize.toU64(depth) }
+  let mut anchor = ()
+  let counters = unsafe Pointer.borrowMut<(), BaselineEnv>(&mut anchor, env)
+  counters.frameExits = counters.frameExits + 1
+  if how == HOW_DEOPT || how == HOW_DECLINED { return engine.moved(pc, depth) }
+  if how == HOW_CALL_THREW { unsafe engine.setPc(record, pc + 1) } else { unsafe engine.setPc(record, pc) }
+  return usize.toU64(depth)
+}
+
+/// HOW_STEPPED: the frame of `record` after a step of shape `shape` that the code goes on
+/// from. `out` is where the instruction's first value goes, owned (null: the code wants none).
+unsafe fn stepped(record: *mut BaselineFrame, out: *mut u8, shape: u32) -> () {
+  let frame = unsafe engine.cellsOf(record)
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(frame.cells)
+  let base = u32.toUsize(shape & 255)
+  let results = u32.toUsize(u32.shiftRight(shape, 8) & 15)
+  let kept = u32.shiftRight(shape, 12) & 255
+  let after = u32.toUsize(u32.shiftRight(shape, 20) & 255)
+  if after > frame.stack { Intrinsic.trap("jitFrameExit: a step that leaves more operands than the frame has cells for") }
+  let mut s: usize = 0
+  while s < after {
+    let at = unsafe Pointer.atMut<ValueBits>(cells, frame.arguments + frame.locals + s)
+    let own = s >= base && s - base < results && (u32.shiftRight(kept, usize.toU32(s - base)) & 1) == 0
+    if own && s == base && Pointer.address<u8>(out) != 0 {
+      unsafe Pointer.write<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(out), unsafe Pointer.read<ValueBits>(at))
+    } else if !own || s == base { unsafe gc.releaseDeferred(unsafe Pointer.read<ValueBits>(at)) }
+    s = s + 1
+  }
+  let mut l: usize = 0
+  while l < frame.locals {
+    let at = unsafe Pointer.atMut<ValueBits>(cells, frame.arguments + l)
+    let old = unsafe Pointer.read<ValueBits>(at)
+    unsafe Pointer.write<ValueBits>(at, ValueBits.Undefined)
+    unsafe gc.releaseDeferred(old)
+    l = l + 1
+  }
+}
+/// HOW_STEP_LEFT: drops what the code owned at `exit` (its moves and an inlined body's
+/// leftovers), from its value slots at `slots`.
+unsafe fn stepLeft(slots: *mut u8, exit: *mut u32) -> () {
+  let words = unsafe Pointer.assumeManyMut<u32>(exit)
+  let recordBytes = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(exit))
+  let bytes = unsafe Pointer.assumeManyMut<u8>(slots)
+  let count = u32.toUsize(unsafe wordAt(words, 4))
+  let chunkSize = u32.toUsize(state.CHUNK)
+  let mut index: usize = 0
+  while index < count {
+    let offset = unsafe wordAt(words, u32.toUsize(state.RECORD_HEAD) + index / chunkSize)
+    let chunk = unsafe Pointer.assumeManyMut<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(unsafe Pointer.atMut<u8>(recordBytes, u32.toUsize(offset))))
+    let within = index % chunkSize
+    let kind = unsafe wordAt(chunk, within * 2)
+    let operand = unsafe wordAt(chunk, within * 2 + 1)
+    if kind == state.ENTRY_VALUE || kind == state.ENTRY_RELEASE {
+      unsafe gc.releaseDeferred(unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(unsafe Pointer.atMut<u8>(bytes, u32.toUsize(operand)))))
+    }
+    index = index + 1
+  }
+}

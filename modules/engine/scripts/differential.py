@@ -45,6 +45,8 @@ are compared with.
   baseline   {jit} --jit-baseline ...           hot functions compiled by the baseline tier, one
                                                 template per instruction (docs/jit/baseline.md)
   baseline-eager                                the same, every function at its first entry
+  opt                                           the optimizer on the baseline tier (--jit-opt), hot after 20 entries
+  opt-eager                                     the same, baseline at the first entry and optimized after 2
   jit-no-hoist, jit-no-borrow, jit-no-unboxed   jit-calls-eager without one code quality pass
                                                 (docs/jit/code-quality.md), to pin a mismatch on it
 
@@ -90,6 +92,8 @@ BUILTIN = {
     "jit-inline-stress": "{jit} --jit --jit-calls --jit-threshold=20 --jit-stress=5 --jit-deopt-limit=0 --jit-stats={stats} {file}",
     "baseline": "{jit} --jit-baseline --jit-threshold=20 --jit-stats={stats} {file}",
     "baseline-eager": "{jit} --jit-baseline --jit-threshold=1 --jit-stats={stats} {file}",
+    "opt": "{jit} --jit-opt=20 --jit-threshold=20 --jit-stats={stats} {file}",
+    "opt-eager": "{jit} --jit-opt=2 --jit-threshold=1 --jit-stats={stats} {file}",
     "jit-no-hoist": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-hoist --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-no-borrow": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-borrow --jit-threshold=20 --jit-stats={stats} {file}",
     "jit-no-unboxed": "{jit} --jit --jit-calls --jit-profile=0 --jit-no-unboxed --jit-threshold=20 --jit-stats={stats} {file}",

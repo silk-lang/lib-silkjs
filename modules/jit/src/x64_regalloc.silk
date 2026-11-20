@@ -50,15 +50,28 @@ pub fn spilled(mem: Mem) -> Place { return Place { kind: SPILL, gpr: Reg.Rax, xm
 pub struct Allocation {
   pub kinds: List<u8>,
   pub registers: List<u8>,
-  /// Bit n: GPRS[n] is used.
+  /// Bit n: the pool's register n is used.
   pub savedMask: u32,
   /// Interval bounds, for the tests' checker.
   pub starts: List<u32>,
   pub ends: List<u32>,
+  /// The integer registers the scan handed out.
+  pub pool: Pool
 }
 
 const GPR_COUNT: usize = 5
 const XMM_COUNT: usize = 14
+
+/// The integer registers a scan hands out, in order: `count` of `registers`. Bit n of
+/// overCalls: register n keeps its value over a call (Op.Call), so a value live across one
+/// may take it. pollCalls: a poll may call out (callsOut), so no double lives across one.
+pub struct Pool { pub registers: [Reg; 5], pub count: usize, pub overCalls: u32, pub pollCalls: bool }
+impl Copy for Pool {}
+/// x64_backend's: rbx, r12 to r15, none of them over a call (an exit and a re-entry).
+pub fn entryPool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R12, Reg.R13, Reg.R14, Reg.R15], count: 5, overCalls: 0, pollCalls: false } }
+/// x64_frame's, on a baseline frame (r12 and r13 are pinned there): rbx, which every callee
+/// restores, then r14 and r15, which baseline code and its stubs use freely.
+pub fn framePool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R14, Reg.R15, Reg.R14, Reg.R15], count: 3, overCalls: 1, pollCalls: true } }
 
 /// The integer pool, in the order the scan hands it out.
 pub fn gprAt(index: usize) -> Reg {
@@ -91,7 +104,7 @@ impl Allocation {
   pub fn place(self: &Self, v: u32, mem: Mem) -> Place {
     let kind = self.kinds.get(u32.toUsize(v))
     let index = u8.toUsize(self.registers.get(u32.toUsize(v)))
-    if kind == GPR { return Place { kind: GPR, gpr: gprAt(index), xmm: Xmm.Xmm0, mem: mem } }
+    if kind == GPR { return Place { kind: GPR, gpr: self.pool.registers[index], xmm: Xmm.Xmm0, mem: mem } }
     if kind == XMM { return Place { kind: XMM, gpr: Reg.Rax, xmm: xmmAt(index), mem: mem } }
     return spilled(mem)
   }
@@ -138,6 +151,10 @@ fn extend(ends: &mut List<u32>, v: u32, end: u32) -> () {
 
 /// Allocates registers for f, which must be compacted and verified.
 pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+  return run allocateIn(&f, entryPool())
+}
+/// allocate with the integer registers of pool.
+pub effect fn allocateIn(f: &Function, pool: Pool) -> Allocation ! OutOfMemoryError ? &mut Allocator {
   let values = f.valueCount()
   let count = f.blockCount()
   let mut starts = List<u32>.make()
@@ -239,27 +256,35 @@ pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut All
   // A call is an exit and a re-entry (docs/jit/compiled-entry.md 7.3): no register survives
   // it, so a value live across one, or read by its exit, stays in its slot. A helper call
   // (callsOut) keeps the callee-saved integer pool but not xmm2 to xmm15.
-  let mut across = List<bool>.make()
-  run across.appendRepeated(false, u32.toUsize(values))
+  // In a pool with registers that last over a call (Pool.overCalls), an integer live across
+  // one may take one of those (OVER_CALL).
+  let mut across = List<u8>.make()
+  run across.appendRepeated(ANYWHERE, u32.toUsize(values))
   let mut c: usize = 0
   while c < f.insts.length() {
     let op = f.insts.get(c).op
     let exits = op == Op.Call
-    if exits || callsOut(op) {
+    if exits || callsOut(op) || (pool.pollCalls && op == Op.Poll) {
       let at = position(usize.toU32(c))
       v = 0
       while v < values {
         let index = u32.toUsize(v)
         let crosses = starts.get(index) != NONE && starts.get(index) < at && ends.get(index) >= at
-        if crosses && (exits || f.value(v).ty == Type.F64) { across.set(index, true) }
+        if crosses && f.value(v).ty == Type.F64 { across.set(index, NOWHERE) }
+        else if crosses && exits { if pool.overCalls == 0 { across.set(index, NOWHERE) } else { across.set(index, OVER_CALL) } }
         v = v + 1
       }
     }
     c = c + 1
   }
   let weights = run weigh(&f)
-  return run scan(&f, move starts, move ends, &across, &weights)
+  return run scan(&f, move starts, move ends, &across, &weights, pool)
 }
+/// What a value's interval allows: any register of its pool, only one that lasts over a
+/// call, or none.
+const ANYWHERE: u8 = 0
+const OVER_CALL: u8 = 1
+const NOWHERE: u8 = 2
 
 /// How hot each value's reads are: a read in block b counts 8^depth(b), at most 8^6. Loops are
 /// back edges s -> h with h <= s, their bodies the blocks h..s in reverse postorder.
@@ -318,7 +343,7 @@ fn addWeight(weights: &mut List<u64>, v: u32, heat: u64) -> () {
 
 fn poolKind(double: bool) -> u8 { if double { return XMM } return GPR }
 
-effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<bool>, weights: &List<u64>) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u8>, weights: &List<u64>, pool: Pool) -> Allocation ! OutOfMemoryError ? &mut Allocator {
   let values = f.valueCount()
   let mut kinds = List<u8>.make()
   run kinds.appendRepeated(SPILL, u32.toUsize(values))
@@ -347,7 +372,7 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<b
   let mut v: u32 = 0
   while v < values {
     let ty = f.value(v).ty
-    if (ty == Type.I32 || ty == Type.Bool || ty == Type.F64) && starts.get(u32.toUsize(v)) != NONE && !across.get(u32.toUsize(v)) {
+    if (ty == Type.I32 || ty == Type.Bool || ty == Type.F64) && starts.get(u32.toUsize(v)) != NONE && across.get(u32.toUsize(v)) != NOWHERE {
       run order.append(u64.bitOr(u64.shiftLeft(u32.toU64(starts.get(u32.toUsize(v))), 32), u32.toU64(v)))
     }
     v = v + 1
@@ -363,22 +388,25 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<b
     let start = starts.get(u32.toUsize(v))
     let double = f.value(v).ty == Type.F64
     let mut first: usize = 0
-    let mut last = GPR_COUNT
+    let mut last = pool.count
     if double { first = GPR_COUNT last = GPR_COUNT + XMM_COUNT }
+    // The registers this value may take: all of its pool, or those that last over a call.
+    let mut allowed: u32 = u32.MAX
+    if !double && across.get(u32.toUsize(v)) == OVER_CALL { allowed = pool.overCalls }
     // Expire what ended before this start; take a free register.
     let mut free = usize.MAX
     let mut r = first
     while r < last {
       let owner = owners.get(r)
       if owner != NONE && ends.get(u32.toUsize(owner)) < start { owners.set(r, NONE) }
-      if owners.get(r) == NONE && free == usize.MAX { free = r }
+      if owners.get(r) == NONE && free == usize.MAX && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(r - first)), 1) != 0 { free = r }
       r = r + 1
     }
     // The hinted value's register, when it is already placed in this pool and free now.
     let hint = hints.get(u32.toUsize(v))
     if free != usize.MAX && hint != NONE && kinds.get(u32.toUsize(hint)) == poolKind(double) {
       let wanted = first + u8.toUsize(registers.get(u32.toUsize(hint)))
-      if owners.get(wanted) == NONE { free = wanted }
+      if owners.get(wanted) == NONE && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(wanted - first)), 1) != 0 { free = wanted }
     }
     if free == usize.MAX {
       // Spill whichever of v and the holders is read least, then ends last.
@@ -388,9 +416,11 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<b
       r = first
       while r < last {
         let owner = owners.get(r)
-        let end = ends.get(u32.toUsize(owner))
-        let weight = weights.get(u32.toUsize(owner))
-        if weight < lightest || (weight == lightest && end > furthestEnd) { furthest = r furthestEnd = end lightest = weight }
+        if owner != NONE && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(r - first)), 1) != 0 {
+          let end = ends.get(u32.toUsize(owner))
+          let weight = weights.get(u32.toUsize(owner))
+          if weight < lightest || (weight == lightest && end > furthestEnd) { furthest = r furthestEnd = end lightest = weight }
+        }
         r = r + 1
       }
       if furthest != usize.MAX {
@@ -406,7 +436,7 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<b
     }
     k = k + 1
   }
-  return Allocation { kinds: move kinds, registers: move registers, savedMask: saved, starts: move starts, ends: move ends }
+  return Allocation { kinds: move kinds, registers: move registers, savedMask: saved, starts: move starts, ends: move ends, pool: pool }
 }
 
 // ---- reading and writing places ----

@@ -7,6 +7,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.mem.pointer { Pointer }
 import silk.collections.slice { Slice }
@@ -42,6 +43,10 @@ import baseline { Settings as BaselineSettings, Outcome as BaselineOutcome, Stub
 import baseline_env { BaselineEnv }
 import baseline_env
 import silkjs.js_baseline as engineBaseline
+import silkjs.js_baseline { BaselineFrame }
+import x64_backend { FramePlan }
+import x64_frame_exit { jitFrameExit }
+import x64_frame_exit as leaving
 
 struct LoopBook { sites: List<u32>, spent: u64,
   /// With --jit-dump, the function's bytecode, to name the opcodes its code deoptimized at.
@@ -106,8 +111,16 @@ pub struct Options {
   /// --jit-no-<pass> clears a bit: the code quality passes that run (ssa_opt.PASS_*).
   pub passes: u32,
   /// --jit-baseline: hot functions get baseline code (docs/jit/baseline.md) and nothing else.
-  pub baseline: bool
+  pub baseline: bool,
+  /// --jit-opt, with --jit-baseline: baseline code counts its entries and a function that
+  /// keeps running gets optimized code on the same frame (docs/jit/optimizer.md).
+  pub optimize: bool,
+  /// --jit-opt=N: the entries baseline code runs before the function is optimized.
+  pub optimizeEntries: u32
 }
+/// The default of Options.optimizeEntries: enough runs for the site caches the optimizer
+/// reads to have settled.
+pub const OPTIMIZE_ENTRIES: u32 = 500
 /// The compile budget's default, in bytecode bytes (measured: K-doubles report, "Compile budget").
 pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 /// Entries before a function is hot when only the baseline tier compiles and no
@@ -118,9 +131,34 @@ pub const DEFAULT_COMPILE_BUDGET: u32 = 32768
 pub const BASELINE_ENTRIES: u32 = 100
 impl Options {
   pub fn make() -> Self {
-    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE, foresee: FORESEE_ALL, passes: 4294967295, inlining: true, baseline: false }
+    return Self { enabled: false, threshold: 0, stress: 0, deoptLimit: 8, stats: false, dump: false, calls: false, compileBudget: DEFAULT_COMPILE_BUDGET, profile: DEFAULT_PROFILE, foresee: FORESEE_ALL, passes: 4294967295, inlining: true, baseline: false, optimize: false, optimizeEntries: OPTIMIZE_ENTRIES }
   }
 }
+
+/// What the optimizer needs of a function's baseline code, by its baseline index: where it
+/// runs, where its `moved` and `finish` tails are in it (optimized code's exits go on
+/// there), and what came of its report to the optimizer (TIER_*).
+/// exits counts the guard failures of its optimized code since that was linked, and
+/// compiles the optimized code it has had.
+struct BaselineInfo { entry: usize, code: *const u8, moved: u32, finish: u32, stepEnded: u32, tier: u8, compiles: u8, exits: u32 }
+impl Copy for BaselineInfo {}
+/// Optimized code that left at guards this often, and at more than one entry in EXIT_RATE
+/// (a loop's turns do not count: code that leaves on each is slow whatever its entries),
+/// gives the function back to its baseline code. It is optimized again, with the sites it
+/// left at kept general (a site that left once is stepped where it would leave again,
+/// x64_backend.stepOnFrame), once it ran OPTIMIZE_BACKOFF times longer than before, up to
+/// some sixteen million entries: no function keeps its baseline code for good.
+const EXIT_BURST: u32 = 8
+const EXIT_RATE: u64 = 1000
+const OPTIMIZE_BACKOFF: u32 = 8
+/// Sites remembered per function (Jit.leftAt).
+const MAX_LEFT: usize = 32
+const TIER_NONE: u8 = 0
+const TIER_OPTIMIZED: u8 = 1
+const TIER_REFUSED: u8 = 2
+/// js_baseline.countFrom's argument that leaves a count as far from the shared prologue's
+/// next report as it goes.
+const PARKED: u32 = 2147483647
 
 pub struct Jit {
   pub options: Options,
@@ -197,7 +235,18 @@ pub struct Jit {
   pub baselineRefused: u64,
   pub baselineBytes: u64,
   /// Reachable instructions without a template in installed baseline code.
-  pub baselineUncovered: u64
+  pub baselineUncovered: u64,
+  /// Options.optimize: each baseline function's BaselineInfo, the functions optimized and
+  /// refused, and the bytes of optimized code.
+  baselineInfo: List<BaselineInfo>,
+  /// Where optimized code left at a guard: a function's index in baselineInfo in the high
+  /// half, the bytecode offset in the low. Its next compilation keeps those sites general.
+  leftAt: List<u64>,
+  /// Functions given back to their baseline code for leaving too often.
+  pub optimizeBacked: u64,
+  pub optimized: u64,
+  pub optimizeRefused: u64,
+  pub optimizedBytes: u64
 }
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
@@ -216,7 +265,8 @@ impl Jit {
       history: History.make(), recompiled: 0,
       osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0,
       baselineTable: move baselineTable, baselineEnv: move baselineEnv, baselineSettings: Option<BaselineSettings>.none(), baselineReady: false, baselineSymbols: List<usize>.make(),
-      baselineCompiled: 0, baselineRefused: 0, baselineBytes: 0, baselineUncovered: 0 }
+      baselineCompiled: 0, baselineRefused: 0, baselineBytes: 0, baselineUncovered: 0,
+      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -279,6 +329,11 @@ impl Jit {
     }
     run line.appendSlice(b" baseline-steps-ended ") run decimal(&mut line, self.baselineEnv.get(0).stepsEnded)
     run line.appendSlice(b" baseline-resumes ") run decimal(&mut line, self.baselineEnv.get(0).resumes)
+    run line.appendSlice(b" optimized ") run decimal(&mut line, self.optimized)
+    run line.appendSlice(b" optimize-refused ") run decimal(&mut line, self.optimizeRefused)
+    run line.appendSlice(b" optimized-bytes ") run decimal(&mut line, self.optimizedBytes)
+    run line.appendSlice(b" optimize-backed ") run decimal(&mut line, self.optimizeBacked)
+    run line.appendSlice(b" frame-exits ") run decimal(&mut line, self.baselineEnv.get(0).frameExits)
     code = 0
     while code < 256 {
       let n = self.baselineEnv.get(0).exitCounts[code]
@@ -424,8 +479,18 @@ pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
   if jit.options.baseline {
     let mut baselineEnv = BaselineEnv.make()
     baselineEnv.runtime = rt
+    if jit.options.optimize {
+      // The helpers of optimized code: the report that makes it, its exits, and the
+      // CompiledEnv whose helpers it calls for what it has no stub for.
+      baselineEnv.owner = jit.setupData()
+      let tier: extern "C" fn(*mut BaselineEnv, *mut HeapHeader) -> () = jitTierUp
+      baselineEnv.helpers[u32.toUsize(baseline_env.TIER)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut HeapHeader) -> (), *const ?*const u8>(Pointer.fromRef(&tier)))
+      let exit: extern "C" fn(*mut BaselineEnv, *mut BaselineFrame, *mut u8, *mut u32, *mut u64, u32) -> u64 = jitFrameLeft
+      baselineEnv.helpers[u32.toUsize(baseline_env.FRAME_EXIT)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut BaselineFrame, *mut u8, *mut u32, *mut u64, u32) -> u64, *const ?*const u8>(Pointer.fromRef(&exit)))
+      baselineEnv.compiled = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0])))
+    }
     jit.baselineEnv.set(0, baselineEnv)
-    jit.baselineSettings = baseline.probe(jit.options.stats)
+    jit.baselineSettings = baseline.probe(jit.options.stats, jit.options.optimize)
     let slots = unsafe jit.baselineTable.storage()
     unsafe engineBaseline.setTable(rt, unsafe Intrinsic.pointerRequalify<?[*]mut ?*const u8, ?*mut ?*const u8>(slots))
   }
@@ -555,6 +620,18 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       run jit.blocks.append(move block)
       let constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(construct))
       unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), entry, constructEntry)
+      // Where the tails optimized code leaves through are; the shared prologue counts the
+      // entries until the function is reported for it.
+      let mut info = BaselineInfo { entry: Pointer.address<u8>(entry), code: entry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0 }
+      let mut mark: usize = 0
+      while mark + 2 < map.length() {
+        if map.get(mark + 2) == baseline.MARK_MOVED { info.moved = map.get(mark) }
+        if map.get(mark + 2) == baseline.MARK_FINISH { info.finish = map.get(mark) }
+        if map.get(mark + 2) == baseline.MARK_STEP_ENDED { info.stepEnded = map.get(mark) }
+        mark = mark + 3
+      }
+      run jit.baselineInfo.append(info)
+      if jit.options.optimize { unsafe engineBaseline.countFrom(bytecode, jit.options.optimizeEntries) }
       jit.baselineCompiled = jit.baselineCompiled + 1
       jit.baselineBytes = jit.baselineBytes + usize.toU64(code.bytes.length())
       jit.baselineUncovered = jit.baselineUncovered + usize.toU64(uncovered.length())
@@ -591,6 +668,189 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       }
     }
   }
+}
+
+/// BaselineEnv.TIER: the shared prologue's count of bytecode's entries ran out. The call
+/// that reported it goes on in the code it entered; the next one finds what this made.
+export "C" fn jitTierUp(env: *mut BaselineEnv, bytecode: *mut HeapHeader) -> () {
+  let envAnchor = ()
+  let owner = (unsafe Pointer.borrow<(), BaselineEnv>(&envAnchor, env)).owner
+  let mut anchor = ()
+  let jit = unsafe jitOf(&mut anchor, owner)
+  let mut system = Allocator.systemAllocatorProvider()
+  let started = now()
+  let outcome = run Effect.result(unsafe compileOptimized(&mut jit, bytecode)) |> Effect.provideMut<Allocator>(&mut system)
+  jit.compileNanoseconds = jit.compileNanoseconds + (now() - started)
+  match move outcome {
+    Result<(), OutOfMemoryError | MemoryError | LinkError>.Success { .. } => ()
+    Result<(), OutOfMemoryError | MemoryError | LinkError>.Failure { .. } => { jit.failed = jit.failed + 1 }
+  }
+}
+/// BaselineEnv.FRAME_EXIT: x64_frame_exit.jitFrameExit, after a guard's failure is counted
+/// against the function's optimized code (noteLeft).
+export "C" fn jitFrameLeft(env: *mut BaselineEnv, record: *mut BaselineFrame, slots: *mut u8, exit: *mut u32, dump: *mut u64, how: u32) -> u64 {
+  if how == leaving.HOW_DEOPT {
+    let envAnchor = ()
+    let owner = (unsafe Pointer.borrow<(), BaselineEnv>(&envAnchor, env)).owner
+    let mut anchor = ()
+    let jit = unsafe jitOf(&mut anchor, owner)
+    let mut system = Allocator.systemAllocatorProvider()
+    let pc = unsafe Pointer.read<u32>(exit)
+    let outcome = run Effect.result(unsafe noteLeft(&mut jit, record, pc)) |> Effect.provideMut<Allocator>(&mut system)
+    match move outcome {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { .. } => { jit.failed = jit.failed + 1 }
+    }
+  }
+  return unsafe jitFrameExit(env, record, slots, exit, dump, how)
+}
+/// The optimized code of the function whose frame record is left at a guard at bytecode
+/// offset pc. The site is remembered; code that leaves too often is unlinked (EXIT_BURST).
+unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
+  let bytecode = (unsafe engineBaseline.cellsOf(record)).bytecode
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let linked = function.baseline
+  // The entries since the code was linked: the shared prologue counts down from the top.
+  let entries = u32.toU64(4294967295 - function.hotness)
+  drop function
+  if linked == 0 { return () }
+  let index = u32.toUsize((linked - 1) / 2)
+  if index >= jit.baselineInfo.length() { return () }
+  let mut info = jit.baselineInfo.get(index)
+  // An activation that outlived its code's unlinking.
+  if info.tier != TIER_OPTIMIZED { return () }
+  let site = u64.bitOr(u64.shiftLeft(usize.toU64(index), 32), u32.toU64(pc))
+  let mut known = false
+  let mut own: usize = 0
+  let mut l: usize = 0
+  while l < jit.leftAt.length() {
+    let left = jit.leftAt.get(l)
+    if left == site { known = true }
+    if u64.toUsize(u64.shiftRight(left, 32)) == index { own = own + 1 }
+    l = l + 1
+  }
+  if !known && own < MAX_LEFT { run jit.leftAt.append(site) }
+  info.exits = info.exits + 1
+  if info.exits >= EXIT_BURST && u32.toU64(info.exits) * EXIT_RATE > entries {
+    unsafe engineBaseline.relink(rt, linked, info.code)
+    jit.optimizeBacked = jit.optimizeBacked + 1
+    info.exits = 0
+    info.tier = TIER_NONE
+    let mut wait = jit.options.optimizeEntries
+    if wait == 0 { wait = 1 }
+    let mut n: u8 = 0
+    while n < info.compiles && wait < 16777216 { wait = wait * OPTIMIZE_BACKOFF n = n + 1 }
+    unsafe engineBaseline.countFrom(bytecode, wait)
+    if jit.options.dump {
+      let mut line = List<u8>.make()
+      run line.appendSlice(b"it left at guards too often, last at pc ")
+      run decimal(&mut line, u32.toU64(pc))
+      run say(b"jit: optimized code unlinked: ", line.asSlice())
+    }
+  }
+  jit.baselineInfo.set(index, info)
+}
+effect fn sayOptimizer(dump: bool, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if dump { run say(b"jit: not optimized: ", text) }
+}
+/// Gives bytecode, which has baseline code, optimized code on the same frame
+/// (x64_backend.lowerOnFrame, docs/jit/optimizer.md), or leaves it its baseline code.
+unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+  // The count stays clear of the prologue's report from here on, whatever comes of this.
+  unsafe engineBaseline.countFrom(bytecode, PARKED)
+  let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let linked = function.baseline
+  if linked == 0 { return () }
+  let index = u32.toUsize((linked - 1) / 2)
+  if index >= jit.baselineInfo.length() { return () }
+  let mut info = jit.baselineInfo.get(index)
+  if info.tier != TIER_NONE { return () }
+  info.tier = TIER_REFUSED
+  jit.baselineInfo.set(index, info)
+  if jit.options.dump { run say(b"jit: optimizing", b"") run unsafe dumpBytecode(&function) }
+  let settings = match jit.baselineSettings {
+    Option<BaselineSettings>.Some { value } => value
+    Option<BaselineSettings>.None => { return () }
+  }
+  let shape = unsafe engineBaseline.shape(bytecode)
+  if shape.scoped || shape.known {
+    jit.optimizeRefused = jit.optimizeRefused + 1
+    run sayOptimizer(jit.options.dump, b"a scope of its own, or a known local function")
+    return ()
+  }
+  let mut cost = Cost.make()
+  cost.dump = jit.options.dump
+  cost.passes = jit.options.passes
+  // What its method calls call, to inline: cells[id] is the FunctionBytecode cell of the
+  // target a CallTarget names.
+  let mut cells = List<?*mut HeapHeader>.make()
+  let mut targets = List<CallTarget>.make()
+  if jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells) }
+  let none = List<u32>.make()
+  // Where its earlier code left at guards.
+  let mut sites = List<u32>.make()
+  let mut l: usize = 0
+  while l < jit.leftAt.length() {
+    let left = jit.leftAt.get(l)
+    if u64.toUsize(u64.shiftRight(left, 32)) == index { run sites.append(u64.wrappingToU32(left)) }
+    l = l + 1
+  }
+  let lowered = run Effect.result(unsafe lower.lowerOnFrame(&function, &sites, move targets, &none, FramePlan.of(settings.frame, &shape), &mut cost))
+  jit.cost.add(&cost)
+  if jit.options.dump { run dumpCost(b"jit: cost optimized", &cost) }
+  drop function
+  let result = match move lowered {
+    Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
+    Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
+  }
+  // The symbols: the shared stubs, the baseline code's tails and entry, then per inline
+  // target the address of its cell and of the first byte of its code.
+  let mut symbols = List<usize>.make()
+  run symbols.appendSlice(jit.baselineSymbols.asSlice())
+  run symbols.append(info.entry + u32.toUsize(info.moved))
+  run symbols.append(info.entry + u32.toUsize(info.finish))
+  run symbols.append(info.entry)
+  run symbols.append(info.entry + u32.toUsize(info.stepEnded))
+  let mut inlinedSites: usize = 0
+  if let Lowered.Code { inlined, .. } = &result {
+    let mut k: usize = 0
+    while k < inlined.length() {
+      let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cells.get(u32.toUsize(inlined.get(k))))
+      if !(unsafe inline.keep(rt, cell)) { jit.optimizeRefused = jit.optimizeRefused + 1 return () }
+      run symbols.append(Pointer.address<HeapHeader>(cell))
+      run symbols.append(Pointer.address<u8>(unsafe inline.codeStart(cell)))
+      k = k + 1
+    }
+    inlinedSites = inlined.length()
+  }
+  let mut code = match move result {
+    Lowered.Code { value, .. } => move value
+    Lowered.Refused { reason } => {
+      jit.optimizeRefused = jit.optimizeRefused + 1
+      if jit.options.dump { run sayRefusal(&reason) }
+      return ()
+    }
+  }
+  if jit.options.dump { run dumpMachine(&code) }
+  let block = match &mut jit.memory {
+    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, symbols.asSlice())
+    Option<CodeMemory>.None => { return () }
+  }
+  let entry = block.entry()
+  run jit.blocks.append(move block)
+  unsafe engineBaseline.relink(rt, linked, entry)
+  info.tier = TIER_OPTIMIZED
+  if info.compiles < 255 { info.compiles = info.compiles + 1 }
+  info.exits = 0
+  jit.baselineInfo.set(index, info)
+  jit.optimized = jit.optimized + 1
+  jit.optimizedBytes = jit.optimizedBytes + usize.toU64(code.bytes.length())
+  jit.inlinedSites = jit.inlinedSites + usize.toU64(inlinedSites)
+  if jit.options.dump { run dumpPlaced(b"jit: optimized code at ", Pointer.address<u8>(entry), &code) }
 }
 
 /// LibcServices.hotFunction through HotHandler: compile bytecode or refuse it.
