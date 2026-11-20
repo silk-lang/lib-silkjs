@@ -38,7 +38,6 @@ import js_vm_operators as operators
 import js_primitives as primitives
 import js_primitives { EqualityMode }
 import js_atoms { AtomTable }
-import js_strings { Strings }
 import js_string_types { FlatString }
 
 /// The entry into baseline code from the engine, which the embedder emits once per runtime
@@ -86,7 +85,8 @@ pub const SERVICE_STEP: u64 = 5
 /// An instruction that allocates, without the interpreter: the request's bits from 8 up hold
 /// its bytecode offset and base is the cell above the operand stack. object leaves the
 /// object there; define_field moves the value under it into the object under that;
-/// array_from leaves the array where the first of its values was. 0, or 2 when the engine
+/// array_from leaves the array where the first of its values was; rest leaves the array of
+/// the arguments past the named ones there. 0, or 2 when the engine
 /// declines with nothing changed (a step runs the instruction then).
 pub const SERVICE_QUICK: u64 = 6
 /// The + of a string and a string or number: base is the left cell, which the text
@@ -626,6 +626,11 @@ pub unsafe fn resume(record: *mut BaselineFrame, request: u64, returnPc: usize) 
 pub const LAZY_ARGUMENTS: u8 = SPECIAL_LAZY_ARGUMENTS
 /// With KNOWN_VARIABLE in a variable index, function is the bytecode of a known local
 /// function and the index names one of its references (FunctionBytecode.known.refs).
+/// A var-ref instruction's operand that names a scope slot (js_core_types.SCOPE_OPERAND),
+/// for the templates.
+pub const SCOPE_OPERAND: u32 = 0x8000
+pub const SCOPE_DEPTH_SHIFT: u32 = 12
+pub const SCOPE_SLOT_MASK: u32 = 0x0fff
 pub const KNOWN_VARIABLE: u32 = 0x80000000
 /// The cell of closure variable index of function (a closure object, or with KNOWN_VARIABLE
 /// a known local function's bytecode), or null.
@@ -688,6 +693,21 @@ pub unsafe fn readField(runtime: *mut HeapHeader, ip: *const u8, cell: *const Va
   let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(cell)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
   return unsafe properties.readFieldKeyedAt(runtime, ip, object, out, true)
 }
+/// The function a field read (ip at its atom operand) of the object in cell calls for its
+/// answer: the getter the site remembers or the interpreter's walk finds
+/// (js_vm_property_ops.siteGetter, functionGetter), into out with a count. False, with
+/// nothing changed, for anything else, and during a side-effect-free evaluation, which
+/// refuses getters.
+pub unsafe fn getterOf(runtime: *mut HeapHeader, ip: *const u8, cell: *const ValueBits, out: *mut ValueBits) -> bool {
+  let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(cell)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let anchor = ()
+  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).debugger.restricted { return false }
+  let mut getter = unsafe properties.siteGetter(runtime, ip, object)
+  if Pointer.isNull<HeapHeader>(getter) { getter = unsafe properties.functionGetter(runtime, object, unsafe properties.fieldAtomAt(ip)) }
+  let function = match Pointer.nonNullMut<HeapHeader>(getter) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  unsafe Pointer.write<ValueBits>(out, unsafe (ValueBits.Object { reference: function }).retained())
+  return true
+}
 /// get_field past its inline key: the field replaces the object in cell, whose count drops.
 pub unsafe fn readFieldTop(runtime: *mut HeapHeader, ip: *const u8, cell: *mut ValueBits) -> bool {
   let object = match Pointer.nonNullMut<HeapHeader>(unsafe objectIn(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(cell))) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
@@ -723,13 +743,14 @@ pub unsafe fn readFieldCached(runtime: *mut HeapHeader, ip: *const u8, cell: *co
   drop context
   return unsafe properties.readFieldCachedAt(runtime, ip, start, out, true)
 }
-/// The length of the string in source as an Int into out; a string that out held (source
-/// itself) is released. False, with nothing changed, for any other value.
-pub unsafe fn lengthOf(source: *const ValueBits, out: *mut ValueBits) -> bool {
+/// The length of the value in source into out where no user code runs
+/// (js_vm_property_ops.quickLength); a value that out held (source itself) is released.
+/// False, with nothing changed, for any other value.
+pub unsafe fn lengthOf(runtime: *mut HeapHeader, source: *const ValueBits, out: *mut ValueBits) -> bool {
   let value = unsafe Pointer.read<ValueBits>(source)
-  if !value.isString() { return false }
+  let length = match unsafe properties.quickLength(runtime, value) { Option<ValueBits>.Some { value: found } => found Option<ValueBits>.None => { return false } }
   let consumed = Pointer.address<ValueBits>(source) == Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(out))
-  unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: usize.toI32(Strings.length(value)) })
+  unsafe Pointer.write<ValueBits>(out, length)
   if consumed { unsafe gc.releaseDeferred(value) }
   return true
 }
@@ -773,32 +794,97 @@ pub unsafe fn equal(left: *mut ValueBits, right: *const ValueBits, negate: bool,
   unsafe Pointer.write<ValueBits>(left, ValueBits.Bool { value: (same == 1) != negate })
   return true
 }
-/// get_array_el where no user code runs (js_vm_property_ops.elementRead): the element of the
-/// object in cell under the key in the cell after it replaces the object, whose count drops.
-pub unsafe fn readElement(cell: *mut ValueBits) -> bool {
+/// readElement's mode: the object and the key stay and the element goes into the cell after
+/// them (get_array_el3).
+pub const ELEMENT_KEEP: u32 = 1
+/// readElement's mode: the key's cell is a borrowed copy above the operands (get_scope0_el).
+pub const ELEMENT_BORROWED_KEY: u32 = 2
+/// readElement's mode: the element replaces the key, whose count drops, and the object stays
+/// (get_array_el2).
+pub const ELEMENT_OVER_KEY: u32 = 3
+/// One entry of baseline code's element site cache (the embedder keeps ELEMENT_SITES of them
+/// by the low bits of site): the element instruction whose operand address is site last
+/// found, under the Symbol whose cell is at symbol, an own plain data property of an object
+/// whose shape version shifted left 16 plus the property's slot index is key
+/// (FieldCacheEntry.key's form); store is key where a store may overwrite the slot in place,
+/// else 0. A version names its shape's records and the shape holds the symbol, so while an
+/// object has that version the address still names that symbol. site 0 is an empty entry.
+pub struct ElementSite { pub site: usize, pub symbol: usize, pub key: u64, pub store: u64 }
+impl Copy for ElementSite {}
+pub const ELEMENT_SITES: usize = 512
+/// Notes in entry what the instruction at site found under the Symbol key in node, when that
+/// is an own plain data property: its value, borrowed. None changes nothing.
+unsafe fn noteSite(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits, site: usize, entry: *mut ElementSite) -> Option<ValueBits> {
+  let symbol = match key { ValueBits.Symbol { reference } => reference _ => { return Option<ValueBits>.none() } }
+  let mut value = ValueBits.Undefined
+  let found = unsafe properties.symbolSite(runtime, node, key, Pointer.fromMutRef<ValueBits>(&mut value))
+  if found == 0 { return Option<ValueBits>.none() }
+  let key = found & ~properties.SITE_WRITABLE
+  let mut store: u64 = 0
+  if (found & properties.SITE_WRITABLE) != 0 { store = key }
+  unsafe Pointer.write<ElementSite>(entry, ElementSite { site: site, symbol: Pointer.address<HeapHeader>(symbol), key: key, store: store })
+  return Option<ValueBits>.some(value)
+}
+/// js_vm_property_ops.quickElement for the element instruction at site, which notes a
+/// Symbol's own property in entry (noteSite) for the code to read next time.
+unsafe fn siteElement(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits, site: usize, entry: *mut ElementSite) -> Option<ValueBits> {
+  if let ValueBits.Object { reference } = object {
+    if let Option<ValueBits>.Some { value } = unsafe noteSite(runtime, reference, key, site, entry) { return Option<ValueBits>.some(unsafe value.retained()) }
+  }
+  return unsafe properties.quickElement(runtime, object, key)
+}
+/// get_array_el where no user code runs (siteElement): the element of
+/// the object in cell under the key in the cell after it replaces the object, and both drop
+/// their counts, or as mode says. False changes nothing.
+pub unsafe fn readElement(runtime: *mut HeapHeader, cell: *mut ValueBits, mode: u32, site: usize, entry: *mut ElementSite) -> bool {
   let object = unsafe Pointer.read<ValueBits>(cell)
   let key = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 1))
-  match unsafe properties.elementRead(object, key) {
-    Option<ValueBits>.Some { value } => {
-      unsafe Pointer.write<ValueBits>(cell, value)
-      unsafe gc.releaseDeferred(object)
-      return true
-    }
+  let value = match unsafe siteElement(runtime, object, key, site, entry) { Option<ValueBits>.Some { value } => value Option<ValueBits>.None => { return false } }
+  if mode == ELEMENT_KEEP {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 2), value)
+    return true
+  }
+  if mode == ELEMENT_OVER_KEY {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 1), value)
+    unsafe gc.releaseDeferred(key)
+    return true
+  }
+  unsafe Pointer.write<ValueBits>(cell, value)
+  if mode != ELEMENT_BORROWED_KEY { unsafe gc.releaseDeferred(key) }
+  unsafe gc.releaseDeferred(object)
+  return true
+}
+/// The element of the object at object under the key at key, both borrowed, into out with
+/// a count of its own (the slot element instructions, at site). False changes nothing.
+pub unsafe fn elementOf(runtime: *mut HeapHeader, object: *const ValueBits, key: *const ValueBits, out: *mut ValueBits, site: usize, entry: *mut ElementSite) -> bool {
+  match unsafe siteElement(runtime, unsafe Pointer.read<ValueBits>(object), unsafe Pointer.read<ValueBits>(key), site, entry) {
+    Option<ValueBits>.Some { value } => { unsafe Pointer.write<ValueBits>(out, value) return true }
     Option<ValueBits>.None => { return false }
   }
 }
-/// put_array_el where no user code runs (js_vm_property_ops.storeElementDeferred): the value
-/// in the third cell from cell goes into the object in cell at the Int index in the second,
-/// and all three drop their counts. False changes nothing.
-pub unsafe fn storeElement(cell: *mut ValueBits) -> bool {
+/// put_array_el where no user code runs: the value in the third cell from cell goes into
+/// the object in cell at the Int index in the second (js_vm_property_ops.storeElementDeferred)
+/// or under the Symbol or name there (storeKeyDeferred), and all three drop their counts.
+/// False changes nothing.
+pub unsafe fn storeElement(runtime: *mut HeapHeader, cell: *mut ValueBits, site: usize, entry: *mut ElementSite) -> bool {
   let object = unsafe Pointer.read<ValueBits>(cell)
   let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
-  let index = match unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 1)) {
+  let key = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 1))
+  let source = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 2)
+  let index = match key {
     ValueBits.Int { value } => value
-    _ => { return false }
+    _ => {
+      // The value moves into the object: its count is the object's now.
+      if !unsafe properties.storeKeyDeferred(runtime, node, key, source) { return false }
+      // The property is there now: the next store at the site finds its slot.
+      drop unsafe noteSite(runtime, node, key, site, entry)
+      unsafe gc.releaseDeferred(key)
+      unsafe gc.releaseDeferred(object)
+      return true
+    }
   }
   if index < 0 { return false }
-  let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(cell), 2))
+  let value = unsafe Pointer.read<ValueBits>(source)
   if !unsafe properties.storeElementDeferred(node, index, value) { return false }
   // The store took its own count of the value.
   unsafe gc.releaseDeferred(value)
@@ -816,12 +902,16 @@ pub unsafe fn truthy(cell: *const ValueBits) -> bool {
 pub unsafe fn truth(cell: *const ValueBits) -> bool {
   return unsafe primitives.toBoolean(unsafe Pointer.read<ValueBits>(cell)) != 0
 }
-/// ! of the value in cell where no coercion can run JavaScript (js_vm_operators.notFast):
-/// the Bool replaces it and its count drops. False changes nothing.
+/// ! of the value in cell (js_vm_operators.notFast, then js_primitives.toBoolean, which
+/// reads the value alone): the Bool replaces it and its count drops. False changes nothing.
 pub unsafe fn logicalNot(cell: *mut ValueBits) -> bool {
   let value = unsafe Pointer.read<ValueBits>(cell)
-  let falsy = unsafe operators.notFast(value)
-  if falsy < 0 { return false }
+  let mut falsy = unsafe operators.notFast(value)
+  if falsy < 0 {
+    let truth = unsafe primitives.toBoolean(value)
+    if truth < 0 { return false }
+    falsy = 1 - truth
+  }
   unsafe Pointer.write<ValueBits>(cell, ValueBits.Bool { value: falsy == 1 })
   unsafe gc.releaseDeferred(value)
   return true
@@ -884,8 +974,9 @@ pub unsafe fn instanceOf(runtime: *mut HeapHeader, cell: *mut ValueBits) -> bool
   return true
 }
 /// typeof_is (index its operand), typeof_is_undefined or typeof_is_function of the value in
-/// cell: true with its count dropped and the Bool in cell; false with nothing changed for
-/// an object only the engine's hooks can classify (a proxy, a document.all).
+/// cell: true with its count dropped and the Bool in cell, or for typeof itself the type's
+/// name (an atom's string); false with nothing changed for an object only the engine's
+/// hooks can classify (a proxy, a document.all).
 pub unsafe fn typeofIs(runtime: *mut HeapHeader, cell: *mut ValueBits, opcode: u8, index: u8) -> bool {
   let value = unsafe Pointer.read<ValueBits>(cell)
   let mut atom = atoms.JS_ATOM_unknown
@@ -915,10 +1006,15 @@ pub unsafe fn typeofIs(runtime: *mut HeapHeader, cell: *mut ValueBits, opcode: u
       _ => { return false }
     }
   }
+  unsafe gc.releaseDeferred(value)
+  if opcode == op.OP_typeof {
+    let anchor = ()
+    unsafe Pointer.write<ValueBits>(cell, (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).atoms.storedAtomValue(atom))
+    return true
+  }
   let mut answer = atom == atoms.JS_ATOM_function
   if opcode == op.OP_typeof_is_undefined { answer = atom == atoms.JS_ATOM_undefined }
   else if opcode == op.OP_typeof_is { answer = atom == typeofIsAtom(index) }
-  unsafe gc.releaseDeferred(value)
   unsafe Pointer.write<ValueBits>(cell, ValueBits.Bool { value: answer })
   return true
 }

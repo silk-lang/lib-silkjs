@@ -184,24 +184,45 @@ pub unsafe fn lengthOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) 
     Option<*mut HeapHeader>.None => { return false }
   }
 }
+/// Whether the length of the typed array node (of classId) is the intrinsic getter's: its
+/// prototype chain reaches that getter through ordinary objects with no own length.
 @inlineAlways
-unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader, classId: u32) -> bool {
+unsafe fn typedLengthIntrinsic(runtime: *mut HeapHeader, node: *mut HeapHeader, classId: u32) -> bool {
   let anchor = ()
   let receiverData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, receiverData.shape)).version
   drop receiverData
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let entry = &state.typedLengthCache[u32.toUsize(classId - classes.JS_CLASS_UINT8C_ARRAY)]
   // The version fixes the receiver's records and prototype chain, an unchanged
   // epoch the chain's shapes: the accessor is still at holder's slot.
   let hit = entry.version == version && entry.epoch == state.shapeEpoch && unsafe typedLengthHolds(entry)
   drop state
-  if !hit && !unsafe typedLengthWalk(machine.runtime, node, classId, version) { return false }
+  return hit || unsafe typedLengthWalk(runtime, node, classId, version)
+}
+@inlineAlways
+unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader, classId: u32) -> bool {
+  if !unsafe typedLengthIntrinsic(machine.runtime, node, classId) { return false }
   let count = unsafe typedRead.count(node)
   let length = if count <= 0x7fffffff { ValueBits.Int { value: u64.toI32(count) } } else { ValueBits.number(u64.toF64(count)) }
   unsafe machine.set(1, length)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
+}
+/// value.length for baseline code (js_baseline), which has no hooks to run user code with:
+/// a string's, an Array's, a typed array's through the intrinsic getter, or a plain length
+/// property of another object. The length, retained; None where the full lookup must run.
+pub unsafe fn quickLength(runtime: *mut HeapHeader, value: ValueBits) -> Option<ValueBits> {
+  if value.isString() { return Option<ValueBits>.some(ValueBits.Int { value: usize.toI32(Strings.length(value)) }) }
+  let node = match value { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
+  let anchor = ()
+  let classId = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).classId()
+  if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+    if !unsafe typedLengthIntrinsic(runtime, node, classId) { return Option<ValueBits>.none() }
+    let count = unsafe typedRead.count(node)
+    return Option<ValueBits>.some(if count <= 0x7fffffff { ValueBits.Int { value: u64.toI32(count) } } else { ValueBits.number(u64.toF64(count)) })
+  }
+  return unsafe getters.quickGet(runtime, node, atoms.JS_ATOM_length)
 }
 @inlineAlways
 unsafe fn typedLengthHolds(entry: &TypedLengthEntry) -> bool {
@@ -1697,42 +1718,116 @@ pub unsafe fn keepSymbolOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machi
   unsafe gc.release(&mut hooks, machine.runtime, key)
   return true
 }
-/// put_array_el under a Symbol key over an own writable data property, by one
-/// shape lookup (putFieldFast's test), or an add along a verified memo entry.
-/// Consumes the operands only when true; other adds are left to addElementOperand.
-@inlineNever
-pub unsafe fn storeSymbolOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool {
-  let node = match unsafe machine.top(3) { ValueBits.Object { reference } => reference _ => { return false } }
-  let key = unsafe machine.top(2)
+/// A store under the key atom names (a Symbol's, or a name's) over an own writable data
+/// property, by one shape lookup (putFieldFast's test), or an add along a verified memo
+/// entry: the value at source moves into the object. The value it replaced, owned
+/// (Undefined for an add); None changes nothing.
+@inlineAlways
+unsafe fn storeNamed(runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> Option<ValueBits> {
   let mut anchor = ()
-  let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).atoms.borrowedSymbolAtom(key)
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   // As putSymbolFast: an exotic object other than an Array keeps its own [[Set]].
-  if data.isExotic() && data.classId() != classes.JS_CLASS_ARRAY { return false }
+  if data.isExotic() && data.classId() != classes.JS_CLASS_ARRAY { return Option<ValueBits>.none() }
   let index = match unsafe shapes.lookup(data.shape, atom) {
     Option<usize>.Some { value: slot } => slot
     Option<usize>.None => {
       // The add (a constructor's this[symbol] = v) along a verified memo entry,
       // as addElementOperand's quick add, without redoing the key and lookup.
-      if !unsafe addsInPlace(&data) { return false }
+      if !unsafe addsInPlace(&data) { return Option<ValueBits>.none() }
       drop data
-      if unsafe quickAddFill(machine.runtime, node, atom, unsafe machine.topCell(1)) == usize.MAX { return false }
-      unsafe machine.discard(3)
-      unsafe gc.release(&mut hooks, machine.runtime, key)
-      unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
-      return true
+      if unsafe quickAddFill(runtime, node, atom, source) == usize.MAX { return Option<ValueBits>.none() }
+      return Option<ValueBits>.some(ValueBits.Undefined)
     }
   }
   let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
   let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags) drop shape
-  if (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return false }
+  if (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return Option<ValueBits>.none() }
   let old = (unsafe data.slotUnchecked(index)).valueBits()
-  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe machine.top(1))) drop data
+  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source))) drop data
+  return Option<ValueBits>.some(old)
+}
+/// put_array_el under a Symbol key (storeNamed). Consumes the operands only when true;
+/// other adds are left to addElementOperand.
+@inlineNever
+pub unsafe fn storeSymbolOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool {
+  let node = match unsafe machine.top(3) { ValueBits.Object { reference } => reference _ => { return false } }
+  let key = unsafe machine.top(2)
+  let anchor = ()
+  let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).atoms.borrowedSymbolAtom(key)
+  let old = match unsafe storeNamed(machine.runtime, node, atom, unsafe machine.topCell(1)) {
+    Option<ValueBits>.Some { value } => value
+    Option<ValueBits>.None => { return false }
+  }
   unsafe machine.discard(3)
   unsafe gc.release(&mut hooks, machine.runtime, old)
   unsafe gc.release(&mut hooks, machine.runtime, key)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
+}
+/// storeNamed for baseline code (js_baseline) under a Symbol key or a flat string that an
+/// atom already spells and that is no index: the value it overwrites drops its count
+/// without running user code (js_gc.releaseDeferred). The value at source moves.
+pub unsafe fn storeKeyDeferred(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits, source: *mut ValueBits) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut atom: u32 = 0
+  match key {
+    ValueBits.Symbol { .. } => { atom = state.atoms.borrowedSymbolAtom(key) }
+    ValueBits.String { .. } => {
+      atom = state.atoms.findString(key)
+      if atom == 0 || atom == UNKNOWN_STRING_ATOM { return false }
+    }
+    _ => { return false }
+  }
+  drop state
+  match unsafe storeNamed(runtime, node, atom, source) {
+    Option<ValueBits>.Some { value } => { unsafe gc.releaseDeferred(value) return true }
+    Option<ValueBits>.None => { return false }
+  }
+}
+/// symbolSite's mark of a property a store may overwrite in place (storeNamed's test of the
+/// record; whether the object keeps its own [[Set]] is the caller's to ask).
+pub const SITE_WRITABLE: u64 = 0x8000000000000000
+/// The own plain data property the Symbol key names in node, for baseline code's element
+/// site cache (js_baseline.ElementSite): its shape's version shifted left 16 plus its slot
+/// index (FieldCacheEntry.key's form), with SITE_WRITABLE, and the slot's value, borrowed,
+/// into value. 0: no such property, or one past the 16 bits of an index.
+pub unsafe fn symbolSite(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits, value: *mut ValueBits) -> u64 {
+  let anchor = ()
+  let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).atoms.borrowedSymbolAtom(key)
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let found = match unsafe shapes.find(data.shape, atom) {
+    Option<FoundProperty>.Some { value: found } => found
+    Option<FoundProperty>.None => { return 0 }
+  }
+  let flags = u8.toU32(found.flags)
+  if (flags & JS_PROP_TMASK) != 0 || found.index >= 0x10000 { return 0 }
+  unsafe Pointer.write<ValueBits>(value, (unsafe data.slotUnchecked(found.index)).valueBits())
+  let mut site = u64.shiftLeft((unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version, 16) | usize.toU64(found.index)
+  if (flags & (JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE { site = site | SITE_WRITABLE }
+  return site
+}
+/// object[key] for baseline code (js_baseline), which has no hooks to run user code with:
+/// what the interpreter's get_array_el arm answers before it steps. A dense element or a
+/// plain indexed property under an Int key, a plain property under a Symbol key or under a
+/// flat string (an index it spells, or a name). The value, retained; None where the full
+/// lookup must run.
+pub unsafe fn quickElement(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits) -> Option<ValueBits> {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
+  match key {
+    ValueBits.Int { .. } => {
+      let dense = unsafe denseRead(object, key)
+      if dense.isSome() { return dense }
+      return unsafe quickIndexRead(runtime, object, key)
+    }
+    ValueBits.Symbol { .. } => { return unsafe quickSymbolRead(runtime, object, key) }
+    ValueBits.String { .. } => {
+      let index = getters.indexString(key)
+      if index >= 0 { return unsafe denseRead(object, ValueBits.Int { value: index }) }
+      return unsafe namedStringRead(runtime, node, key)
+    }
+    _ => { return Option<ValueBits>.none() }
+  }
 }
 /// get_array_el2 fast path: replaces the Int key with a dense element and keeps the
 /// object below it. False leaves the operands to step.
