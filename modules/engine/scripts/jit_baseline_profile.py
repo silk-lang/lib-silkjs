@@ -11,6 +11,10 @@ every slow path and every exit starts at).
         [--show NAME]        disassemble the hottest part of that name with its counts
                              (an opcode name, or @prologue, @leave, @slow:call, ...)
         [--functions]        one row per compiled function as well
+        [--coverage]         the share of the run's bytecode instructions that ran in baseline
+                             code: templates entered, less the ones that went to the engine's
+                             step service, against what the interpreter dispatched (every
+                             dispatch is a jump through the opcode table of js_vm executeLoop or js_vm_leaf evaluate)
         [--time SAMPLER.so]  where the time goes instead: runs the script natively under an
                              LD_PRELOAD sampler that writes one program counter per line to
                              $SAMPLES_OUT, and prints each part's share of the samples.
@@ -24,9 +28,11 @@ row counts only its straight path; what it does out of line is in the @slow rows
 """
 import argparse, collections, os, re, subprocess, sys, tempfile
 
-MARKS = {0x1000: "@prologue", 0x1001: "@leave", 0x1002: "@finish", 0x1003: "@overflow", 0x1004: "@exit"}
+MARKS = {0x1000: "@prologue", 0x1001: "@leave", 0x1002: "@finish", 0x1003: "@overflow", 0x1004: "@exit",
+         0x1005: "@construct", 0x1006: "@table", 0x1007: "@resume"}
 SLOW = {0: "release", 1: "release-object", 2: "helper", 3: "equal", 4: "truthy", 5: "back-edge", 6: "call",
-        8: "variable", 9: "attached"}
+        8: "variable", 9: "attached", 10: "helper-argument", 11: "arithmetic", 12: "cell", 13: "truth", 14: "step",
+        15: "release-at", 16: "quick", 17: "known", 18: "length", 19: "truncate", 20: "native"}
 
 
 def what_name(text):
@@ -55,6 +61,28 @@ def compiled(stderr):
         functions.append((start, code, entries))
     functions.sort()
     return functions
+
+
+def dispatched(shell, counts):
+    """Bytecode instructions the interpreter ran: the executions of every jump through the
+    opcode table (the table most indirect jumps use) in each copy of js_vm executeLoop and of
+    the frameless leaf loop, js_vm_leaf evaluate."""
+    total = 0
+    symbols = subprocess.run(["nm", "-S", shell], capture_output=True, text=True).stdout
+    for line in symbols.splitlines():
+        parts = line.split()
+        if len(parts) != 4 or not parts[3].endswith(("js_vm.silk::executeLoop", "js_vm_leaf.silk::evaluate")): continue
+        start = int(parts[0], 16); size = int(parts[1], 16)
+        dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "--start-address=%d" % start,
+                              "--stop-address=%d" % (start + size), shell], capture_output=True, text=True).stdout
+        sites = collections.Counter(); ran = collections.Counter()
+        for row in dis.splitlines():
+            m = re.match(r"\s*([0-9a-f]+):\s+jmp\s+\*(\S+)\(,%\w+,8\)$", row)
+            if not m: continue
+            sites[m.group(2)] += 1
+            ran[m.group(2)] += counts.get(int(m.group(1), 16), 0)
+        if sites: total += ran[sites.most_common(1)[0][0]]
+    return total
 
 
 def time_shares(args):
@@ -91,6 +119,7 @@ def main():
     parser.add_argument("--top", type=int, default=40)
     parser.add_argument("--show")
     parser.add_argument("--functions", action="store_true", help="also one row per compiled function")
+    parser.add_argument("--coverage", action="store_true", help="the share of bytecode instructions run in baseline code")
     parser.add_argument("--threshold", default=None, help="pass --jit-threshold")
     parser.add_argument("--time", default=None, help="an LD_PRELOAD sampler: print time shares instead")
     args = parser.parse_args()
@@ -99,7 +128,12 @@ def main():
     command = ["valgrind", "--tool=callgrind", "--dump-instr=yes", "--compress-pos=no", "--compress-strings=no",
                "--callgrind-out-file=" + out, args.shell, "--jit-baseline", "--jit-dump"]
     if args.threshold: command.append("--jit-threshold=" + args.threshold)
+    stats = tempfile.mktemp(suffix=".stats")
+    command.append("--jit-stats=" + stats)
     run = subprocess.run(command + [args.script], capture_output=True, text=True)
+    words = open(stats).read().split() if os.path.exists(stats) else []
+    if os.path.exists(stats): os.unlink(stats)
+    steps = int(dict(zip(words[1::2], words[2::2])).get("baseline-steps", 0))
     total = int(re.search(r"Collected : (\d+)", run.stderr).group(1))
     functions = compiled(run.stderr)
     counts = collections.Counter()
@@ -132,6 +166,11 @@ def main():
             if what.startswith("@slow") and pc in opcode_at: slow_of[opcode_at[pc]] += spent
             if spent > hottest.get(what, (0,))[0]: hottest[what] = (spent, f, k)
     print("total %d, baseline code %d (%.1f%%), %d functions" % (total, inside, 100.0 * inside / max(total, 1), len(functions)))
+    if args.coverage:
+        templates = sum(entered for name, (_, entered) in rows.items() if not name.startswith("@")) - steps
+        interpreted = dispatched(args.shell, counts)
+        print("bytecode instructions: %d in baseline code, %d in the interpreter (%d of them steps): %.1f%% in machine code"
+              % (templates, interpreted, steps, 100.0 * templates / max(templates + interpreted, 1)))
     if args.functions:
         print("%14s %12s %8s %6s  %s" % ("instructions", "entered", "each", "bytes", "function (bytecode instructions, calls it makes)"))
         table = []

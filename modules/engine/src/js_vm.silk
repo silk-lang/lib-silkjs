@@ -280,12 +280,16 @@ unsafe effect fn callResuming<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
     Option<*mut HeapHeader>.None => ()
   }
   let description = unsafe activation.describe(function, empty, emptyRefs, argv.length(), flags, true)
-  // Baseline code builds its own frame (js_baseline); a constructor's new.target stays here.
-  if description.baseline != 0 && Pointer.isNull<u64>(resume.state) && unsafe baselineOpen(rt) && match newTarget { ValueBits.Undefined => true _ => false } {
-    let mut value = ValueBits.Undefined
-    let host = unsafe Intrinsic.pointerReinterpret<*mut H, *mut u8>(Pointer.fromMutRef<H>(&mut hooks))
-    if unsafe enterBaseline(rt, host, function, receiver, FrameSlots { data: argv.data, count: argv.count }, Pointer.fromMutRef<ValueBits>(&mut value)) != 0 { fail JsException {} }
-    return value
+  // Baseline code builds its own frame (js_baseline), a construct frame for a `new` of the
+  // function itself; any other new.target stays here.
+  if description.baseline != 0 && Pointer.isNull<u64>(resume.state) && unsafe baselineOpen(rt) {
+    let constructs = unsafe sameValueBits(newTarget, function)
+    if constructs || match newTarget { ValueBits.Undefined => true _ => false } {
+      let mut value = ValueBits.Undefined
+      let host = unsafe Intrinsic.pointerReinterpret<*mut H, *mut u8>(Pointer.fromMutRef<H>(&mut hooks))
+      if unsafe enterBaseline(rt, host, function, receiver, FrameSlots { data: argv.data, count: argv.count }, Pointer.fromMutRef<ValueBits>(&mut value), description.baseline, constructs) != 0 { fail JsException {} }
+      return value
+    }
   }
   if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), description.bytes, true) {
     return run unsafe stackOverflow(&mut hooks, memory, context)
@@ -644,13 +648,15 @@ unsafe fn baselineOpen(runtime: *mut HeapHeader) -> bool {
 unsafe fn baselineIndex(bytecode: *mut HeapHeader) -> u32 {
   let anchor = () return (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)).baseline
 }
-/// Runs the baseline code function's bytecode is linked to (FunctionBytecode.baseline,
-/// nonzero) on argv, borrowed, with receiver as `this`: 0 with the owned result in out, or 1
+/// Runs the baseline code function's bytecode is linked to (index, its
+/// FunctionBytecode.baseline, nonzero) on argv, borrowed, with receiver as `this`, as a
+/// construct call with the function as new.target when constructs: 0 with the owned result in out, or 1
 /// when it threw, the exception pending. hooks is the caller's hooks object: what the code
 /// asks the engine for meanwhile runs on it (CompiledTable.serviceHooks), as the hooks of
 /// an outer entry do again once this one returns.
 @inlineNever
-unsafe fn enterBaseline(runtime: *mut HeapHeader, hooks: *mut u8, function: ValueBits, receiver: ValueBits, argv: FrameSlots, out: *mut ValueBits) -> u32 {
+unsafe fn enterBaseline(runtime: *mut HeapHeader, hooks: *mut u8, function: ValueBits, receiver: ValueBits, argv: FrameSlots, out: *mut ValueBits,
+  index: u32, constructs: bool) -> u32 {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   let enter = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(state.compiled.baselineEnter)
@@ -660,11 +666,115 @@ unsafe fn enterBaseline(runtime: *mut HeapHeader, hooks: *mut u8, function: Valu
   drop state
   let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const baseline.Enter>(Pointer.fromRef<*const u8>(&enter))
   let code = unsafe Pointer.read<baseline.Enter>(slot)
-  let status = unsafe code(env, core.reference(function), argv.data, argv.count, Pointer.fromRef<ValueBits>(&receiver), out)
+  let status = unsafe code(env, unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(core.reference(function)), argv.data, argv.count, Pointer.fromRef<ValueBits>(&receiver), out,
+    unsafe baseline.entryOf(runtime, index, constructs), (unsafe activation.calleeOf(function)).bytecode)
   let mut afterAnchor = ()
   let after = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut afterAnchor, runtime)
   after.compiled.serviceHooks = outer
   return status
+}
+/// enterBaseline for a known local function, its bytecode linked as index, in scope (what
+/// js_vm_activation.knownContext gives for the caller): it has no receiver.
+@inlineNever
+unsafe fn enterBaselineKnown(runtime: *mut HeapHeader, hooks: *mut u8, bytecode: *mut HeapHeader, scope: ?*mut HeapHeader, argv: FrameSlots, out: *mut ValueBits,
+  index: u32) -> u32 {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let enter = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(state.compiled.baselineEnter)
+  let env = state.compiled.baselineEnv
+  let outer = state.compiled.serviceHooks
+  state.compiled.serviceHooks = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(hooks)
+  drop state
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const baseline.Enter>(Pointer.fromRef<*const u8>(&enter))
+  let code = unsafe Pointer.read<baseline.Enter>(slot)
+  let receiver = ValueBits.Undefined
+  let status = unsafe code(env, scope, argv.data, argv.count, Pointer.fromRef<ValueBits>(&receiver), out, unsafe baseline.entryOf(runtime, index, false), bytecode)
+  let mut afterAnchor = ()
+  let after = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut afterAnchor, runtime)
+  after.compiled.serviceHooks = outer
+  return status
+}
+/// Baseline code takes over the activation machine runs, at the back edge it just took
+/// (docs/jit/baseline.md, entering a running loop): when its function is linked and has a
+/// resume entry, the code builds its frame, moves the locals and operands into it
+/// (SERVICE_RESUME) and runs the function to its return. The activation is then left with
+/// the result, about to return it. False, with nothing changed, when the activation stays
+/// in the interpreter; an exception the code let out is raised with the operand stack empty,
+/// so no handler of the activation sees it twice.
+@inlineNever
+unsafe effect fn baselineLoop<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool ! JsException {
+  let index = unsafe baselineIndex(machine.bytecode)
+  if index == 0 || !unsafe baselineOpen(machine.runtime) { return false }
+  // A plain call's frame only: no construction, no setter's discarded result.
+  if activation.flagged(&machine) || !core.undefined(unsafe activation.newTargetOf(&machine)) { return false }
+  let rt = machine.runtime
+  let entry = match Pointer.nonNull<u8>(unsafe baseline.resumeOf(rt, index)) { Option<*const u8>.Some { value } => value Option<*const u8>.None => { return false } }
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  let cells = u16.toUsize(code.argumentCount) + u16.toUsize(code.variableCount) + u16.toUsize(code.stackSize)
+  drop code
+  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), cells * Layout.of<ValueBits>().bytes + baseline.recordBytes() + 4096, true) { return false }
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut StackFrame, *const StackFrame>(machine.frame))
+  let function = frame.currentFunction
+  let arguments = frame.arguments
+  let outer = frame.previous
+  drop frame
+  let mut from = baseline.Resume { arguments: arguments.data, count: arguments.count, locals: machine.locals, stack: machine.stack, sp: machine.sp(), pc: machine.pc(),
+    returnPc: 0, returnsValue: false, taken: false }
+  // A known local function's frame names its bytecode and runs in the scope its caller passed.
+  let target = match function {
+    ValueBits.Object { reference } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
+    ValueBits.FunctionBytecode { reference: _ } => machine.scope
+    _ => { return false }
+  }
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, rt)
+  let enter = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(state.compiled.baselineEnter)
+  let env = state.compiled.baselineEnv
+  let servicing = state.compiled.serviceHooks
+  state.compiled.serviceHooks = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut H, *mut u8>(Pointer.fromMutRef<H>(&mut hooks)))
+  // The code's frame stands in the chain where the activation's did.
+  state.currentStackFrame = outer
+  drop state
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const baseline.Enter>(Pointer.fromRef<*const u8>(&enter))
+  let stub = unsafe Pointer.read<baseline.Enter>(slot)
+  let receiver = machine.thisValue
+  let mut value = ValueBits.Undefined
+  let status = unsafe stub(env, target, unsafe Intrinsic.pointerReinterpret<*mut baseline.Resume, *mut ValueBits>(Pointer.fromMutRef<baseline.Resume>(&mut from)), 0,
+    Pointer.fromRef<ValueBits>(&receiver), Pointer.fromMutRef<ValueBits>(&mut value), entry, machine.bytecode)
+  let mut afterAnchor = ()
+  let after = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut afterAnchor, rt)
+  after.compiled.serviceHooks = servicing
+  after.currentStackFrame = unsafe Intrinsic.pointerRequalify<*mut StackFrame, ?*mut StackFrame>(machine.frame)
+  drop after
+  if from.taken { unsafe machine.setSp(0) }
+  if status != 0 { fail JsException {} }
+  if !from.taken { Intrinsic.trap("baseline resume invariant violated") }
+  unsafe machine.setPc(from.returnPc)
+  if from.returnsValue { unsafe machine.push(value) } else { unsafe gc.release(&mut hooks, rt, value) }
+  return true
+}
+/// The Description of the activation in record, a baseline frame: its closure's, or a known
+/// local function's with the scope its caller passed. The empty tables are the caller's
+/// (stack allocated there).
+@inlineAlways
+unsafe fn baselineDescribe(record: *mut baseline.BaselineFrame, empty: *mut ValueBits, emptyRefs: *mut ?*mut HeapHeader) -> activation.Description {
+  let anchor = ()
+  let running = unsafe Pointer.borrow<(), baseline.BaselineFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut baseline.BaselineFrame, *const baseline.BaselineFrame>(record))
+  let function = running.frame.currentFunction
+  let argc = running.argc
+  let scope = running.scope
+  drop running
+  match function {
+    ValueBits.FunctionBytecode { reference } => {
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      let mut references = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(emptyRefs)
+      if code.known.refs.length() != 0 { references = Pointer.fromRef<?*mut HeapHeader>(&code.known.refs.asSlice()[0]) }
+      drop code
+      return unsafe activation.describeKnown(reference, activation.KnownContext { references: references, scope: scope }, empty, argc, activation.COPY_ARGUMENTS, false)
+    }
+    _ => { return unsafe activation.describe(function, empty, emptyRefs, argc, activation.COPY_ARGUMENTS, false) }
+  }
 }
 /// What baseline code asks the engine for through its host (js_baseline.ServiceEntry), on the
 /// hooks of the dispatch that entered it. record is the running baseline frame; request a
@@ -673,10 +783,39 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, record: *mut baseline.BaselineFrame, request: u64, base: *mut ValueBits, count: usize) -> u64 ? &mut Allocator {
   let kind = request & 0xff
+  // What only allocates reads no frame: it leaves the code's bare frames bare, and stays
+  // out of the frame the other requests need.
+  if kind >= baseline.SERVICE_QUICK {
+    if kind == baseline.SERVICE_RESUME { return unsafe baseline.resume(record, request, count) }
+    return run unsafe baselineLight(&mut hooks, memory, record, request, base, count)
+  }
+  return run unsafe baselineHeavy(&mut hooks, memory, record, request, base, count)
+}
+/// baselineService's SERVICE_QUICK and SERVICE_CONCAT.
+@inlineNever
+unsafe effect fn baselineLight<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, record: *mut baseline.BaselineFrame,
+  request: u64, base: *mut ValueBits, count: usize) -> u64 ? &mut Allocator {
+  let anchor = ()
+  let running = unsafe Pointer.borrow<(), baseline.BaselineFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut baseline.BaselineFrame, *const baseline.BaselineFrame>(record))
+  let function = running.frame.currentFunction
+  drop running
+  let bytecode = match function { ValueBits.FunctionBytecode { reference } => reference _ => (unsafe activation.calleeOf(function)).bytecode }
+  let context = (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)).realm
+  // An allocation profile attributes what is made now to the frame chain.
+  if memory.profiling() { unsafe baseline.build(unsafe runtime.contextRuntime(context), record) }
+  if (request & 0xff) == baseline.SERVICE_QUICK { return run unsafe baselineQuick(&mut hooks, memory, context, bytecode, u64.toUsize(u64.shiftRight(request, 8)), base) }
+  return run unsafe baselineConcat(&mut hooks, context, record, bytecode, base, count, request)
+}
+/// baselineService's other requests.
+@inlineNever
+unsafe effect fn baselineHeavy<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, record: *mut baseline.BaselineFrame, request: u64, base: *mut ValueBits, count: usize) -> u64 ? &mut Allocator {
+  let kind = request & 0xff
   if kind == baseline.SERVICE_OVERFLOW {
-    let entered = unsafe activation.calleeOf(ValueBits.Object { reference: unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut HeapHeader>(base) })
+    // base is the entered function's bytecode (it has no frame to name it).
     let enteredAnchor = ()
-    let home = (unsafe HeapCell.payload<FunctionBytecode, ()>(&enteredAnchor, entered.bytecode)).realm
+    let home = (unsafe HeapCell.payload<FunctionBytecode, ()>(&enteredAnchor, unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut HeapHeader>(base))).realm
     // The error's stack names the callers: their frames first.
     unsafe baseline.build(unsafe runtime.contextRuntime(home), record)
     drop run Effect.result(unsafe stackOverflowValue(&mut hooks, memory, home))
@@ -686,12 +825,14 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
   let running = unsafe Pointer.borrowMut<(), baseline.BaselineFrame>(&mut anchor, record)
   let function = running.frame.currentFunction
   drop running
-  let callee = unsafe activation.calleeOf(function)
+  // A known local function's frame names its bytecode; any other its closure object.
+  let bytecode = match function { ValueBits.FunctionBytecode { reference } => reference _ => (unsafe activation.calleeOf(function)).bytecode }
   let codeAnchor = ()
-  let context = (unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, callee.bytecode)).realm
+  let context = (unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, bytecode)).realm
   // Whatever runs now may read the frame chain: complete the code's bare frames.
   unsafe baseline.build(unsafe runtime.contextRuntime(context), record)
   if kind == baseline.SERVICE_FINISH { return run unsafe baselineFinish(&mut hooks, memory, record, (request & baseline.FINISH_THROWING) != 0, count) }
+  if kind == baseline.SERVICE_STEP { return run unsafe baselineStep(&mut hooks, memory, record, u64.toUsize(u64.shiftRight(request, 8)), Pointer.address<ValueBits>(base), count) }
   if kind == baseline.SERVICE_POLL {
     let polled = run Effect.result(interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)))
     return match move polled {
@@ -703,7 +844,7 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
   if kind == baseline.SERVICE_CONSTRUCT {
     let newTarget = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(base), 1))
     let operands = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(base), 2), count: count }
-    let made = run Effect.result(unsafe constructInternal(&mut hooks, memory, context, target, newTarget, &operands, activation.COPY_ARGUMENTS))
+    let made = run Effect.result(unsafe baselineConstruct(&mut hooks, memory, context, target, newTarget, &operands))
     match move made {
       Result<ValueBits, JsException>.Success { value } => {
         let mut madeAnchor = ()
@@ -717,7 +858,14 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
   let mut receiver = ValueBits.Undefined
   if (request & baseline.CALL_METHOD) != 0 { receiver = unsafe Pointer.read<ValueBits>(unsafe operandCell(base, 1)) }
   let argv = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(base), 1), count: count }
-  let called = run Effect.result(unsafe callInternal(&mut hooks, memory, context, target, receiver, ValueBits.Undefined, &argv, activation.COPY_ARGUMENTS))
+  let mut called: Result<ValueBits, JsException> = Result<ValueBits, JsException>.Success { value: ValueBits.Uninitialized }
+  if (request & baseline.CALL_NATIVE) != 0 && target.isObject() && unsafe classId(target) == classes.JS_CLASS_C_FUNCTION {
+    called = run Effect.result(unsafe baselineNative(&mut hooks, memory, context, target, receiver, &argv, (request & baseline.CALL_METHOD) != 0))
+  }
+  // No native, or one whose poll is due.
+  if let Result<ValueBits, JsException>.Success { value: ValueBits.Uninitialized } = &called {
+    called = run Effect.result(unsafe callInternal(&mut hooks, memory, context, target, receiver, ValueBits.Undefined, &argv, activation.COPY_ARGUMENTS))
+  }
   match move called {
     Result<ValueBits, JsException>.Success { value } => {
       let mut resultAnchor = ()
@@ -728,15 +876,246 @@ pub unsafe effect fn baselineService<H: HeapHooks + CoercionHooks + OwnPropertyH
     Result<ValueBits, JsException>.Failure { .. } => { return 1 }
   }
 }
+/// A call of function, a native, from baseline code (SERVICE_CALL with CALL_NATIVE): the
+/// native call the interpreter's call instruction makes with no frames of its own around it
+/// (quickInline, nativeInline, stringInline), charging the poll as they do, and with their
+/// answers that need no Machine: RegExp.prototype.exec through quickExec,
+/// String.prototype.replace through quickReplace, String(n) of an Int, a string method's
+/// primitive entry. The operands stay the caller's. Uninitialized, with nothing changed,
+/// when the poll is due: the full call handles it.
+unsafe effect fn baselineNative<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots, method: bool) -> ValueBits
+  ! JsException ? &mut Allocator {
+  let counter = unsafe interrupts.counter(context)
+  let left = unsafe Pointer.read<i32>(counter)
+  if left <= 1 { return ValueBits.Uninitialized }
+  unsafe Pointer.write<i32>(counter, left - 1)
+  let kind = unsafe nativeFunctions.callKind(function)
+  if kind == nativeFunctions.CALL_KIND_STRING && method && receiver.isString() {
+    if let Option<ValueBits>.Some { value } = move run unsafe nativeFunctions.stringCall(&mut hooks, function, receiver, argv) { return value }
+  }
+  if kind == nativeFunctions.OBJECT_METHOD_MATH {
+    let answer = unsafe nativeFunctions.mathCall(function, argv.*)
+    match answer { ValueBits.Uninitialized => () _ => { return answer } }
+  }
+  if kind == nativeFunctions.CALL_KIND_ANSWER {
+    let answer = unsafe nativeFunctions.leanAnswer(function, argv)
+    match answer { ValueBits.Uninitialized => () _ => { return answer } }
+  }
+  if kind < nativeFunctions.CALL_KIND_LEAN {
+    if let Option<nativeFunctions.QuickTarget>.Some { value: target } = unsafe nativeFunctions.quickTarget(function) {
+      if argv.count == 1 {
+        if let Option<ValueBits>.Some { value } = move run nativeFunctions.stringOfInteger(&target, argv) { return value }
+      }
+      if method && argv.count == 2 {
+        if let Option<*mut HeapHeader>.Some { value: home } = Pointer.nonNullMut<HeapHeader>(nativeFunctions.stringReplaceRealm(&target)) {
+          let quick = run regexpSymbols.quickReplace(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, unsafe argv.get(0), unsafe argv.get(1))
+          if let Option<ValueBits>.Some { value } = move quick { return value }
+        }
+      }
+      // callClass's answers: the reads that cannot throw, then push, pop and the like.
+      let quick = nativeFunctions.quick(&mut hooks, unsafe lendRealm(&context, context), &target, unsafe lendBits(&receiver, receiver), argv.*)
+      match quick { ValueBits.Uninitialized => () _ => { return quick } }
+      let written = run unsafe nativeFunctions.quickWrite(&mut hooks, &target, receiver, argv)
+      if let Option<ValueBits>.Some { value } = move written { return value }
+    } else if method && argv.count != 0 {
+      let mut test = false
+      if let Option<*mut HeapHeader>.Some { value: home } = Pointer.nonNullMut<HeapHeader>(unsafe nativeFunctions.regexpExecRealm(function, &mut test)) {
+        if !test {
+          let quick = run regexpExec.quickExec(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, unsafe argv.get(0), false)
+          if let Option<ValueBits>.Some { value } = move quick { return value }
+        }
+      }
+    }
+  }
+  return run unsafe callNativePlain(&mut hooks, memory, context, function, receiver, argv)
+}
+/// SERVICE_QUICK (js_baseline): the allocating instruction at offset pc of bytecode's code,
+/// with top the cell above the frame's operand stack.
+unsafe effect fn baselineQuick<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, bytecode: *mut HeapHeader,
+  pc: usize, top: *mut ValueBits) -> u64 ? &mut Allocator {
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let bytes = unsafe function.code.asSlice()
+  drop function
+  if pc + 5 > bytes.length { return 2 }
+  let opcode = bytes[pc]
+  // The address of the instruction's operand, as the interpreter's caches key it.
+  let site = Pointer.address<u8>(Pointer.fromRef<u8>(&bytes[pc])) + 1
+  let rt = unsafe runtime.contextRuntime(context)
+  if opcode == op.OP_object {
+    // {...source} of a local or argument starts with a read of it (object_ops.spreadSourceWidth).
+    let next = bytes[pc + 1]
+    let reads = (next >= op.OP_get_loc0 && next <= op.OP_get_loc0 + 3) || (next >= op.OP_get_arg0 && next <= op.OP_get_arg0 + 3)
+      || next == op.OP_get_loc8 || next == op.OP_get_loc || next == op.OP_get_arg || next == op.OP_get_loc_check
+    if run unsafe objects.literalAt(&mut hooks, memory, rt, context, site, !reads, top) { return 0 }
+    return 2
+  }
+  if opcode == op.OP_define_field {
+    let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
+    let object = unsafe Pointer.read<ValueBits>(unsafe operandCell(top, 2))
+    let value = unsafe Pointer.read<ValueBits>(unsafe operandCell(top, 1))
+    if run unsafe objects.defineFieldAt(&mut hooks, rt, object, atom, value, site) { return 0 }
+    return 2
+  }
+  if opcode == op.OP_array_from {
+    let count = u8.toUsize(bytes[pc + 1]) | usize.shiftLeft(u8.toUsize(bytes[pc + 2]), 8)
+    if count > 16 { return 2 }
+    let first = unsafe operandCell(top, count)
+    if run unsafe objects.arrayAt(&mut hooks, memory, context, first, count) { return 0 }
+    return 2
+  }
+  return 2
+}
+/// SERVICE_CONCAT (js_baseline): the + of the values in left and the cell at address right.
+unsafe effect fn baselineConcat<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, record: *mut baseline.BaselineFrame, bytecode: *mut HeapHeader,
+  left: *mut ValueBits, right: usize, request: u64) -> u64 ? &mut Allocator {
+  let borrowed = (request & baseline.CONCAT_BORROWED) != 0
+  // left + (right - left), so the pointer keeps left's provenance.
+  let bytes = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut u8>(left))
+  let other = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(unsafe Pointer.atMut<u8>(bytes, usize.wrappingSubtract(right, Pointer.address<ValueBits>(left))))
+  let a = unsafe Pointer.read<ValueBits>(left)
+  let mut b = unsafe Pointer.read<ValueBits>(other)
+  if !a.isString() && !b.isString() { return 2 }
+  let rt = unsafe runtime.contextRuntime(context)
+  if borrowed { b = unsafe b.retained() }
+  if (request & baseline.CONCAT_STACK) != 0 && a.isString() && b.isString() {
+    // `a + b + 'c'`, as the interpreter's add joins it (js_vm_operators addThree): the
+    // literal's push and the add after it are done with this one.
+    let anchor = ()
+    let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+    let code = unsafe function.code.asSlice()
+    let stack = u16.toUsize(function.stackSize)
+    drop function
+    let pc = u64.toUsize(u64.shiftRight(request, 16))
+    if pc < code.length {
+      let after = pc + u8.toUsize(op.opcodeInfo(code[pc], true).size)
+      if after + 6 <= code.length && code[after] == op.OP_push_atom_value && code[after + 5] == op.OP_add {
+        let atom = u8.toU32(code[after + 1]) | u32.shiftLeft(u8.toU32(code[after + 2]), 8) | u32.shiftLeft(u8.toU32(code[after + 3]), 16) | u32.shiftLeft(u8.toU32(code[after + 4]), 24)
+        let three = run Effect.result(unsafe operators.joinThree(rt, a, b, atom))
+        match move three {
+          Result<ValueBits, OutOfMemoryError>.Success { value } => {
+            match value {
+              ValueBits.Uninitialized => ()
+              _ => {
+                unsafe Pointer.write<ValueBits>(left, value)
+                // The operand stack ends where the record starts: left's index, plus the result.
+                let below = (Pointer.address<baseline.BaselineFrame>(unsafe Intrinsic.pointerRequalify<*mut baseline.BaselineFrame, *const baseline.BaselineFrame>(record)) - Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(left))) / Layout.of<ValueBits>().bytes
+                return baseline.moved(after + 6, stack - below + 1)
+              }
+            }
+          }
+          // Nothing was consumed: the two-part join below reports what fails.
+          Result<ValueBits, OutOfMemoryError>.Failure { .. } => ()
+        }
+      }
+    }
+  }
+  let joined = run Effect.result(operators.joinValues(a, b))
+  match move joined {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => {
+      match value {
+        ValueBits.Uninitialized => { if borrowed { unsafe gc.release(&mut hooks, rt, b) } return 2 }
+        _ => ()
+      }
+      unsafe Pointer.write<ValueBits>(left, value)
+      return 0
+    }
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => {
+      // The concatenation consumed its string operands.
+      unsafe Pointer.write<ValueBits>(left, ValueBits.Undefined)
+      if !borrowed { unsafe Pointer.write<ValueBits>(other, ValueBits.Undefined) }
+      // The error's stack names the code's frames.
+      unsafe baseline.build(rt, record)
+      let _pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&context, context), move error), core.exceptionValue)
+      return 1
+    }
+  }
+}
+/// SERVICE_CONSTRUCT: `new` of function with newTarget on argv, borrowed, as constructInline
+/// does it for the interpreter: from the constructor's plan or recipe where it has one,
+/// through the function a forwarding wrapper calls, or by running it. Arguments a plan moved
+/// into the object are left Undefined in argv.
+@inlineNever
+unsafe effect fn baselineConstruct<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, newTarget: ValueBits, argv: &FrameSlots) -> ValueBits
+  ! JsException ? &mut Allocator {
+  if !function.isObject() || unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION || !boxing.isConstructor(unsafe lendBits(&function, function)) {
+    return run unsafe constructInternal(&mut hooks, memory, context, function, newTarget, argv, activation.COPY_ARGUMENTS)
+  }
+  let mut realm = context
+  if unsafe isDerivedConstructor(function, &mut realm) {
+    return run unsafe constructInternal(&mut hooks, memory, context, function, newTarget, argv, activation.COPY_ARGUMENTS)
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  let form = unsafe constructors.formOf(function)
+  let same = unsafe sameValueBits(function, newTarget)
+  let mut polled = false
+  if same && form != CONSTRUCT_GENERIC {
+    let mut planned = ValueBits.Uninitialized
+    let mut consumed = false
+    if form == CONSTRUCT_STORES { planned = run unsafe constructPlanned(&mut hooks, memory, realm, function, argv, &mut consumed) }
+    else {
+      if interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
+      polled = true
+      planned = run unsafe constructRecipe(&mut hooks, memory, realm, rt, function, form, argv)
+    }
+    match planned {
+      ValueBits.Object { reference } => {
+        if form != CONSTRUCT_STORES { unsafe gc.pinConstructed(&mut hooks, rt, reference) }
+        if consumed {
+          // Moved into the object bitwise: the code's releases find nothing.
+          let mut index: usize = 0
+          while index < argv.count {
+            unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(argv.data), index), ValueBits.Undefined)
+            index = index + 1
+          }
+        }
+        return planned
+      }
+      _ => ()
+    }
+  }
+  if !polled && interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
+  let receiver = run unsafe constructors.createReceiver(&mut hooks, memory, unsafe lendRealm(&realm, realm), newTarget)
+  if form == CONSTRUCT_STORES && unsafe constructors.simpleConstruct(&mut hooks, rt, function, receiver, argv) {
+    match receiver { ValueBits.Object { reference } => { unsafe gc.pinConstructed(&mut hooks, rt, reference) } _ => () }
+    return receiver
+  }
+  if form == CONSTRUCT_EVAL && run unsafe evaluation.constructGrowing(&mut hooks, rt, core.reference(newTarget), function, receiver, argv, same) {
+    match receiver { ValueBits.Object { reference } => { unsafe gc.pinConstructed(&mut hooks, rt, reference) } _ => () }
+    return receiver
+  }
+  if form == CONSTRUCT_FORWARD {
+    // new W(...) for a wrapper W whose body is this[name].apply(this, arguments): the
+    // function it names runs on the receiver, and its result is the wrapper's to drop.
+    let target = unsafe forwardedTarget(rt, function, receiver, unsafe constructors.forwardedAtom(function))
+    if target.isObject() {
+      if unsafe constructors.formOf(target) == CONSTRUCT_EVAL && run unsafe evaluation.constructGrowing(&mut hooks, rt, core.reference(newTarget), target, receiver, argv, true) {
+        match receiver { ValueBits.Object { reference } => { unsafe gc.pinConstructed(&mut hooks, rt, reference) } _ => () }
+        return receiver
+      }
+      let called = run Intrinsic.catchFailure<JsException>(unsafe callInternal(&mut hooks, memory, context, target, receiver, ValueBits.Undefined, argv, activation.COPY_ARGUMENTS), failedConstruct)
+      return match move called {
+        ValueBits value => { unsafe gc.release(&mut hooks, rt, value) receiver }
+        FailedConstruct { error } => { unsafe gc.release(&mut hooks, rt, receiver) fail move error }
+      }
+    }
+  }
+  return run unsafe constructWith(&mut hooks, memory, context, function, receiver, newTarget, argv, JS_CALL_FLAG_CONSTRUCTOR | activation.COPY_ARGUMENTS)
+}
 unsafe effect fn stackOverflowValue<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader) -> ValueBits
   ! JsException ? &mut Allocator {
   return run unsafe stackOverflow(&mut hooks, memory, context)
 }
 /// SERVICE_FINISH: the interpreter takes over the activation of record, a built baseline frame
 /// whose StackFrame holds the bytecode offset to continue at, with sp operands on its
-/// stack, runs it to its return (after unwinding to a handler when throwing) and releases
-/// its cells, as callResuming does for a frame it built. The frame stays published; the code
-/// unlinks it.
+/// stack, runs it to its return and releases its cells, as callResuming does for a frame it
+/// built: 0 with the result in the record, or 1 when it threw. The frame stays published; the
+/// code unlinks it. When throwing, the pending exception is unwound instead: 1 when the frame
+/// has no handler for it (the cells are released), or js_baseline.moved to the handler, where
+/// the code goes on.
 unsafe effect fn baselineFinish<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, record: *mut baseline.BaselineFrame, throwing: bool, sp: usize) -> u64 ? &mut Allocator {
@@ -745,16 +1124,23 @@ unsafe effect fn baselineFinish<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
   let framePointer = Pointer.fromMutRef<StackFrame>(&mut running.frame)
   let argv = FrameSlots { data: running.argv, count: running.argc }
   let pc = running.frame.currentPc if pc == NO_PC { invariant() }
-  let function = running.frame.currentFunction
   let receiver = running.frame.thisValue
   let newTarget = running.frame.newTarget
   drop running
   let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
   let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
-  let description = unsafe activation.describe(function, empty, emptyRefs, argv.count, activation.COPY_ARGUMENTS, false)
+  let description = unsafe baselineDescribe(record, empty, emptyRefs)
   let rt = unsafe runtime.contextRuntime(description.realm)
   let mut machine = unsafe activation.machine(&description, rt, description.realm, framePointer, &argv, receiver, newTarget, empty, pc, sp)
-  let result = run Effect.result(unsafe dispatch(&mut hooks, memory, &mut machine, throwing))
+  if throwing {
+    // A handler of the frame's own takes the exception: the code goes on there.
+    let noted = run Effect.result(unsafe debugger.boundary(&mut hooks, memory, &machine, machine.pc(), true))
+    let stands = match move noted { Result<(), JsException>.Success { .. } => true Result<(), JsException>.Failure { .. } => false }
+    if stands && run unsafe unwind(&mut hooks, memory, &mut machine) { return baseline.moved(machine.pc(), machine.sp()) }
+    unsafe activation.release(&mut hooks, &description, &machine)
+    return 1
+  }
+  let result = run Effect.result(unsafe dispatch(&mut hooks, memory, &mut machine, false))
   unsafe activation.release(&mut hooks, &description, &machine)
   match move result {
     Result<ValueBits, JsException>.Success { value } => {
@@ -764,6 +1150,69 @@ unsafe effect fn baselineFinish<H: HeapHooks + CoercionHooks + OwnPropertyHooks 
       return 0
     }
     Result<ValueBits, JsException>.Failure { .. } => { return 1 }
+  }
+}
+/// SERVICE_STEP: the interpreter runs the one instruction at the frame's bytecode offset on
+/// the cells of record, a built baseline frame with sp operands on its stack. 0 when the
+/// frame is then at next, the offset of the instruction after it, with after operands, as
+/// the code expects: the code goes on there.
+/// js_baseline.moved when the frame is at another instruction (a branch, instructions the
+/// interpreter runs as one, a handler that took what the instruction threw): the code goes on
+/// there if it has code for it. Otherwise the interpreter ran the activation to its end, as
+/// baselineFinish does (the instruction returned, or threw with no handler in the frame): 1
+/// with the result in the record, or 2 when it threw.
+unsafe effect fn baselineStep<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, record: *mut baseline.BaselineFrame, next: usize, after: usize, sp: usize) -> u64 ? &mut Allocator {
+  let mut anchor = ()
+  let running = unsafe Pointer.borrowMut<(), baseline.BaselineFrame>(&mut anchor, record)
+  let framePointer = Pointer.fromMutRef<StackFrame>(&mut running.frame)
+  let argv = FrameSlots { data: running.argv, count: running.argc }
+  let pc = running.frame.currentPc if pc == NO_PC { invariant() }
+  let receiver = running.frame.thisValue
+  let newTarget = running.frame.newTarget
+  drop running
+  let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
+  let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
+  let description = unsafe baselineDescribe(record, empty, emptyRefs)
+  let rt = unsafe runtime.contextRuntime(description.realm)
+  let mut machine = unsafe activation.machine(&description, rt, description.realm, framePointer, &argv, receiver, newTarget, empty, pc, sp)
+  let mut handoff = false
+  let mut result: Result<ValueBits, JsException> = Result<ValueBits, JsException>.Success { value: ValueBits.Undefined }
+  let executed = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(
+    unsafe executeSingle(&mut hooks, memory, &mut machine, &mut handoff), failed)
+  match move executed {
+    ValueBits value => {
+      if handoff {
+        // The frame itself at the next instruction: an inline callee's frame above it is a
+        // run the plain loop handed to the observed one.
+        if Pointer.address<Machine>(unsafe activation.innermost(&mut machine)) == Pointer.address<Machine>(Pointer.fromMutRef<Machine>(&mut machine)) {
+          if machine.pc() == next && machine.sp() == after { return 0 }
+          // An instruction the interpreter ran together with those after it, or a branch.
+          return baseline.moved(machine.pc(), machine.sp())
+        }
+        result = run Effect.result(unsafe dispatch(&mut hooks, memory, &mut machine, false))
+      } else { result = Result<ValueBits, JsException>.Success { value: value } }
+    }
+    Failed { error } => {
+      if !unsafe restricted.rejected(machine.runtime) {
+        let _pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+        run unsafe exceptionBoundary(&mut hooks, memory, &mut machine)
+      } else { drop error }
+      // A handler of the frame's own: the code goes on there.
+      if run unsafe unwindFrames(&mut hooks, memory, &mut machine) { return baseline.moved(machine.pc(), machine.sp()) }
+      result = Result<ValueBits, JsException>.Failure { error: JsException {} }
+    }
+  }
+  unsafe activation.release(&mut hooks, &description, &machine)
+  match move result {
+    Result<ValueBits, JsException>.Success { value } => {
+      let mut resultAnchor = ()
+      let after = unsafe Pointer.borrowMut<(), baseline.BaselineFrame>(&mut resultAnchor, record)
+      after.result = value
+      return 1
+    }
+    Result<ValueBits, JsException>.Failure { .. } => { return 2 }
   }
 }
 /// Runs the compiled code linked as index (FunctionBytecode.compiled, nonzero) for machine, a
@@ -1812,6 +2261,14 @@ unsafe effect fn executeObserved<H: HeapHooks + CoercionHooks + OwnPropertyHooks
   let mode = ObservedRun { unused: 0 }
   return run unsafe executeLoop(&mut hooks, memory, &mut base, &mode, &mut handoff)
 }
+@inlineNever
+unsafe effect fn executeSingle<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, base: &mut Machine, handoff: &mut bool) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let mode = SingleRun { unused: 0 }
+  return run unsafe executeLoop(&mut hooks, memory, &mut base, &mode, &mut handoff)
+}
 /// The interrupt poll of a backward jump that fell due, out of line so the dispatch loop
 /// carries one call: handles the interrupt, then reports whether a plain run must hand off
 /// to the observed loop, else lets compiled loop code take the frame (js_compiled_osr).
@@ -1822,6 +2279,7 @@ unsafe effect fn backEdgePoll<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context))
   if observe { return false }
   if unsafe Pointer.read<bool>(unsafe observationFlag(machine.runtime)) { return true }
+  if run unsafe baselineLoop(&mut hooks, &mut machine) { return false }
   run unsafe osrAtPoll(&mut hooks, memory, &mut machine)
   return false
 }
@@ -1859,11 +2317,24 @@ unsafe effect fn osrAtPoll<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
 }
 /// Which copy of the dispatch loop a run is in: a type, so each copy is its
 /// own instance with the answer constant.
-interface Observation { fn observes(self: &Self) -> bool }
+interface Observation { fn observes(self: &Self) -> bool fn single(self: &Self) -> bool }
 struct PlainRun { unused: u8 }
-impl Observation for PlainRun { @inlineAlways fn observes(self: &Self) -> bool { return false } }
+impl Observation for PlainRun {
+  @inlineAlways fn observes(self: &Self) -> bool { return false }
+  @inlineAlways fn single(self: &Self) -> bool { return false }
+}
 struct ObservedRun { unused: u8 }
-impl Observation for ObservedRun { @inlineAlways fn observes(self: &Self) -> bool { return true } }
+impl Observation for ObservedRun {
+  @inlineAlways fn observes(self: &Self) -> bool { return true }
+  @inlineAlways fn single(self: &Self) -> bool { return false }
+}
+/// The plain loop for one instruction of the frame it starts in (baselineStep): it stops,
+/// with handoff set, before that frame's next instruction.
+struct SingleRun { unused: u8 }
+impl Observation for SingleRun {
+  @inlineAlways fn observes(self: &Self) -> bool { return false }
+  @inlineAlways fn single(self: &Self) -> bool { return true }
+}
 /// The dispatch loop. Returns with handoff set (and the frames' state written
 /// back) when the run must continue in the other copy.
 unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
@@ -1881,8 +2352,15 @@ unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
   // One runtime serves every frame, so the flag's address holds for the whole run.
   let observeInstructions = unsafe observationFlag(m.runtime)
   let mut restricting = false
+  let single = mode.single()
+  let start = Pointer.address<Machine>(current)
+  let mut stepped = false
   while true {
     let mut anchor = () let machine = unsafe Pointer.borrowMut<(), Machine>(&mut anchor, current)
+    if single {
+      if stepped && Pointer.address<Machine>(current) == start { unsafe sync(&m, &mut machine) handoff.* = true return ValueBits.Undefined }
+      stepped = true
+    }
     if observe {
       unsafe sync(&m, &mut machine)
       if !unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined }
@@ -4683,9 +5161,21 @@ unsafe effect fn callInlineKnown<H: HeapHooks + CoercionHooks + OwnPropertyHooks
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, function: ValueBits, argv: FrameSlots, first: usize) -> *mut Machine ! JsException ? &mut Allocator {
   let running = Pointer.fromMutRef<Machine>(&mut machine)
+  let bytecode = match function { ValueBits.FunctionBytecode { reference } => reference _ => invariant() }
+  // Linked to baseline code (js_baseline): it runs on the operand cells, in the scope an
+  // inline frame of it would get.
+  let linked = unsafe baselineIndex(bytecode)
+  if linked != 0 && unsafe baselineOpen(machine.runtime) {
+    let emptyRefs = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ?*mut HeapHeader>(running))
+    let known = unsafe activation.knownContext(bytecode, unsafe Intrinsic.pointerRequalify<*mut Machine, *const Machine>(running), emptyRefs)
+    let mut value = ValueBits.Undefined
+    let host = unsafe Intrinsic.pointerReinterpret<*mut H, *mut u8>(Pointer.fromMutRef<H>(&mut hooks))
+    if unsafe enterBaselineKnown(machine.runtime, host, bytecode, known.scope, argv, Pointer.fromMutRef<ValueBits>(&mut value), linked) != 0 { fail JsException {} }
+    unsafe releaseOperands(&mut hooks, &mut machine, first) unsafe machine.push(value)
+    return running
+  }
   let entered = unsafe activation.enterKnown(machine.runtime, function, argv, unsafe machine.slot(first), running, machine.context)
   match entered { Option<*mut Machine>.Some { value } => { return value } Option<*mut Machine>.None => () }
-  let bytecode = match function { ValueBits.FunctionBytecode { reference } => reference _ => invariant() }
   let index = unsafe compiledIndex(bytecode)
   if index != 0 && run unsafe callCompiled(&mut hooks, memory, &mut machine, function, bytecode, index, ValueBits.Undefined, argv, first, true) {
     return running
@@ -4881,10 +5371,11 @@ unsafe effect fn callInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Ge
     if function.isObject() && unsafe classId(function) == classes.JS_CLASS_BYTECODE_FUNCTION {
       let callee = unsafe activation.calleeOf(function)
       // Linked to baseline code (js_baseline): it runs on the operand cells, on its own frame.
-      if unsafe baselineIndex(callee.bytecode) != 0 && unsafe baselineOpen(machine.runtime) {
+      let linked = unsafe baselineIndex(callee.bytecode)
+      if linked != 0 && unsafe baselineOpen(machine.runtime) {
         let mut value = ValueBits.Undefined
         let host = unsafe Intrinsic.pointerReinterpret<*mut H, *mut u8>(Pointer.fromMutRef<H>(&mut hooks))
-        if unsafe enterBaseline(machine.runtime, host, function, receiver, argv, Pointer.fromMutRef<ValueBits>(&mut value)) != 0 { fail JsException {} }
+        if unsafe enterBaseline(machine.runtime, host, function, receiver, argv, Pointer.fromMutRef<ValueBits>(&mut value), linked, false) != 0 { fail JsException {} }
         unsafe releaseOperands(&mut hooks, &mut machine, start - extra) unsafe machine.push(value)
         return running
       }
@@ -5071,15 +5562,35 @@ unsafe effect fn constructInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks
         unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(receiver)
         return running
       }
+      if target.isObject() && unsafe baselineOpen(machine.runtime) {
+        // The wrapper's function in baseline code: a plain call on the receiver, whose
+        // result the wrapper drops.
+        let linked = unsafe baselineIndex((unsafe activation.calleeOf(target)).bytecode)
+        if linked != 0 {
+          let mut value = ValueBits.Undefined
+          let host = unsafe Intrinsic.pointerReinterpret<*mut H, *mut u8>(Pointer.fromMutRef<H>(&mut hooks))
+          if unsafe enterBaseline(machine.runtime, host, target, receiver, argv, Pointer.fromMutRef<ValueBits>(&mut value), linked, false) != 0 {
+            unsafe gc.release(&mut hooks, machine.runtime, receiver)
+            fail JsException {}
+          }
+          unsafe gc.release(&mut hooks, machine.runtime, value)
+          unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(receiver)
+          return running
+        }
+      }
       if target.isObject() {
         let forwarded = unsafe activation.enterInline(machine.runtime, target, argv, first, running, context, receiver,
           newTarget, true, false)
         match forwarded { Option<*mut Machine>.Some { value } => { unsafe activation.markForwarded(value) return value } Option<*mut Machine>.None => () }
       }
     }
-    let entered = unsafe activation.enterInline(machine.runtime, function, argv, first, running, context, receiver,
-      newTarget, true, false)
-    match entered { Option<*mut Machine>.Some { value } => { return value } Option<*mut Machine>.None => () }
+    // Linked to baseline code (js_baseline): constructWith reaches its construct entry.
+    let linked = unsafe sameValueBits(function, newTarget) && unsafe baselineOpen(machine.runtime) && unsafe baselineIndex((unsafe activation.calleeOf(function)).bytecode) != 0
+    if !linked {
+      let entered = unsafe activation.enterInline(machine.runtime, function, argv, first, running, context, receiver,
+        newTarget, true, false)
+      match entered { Option<*mut Machine>.Some { value } => { return value } Option<*mut Machine>.None => () }
+    }
     result = run unsafe constructWith(&mut hooks, memory, context, function, receiver, newTarget, &argv, JS_CALL_FLAG_CONSTRUCTOR)
   }
   unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(result)
