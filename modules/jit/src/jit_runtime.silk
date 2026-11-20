@@ -35,7 +35,7 @@ import jit_recompile { History }
 import jit_recompile as recompile
 import ssa_input { inputOf }
 import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, Refusal as TranslateRefusal }
-import ssa { Function }
+import ssa { Function, TARGET_EXACT }
 import jit_helpers { CompiledEnv }
 import jit_cost { Cost, now }
 import baseline
@@ -72,10 +72,10 @@ pub const KEPT_CAPACITY: usize = 16384
 /// (js_compiled_inline.setSiteShapes): a power of two.
 pub const SITE_SHAPE_ENTRIES: usize = 2048
 /// Candidates looked up for one compilation, nested ones included, and how deep they nest.
-const MAX_CANDIDATES: usize = 64
-const CANDIDATE_DEPTH: u32 = 2
+const MAX_CANDIDATES: usize = 128
+const CANDIDATE_DEPTH: u32 = 4
 /// A callee longer than this many bytes of code is not a candidate (ssa_translate's limit).
-const CANDIDATE_BYTES: usize = 260
+const CANDIDATE_BYTES: usize = 460
 /// Address space reserved for machine code.
 const CODE_BYTES: usize = 67108864
 
@@ -799,8 +799,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
   // What its method calls call, to inline: cells[id] is the FunctionBytecode cell of the
   // target a CallTarget names.
   let mut cells = List<?*mut HeapHeader>.make()
+  let mut closures = List<?*mut HeapHeader>.make()
   let mut targets = List<CallTarget>.make()
-  if jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells) }
+  if jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, true) }
   let none = List<u32>.make()
   // Where its earlier code left at guards.
   let mut sites = List<u32>.make()
@@ -820,7 +821,7 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
   }
   // The symbols: the shared stubs, the baseline code's tails and entry, then per inline
-  // target the address of its cell and of the first byte of its code.
+  // target the address of its cell, of the first byte of its code and of its closure.
   let mut symbols = List<usize>.make()
   run symbols.appendSlice(jit.baselineSymbols.asSlice())
   run symbols.append(info.entry + u32.toUsize(info.moved))
@@ -831,11 +832,34 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
   if let Lowered.Code { inlined, .. } = &result {
     let mut k: usize = 0
     while k < inlined.length() {
-      let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cells.get(u32.toUsize(inlined.get(k))))
+      let id = u32.toUsize(u32.bitAnd(inlined.get(k), u32.bitNot(TARGET_EXACT)))
+      let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cells.get(id))
       if !(unsafe inline.keep(rt, cell)) { jit.optimizeRefused = jit.optimizeRefused + 1 return () }
       run symbols.append(Pointer.address<HeapHeader>(cell))
       run symbols.append(Pointer.address<u8>(unsafe inline.codeStart(cell)))
+      // The closure of an exact target: the code holds its address, the runtime a count.
+      let mut closure: usize = 0
+      if u32.bitAnd(inlined.get(k), TARGET_EXACT) != 0 {
+        let object = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(closures.get(id))
+        if !(unsafe inline.keepClosure(rt, object)) { jit.optimizeRefused = jit.optimizeRefused + 1 return () }
+        closure = Pointer.address<HeapHeader>(object)
+      }
+      run symbols.append(closure)
       k = k + 1
+    }
+    // The variable cells the code reads by address: (target << 16 | variable), each a cell
+    // of that target's closure, which the runtime keeps.
+    if let Lowered.Code { cells: named, .. } = &result {
+      let mut c: usize = 0
+      while c < named.length() {
+        let entry = named.get(c)
+        c = c + 1
+        let id = u32.toUsize(u32.bitAnd(inlined.get(u32.toUsize(u32.shiftRight(entry, 16))), u32.bitNot(TARGET_EXACT)))
+        let mut cell: usize = 0
+        if let Option<*mut HeapHeader>.Some { value: object } = Pointer.nonNullMut<HeapHeader>(closures.get(id)) { cell = unsafe inline.ownedCell(object, u32.bitAnd(entry, 0xffff)) }
+        if cell == 0 { jit.optimizeRefused = jit.optimizeRefused + 1 return () }
+        run symbols.append(cell)
+      }
     }
     inlinedSites = inlined.length()
   }
@@ -1074,8 +1098,9 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   // What its method calls called last, to inline (docs/jit/inlining.md): cells[id] is the
   // FunctionBytecode cell of the target a CallTarget names.
   let mut cells = List<?*mut HeapHeader>.make()
+  let mut closures = List<?*mut HeapHeader>.make()
   let mut targets = List<CallTarget>.make()
-  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells) }
+  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, false) }
   let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &plan.elements, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
@@ -1295,7 +1320,8 @@ pub unsafe effect fn install(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mu
 unsafe effect fn installLinked(jit: &mut Jit, bytecode: *mut HeapHeader, code: &mut Code, callWords: u32, sites: &List<u32>, spent: u64, targets: &List<?*mut HeapHeader>) -> bool ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
   if jit.entries.length() >= CAPACITY { return false }
   let attachedRuntime = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
-  // Per target: the address of its cell, then of the first byte of its code.
+  // Per target: the address of its cell, of the first byte of its code, and a word for the
+  // closure of an exact target, which this entry kind has none of.
   let mut symbols = List<usize>.make()
   let mut s: usize = 0
   while s < targets.length() {
@@ -1303,6 +1329,7 @@ unsafe effect fn installLinked(jit: &mut Jit, bytecode: *mut HeapHeader, code: &
     if !(unsafe inline.keep(attachedRuntime, cell)) { return false }
     run symbols.append(Pointer.address<HeapHeader>(cell))
     run symbols.append(Pointer.address<u8>(unsafe inline.codeStart(cell)))
+    run symbols.append(0)
     s = s + 1
   }
   if jit.memory.isNone() { jit.memory = Option<CodeMemory>.some(run CodeMemory.reserve(CODE_BYTES)) }
@@ -1331,10 +1358,25 @@ unsafe effect fn installLinked(jit: &mut Jit, bytecode: *mut HeapHeader, code: &
   return true
 }
 
+/// CallTarget.owned for a target whose one closure is closure (null: none): which of its
+/// first 64 variable cells own an initialized value.
+unsafe fn ownedCells(closure: ?*mut HeapHeader) -> u64 {
+  let object = match Pointer.nonNullMut<HeapHeader>(closure) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return 0 } }
+  let mut owned: u64 = 0
+  let mut i: u32 = 0
+  while i < 64 {
+    if unsafe inline.ownedCell(object, i) != 0 { owned = u64.bitOr(owned, u64.shiftLeft(1, u32.toU64(i))) }
+    i = i + 1
+  }
+  return owned
+}
+
 /// The inline candidates of bytecode (docs/jit/inlining.md): for each get_field2 whose site
 /// cache names a small plain function on a prototype, that function, with its own candidates
 /// while depth allows. cells receives each one's FunctionBytecode cell address, at its id.
-unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
+/// closures receives, at the same place, the closure of a target that is one closure (exact:
+/// its id carries ssa.TARGET_EXACT), or null.
+unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, exact: bool) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
   let mut targets = List<CallTarget>.make()
   let rt = match Pointer.nonNullMut<HeapHeader>(jit.runtime) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return move targets } }
   let anchor = ()
@@ -1362,8 +1404,9 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         input.siteShapes = run unsafe siteShapesOf(rt, cell)
         let id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells) }
-        run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false })
+        run closures.append(Pointer.null<HeapHeader>())
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, exact) }
+        run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0 })
       }
     }
   }
@@ -1376,13 +1419,18 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
     // are recorded): several, or one among shapes whose method is not known, are tested in
     // turn where they are called (CallTarget.chained).
     let mut several: [?*mut HeapHeader; 4] = [Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()]
+    // The closure each was read as, when the site read one closure for it: the target is
+    // then that closure (ssa.TARGET_EXACT).
+    let mut objects: [?*mut HeapHeader; 4] = [Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()]
     let mut partial = false
     let mut known: u32 = 0
-    if opcode == op.OP_get_field2 { known = unsafe inline.methodTargets(rt, bytecode, usize.toU32(pc), &mut several, &mut partial) }
+    if opcode == op.OP_get_field2 { known = unsafe inline.methodTargets(rt, bytecode, usize.toU32(pc), &mut several, &mut objects, &mut partial) }
     if known > 1 || (known == 1 && partial) {
       let mut n: usize = 0
       while n < u32.toUsize(known) && cells.length() < MAX_CANDIDATES {
         let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(several[n])
+        let mut object = objects[n]
+        if !exact { object = Pointer.null<HeapHeader>() }
         n = n + 1
         let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
         if (unsafe callee.code.asSlice()).length > CANDIDATE_BYTES {
@@ -1391,21 +1439,27 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         }
         let mut input = run inputOf(&callee)
         input.siteShapes = run unsafe siteShapesOf(rt, cell)
-        let id = usize.toU32(cells.length())
+        let mut id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells) }
-        run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true })
+        run closures.append(object)
+        if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, exact) }
+        run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object) })
       }
     } else if opcode == op.OP_get_field2 {
-      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc))) {
+      let mut object = Pointer.null<HeapHeader>()
+      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc), &mut object)) {
+        if !exact { object = Pointer.null<HeapHeader>() }
         let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
         if (unsafe callee.code.asSlice()).length <= CANDIDATE_BYTES {
           let mut input = run inputOf(&callee)
           input.siteShapes = run unsafe siteShapesOf(rt, cell)
-          let id = usize.toU32(cells.length())
+          let mut id = usize.toU32(cells.length())
           run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
-          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells) }
-          run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false })
+          run closures.append(object)
+          if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
+          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, exact) }
+          run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object) })
         } else if jit.options.dump && depth == 0 { run say(b"jit: no inline target: ", b"the method is too long") }
       } else if jit.options.dump && depth == 0 {
         let why = unsafe inline.methodMiss(rt, bytecode, usize.toU32(pc))

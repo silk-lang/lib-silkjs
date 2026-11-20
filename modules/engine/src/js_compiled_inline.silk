@@ -9,14 +9,14 @@ import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import silk.core.option { Option }
-import js_core_types { RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FunctionKind, FIELD_PROTO_KEY, FIELD_PASS_THROUGH, fieldCacheIndex, SiteShapes, SITE_SHAPES, siteShapeIndex }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FunctionKind, VarRef, VarRefState, FIELD_PROTO_KEY, FIELD_PASS_THROUGH, fieldCacheIndex, SiteShapes, SITE_SHAPES, siteShapeIndex }
 import js_gc { HeapHooks }
 import js_gc as gc
 
 /// The FunctionBytecode cell of the bytecode closure that the get_field2 at offset pc of
 /// bytecode last read from a prototype (its site cache entry, still current), or null: the
 /// method a call_method after it would call. A snapshot, to be guarded where it is used.
-pub unsafe fn methodTarget(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32) -> ?*mut HeapHeader {
+pub unsafe fn methodTarget(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32, closure: &mut ?*mut HeapHeader) -> ?*mut HeapHeader {
   let anchor = ()
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let site = Pointer.address<u8>(unsafe code.code.start()) + u32.toUsize(pc) + 1
@@ -36,6 +36,7 @@ pub unsafe fn methodTarget(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, 
   let target = match Pointer.nonNullMut<HeapHeader>(unsafe closureBytecode(found)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() } }
   // An inlined body runs for the caller's realm.
   if Pointer.address<HeapHeader>((unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, target)).realm) != Pointer.address<HeapHeader>(realm) { return Pointer.null<HeapHeader>() }
+  closure.* = closureObject(found)
   return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(target)
 }
 /// The plain bytecode functions the `get_field2` at pc of bytecode read from prototypes, one
@@ -44,7 +45,7 @@ pub unsafe fn methodTarget(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, 
 /// more than SITE_SHAPES shapes or nothing is recorded of it; `partial` is set when some
 /// shape's method is not known (an own property, a prototype that changed since, another
 /// realm's function). Snapshots, to be guarded where they are used.
-pub unsafe fn methodTargets(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32, targets: &mut [?*mut HeapHeader; 4], partial: &mut bool) -> u32 {
+pub unsafe fn methodTargets(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32, targets: &mut [?*mut HeapHeader; 4], closures: &mut [?*mut HeapHeader; 4], partial: &mut bool) -> u32 {
   let anchor = ()
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let site = Pointer.address<u8>(unsafe code.code.start()) + u32.toUsize(pc) + 1
@@ -60,6 +61,7 @@ pub unsafe fn methodTargets(runtime: *mut HeapHeader, bytecode: *mut HeapHeader,
   let mut i: usize = 0
   while i < entry.seen {
     let mut found = Pointer.null<HeapHeader>()
+    let mut closure = Pointer.null<HeapHeader>()
     // The epoch is the one the entry was filled at: no prototype changed or died since, so
     // the holder is the object it was and the slot is where the property is.
     if u64.bitAnd(entry.keys[i], FIELD_PROTO_KEY) != 0 && u64.shiftRight(entry.keys[i], 62) != 3 && entry.epochs[i] == epoch
@@ -71,6 +73,7 @@ pub unsafe fn methodTargets(runtime: *mut HeapHeader, bytecode: *mut HeapHeader,
         if let Option<*mut HeapHeader>.Some { value: target } = Pointer.nonNullMut<HeapHeader>(unsafe closureBytecode(value)) {
           if Pointer.address<HeapHeader>((unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, target)).realm) == Pointer.address<HeapHeader>(realm) {
             found = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(target)
+            closure = closureObject(value)
           }
         }
       }
@@ -79,8 +82,15 @@ pub unsafe fn methodTargets(runtime: *mut HeapHeader, bytecode: *mut HeapHeader,
       Option<*mut HeapHeader>.Some { value: target } => {
         let mut known = false
         let mut n: usize = 0
-        while n < u32.toUsize(count) { if Pointer.address<HeapHeader>(targets[n]) == Pointer.address<HeapHeader>(target) { known = true } n = n + 1 }
-        if !known { targets[u32.toUsize(count)] = found count = count + 1 }
+        while n < u32.toUsize(count) {
+          if Pointer.address<HeapHeader>(targets[n]) == Pointer.address<HeapHeader>(target) {
+            known = true
+            // Two closures of one function: the function is the target, neither closure is.
+            if Pointer.address<HeapHeader>(closures[n]) != Pointer.address<HeapHeader>(closure) { closures[n] = Pointer.null<HeapHeader>() }
+          }
+          n = n + 1
+        }
+        if !known { targets[u32.toUsize(count)] = found closures[u32.toUsize(count)] = closure count = count + 1 }
       }
       Option<*mut HeapHeader>.None => { partial.* = true }
     }
@@ -131,6 +141,30 @@ pub unsafe fn closureBytecode(value: ValueBits) -> ?*mut HeapHeader {
   if code.kind != FunctionKind.Normal { return Pointer.null<HeapHeader>() }
   return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(bytecode)
 }
+/// The object of value when it is one, or null.
+pub fn closureObject(value: ValueBits) -> ?*mut HeapHeader {
+  return match value { ValueBits.Object { reference } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference) _ => Pointer.null<HeapHeader>() }
+}
+/// The address of variable cell `index` of the bytecode closure `closure` when that cell owns
+/// an initialized value, or 0. Such a cell owns one from then on (a cell never goes back to
+/// a frame, and a binding is initialized once), at the same address while the closure lives:
+/// code that keeps the closure (keepClosure) may read the cell without a test.
+pub unsafe fn ownedCell(closure: *mut HeapHeader, index: u32) -> usize {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, closure)
+  let mut cell = Pointer.null<HeapHeader>()
+  match &data.payload {
+    ObjectPayload.BytecodeFunction { function } => { if u32.toUsize(index) < function.varRefs.length() { cell = function.varRefs.get(u32.toUsize(index)) } }
+    _ => ()
+  }
+  drop data
+  let found = match Pointer.nonNullMut<HeapHeader>(cell) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return 0 } }
+  let binding = unsafe HeapCell.payload<VarRef, ()>(&anchor, found)
+  return match binding.state {
+    VarRefState.Detached { value } => match value { ValueBits.Uninitialized => 0 _ => Pointer.address<HeapHeader>(found) }
+    _ => 0
+  }
+}
 /// The first byte of bytecode's code: what CompiledFrame.code holds for it.
 pub unsafe fn codeStart(bytecode: *mut HeapHeader) -> *const u8 {
   let anchor = ()
@@ -154,6 +188,18 @@ pub unsafe fn keep(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> bool 
   state.compiled.keptCount = count + 1
   drop state
   unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, count), unsafe (ValueBits.FunctionBytecode { reference: bytecode }).retained())
+  return true
+}
+/// keep for a closure object that compiled code tests a callee against by address.
+pub unsafe fn keepClosure(runtime: *mut HeapHeader, closure: *mut HeapHeader) -> bool {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let count = state.compiled.keptCount
+  if count >= state.compiled.keptCapacity { return false }
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.compiled.kept))
+  state.compiled.keptCount = count + 1
+  drop state
+  unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, count), unsafe (ValueBits.Object { reference: closure }).retained())
   return true
 }
 /// Releases every kept value (destroyRuntime).
