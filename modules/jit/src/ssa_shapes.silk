@@ -17,7 +17,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import ssa { Function, Op, NONE, edgeCount }
-import ssa_translate { FunctionInput, FIELD_KEYED }
+import ssa_translate { FunctionInput, SiteShape, FIELD_KEYED, FIELD_CACHED }
 
 /// In Shapes.facts: the site's object is known to be an object; and to have the key's shape.
 pub const FACT_OBJECT: u8 = 1
@@ -27,12 +27,21 @@ const TAG_OBJECT: i32 = -1
 /// A key the compiler has not filled (js_vm_property_ops.fieldKeyAt).
 const NO_KEY: u64 = 18446744073709551615
 
+/// A cached site (Shapes.reads) that left before: a shape it has no test for goes to the
+/// helper instead of leaving, so the site proves nothing.
+pub const FACT_HEDGED: u8 = 4
+/// A cached site whose object is known to have the shape of its pair n: (1 + n) << FACT_PAIR.
+pub const FACT_PAIR: u8 = 4
+
 /// By instruction: the constant key of a field site (shape version << 16 | slot), or 0 for
-/// an instruction lowered as before; and the FACT_* of its object.
-pub struct Shapes { pub keys: List<u64>, pub facts: List<u8> }
+/// an instruction lowered as before; and the FACT_* of its object. For a cached field site
+/// the embedder knows the shapes of (FunctionInput.siteShapes): reads is 1 + its index in
+/// sites, and the read is lowered as tests against those shapes.
+pub struct Shapes { pub keys: List<u64>, pub facts: List<u8>, pub reads: List<u32>, pub sites: List<SiteShape> }
 
 impl Shapes {
-  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make() } }
+  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make(), reads: List<u32>.make(), sites: List<SiteShape>.make() } }
+  pub fn read(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.reads.length() { return self.reads.get(u32.toUsize(inst)) } return 0 }
   pub fn key(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.keys.length() { return self.keys.get(u32.toUsize(inst)) } return 0 }
   pub fn fact(self: &Self, inst: u32) -> u8 { if u32.toUsize(inst) < self.facts.length() { return self.facts.get(u32.toUsize(inst)) } return 0 }
 }
@@ -47,6 +56,15 @@ fn keyAt(code: &[u8], pc: u32) -> u64 {
   // A version the code can compare as a sign-extended 32-bit immediate.
   if key == NO_KEY || u64.shiftRight(key, 16) == 0 || u64.shiftRight(key, 16) >= 2147483648 { return 0 }
   return key
+}
+
+/// The shape version of a site cache key (own or of the prototype).
+pub fn versionOf(key: u64) -> u64 { return u64.shiftRight(u64.shiftLeft(key, 1), 17) }
+/// The entry of sites for the cached field site at pc, or none.
+fn siteAt(sites: &List<SiteShape>, pc: u32) -> SiteShape {
+  let mut s: usize = 0
+  while s < sites.length() { if sites.get(s).pc == pc { return sites.get(s) } s = s + 1 }
+  return SiteShape { pc: pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }
 }
 
 /// Whether op leaves every object's shape as it is. Anything not listed may change one.
@@ -71,10 +89,36 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
   run keys.appendRepeated(0, count)
   let mut facts = List<u8>.make()
   run facts.appendRepeated(0, count)
+  let mut reads = List<u32>.make()
+  run reads.appendRepeated(0, count)
+  let mut read = List<SiteShape>.make()
   let mut any = false
   let mut i: usize = 0
   while i < count {
     let inst = f.insts.get(i)
+    if inst.op == Op.GetField && (inst.k & 1) == FIELD_CACHED {
+      let mut site = SiteShape { pc: inst.pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }
+      let mut hedged = false
+      if inst.frame == 0 {
+        site = siteAt(&input.siteShapes, inst.pc)
+        let mut s: usize = 0
+        while s < sites.length() { if sites.get(s) == inst.pc { hedged = true } s = s + 1 }
+      } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
+        let id = f.inlineTargets.get(u32.toUsize(inst.frame - 1))
+        let mut t: usize = 0
+        while t < input.targets.length() {
+          let target = &input.targets.asSlice()[t]
+          if target.id == id { site = siteAt(&target.input.siteShapes, inst.pc) break }
+          t = t + 1
+        }
+      }
+      if site.count != 0 {
+        run read.append(site)
+        reads.set(i, usize.toU32(read.length()))
+        if hedged { facts.set(i, FACT_HEDGED) }
+        any = true
+      }
+    }
     if (inst.op == Op.GetField && inst.k == FIELD_KEYED) || inst.op == Op.PutField {
       let mut key: u64 = 0
       if inst.frame == 0 {
@@ -95,7 +139,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
     }
     i = i + 1
   }
-  if !any { return Shapes { keys: move keys, facts: move facts } }
+  if !any { return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read } }
   // The block each edge leaves.
   let blocks = u32.toUsize(f.blockCount())
   let values = u32.toUsize(f.valueCount())
@@ -173,10 +217,32 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         facts.set(index, fact)
         object.set(a, 1)
         version.set(a, u64.shiftRight(key, 16))
+      } else if reads.get(index) != 0 {
+        let site = read.get(u32.toUsize(reads.get(index) - 1))
+        let a = u32.toUsize(inst.a)
+        let mut fact = facts.get(index)
+        if object.get(a) != 0 { fact = u8.bitOr(fact, FACT_OBJECT) }
+        let mut n: u32 = 0
+        while n < site.count {
+          if version.get(a) != 0 && version.get(a) == versionOf(site.keys[u32.toUsize(n)]) { fact = u8.bitOr(fact, u8.shiftLeft(u32.wrappingToU8(n + 1), FACT_PAIR)) }
+          n = n + 1
+        }
+        facts.set(index, fact)
+        if u8.bitAnd(fact, FACT_HEDGED) != 0 {
+          // Its helper may run a getter.
+          let mut v: usize = 0
+          while v < values { version.set(v, 0) v = v + 1 }
+        } else {
+          object.set(a, 1)
+          if site.count == 1 { version.set(a, versionOf(site.keys[0])) }
+        }
+      } else if inst.op == Op.Release {
+        if u32.toUsize(inst.a) < values && object.get(u32.toUsize(inst.a)) != 0 { facts.set(index, FACT_OBJECT) }
       } else if inst.op == Op.Retain {
         // Another owner of the same object.
         if inst.result != NONE && u32.toUsize(inst.result) < values && u32.toUsize(inst.a) < values {
           let isObject = object.get(u32.toUsize(inst.a))
+          if isObject != 0 { facts.set(index, FACT_OBJECT) }
           let has = version.get(u32.toUsize(inst.a))
           object.set(u32.toUsize(inst.result), isObject)
           version.set(u32.toUsize(inst.result), has)
@@ -193,5 +259,5 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
     done.set(b, 1)
     b = b + 1
   }
-  return Shapes { keys: move keys, facts: move facts }
+  return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read }
 }
