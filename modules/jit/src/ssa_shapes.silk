@@ -11,6 +11,7 @@
 //! change no shape. Where blocks meet, a fact holds when every block before the meeting
 //! proved the same; a loop header starts with none (its back edge is not known yet).
 import silk.collections.list { List }
+import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u8
 import silk.num.u32
@@ -37,10 +38,20 @@ pub const FACT_PAIR: u8 = 4
 /// an instruction lowered as before; and the FACT_* of its object. For a cached field site
 /// the embedder knows the shapes of (FunctionInput.siteShapes): reads is 1 + its index in
 /// sites, and the read is lowered as tests against those shapes.
-pub struct Shapes { pub keys: List<u64>, pub facts: List<u8>, pub reads: List<u32>, pub sites: List<SiteShape> }
+/// same, by instruction: for a field read whose value an earlier value still holds (an
+/// earlier read of the same property of the same object, or what was stored there, with
+/// nothing since that could change it), that value: the read is a copy of it. NONE otherwise.
+pub struct Shapes { pub keys: List<u64>, pub facts: List<u8>, pub reads: List<u32>, pub sites: List<SiteShape>, pub same: List<u32> }
+/// A property whose value a value holds: `atom` of the object `object` (the first value
+/// that was this object, Retain copies seen through) is in the slot of `value`.
+struct Known { object: u32, atom: u32, value: u32 }
+impl Copy for Known {}
+/// The most properties tracked at a time; more push the oldest out.
+const KNOWN: usize = 8
 
 impl Shapes {
-  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make(), reads: List<u32>.make(), sites: List<SiteShape>.make() } }
+  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make(), reads: List<u32>.make(), sites: List<SiteShape>.make(), same: List<u32>.make() } }
+  pub fn sameAs(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.same.length() { return self.same.get(u32.toUsize(inst)) } return NONE }
   pub fn read(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.reads.length() { return self.reads.get(u32.toUsize(inst)) } return 0 }
   pub fn key(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.keys.length() { return self.keys.get(u32.toUsize(inst)) } return 0 }
   pub fn fact(self: &Self, inst: u32) -> u8 { if u32.toUsize(inst) < self.facts.length() { return self.facts.get(u32.toUsize(inst)) } return 0 }
@@ -65,6 +76,53 @@ fn siteAt(sites: &List<SiteShape>, pc: u32) -> SiteShape {
   let mut s: usize = 0
   while s < sites.length() { if sites.get(s).pc == pc { return sites.get(s) } s = s + 1 }
   return SiteShape { pc: pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }
+}
+
+/// The atom of the field site at pc of code: the 4 bytes after its opcode. 0: none.
+fn atomAt(code: &[u8], pc: u32) -> u32 {
+  let at = u32.toUsize(pc) + 1
+  if at + 4 > code.length { return 0 }
+  return u8.toU32(code[at]) | u32.shiftLeft(u8.toU32(code[at + 1]), 8) | u32.shiftLeft(u8.toU32(code[at + 2]), 16) | u32.shiftLeft(u8.toU32(code[at + 3]), 24)
+}
+/// The value among held[0..] that holds `atom` of `object`, or NONE.
+fn knownValue(held: &List<Known>, object: u32, atom: u32) -> u32 {
+  let mut i: usize = 0
+  while i < held.length() {
+    let k = held.get(i)
+    if k.object == object && k.atom == atom { return k.value }
+    i = i + 1
+  }
+  return NONE
+}
+/// held without what it knew of `atom` (0: of anything), of any object: a store may alias.
+fn forget(held: &mut List<Known>, atom: u32) -> () {
+  let mut kept: usize = 0
+  let mut i: usize = 0
+  while i < held.length() {
+    let k = held.get(i)
+    if atom != 0 && k.atom != atom { held.set(kept, k) kept = kept + 1 }
+    i = i + 1
+  }
+  held.truncate(kept)
+}
+
+/// held with k, in place of what was held for the same property, the oldest dropped when full.
+effect fn remember(held: &mut List<Known>, k: Known) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut kept: usize = 0
+  let mut i: usize = 0
+  while i < held.length() {
+    let h = held.get(i)
+    if h.object != k.object || h.atom != k.atom { held.set(kept, h) kept = kept + 1 }
+    i = i + 1
+  }
+  held.truncate(kept)
+  if held.length() >= KNOWN {
+    i = 1
+    while i < held.length() { let h = held.get(i) held.set(i - 1, h) i = i + 1 }
+    let less = held.length() - 1
+    held.truncate(less)
+  }
+  run held.append(k)
 }
 
 /// Whether op leaves every object's shape as it is. Anything not listed may change one.
@@ -92,6 +150,11 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
   let mut reads = List<u32>.make()
   run reads.appendRepeated(0, count)
   let mut read = List<SiteShape>.make()
+  let mut same = List<u32>.make()
+  run same.appendRepeated(NONE, count)
+  // The property each field site names.
+  let mut atoms = List<u32>.make()
+  run atoms.appendRepeated(0, count)
   let mut any = false
   let mut i: usize = 0
   while i < count {
@@ -101,6 +164,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
       let mut hedged = false
       if inst.frame == 0 {
         site = siteAt(&input.siteShapes, inst.pc)
+        atoms.set(i, atomAt(input.code.asSlice(), inst.pc))
         let mut s: usize = 0
         while s < sites.length() { if sites.get(s) == inst.pc { hedged = true } s = s + 1 }
       } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
@@ -108,7 +172,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         let mut t: usize = 0
         while t < input.targets.length() {
           let target = &input.targets.asSlice()[t]
-          if target.id == id { site = siteAt(&target.input.siteShapes, inst.pc) break }
+          if target.id == id { site = siteAt(&target.input.siteShapes, inst.pc) atoms.set(i, atomAt(target.input.code.asSlice(), inst.pc)) break }
           t = t + 1
         }
       }
@@ -126,12 +190,13 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         let mut s: usize = 0
         while s < sites.length() { if sites.get(s) == inst.pc { left = true } s = s + 1 }
         if !left { key = keyAt(input.code.asSlice(), inst.pc) }
+        atoms.set(i, atomAt(input.code.asSlice(), inst.pc))
       } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
         let id = f.inlineTargets.get(u32.toUsize(inst.frame - 1))
         let mut t: usize = 0
         while t < input.targets.length() {
           let target = &input.targets.asSlice()[t]
-          if target.id == id { key = keyAt(target.input.code.asSlice(), inst.pc) break }
+          if target.id == id { key = keyAt(target.input.code.asSlice(), inst.pc) atoms.set(i, atomAt(target.input.code.asSlice(), inst.pc)) break }
           t = t + 1
         }
       }
@@ -139,7 +204,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
     }
     i = i + 1
   }
-  if !any { return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read } }
+  if !any { return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same } }
   // The block each edge leaves.
   let blocks = u32.toUsize(f.blockCount())
   let values = u32.toUsize(f.valueCount())
@@ -156,23 +221,45 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
     b = b + 1
   }
   // What each block leaves known, by value: its shape version (0: none) and whether it is
-  // an object. `done` tells a block that was walked from one that was not (a back edge's).
+  // an object; and the properties whose values are held (heldOut, KNOWN a block, heldCount
+  // of them in use). `done` tells a block that was walked from one that was not.
+  //
+  // Two walks. In the first a block entered from one not walked yet (a loop header, by its
+  // back edge) starts with nothing. The second takes what the first found at the end of
+  // such a block: that was found with nothing assumed at the header, so it holds at the end
+  // of every turn, and with it the header keeps what the code before the loop and every
+  // turn agree on.
   let mut versions = List<u64>.make()
   run versions.appendRepeated(0, blocks * values)
   let mut objects = List<u8>.make()
   run objects.appendRepeated(0, blocks * values)
+  let mut heldOut = List<Known>.make()
+  run heldOut.appendRepeated(Known { object: NONE, atom: 0, value: NONE }, blocks * KNOWN)
+  let mut heldCount = List<u32>.make()
+  run heldCount.appendRepeated(0, blocks)
   let mut done = List<u8>.make()
   run done.appendRepeated(0, blocks)
   let mut version = List<u64>.make()
   run version.appendRepeated(0, values)
   let mut object = List<u8>.make()
   run object.appendRepeated(0, values)
+  let mut held = List<Known>.make()
+  // The first value that was the same object as each value (Retain and copies seen through).
+  let mut alias = List<u32>.make()
+  let mut pass: u32 = 0
+  while pass < 2 {
+  alias.truncate(0)
+  let mut v0: usize = 0
+  while v0 < values { run alias.append(usize.toU32(v0)) v0 = v0 + 1 }
+  let mut clear: usize = 0
+  while clear < count { let fixed = u8.bitAnd(facts.get(clear), FACT_HEDGED) facts.set(clear, fixed) same.set(clear, NONE) clear = clear + 1 }
   b = 0
   while b < blocks {
     // What every edge into the block agrees on; nothing when one comes from a block not
     // walked yet, or when there is none (the entry).
     let mut first = true
     let mut open = false
+    held.truncate(0)
     let mut e: usize = 0
     while e < f.edges.length() {
       if u32.toUsize(f.edges.get(e).target) == b {
@@ -189,6 +276,28 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
             }
             v = v + 1
           }
+          let theirs = u32.toUsize(from) * KNOWN
+          let their = u32.toUsize(heldCount.get(u32.toUsize(from)))
+          if first {
+            let mut k: usize = 0
+            while k < their { run held.append(heldOut.get(theirs + k)) k = k + 1 }
+          } else {
+            let mut kept: usize = 0
+            let mut k: usize = 0
+            while k < held.length() {
+              let mine = held.get(k)
+              let mut both = false
+              let mut t: usize = 0
+              while t < their {
+                let other = heldOut.get(theirs + t)
+                if other.object == mine.object && other.atom == mine.atom && other.value == mine.value { both = true }
+                t = t + 1
+              }
+              if both { held.set(kept, mine) kept = kept + 1 }
+              k = k + 1
+            }
+            held.truncate(kept)
+          }
           first = false
         }
       }
@@ -197,6 +306,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
     if first || open {
       let mut v: usize = 0
       while v < values { version.set(v, 0) object.set(v, 0) v = v + 1 }
+      held.truncate(0)
     }
     let block = f.blocks.get(b)
     let mut n: u32 = 0
@@ -204,7 +314,25 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
       let index = u32.toUsize(block.firstInst + n)
       let inst = f.insts.get(index)
       let key = keys.get(index)
-      if inst.op == Op.CheckTag {
+      let atom = atoms.get(index)
+      // A read of a data property with no helper behind it: a keyed site, or a cached one
+      // that leaves on another shape.
+      let plain = inst.op == Op.GetField && u32.toUsize(inst.a) < values && u32.toUsize(inst.result) < values
+        && (key != 0 || (reads.get(index) != 0 && u8.bitAnd(facts.get(index), FACT_HEDGED) == 0))
+      let mut copied = NONE
+      if plain && atom != 0 { copied = knownValue(&held, alias.get(u32.toUsize(inst.a)), atom) }
+      if copied != NONE && u32.toUsize(copied) < values {
+        // The property's value is still in `copied`: the same value, and what is known of it.
+        same.set(index, copied)
+        let r = u32.toUsize(inst.result)
+        let first = alias.get(u32.toUsize(copied))
+        let isObject = object.get(u32.toUsize(copied))
+        let has = version.get(u32.toUsize(copied))
+        alias.set(r, first)
+        object.set(r, isObject)
+        version.set(r, has)
+        if isObject != 0 { let fact = u8.bitOr(facts.get(index), FACT_OBJECT) facts.set(index, fact) }
+      } else if inst.op == Op.CheckTag {
         if u32.toUsize(inst.a) < values {
           if object.get(u32.toUsize(inst.a)) != 0 && inst.k == TAG_OBJECT { facts.set(index, FACT_OBJECT) }
           if inst.k == TAG_OBJECT { object.set(u32.toUsize(inst.a), 1) }
@@ -217,24 +345,32 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         facts.set(index, fact)
         object.set(a, 1)
         version.set(a, u64.shiftRight(key, 16))
+        if inst.op == Op.PutField {
+          // In place, in the slot of this property: whatever held it before is out of date,
+          // on any object (another value may be the same one), and the stored value has it.
+          forget(&mut held, atom)
+          if atom != 0 && u32.toUsize(inst.b) < values { run remember(&mut held, Known { object: alias.get(a), atom: atom, value: inst.b }) }
+        } else if atom != 0 { run remember(&mut held, Known { object: alias.get(a), atom: atom, value: inst.result }) }
       } else if reads.get(index) != 0 {
         let site = read.get(u32.toUsize(reads.get(index) - 1))
         let a = u32.toUsize(inst.a)
         let mut fact = facts.get(index)
         if object.get(a) != 0 { fact = u8.bitOr(fact, FACT_OBJECT) }
-        let mut n: u32 = 0
-        while n < site.count {
-          if version.get(a) != 0 && version.get(a) == versionOf(site.keys[u32.toUsize(n)]) { fact = u8.bitOr(fact, u8.shiftLeft(u32.wrappingToU8(n + 1), FACT_PAIR)) }
-          n = n + 1
+        let mut m: u32 = 0
+        while m < site.count {
+          if version.get(a) != 0 && version.get(a) == versionOf(site.keys[u32.toUsize(m)]) { fact = u8.bitOr(fact, u8.shiftLeft(u32.wrappingToU8(m + 1), FACT_PAIR)) }
+          m = m + 1
         }
         facts.set(index, fact)
         if u8.bitAnd(fact, FACT_HEDGED) != 0 {
           // Its helper may run a getter.
           let mut v: usize = 0
           while v < values { version.set(v, 0) v = v + 1 }
+          held.truncate(0)
         } else {
           object.set(a, 1)
           if site.count == 1 { version.set(a, versionOf(site.keys[0])) }
+          if atom != 0 { run remember(&mut held, Known { object: alias.get(a), atom: atom, value: inst.result }) }
         }
       } else if inst.op == Op.Release {
         if u32.toUsize(inst.a) < values && object.get(u32.toUsize(inst.a)) != 0 { facts.set(index, FACT_OBJECT) }
@@ -246,18 +382,29 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
           let has = version.get(u32.toUsize(inst.a))
           object.set(u32.toUsize(inst.result), isObject)
           version.set(u32.toUsize(inst.result), has)
+          let first = alias.get(u32.toUsize(inst.a))
+          alias.set(u32.toUsize(inst.result), first)
         }
       } else if !quiet(inst.op) {
         let mut v: usize = 0
         while v < values { version.set(v, 0) v = v + 1 }
+        held.truncate(0)
+      } else if inst.op == Op.PutVar {
+        // A global binding may be a property of the global object.
+        held.truncate(0)
       }
       n = n + 1
     }
     let base = b * values
     let mut v: usize = 0
     while v < values { versions.set(base + v, version.get(v)) objects.set(base + v, object.get(v)) v = v + 1 }
+    let mut k: usize = 0
+    while k < held.length() && k < KNOWN { heldOut.set(b * KNOWN + k, held.get(k)) k = k + 1 }
+    heldCount.set(b, usize.toU32(k))
     done.set(b, 1)
     b = b + 1
   }
-  return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read }
+  pass = pass + 1
+  }
+  return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same }
 }
