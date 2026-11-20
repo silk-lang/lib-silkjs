@@ -111,6 +111,19 @@ def compiled_fraction(shell, path, cwd, timeout):
     return {"exit": 0, **costs, "stats": parse_stats(done.stderr)}
 
 
+def jit_group(function):
+    """The category of a readable symbol (Silk 0.1.0-dev.88 names functions package:module::name)."""
+    module = function.partition("::")[0]
+    package, _, source = module.partition(":")
+    if package.partition("@")[0] != "silkjs-jit":
+        return None
+    if source in ("jit_helpers.silk", "jit_exit_state.silk"):
+        return "helpers"
+    if source in ("ssa.silk", "asm_x64.silk") or source.startswith(("ssa_", "x64_")):
+        return "compiler"
+    return None
+
+
 def jit_symbol_groups(shell):
     """Map compiler-pass and runtime-helper symbols from the matching release sidecar."""
     groups = {}
@@ -155,6 +168,8 @@ def per_object(path, groups):
                         unknown += cost
                     elif function in groups:
                         named[groups[function]] += cost
+                    elif jit_group(function):
+                        named[jit_group(function)] += cost
                 continue
             key, _, value = line.rstrip("\n").partition("=")
             if key in ("ob", "cob", "fn", "cfn"):
@@ -174,7 +189,7 @@ def per_object(path, groups):
     result = {"instructions": total, "compiled": unknown, "fraction": unknown / total if total else 0.0}
     for category, fraction in (("compiler", "compiler_fraction"), ("helpers", "helper_fraction")):
         # A measured zero requires symbols in this category, even if none ran.
-        available = category in groups.values()
+        available = category in groups.values() or named[category] > 0
         result[category] = named[category] if available else None
         result[fraction] = named[category] / total if available and total else None
     return result
@@ -252,6 +267,13 @@ def main():
                     share = c[key]
                     cost += " %s %s" % (label, "%.4f%%" % (100 * share) if share is not None else "unavailable")
             print(cost, flush=True)
+            # Departures: entries of compiled code that came from the VM, not from a direct call out of
+            # machine code. Each one pays the VM's call path (linkedCall, startActivation).
+            runs, direct = s.get("runs") or 0, s.get("direct-calls") or 0
+            if runs:
+                entry["departures_per_1000"] = 1000.0 * (runs - direct) / runs
+                print("%-22s   calls: direct %s of %s runs, %.0f per 1,000 entered from the VM" % (
+                    "", direct, runs, entry["departures_per_1000"]), flush=True)
             top = sorted(entry["counters"]["refused"].items(), key=lambda kv: -kv[1])[:4]
             if top:
                 print("%-22s   refused: %s" % ("", "; ".join("%s x%d" % kv for kv in top)), flush=True)
