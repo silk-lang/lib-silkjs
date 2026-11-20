@@ -1,18 +1,22 @@
 # The baseline tier
 
-Status on 2026-11-20: a spike on x86-64 that runs Richards and DeltaBlue end to end. It answers
+Status on 2026-11-20: a tier on x86-64 that runs the eight V8 benchmarks end to end. It answers
 step 2 of the plan of 20 November (one vertical at a time, Richards first): is a tier that
 compiles every bytecode instruction to a fixed template, on the interpreter's own frame, a
-better base than the SSA compiler's separate frame world?
+better base than the SSA compiler's separate frame world? Both gates of that step are measured
+below: Richards first, then all eight benchmarks.
 
 Everything here was measured on the JIT shell (`modules/jit/shell`) in release mode unless it
 says otherwise. Code: `modules/jit/src/baseline.silk` (the compiler), `baseline_env.silk` (what
 the code reaches at run time), `modules/engine/src/js_baseline.silk` (the engine's side) and
-`js_vm.silk` (`enterBaseline`, `baselineService`, `baselineFinish`).
+`js_vm.silk` (`enterBaseline`, `baselineService`, `baselineFinish`, `baselineStep`,
+`baselineNative`, `baselineLoop`).
 
 ## Result
 
-Richards, fixed work, marginal instructions for 20 runs of the benchmark (40 runs minus 20, so
+### The first gate: Richards
+
+The numbers of this part are the state at the first gate (commit `6afdf7ec`). Richards, fixed work, marginal instructions for 20 runs of the benchmark (40 runs minus 20, so
 startup and compilation cancel):
 
 | Build | Instructions | Against the interpreter | Instructions per call |
@@ -44,62 +48,78 @@ per call):
 86.7% of the run's instructions are in baseline code. The rest is the engine's helpers for
 polymorphic field reads (about 4%) and startup.
 
-### DeltaBlue
+### The second gate: all eight
 
-The second vertical. With Richards' templates alone DeltaBlue ran slower than the interpreter:
-368,055 activations left baseline code in a fixed run, and each departure costs about 380
-instructions before the interpreter runs its first one. Templates for the nine opcodes it
-departed on (below) bring that to 103.
+The gate: no benchmark above the interpreter's instruction count, and 95% of bytecode
+instructions in machine code. A fixed run of each benchmark, whole process, compilation
+included:
 
-| DeltaBlue, marginal instructions for 20 runs | Instructions | Against the interpreter |
-| --- | ---: | ---: |
-| Interpreter | 739.3M | 1.00x |
-| Baseline with Richards' templates | slower than the interpreter | |
-| Baseline, this state | 579.3M | 1.28x fewer |
+| Benchmark | Runs | Interpreter | Baseline | Fewer | In machine code, whole run | Runs 22 to 27 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Richards | 20 | 521.9M | 258.9M | 2.02x | 99.6% | 100.0% |
+| DeltaBlue | 20 | 750.1M | 627.6M | 1.20x | 95.0% | 98.6% |
+| Crypto | 4 | 3,020.9M | 1,379.9M | 2.19x | 99.5% | 100.0% |
+| RayTrace | 8 | 1,245.6M | 1,175.8M | 1.06x | 99.2% | 99.9% |
+| EarleyBoyer | 2 | 1,153.4M | 1,110.3M | 1.04x | 97.4% | 97.9% |
+| RegExp | 2 | 1,367.5M | 1,244.5M | 1.10x | 88.8% | 99.7% |
+| Splay | 4 | 1,320.3M | 1,272.3M | 1.04x | 98.5% | 99.2% |
+| NavierStokes | 2 | 1,100.5M | 669.8M | 1.64x | 97.3% | 100.0% |
 
-51 functions compile, none is refused and none has an instruction without a template. 2.0M
-calls go straight from baseline code to baseline code and 110,254 through the engine: about
-75,000 calls of natives (`Array.prototype.push` and `pop`, `Function.prototype.call`), 12,600
-constructions, and calls of functions that are not hot yet. 56% of the run's instructions are
-in baseline code. What keeps it from Richards' ratio:
+- **No benchmark above the interpreter: met.** The margin is 4% or more everywhere. Whole-run
+  counts of the baseline column move by 1% to 2% from build to build (placement of code and of
+  collections), so the three smallest ratios are not ranked against each other.
+- **95% in machine code: met in steady state on all eight, and on seven in the short runs.**
+  "In machine code" counts bytecode instructions: entries into templates, less the steps,
+  against the interpreter's dispatches (`jit_baseline_profile.py --coverage`). The last column
+  is runs 22 to 27 of a 27-run process (the difference of two processes), which is the tier
+  without its warm-up. RegExp's fixed run is two runs of the benchmark. Its twelve block
+  functions are entered once per run, so they never count 100 entries and get their code
+  through loop entry, which needs three polls of a loop that is running; much of the first run
+  is over by then. Over 27 runs the whole process is at 95.0%. What stays interpreted in
+  steady state is the functions the tier refuses (four in EarleyBoyer, most of its 2%) and
+  steps.
+- No function departs: every reachable instruction has a template or runs as a step.
 
-- Constructors run interpreted (a construction's `new.target` has no place in a bare frame
-  yet), and so do the test drivers, whose loops are entered once per run. About 15% of the run
-  is still the interpreter.
-- `get_field2` misses its one-entry site cache 160,000 times (method lookups on receivers of
-  several shapes), each a helper call of about 120 instructions.
-- Field reads and calls cost what they cost on Richards: 38 instructions for a prototype
-  method lookup, 60 for a call.
+How much the tier can take out depends on where the interpreter spends its instructions. Per
+bytecode instruction executed, in the same runs:
 
-### The other six
+| Benchmark | Interpreter, instructions per bytecode instruction | Baseline takes out | Calls through the engine | Steps |
+| --- | ---: | ---: | ---: | ---: |
+| Crypto | 24 | 13 | 18,466 | 15,936 |
+| NavierStokes | 23 | 9 | 13 | 496 |
+| Richards | 38 | 19 | 970 | 0 |
+| DeltaBlue | 36 | 6 | 118,153 | 187 |
+| EarleyBoyer | 51 | 2 | 529,713 | 52,636 |
+| RayTrace | 65 | 4 | 615,096 | 11,356 |
+| Splay | 83 | 3 | 41,938 | 201 |
+| RegExp | 87 | 8 | 350,832 | 13,610 |
 
-A fixed run of each remaining V8 benchmark, whole process, before any work on them:
-
-| Benchmark | Compiled | Departures | Against the interpreter | Departs on |
-| --- | ---: | ---: | ---: | --- |
-| Crypto | 15 | 294,103 | 0.94x | the fused local and argument arithmetic, `step_loc8`, element reads from locals |
-| RayTrace | 29 | 406,452 | 0.40x | fused arithmetic, `put_arg`, `neg`, `push_const8`, `put_var`, `arguments` |
-| EarleyBoyer | 21 | 976,919 | 0.63x | `instanceof`, null tests, `typeof`; most of its functions are closures |
-| RegExp | 2 | 32,059 | 0.98x | scope reads, `array_from` |
-| Splay | 13 | 537,613 | 0.76x | object literals, scope reads, `put_var`, `throw` |
-| NavierStokes | 1 | 1 | 1.00x | nothing compiles: its functions read a scope |
-
-A departure is expensive, so a function that departs on most calls is a loss. The list is the
-work for the next gate (no benchmark above the interpreter's count): templates for the hot
-fused opcodes, scope reads and captured variables, constructors, and one engine service that
-runs any single rare instruction and returns to the code.
+Where the interpreter spends 23 to 38 instructions per bytecode instruction the work is the
+bytecode itself, and templates remove a third to a half of it. Where it spends 51 to 87 the
+work is in the runtime (allocation, collection, natives, the regular expression engine), which
+this tier calls exactly as the interpreter does. There a template can only remove dispatch and
+operand traffic, and each call that still goes through the engine (a native, a construction, a
+callee that is not hot yet) and each step (about 450 instructions) gives some of that back.
 
 ## How to run it
 
 ```sh
 silkjs-jit-shell --jit-baseline script.js          # hot functions get baseline code
-    --jit-threshold=N                              # entries before a function is hot
+    --jit-threshold=N                              # entries before a function is hot (default 100)
     --jit-stats=FILE                               # counters, among them baseline-*
     --jit-dump                                     # code bytes and the code map on stderr
 ```
 
 `--jit-baseline` implies `--jit` and replaces the SSA compiler: a hot function gets baseline
-code or stays interpreted.
+code or stays interpreted. The HTTP embedding host (`modules/jit/embed-smoke`) takes the same
+flag, and `modules/runtime/bench/jit_http.py --jit-baseline` runs the order service on it.
+
+A function is hot after 100 entries with this tier, where the engine's default for the SSA
+compiler is 1,000 (`jit_runtime.BASELINE_ENTRIES`). Baseline code costs about 4,700
+instructions to make per bytecode instruction and saves about 20 each time one runs, so it has
+paid for itself after a few hundred executions. Whole fixed runs at thresholds 20, 50, 100 and
+200 differ by less than the build-to-build noise on six benchmarks; Richards runs 4% fewer
+instructions at any of them than at 1,000 and DeltaBlue 3% to 6% fewer.
 
 ## Design
 
@@ -111,10 +131,24 @@ cell, exactly where the interpreter keeps it: a template loads its operands from
 into scratch registers and stores its result back. Nothing is cached in registers between
 instructions, so the frame is a valid interpreter frame at every instruction boundary.
 
-An instruction without a template is an exit: it jumps to a block that hands the activation to
-the interpreter (`SERVICE_FINISH`), which runs the rest of the function on the same cells and
-returns its result. The compiler reports such opcodes (`Outcome.uncovered`,
-`baseline-uncovered`), and each use counts as a departure (`baseline-departures`).
+An instruction without a template is a **step**: the code asks the engine to run that one
+instruction in the interpreter, on the same cells, and goes on after it (`SERVICE_STEP`,
+`js_vm.baselineStep`, which runs a copy of the dispatch loop that stops before the frame's
+next instruction). A template that meets a case it does not handle, such as an element read on
+something that is not a fast Array, steps the same way. A step costs about 450 instructions:
+75 to build the frame, 110 to describe the activation and make the interpreter's state, 170 in
+the one-instruction loop, 45 in the trampolines and 15 in the code. The compiler reports
+stepped opcodes (`Outcome.stepped`, and `step:<opcode>` counts in `--jit-stats`).
+
+The interpreter may leave the frame somewhere else than the next instruction: at a branch
+target, after a pair it runs as one, or at a handler that took what the instruction threw. The
+service then answers where the frame is (`js_baseline.moved`: bytecode offset and operands on
+the stack), and the code looks that offset up in the function's **resume table**, one word per
+bytecode byte after the code, with the distance to the instruction's template and the operand
+depth it expects. If the table has it, the code jumps there (`baseline-resumes`). If not, the
+interpreter finishes the activation (`SERVICE_FINISH`), which is the only way an activation
+still leaves baseline code and counts as a departure (`baseline-departures`). No benchmark of
+the eight departs.
 
 Work that is rare stays out of the straight path as a slow path (`Slow`, emitted after the
 body): a count that drops to zero, a cache miss, a call of a function without baseline code, a
@@ -124,9 +158,17 @@ Two adjacent instructions compile as one where the second only consumes what the
 and no branch reaches it (`fused`): `push_this; put_loc`, `is_undefined_or_null` followed by a
 branch, and a comparison followed by a branch.
 
-Numbers: two Ints compute inline. An overflow, a product of 0, a division, a remainder or any
-other pair of numbers goes to one helper (`arithmetic`, the interpreter's `numericFast`), and
-only what is not a pair of numbers leaves to the interpreter.
+Numbers: two Ints compute inline, and so do two Float64 and an Int with a Float64 for `+`, `-`,
+`*` and the orderings. An overflow, a product of 0, a remainder or any other pair of numbers
+goes to one helper (`arithmetic`, the interpreter's `numericFast`), and only what is not a pair
+of numbers is a step.
+
+Truthiness is inline for booleans, Ints, undefined, null, flat strings (by length) and objects
+(true unless the object is one of the falsy kind); a flat string's `length` is one load.
+
+Object and array literals, `define_field` and the `+` of a string with a string or a number go
+through services that build no frame (`SERVICE_QUICK`, `SERVICE_CONCAT`): they only allocate,
+so nothing can read the frame chain meanwhile.
 
 ### Frame
 
@@ -148,7 +190,9 @@ the engine for anything (every `SERVICE_*` request), `js_baseline.build` first c
 bare frames from the innermost outwards and publishes them as the runtime's current frame
 chain. It finds the callers through the saved rbp chain; the entry stub keeps two zero words
 where a record's state would be, which ends the walk. A frame that was built is unlinked when
-it returns; a frame that stayed bare just pops. Anything that reads the frame chain (error
+it returns; a frame that stayed bare just pops. A frame entered through the function's
+construct entry is in the construct state of each (`FRAME_BARE_CONSTRUCT`,
+`FRAME_BUILT_CONSTRUCT`), which is where `new.target` lives: it is the function itself. Anything that reads the frame chain (error
 stacks, closures attaching to a frame, the debugger) therefore sees every frame, and a call that
 never leaves baseline code pays for none of it.
 
@@ -168,8 +212,20 @@ A call site checks that the callee is a bytecode function with baseline code
 through the table. Anything else goes through the engine (`SERVICE_CALL`).
 
 The engine enters baseline code from `callInternal` through a stub (`entryStub`) that turns the
-C ABI into this one. It does so only for a plain call: no `new.target`, no resumed generator,
-and no instruction observer (debugger, coverage, profiler).
+C ABI into this one. It does so for a plain call and for a `new` of the function itself
+(through the construct entry, the second table slot of each function), never for a resumed
+generator or under an instruction observer (debugger, coverage, profiler).
+
+A known local function (`js_compiler_known`) has no closure object. Its frame names its
+bytecode as the function, and the caller passes the scope it runs in where a closure's caller
+passes the object (rdi). A call site reaches one out of line (`S_KNOWN`).
+
+A native callee is called without any frame of the engine's (`CALL_NATIVE`,
+`js_vm.baselineNative`), as the interpreter's call instruction calls one: first the answers
+that need no native frame (Math on numbers, `push` and `pop`, the string methods with a
+primitive entry, `String(int)`, regular expression `exec` and `replace`, the collection
+reads), then the native itself. The call charges the interrupt counter as the interpreter's
+does.
 
 ### What the code asks the engine for
 
@@ -178,16 +234,63 @@ the runtime:
 
 | Request | Meaning |
 | --- | --- |
-| `SERVICE_FINISH` | The interpreter finishes this activation from the published bytecode offset, with `count` operands on the stack; with `FINISH_THROWING` an exception is pending and it unwinds first |
-| `SERVICE_CALL` | Call the value at `base` on `count` arguments; with `CALL_METHOD` the cell before it is the receiver |
+| `SERVICE_FINISH` | The interpreter finishes this activation from the published bytecode offset, with `count` operands on the stack. With `FINISH_THROWING` an exception is pending and it unwinds first: when a handler of the frame takes it, the answer is `moved` to the handler and the code goes on there |
+| `SERVICE_CALL` | Call the value at `base` on `count` arguments; with `CALL_METHOD` the cell before it is the receiver, with `CALL_NATIVE` the callee is a native and gets no engine frame |
 | `SERVICE_CONSTRUCT` | Construct with the function at `base`, `new.target` after it, then `count` arguments |
 | `SERVICE_POLL` | The interrupt counter ran out |
 | `SERVICE_OVERFLOW` | No room on the native stack: throw the RangeError |
+| `SERVICE_STEP` | Run the one instruction at the published offset in the interpreter |
+| `SERVICE_QUICK` | An allocating instruction (`object`, `define_field`, `array_from`) without a frame; the engine may decline, and the instruction is a step then |
+| `SERVICE_CONCAT` | The `+` of a string and a string or number, without a frame |
+| `SERVICE_RESUME` | Only from a resume entry: fill the new frame from an interpreter activation (below) |
+
+The first five and the step build the bare frames first; the last three do not.
 
 Helpers (`BaselineEnv.helpers`, C functions named by index) cover the misses that run no user
 code: field reads and writes that miss their cache, `get_var`, loose equality, truthiness,
 `!`, arithmetic and comparisons of numbers, string constants, element reads and stores. A helper that would have to run user code returns 0 and the template
-exits to the interpreter instead, so user code never runs under a bare frame.
+steps instead, so user code never runs under a bare frame.
+
+### Exceptions
+
+A throw in baseline code, or in anything it called, reaches the code as a service or a call
+that answers "threw". The code asks the engine to unwind (`FINISH_THROWING`). The interpreter's
+unwinder runs on the frame's cells, where the catch markers are operands as in any frame: with
+a handler in this frame the code goes on at the handler through the resume table, and without
+one the cells are released and the caller sees the exception. Handlers therefore run in
+baseline code.
+
+### Entering a running loop
+
+A function that is called once and loops for long is hot before it is ever entered again. The
+interpreter reports it at a back-edge poll (`js_hotness.loopPoll`), it compiles at the next
+poll, and from the poll after that the running activation moves over (`js_vm.baselineLoop`,
+called from `backEdgePoll`, which only runs when the interrupt counter is out):
+
+1. The function has a **resume entry**, a third way into its code next to the plain and the
+   construct entries. Its distance from the construct entry is in the four bytes before that
+   entry (0 for none), so the table needs no third slot.
+2. The engine calls the resume entry through the usual stub with a `js_baseline.Resume` in
+   place of the arguments: the activation's argument cells, locals, operand stack, bytecode
+   offset and operand depth.
+3. The resume entry makes the frame as the prologue does, then asks `SERVICE_RESUME`. The
+   engine fills the cells: arguments as the prologue would (the frame's own copies when the
+   function writes a parameter), locals and operands moved out of the interpreter's frame. It
+   answers `moved` to the back edge's target, and the code goes on there through the resume
+   table.
+4. When the code returns, the interpreter's activation holds no values. It gets the result on
+   its stack and its instruction pointer at a `return` of the function, so it ends as any
+   activation does. An exception the code let out is raised with the activation's operand
+   stack empty, so no handler of it sees the exception a second time.
+
+While the code runs, its frame stands in the frame chain where the activation's did, so an
+error stack shows the function once. A function gets a resume entry unless it reads how it was
+called (`arguments`, a rest parameter) or has no `return` instruction to end at. Only a plain
+call's activation moves: not a construction, not a setter's.
+
+On NavierStokes, whose `lin_solve` runs for about 10M instructions per call, this took the
+share of bytecode instructions in machine code from 76% to 96% and the run from 1.43x to 1.63x
+fewer instructions than the interpreter (both at the 1,000-entry threshold the tier had then).
 
 ### Fields, variables, elements
 
@@ -210,9 +313,9 @@ release through a stub that preserves every register.
 
 ### Polls
 
-A taken backward branch charges the realm's interrupt counter and polls when it runs out. A
-function entry does not: recursion is bounded by the stack check, so every unbounded run passes
-a backward branch or interpreted code.
+A taken backward branch charges the realm's interrupt counter and polls when it runs out, and
+so does a call of a native. A function entry does not: recursion is bounded by the stack check,
+so every unbounded run passes a backward branch or interpreted code.
 
 ### No addresses in the code
 
@@ -224,21 +327,38 @@ This is what ahead-of-time compilation needs.
 ### What the interpreter pays
 
 A linked function sets `FunctionBytecode.baseline` and reuses the frame-cells sentinel, so the
-interpreter's inline call finds no room for it and the call reaches `callInline`, which enters
-the code. The interpreter gains no check on its fast paths. Its instruction counts on the eight
-V8 benchmarks, against the build before the tier (`74490486`, `scripts/v8bench.py
---instructions`), moved by at most 0.03%:
+interpreter's inline call and inline construction find no room for it and the call reaches
+`callInline` or `constructWith`, which enter the code. The interpreter gains no check on its
+fast paths; the checks sit where an inline frame was already refused. Its instruction counts on
+the eight V8 benchmarks, against the build before the tier (`74490486`, `scripts/v8bench.py
+--instructions`):
 
-| Benchmark | Before | With the tier |
-| --- | ---: | ---: |
-| richards | 521,963,323 | 521,950,931 |
-| deltablue | 749,732,780 | 749,759,390 |
-| crypto | 3,021,285,126 | 3,020,824,446 |
-| raytrace | 1,244,834,173 | 1,245,128,329 |
-| earley-boyer | 1,153,452,879 | 1,153,447,065 |
-| regexp | 1,367,268,925 | 1,367,522,673 |
-| splay | 1,319,620,930 | 1,319,645,730 |
-| navier-stokes | 1,100,563,324 | 1,100,548,265 |
+| Benchmark | Before | With the tier | |
+| --- | ---: | ---: | ---: |
+| richards | 521,963,339 | 521,920,059 | 1.000x |
+| deltablue | 749,732,780 | 750,203,328 | 1.001x |
+| crypto | 3,020,678,796 | 3,019,926,091 | 1.000x |
+| raytrace | 1,245,110,287 | 1,249,627,662 | 1.004x |
+| earley-boyer | 1,153,452,637 | 1,153,416,570 | 1.000x |
+| regexp | 1,367,250,776 | 1,367,498,331 | 1.000x |
+| splay | 1,319,620,824 | 1,320,347,019 | 1.001x |
+| navier-stokes | 1,100,563,338 | 1,100,521,749 | 1.000x |
+
+Two rows of this tool move with things that are not the tier, in either build:
+
+- RayTrace swings by 4M (0.3%) with the script's path, which decides where bytecode lands and
+  so which sites share a slot of the prototype field cache. At another path of the same length
+  the build before the tier counts 1,249.35M and this one 1,245.57M. By function, the tier's
+  own cost there is 0.73M in `constructInline` and 0.16M in `executeLoop`, 0.07%.
+- RegExp has two levels, 1,367M and 1,390M, picked by the size of the process environment
+  (it moves the native stack, and with it the alignment of the matcher's buffers). Each build
+  hits the high level at some sizes: the old one with 5 or 13 more bytes of environment, this
+  one with 64. The row above is from a run where both sit on the low level.
+
+An earlier state of this branch did break the 0.5% budget on RayTrace (0.57%), with a test for
+baseline code on every construction. The test now runs only after an inline frame was refused.
+`joinText` is marked `@inlineAlways` for the same reason: a second caller (the tier's concat
+service) had moved it out of line under the interpreter's `+`.
 
 One exception keeps its interpreter path: a leaf the interpreter runs without a frame
 (`js_vm_leaf`) whose runs were never declined stays frameless for interpreted callers, which
@@ -287,41 +407,71 @@ closely, so there is no single stall to remove; the code is bound by loads that 
 ## Checks
 
 - `scripts/differential.py --configs plain,baseline,baseline-eager`: generated programs agree
-  with the interpreter at thresholds 20 and 1. 1,500 of 1,500 agree, run on the build with the
-  leaf fix and again on the build with DeltaBlue's templates.
-- `silk test` in `modules/jit`: 94 of 94, with `hotFunctionsRunBaselineCode` running a linked
-  list, field stores, a throw through two baseline frames, deep recursion, and the operators,
-  keep branches, `length`, string constants and a construction DeltaBlue added.
-- Hand tests for deep recursion and the stack overflow, exceptions through baseline frames,
-  error stacks from frames built lazily, closures, `arguments`, getters, and every comparison
-  on mixed operand types, at thresholds 1, 5 and 60.
-- Richards and DeltaBlue print the interpreter's output at every threshold.
+  with the interpreter at thresholds 20 and 1. 1,500 of 1,500 agree on the final state, with
+  3.8M resumes through the resume table, 158M steps and 0.7M departures among them (generated
+  programs use what the benchmarks do not: generators, `for-of`, private fields, `try`).
+- `silk test` in `modules/jit`: 94 of 94. `hotFunctionsRunBaselineCode` runs a linked list,
+  field stores, a throw through two baseline frames, deep recursion, operators, keep branches,
+  `length`, string constants, constructions, handlers that catch in baseline code, steps that
+  move the frame, and three loops that are entered while they run.
+- `python3 modules/jit/scripts/baseline_scripts.py <shell>`: the 20 scripts of
+  `modules/jit/tests/baseline` print the interpreter's output at thresholds 1, 5 and 60. They
+  cover deep recursion and the stack overflow, exceptions through baseline frames, error
+  stacks from frames built lazily, closures, `arguments`, getters, constructors, natives, every
+  comparison on mixed operand types, and loop entry with live operands. Fixed-work Richards
+  and DeltaBlue pass the same way.
+- All eight benchmarks print the interpreter's output with baseline code.
 
 ## Tools
 
 `scripts/jit_baseline_profile.py <shell> <script.js>` runs the script under callgrind and joins
 the count of every machine instruction with the code map that `--jit-dump` prints: one row per
-kind of part (opcode, prologue, leave, each slow path), with instructions, share, entries and
-instructions per entry. `--show NAME` disassembles the hottest instance with its counts,
-`--functions` adds a row per function, and `--time SAMPLER.so` prints time shares from an
-LD_PRELOAD program-counter sampler instead.
+kind of part (opcode, prologue, leave, each slow path, each entry), with instructions, share,
+entries and instructions per entry. `--show NAME` disassembles the hottest instance with its
+counts, `--functions` adds a row per function, and `--time SAMPLER.so` prints time shares from
+an LD_PRELOAD program-counter sampler instead.
+
+`--coverage` prints the gate's measure: bytecode instructions run by templates (entries into
+templates, less the steps) against the interpreter's dispatches in `executeLoop` and the
+frameless leaf evaluator. Steady state is the difference of two processes that run the
+benchmark a different number of times (22 and 27 here).
+
+`--jit-stats=FILE` has the tier's counters: `baseline-compiled`, `-refused`, `-departures`,
+`-resumes`, `-service-calls`, `-direct-calls`, `-steps`, and `step:<opcode>` and
+`exit:<opcode>` per opcode.
 
 ## Not done
 
-- Opcodes beyond what Richards and DeltaBlue use: see the table of the other six benchmarks.
-  93 of the interpreter's 250 opcodes have a template.
-- Only plain functions compile: no scope of their own, no captured locals, not a known local
-  function, not async or a generator. Constructors run interpreted.
-- Calls of natives go through the engine's generic call, without the interpreter's quick
-  paths for `push`, `pop`, `charCodeAt` and the like.
-- A function that keeps departing is never given back to the interpreter.
-- Exceptions leave to the interpreter, which unwinds and finishes the activation. Handlers
-  never run in baseline code.
-- No entry into a running loop.
+- Functions the tier refuses: one with a scope of its own or with locals an inner function
+  captures, a known local function that has either, a derived class constructor, async
+  functions and generators. EarleyBoyer has four such functions, and they are most of what it
+  still interprets.
+- Instructions without a template run as steps, and so do the cases a template does not
+  handle. The benchmarks step most on the `regexp` literal (RegExp), on `get_length`,
+  `special_object` and element reads (EarleyBoyer), on element reads and stores outside the
+  fast case (Crypto) and on `mod` (RayTrace).
+- A call that leaves baseline code for a native, a construction or a callee without code
+  goes through the engine. RayTrace and EarleyBoyer make half a million of those per run.
+- A function that keeps stepping or departing is never given back to the interpreter.
+- A loop is entered only from a plain call's activation, and only in a function that has a
+  `return` and does not read `arguments`.
 - Code is never freed, and the table holds 4,096 functions.
+- No feedback is recorded for a higher tier yet.
 - x86-64 only.
 
-## Next cuts, measured or estimated on Richards
+## Next cuts
+
+For the six benchmarks where the runtime dominates, in the order the tables above suggest:
+
+| Change | What it reaches |
+| --- | --- |
+| Functions with a scope of their own and captured locals | EarleyBoyer's four refused functions and 5,000 `get_var_ref` steps; the same shape is every closure-heavy program |
+| A frameless path for constructions and for natives without a quick answer | RayTrace's 615,000 and EarleyBoyer's 530,000 calls through the engine per run |
+| `regexp` literals without a step | 13,000 steps per RegExp run, 450 instructions each, 0.5% of the run |
+| The cases `mod`, `add_imm`, `get_array_el` and `put_array_el` still step on | RayTrace's 11,000 and Crypto's 16,000 steps per run |
+| A step that does not describe the activation for instructions that cannot throw | Every step: 110 of its 450 instructions |
+
+Measured or estimated on Richards:
 
 | Change | Saves |
 | --- | --- |
