@@ -301,6 +301,8 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
     return plain(1, 1, 0)
   }
   if opcode == op.OP_typeof_is { if size != 2 { return departs(size) } return plain(2, 1, 0) }
+  if opcode == op.OP_to_object { if size != 1 { return departs(size) } return plain(1, 1, 0) }
+  if opcode == op.OP_set_proto { if size != 1 { return departs(size) } return plain(1, 2, -1) }
   if opcode == op.OP_define_field { if size != 5 { return departs(size) } return plain(5, 2, -1) }
   if opcode == op.OP_rest { if size != 3 { return departs(size) } return plain(3, 0, 1) }
   if opcode == op.OP_array_from && size == 3 {
@@ -384,7 +386,9 @@ struct Plan {
   scopeSlots: u32,
   scopeAt: i32,
   /// The code has a lazy arguments slot (engine.LAZY_ARGUMENTS).
-  lazy: bool
+  lazy: bool,
+  /// Strict code: `this` is the receiver as passed, whatever it is.
+  strict: bool
 }
 impl Copy for Plan {}
 fn signed(value: u32) -> i32 { return u32.wrappingToI32(value) }
@@ -396,7 +400,7 @@ impl Plan {
     return Plan { layout: settings.layout, f: settings.frame, fields: settings.fields,
       record: 0 - signed(record), cells: 0 - signed(record + cells), below: signed(record + cells + scope),
       arguments: shape.arguments, locals: shape.locals, stack: shape.stack, codeDelta: signed(shape.codeDelta),
-      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - signed(record + cells + scope), lazy: false }
+      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - signed(record + cells + scope), lazy: false, strict: (shape.mode & 1) != 0 }
   }
   /// A field of the record, and of its StackFrame.
   fn rec(self: &Self, offset: u32) -> Mem { return Mem.at(Reg.Rbp, self.record + signed(offset)) }
@@ -469,6 +473,10 @@ const S_ELEMENT: u8 = 21
 /// (a itself, or a free cell that takes a copy) and the getter in the cell after it; the
 /// result replaces the object in c at back. other when no function getter answers.
 const S_GETTER: u8 = 22
+/// A field store that a setter takes: the setter of the field at pc of the object in cell a
+/// is called on it with the value in cell b, the cell above it (c) free for the call; its
+/// result is dropped at back. other when no function setter takes the store.
+const S_SETTER: u8 = 23
 /// S_HELPER.b when the helper takes no second cell.
 const NO_CELL: i32 = 1
 /// Code kept out of the straight path: a last release, a cache miss, a poll, a generic call.
@@ -1245,6 +1253,31 @@ impl Emitter {
       run self.a.jmp(item.back)
       return ()
     }
+    if item.kind == S_SETTER {
+      // setter(env, ip, object cell, out) -> 0: no function setter.
+      run self.operandInto(Reg.Rsi, u32.toUsize(item.pc))
+      run self.a.lea(Width.W64, Reg.Rdx, word(item.a))
+      run self.a.lea(Width.W64, Reg.Rcx, word(item.c))
+      run self.helper(env.SETTER)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, item.other)
+      // object value setter -> object setter value: call_method's operands.
+      run self.a.load(Width.W64, Reg.Rax, word(item.b))
+      run self.a.load(Width.W64, Reg.Rdx, payload(item.b))
+      run self.a.load(Width.W64, Reg.R8, word(item.c))
+      run self.a.load(Width.W64, Reg.R9, payload(item.c))
+      run self.a.store(Width.W64, word(item.b), Reg.R8)
+      run self.a.store(Width.W64, payload(item.b), Reg.R9)
+      run self.a.store(Width.W64, word(item.c), Reg.Rax)
+      run self.a.store(Width.W64, payload(item.c), Reg.Rdx)
+      // The setter is an object (the helper's word), so the call never takes other.
+      let above = (item.c - p.operandAt(0)) / 16 + 1
+      run self.callAt(u32.toUsize(item.pc), above, 1, true, item.other)
+      // The call left the setter's result where the object was: it is dropped.
+      run self.releaseCell(item.a)
+      run self.a.jmp(item.back)
+      return ()
+    }
     if item.kind == S_ELEMENT {
       if (item.k & 3) != 0 { run self.a.load(Width.W64, Reg.Rax, p.sf(f.argumentsData)) }
       if (item.k & 1) != 0 { run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rax, item.a)) } else { run self.a.lea(Width.W64, Reg.Rsi, word(item.a)) }
@@ -1523,12 +1556,13 @@ impl Emitter {
       let callee = item.a
       let found = run self.a.label()
       let walk = run self.a.label()
+      let cold = run self.a.label()
       let threw = run self.exit(u32.toUsize(item.pc) + 1, signed(item.depth), true)
       run self.tagIs(word(callee), p.tag(-2), item.other)
       run self.a.load(Width.W64, Reg.R11, payload(callee))
       run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.Equal, item.other)
+      run self.a.jcc(Cond.Equal, cold)
       run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(item.pc + 1))
       run self.a.load(Width.W32, Reg.Rcx, Mem.at(Reg.R11, signed(f.knownLevel)))
       run self.a.movImm32(Reg.Rdi, 0)
@@ -1554,6 +1588,12 @@ impl Emitter {
       run self.a.store(Width.W64, word(callee), Reg.Rax)
       run self.a.store(Width.W64, payload(callee), Reg.Rdx)
       run self.a.jmp(item.back)
+      // No code yet: the interpreter's call, counted where its run would not be
+      // (js_baseline.countLeaf), so a function this code calls becomes hot.
+      self.a.bind(cold)
+      run self.a.mov(Width.W64, Reg.Rsi, Reg.R11)
+      run self.helper(env.HOT)
+      run self.a.jmp(item.other)
       return ()
     }
     if item.kind == S_NATIVE {
@@ -1744,8 +1784,11 @@ impl Emitter {
     let symbolTag = self.p.tag(0 - 8)
     run self.tagIs(index.word(), symbolTag, miss)
     run self.a.load(Width.W64, Reg.Rsi, object.payload())
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsi, signed(fields.objectShape)))
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(fields.shapeVersion)))
+    // The entry of the site and the shape version (js_baseline.elementIndex).
     run self.operandInto(Reg.R9, pc)
-    run self.a.mov(Width.W64, Reg.R8, Reg.R9)
+    run self.a.lea(Width.W64, Reg.R8, Mem.indexed(Reg.R9, Reg.Rax, Scale.Eight, 0))
     run self.a.aluImm(Alu.And, Width.W32, Reg.R8, env.ELEMENT_MASK)
     run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R8, env.ELEMENT_SHIFT)
     run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R9, Mem.indexed(Reg.R12, Reg.R8, Scale.One, env.ELEMENTS_OFFSET + env.ELEMENT_SITE))
@@ -1753,8 +1796,6 @@ impl Emitter {
     run self.a.load(Width.W64, Reg.R10, index.payload())
     run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R10, Mem.indexed(Reg.R12, Reg.R8, Scale.One, env.ELEMENTS_OFFSET + env.ELEMENT_SYMBOL))
     run self.a.jcc(Cond.NotEqual, miss)
-    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsi, signed(fields.objectShape)))
-    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(fields.shapeVersion)))
     // As keyedSlot: the slot index is left, or more when the versions differ.
     run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rax, 16)
     run self.a.aluLoad(Alu.Xor, Width.W64, Reg.Rax, Mem.indexed(Reg.R12, Reg.R8, Scale.One, env.ELEMENTS_OFFSET + which))
@@ -1931,6 +1972,16 @@ impl Emitter {
       if then == op.OP_put_loc8 { index = u8.toU32(bytes[second + 1]) } else { index = u8.toU32(then) - u8.toU32(op.OP_put_loc0) }
       if index >= p.locals { return 0 }
       let at = p.localAt(index)
+      if p.strict {
+        // Strict code reads the receiver as it is.
+        run self.a.load(Width.W64, Reg.Rax, p.sf(f.thisValue))
+        run self.a.load(Width.W64, Reg.Rdx, p.sf(f.thisValue + 8))
+        run self.retain(Reg.Rax, Reg.Rdx)
+        if pc != 0 || entered { run self.releaseCell(at) }
+        run self.a.store(Width.W64, word(at), Reg.Rax)
+        run self.a.store(Width.W64, payload(at), Reg.Rdx)
+        return follow.size
+      }
       let other = run self.bailPair(pc, depth, step, &follow)
       run self.tagIs(p.sf(f.thisValue), p.object(), other)
       run self.a.load(Width.W64, Reg.Rdx, p.sf(f.thisValue + 8))
@@ -2007,6 +2058,21 @@ impl Emitter {
     let next = p.operandAt(depth)
     // The fusion prefix may always do nothing: the instructions it covers run themselves.
     if opcode == op.OP_nop || opcode == op.OP_fuse_prefix { return true }
+    if opcode == op.OP_push_this && p.strict {
+      // Strict code reads the receiver as it is.
+      run self.a.load(Width.W64, Reg.Rax, p.sf(f.thisValue))
+      run self.a.load(Width.W64, Reg.Rdx, p.sf(f.thisValue + 8))
+      run self.a.store(Width.W64, word(next), Reg.Rax)
+      run self.a.store(Width.W64, payload(next), Reg.Rdx)
+      run self.retain(Reg.Rax, Reg.Rdx)
+      return true
+    }
+    if opcode == op.OP_to_object {
+      // An object stays; anything else is the interpreter's conversion (or its TypeError).
+      let other = run self.bail(pc, depth, step)
+      run self.tagIs(word(top), p.object(), other)
+      return true
+    }
     if opcode == op.OP_push_this {
       // An object receiver needs no conversion; anything else is the interpreter's.
       let other = run self.bail(pc, depth, step)
@@ -2165,6 +2231,14 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, threw)
       run self.a.jmp(other)
       self.a.bind(done)
+      return true
+    }
+    if opcode == op.OP_set_proto {
+      // The literal's prototype through the engine, without the interpreter.
+      let other = run self.bail(pc, depth, step)
+      run self.quick(usize.toU32(pc), next)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.NotEqual, other)
       return true
     }
     if opcode == op.OP_define_field {
@@ -2399,7 +2473,16 @@ impl Emitter {
     if opcode == op.OP_put_field {
       let other = run self.bail(pc, depth, step)
       let done = run self.a.label()
-      let miss = run self.slow(S_HELPER, done, other, under, top, env.PUT_FIELD | 256, pc, depth, Reg.Rax, false)
+      // What the helper declines the engine may still store without the interpreter (a
+      // store that allocates).
+      let grows = run self.slow(S_QUICK, done, other, next, 0, 0, pc, depth, Reg.Rax, false)
+      // A function setter is called here, where the frame has a cell above the operands.
+      let mut declined = grows
+      if next < p.operandAt(u32.wrappingToI32(p.stack)) {
+        declined = run self.a.label()
+        run self.slows.append(Slow { kind: S_SETTER, entry: declined, back: done, other: grows, a: under, b: top, c: next, k: 0, pc: usize.toU32(pc), depth: i32.wrappingToU32(depth), reg: Reg.Rax, flag: false })
+      }
+      let miss = run self.slow(S_HELPER, done, declined, under, top, env.PUT_FIELD | 256, pc, depth, Reg.Rax, false)
       run self.keyedSlot(word(under), payload(under), pc, miss)
       run self.displace(miss)
       // The operand's count moves into the slot; the object operand's drops.

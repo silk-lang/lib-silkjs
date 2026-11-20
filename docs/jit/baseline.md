@@ -10,7 +10,7 @@ Everything here was measured on the JIT shell (`modules/jit/shell`) in release m
 says otherwise. Code: `modules/jit/src/baseline.silk` (the compiler), `baseline_env.silk` (what
 the code reaches at run time), `modules/engine/src/js_baseline.silk` (the engine's side) and
 `js_vm.silk` (`enterBaseline`, `baselineService`, `baselineFinish`, `baselineStep`,
-`baselineNative`, `baselineLoop`).
+`baselineCallNative`, `baselineQuick`, `baselineLoop`).
 
 ## Result
 
@@ -166,9 +166,13 @@ of numbers is a step.
 Truthiness is inline for booleans, Ints, undefined, null, flat strings (by length) and objects
 (true unless the object is one of the falsy kind); a flat string's `length` is one load.
 
-Object and array literals, `define_field` and the `+` of a string with a string or a number go
-through services that build no frame (`SERVICE_QUICK`, `SERVICE_CONCAT`): they only allocate,
-so nothing can read the frame chain meanwhile.
+Object and array literals, `define_field`, closures, a literal's `__proto__`, a field store that
+must allocate and the `+` of a string with a string or a number go through services that build
+no frame (`SERVICE_QUICK`, `SERVICE_CONCAT`): they only allocate, so nothing can read the frame
+chain meanwhile.
+
+`to_object` on an object is nothing, and strict code reads `this` as the cell it was passed;
+only a conversion (a primitive, or a sloppy function's missing receiver) is a step.
 
 ### Frame
 
@@ -179,6 +183,7 @@ The code runs on the native stack:
 [rbp]            the caller's rbp
 [rbp - R, rbp)   the BaselineFrame record (js_baseline); its last word is the state
 below it         the cells: [arguments][locals][operand stack], 16 bytes each, ascending
+below them       the scope of a function that has one of its own: a header, then its slots
 ```
 
 The record holds a `StackFrame`, which is what the engine reads when it walks frames, plus the
@@ -218,14 +223,20 @@ generator or under an instruction observer (debugger, coverage, profiler).
 
 A known local function (`js_compiler_known`) has no closure object. Its frame names its
 bytecode as the function, and the caller passes the scope it runs in where a closure's caller
-passes the object (rdi). A call site reaches one out of line (`S_KNOWN`).
+passes the object (rdi). A call site reaches one out of line (`S_KNOWN`). The interpreter runs
+a small one without a frame (`js_vm_leaf`) and counts no entry for it, so a function that only
+baseline code calls would never be hot: a call site that finds no code counts the entry itself
+(`js_baseline.countLeaf`) before it hands the call to the interpreter.
 
 A native callee is called without any frame of the engine's (`CALL_NATIVE`,
-`js_vm.baselineNative`), as the interpreter's call instruction calls one: first the answers
+`js_vm.baselineCallNative`), as the interpreter's call instruction calls one: first the answers
 that need no native frame (Math on numbers, `push` and `pop`, the string methods with a
 primitive entry, `String(int)`, regular expression `exec` and `replace`, the collection
 reads), then the native itself. The call charges the interrupt counter as the interpreter's
-does.
+does. The request has a path of its own in the service, apart from the one that serves steps,
+finishes and calls of bytecode: that one is 113 instructions long before it reaches a native,
+and a native is the most frequent thing baseline code asks the engine for (135 of 163 requests
+per HTTP order).
 
 ### What the code asks the engine for
 
@@ -240,16 +251,26 @@ the runtime:
 | `SERVICE_POLL` | The interrupt counter ran out |
 | `SERVICE_OVERFLOW` | No room on the native stack: throw the RangeError |
 | `SERVICE_STEP` | Run the one instruction at the published offset in the interpreter |
-| `SERVICE_QUICK` | An allocating instruction (`object`, `define_field`, `array_from`) without a frame; the engine may decline, and the instruction is a step then |
+| `SERVICE_QUICK` | An allocating instruction (`object`, `define_field`, `array_from`, `rest`, `fclosure`, `set_proto`, a `put_field` that adds past the object's room or sets an Array's length) without a frame; the engine may decline, and the instruction is a step then |
 | `SERVICE_CONCAT` | The `+` of a string and a string or number, without a frame |
 | `SERVICE_RESUME` | Only from a resume entry: fill the new frame from an interpreter activation (below) |
+| `SERVICE_SCOPE` | From the leave tail of a function whose own scope a closure moved to the heap: drop the frame's count of it |
 
-The first five and the step build the bare frames first; the last three do not.
+The first five and the step build the bare frames first; the last four do not.
 
 Helpers (`BaselineEnv.helpers`, C functions named by index) cover the misses that run no user
-code: field reads and writes that miss their cache, `get_var`, loose equality, truthiness,
-`!`, arithmetic and comparisons of numbers, string constants, element reads and stores. A helper that would have to run user code returns 0 and the template
-steps instead, so user code never runs under a bare frame.
+code: field reads and writes that miss their cache, `get_var`, equality, truthiness, `!`,
+`typeof`, lengths, arithmetic and comparisons of numbers, string constants, element reads and
+stores, and finding a getter or a setter to call. A helper that would have to run user code returns 0 and
+the template steps instead, so user code never runs under a bare frame. A helper has no hooks
+to free a cell with, so a count it drops to zero is queued (`releaseDeferred`) and the engine
+drains the queue later; a count that stays above zero drops in the helper itself.
+
+**try, catch and finally.** `catch` stores the handler marker (the catch offset) in its operand
+cell, `nip_catch` drops it, `gosub` pushes the return offset as an Int and jumps to the finally
+block, and `ret` goes back through the function's resume table, since the offset is a value.
+A function with `try` therefore runs whole in machine code; the unwinder finds the marker in
+the cells as it does for the interpreter.
 
 ### Exceptions
 
@@ -292,6 +313,33 @@ On NavierStokes, whose `lin_solve` runs for about 10M instructions per call, thi
 share of bytecode instructions in machine code from 76% to 96% and the run from 1.43x to 1.63x
 fewer instructions than the interpreter (both at the 1,000-entry threshold the tier had then).
 
+### Scopes and closures
+
+A function whose variables an inner function captures has a scope of its own
+(`FunctionBytecode.scopeSlots`). The interpreter keeps that scope in the frame while no closure
+holds it and moves it to the heap when one does (`js_scopes.placeFrameScope`, `promote`), and
+baseline frames do the same:
+
+- The prologue reserves the scope's header and slots below the cells and calls one helper
+  (`SCOPE`, `js_baseline.beginScope`): it places the scope, links its parent (the scope the
+  closure captured, or the one the caller passed to a known local function) and moves the
+  captured parameters in. `BaselineFrame.scope` names it, and the scope templates
+  (`get_scope0`, `put_scope0` and their checked forms) read it from there.
+- `fclosure` goes through `SERVICE_QUICK` (`js_vm_factories.closureAt`). A known local child
+  is just its bytecode, with the level of the scope it will run in. Any other child gets a
+  closure object, and the frame's scope moves to the heap first; the record then names it
+  there. A closure that would capture a local or an argument by frame slot is declined, and
+  the instruction steps.
+- The leave tail compares the record's scope with the frame's own address. Still in the
+  frame: the slots are released inline. Moved: `SERVICE_SCOPE` drops the frame's count.
+- A known local function with a scope of its own never moves it: every function it makes is
+  known as well, so its leave tail has no compare.
+- When the interpreter steps or finishes such an activation it runs on the record's scope and
+  writes back the one it ends with, since a closure it made may have moved it.
+
+A function with a scope of its own gets no resume entry, so a loop in it is not entered while
+it runs.
+
 ### Fields, variables, elements
 
 - `get_field`, `get_loc_field8`, `get_arg_field8`, `put_field`, `put_loc_field_loc8` use the
@@ -300,9 +348,54 @@ fewer instructions than the interpreter (both at the 1,000-entry threshold the t
 - `get_field2` uses the interpreter's site cache (`RuntimeState.fieldCache`), own and prototype
   entries.
 - `get_var` reads the closure's variable cell inline, detached or attached to a frame.
-- `get_array_el` and `put_array_el` handle a fast Array with an Int index in bounds.
+  `get_var_ref` and `get_var_ref_check` read a captured variable up the scope chain (the
+  operand names the depth and the slot) or a closure cell.
+- `get_scope0_check`, `put_scope0_check`, `get_loc_check`, `put_loc_check` and
+  `set_loc_uninitialized` test the slot's tag for the uninitialized marker and step only when
+  the read or write must throw.
+- `get_array_el`, `get_array_el2`, `get_array_el3`, `get_scope0_el`, the four slot forms
+  (`get_loc_el8` and so on) and `put_array_el` handle a fast Array with an Int index in
+  bounds, and a Symbol key through the element site cache below. Everything else that runs
+  no user code goes to a helper: an indexed or named property found without a getter, a
+  flat string key that an atom already spells.
+- Lengths: an Array's inline, a string's, a typed array's and any other plain `length`
+  property through a helper.
+- A read that finds a getter calls it from machine code. The helper asks the interpreter's
+  getter caches (`siteGetter`, `functionGetter`) for the function, puts it above the
+  operands with the receiver, and the template's slow path makes an ordinary call. Node's
+  stream state is all getters (`destroyed`, `readable`, `writableHighWaterMark`), so on the
+  HTTP service this was 46 calls per order that had been steps.
+- A store by name (`put_field` and its slot forms) that misses the inline key goes on in a
+  helper: an own writable data property, or an add along a verified transition memo entry.
+  What the helper declines on a `put_field` is tried twice more before it is a step. A
+  bytecode setter is called from machine code as a getter is: the helper finds it
+  (`functionSetter`), the slow path turns `object value` into `object setter value` and makes
+  an ordinary method call whose result it drops. Then the engine's store without a frame
+  (`SERVICE_QUICK`): an add that needs a new shape or more room, and `array.length = n`.
+  On the HTTP service these were 15 steps per order.
+- `typeof`, `!` of any value and `===` answer without the interpreter. `===` is decided in
+  the slow path from tags and words where that is enough (one cell twice, two objects, two
+  symbols, anything against `undefined` or `null`); numbers, strings and booleans go to the
+  helper.
 
-The code and the interpreter share these caches, so either one warms them for the other.
+The code and the interpreter share the field caches, so either one warms them for the other.
+
+**The element site cache.** `this[kState]` is how Node's own modules keep private state: a
+Symbol key from a module scope, read and written about 340 times per HTTP order. The
+interpreter looks the symbol's atom up in the shape's hash on every one (92 instructions a
+read). Baseline code keeps a table of 2,048 entries in its environment, picked by the
+instruction's address and the object's shape version together, so a site that sees several
+shapes (the same module code on a request, a response and a socket) keeps an entry for each:
+the instruction, the symbol's cell, and `version << 16 | slot` of the own plain data property
+it found last time, once for reads and once for stores (zero when the property is not
+writable). The template compares the three and reads or writes the
+slot: about 25 instructions. A helper fills the entry on a miss. Only own data properties are
+entered, so a getter, a prototype's property or a missing one keeps taking the helper. The
+entry cannot go stale: a shape's version changes with its records, and a shape that has the
+property holds the symbol, so while an object has that version the cell address still names
+the same symbol. A store also asks the object for the exotic flag, since an entry is per
+shape and an exotic object keeps its own `[[Set]]`. The table lives in `BaselineEnv`, not in
+the code, so the code still holds no address.
 
 ### Counts
 
@@ -414,12 +507,14 @@ closely, so there is no single stall to remove; the code is bound by loads that 
   field stores, a throw through two baseline frames, deep recursion, operators, keep branches,
   `length`, string constants, constructions, handlers that catch in baseline code, steps that
   move the frame, and three loops that are entered while they run.
-- `python3 modules/jit/scripts/baseline_scripts.py <shell>`: the 20 scripts of
+- `python3 modules/jit/scripts/baseline_scripts.py <shell>`: the 29 scripts of
   `modules/jit/tests/baseline` print the interpreter's output at thresholds 1, 5 and 60. They
   cover deep recursion and the stack overflow, exceptions through baseline frames, error
-  stacks from frames built lazily, closures, `arguments`, getters, constructors, natives, every
-  comparison on mixed operand types, and loop entry with live operands. Fixed-work Richards
-  and DeltaBlue pass the same way.
+  stacks from frames built lazily, closures and scopes that escape or die with the frame,
+  `arguments`, getters and setters, constructors, natives that answer, throw or call back,
+  every comparison on mixed operand types, symbol keys under several shapes, stores that grow
+  an object, and loop entry with live operands. Fixed-work Richards and DeltaBlue pass the
+  same way.
 - All eight benchmarks print the interpreter's output with baseline code.
 
 ## Tools
@@ -436,22 +531,31 @@ templates, less the steps) against the interpreter's dispatches in `executeLoop`
 frameless leaf evaluator. Steady state is the difference of two processes that run the
 benchmark a different number of times (22 and 27 here).
 
+`docs/jit/jit-scorecard-results/2026-11-20-http-baseline/instructions.py --host <embed host>
+--out DIR [--stats]` gives instructions per order of the HTTP order service by function, for
+baseline code and for the interpreter. It runs the host under callgrind with 400 and with
+1,400 orders and charges the difference to an order, so start-up, warm-up and compilation
+cancel and the figure does not depend on how busy the machine is. `--stats` adds steps by
+opcode, service calls and direct calls per order.
+
 `--jit-stats=FILE` has the tier's counters: `baseline-compiled`, `-refused`, `-departures`,
 `-resumes`, `-service-calls`, `-direct-calls`, `-steps`, and `step:<opcode>` and
 `exit:<opcode>` per opcode.
 
 ## Not done
 
-- Functions the tier refuses: one with a scope of its own or with locals an inner function
-  captures, a known local function that has either, a derived class constructor, async
-  functions and generators. EarleyBoyer has four such functions, and they are most of what it
-  still interprets.
+- Functions the tier refuses: one with locals an inner function captures by frame slot, a
+  derived class constructor, async functions and generators.
 - Instructions without a template run as steps, and so do the cases a template does not
   handle. The benchmarks step most on the `regexp` literal (RegExp), on `get_length`,
   `special_object` and element reads (EarleyBoyer), on element reads and stores outside the
   fast case (Crypto) and on `mod` (RayTrace).
 - A call that leaves baseline code for a native, a construction or a callee without code
-  goes through the engine. RayTrace and EarleyBoyer make half a million of those per run.
+  goes through the engine. RayTrace and EarleyBoyer make half a million of those per run. A
+  native with no frameless answer still gets a native frame there, as it does from the
+  interpreter (188 instructions in `callPlain`).
+- `for-in`, `for-of`, private fields, `special_object` and the slot forms of a store that
+  meets a setter are steps.
 - A function that keeps stepping or departing is never given back to the interpreter.
 - A loop is entered only from a plain call's activation, and only in a function that has a
   `return` and does not read `arguments`.
@@ -465,7 +569,6 @@ For the six benchmarks where the runtime dominates, in the order the tables abov
 
 | Change | What it reaches |
 | --- | --- |
-| Functions with a scope of their own and captured locals | EarleyBoyer's four refused functions and 5,000 `get_var_ref` steps; the same shape is every closure-heavy program |
 | A frameless path for constructions and for natives without a quick answer | RayTrace's 615,000 and EarleyBoyer's 530,000 calls through the engine per run |
 | `regexp` literals without a step | 13,000 steps per RegExp run, 450 instructions each, 0.5% of the run |
 | The cases `mod`, `add_imm`, `get_array_el` and `put_array_el` still step on | RayTrace's 11,000 and Crypto's 16,000 steps per run |
