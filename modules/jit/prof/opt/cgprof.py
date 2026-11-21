@@ -11,9 +11,15 @@ code bytes, most first. --all prints every function, not only the top 30.
 --ops FN: instead, the instructions of each SSA instruction of function FN (all its
 compiles, joined by the `jit: optimized map` offsets), the 40 most costly, then the totals
 per operation.
+
+--asm FN TEXT: the machine code of each SSA instruction of FN whose line contains TEXT,
+with the instructions callgrind counted at each address (objdump disassembles it).
 """
+import os
 import re
 import signal
+import subprocess
+import tempfile
 import sys
 from bisect import bisect_right
 
@@ -40,7 +46,7 @@ def regions(err, ssa=None):
             elif line.startswith("jit: optimized code at "):
                 parts = line.split()
                 if ssa is not None and offsets is not None:
-                    ssa[len(opt)] = (lines_done, offsets)
+                    ssa[len(opt)] = (lines_done, offsets, parts[5])
                 offsets = None
                 opt.append((int(parts[4]), len(parts[5]) // 2, current))
             elif line.startswith("jit: baseline code at "):
@@ -88,7 +94,7 @@ def ops(opt, ssa, per, fn):
     for k, (a, n, f) in enumerate(opt):
         if f != fn or k not in ssa:
             continue
-        lines, offsets = ssa[k]
+        lines, offsets, _ = ssa[k]
         if len(offsets) != len(lines) + 1:
             print(f"compile {k}: {len(lines)} SSA lines, {len(offsets)} offsets: skipped")
             continue
@@ -117,12 +123,45 @@ def ops(opt, ssa, per, fn):
         print(f"{c:>12,}  {op}")
 
 
+def asm(opt, ssa, per, fn, text):
+    for k, (a, n, f) in enumerate(opt):
+        if f != fn or k not in ssa:
+            continue
+        lines, offsets, code = ssa[k]
+        if len(offsets) != len(lines) + 1:
+            continue
+        with tempfile.NamedTemporaryFile(delete=False) as out:
+            out.write(bytes.fromhex(code))
+            path = out.name
+        for i, line in enumerate(lines):
+            if text not in line:
+                continue
+            lo, hi = a + offsets[i], a + offsets[i + 1]
+            total = sum(c for x, c in per.items() if lo <= x < hi)
+            if total == 0:
+                continue
+            print(f"[{k}] {line[:140]}  ({total:,})")
+            listing = subprocess.run(["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", "--no-show-raw-insn",
+                                      f"--adjust-vma={a}", f"--start-address={lo}", f"--stop-address={hi}", path],
+                                     capture_output=True, text=True).stdout
+            for row in listing.splitlines():
+                m = re.match(r"\s*([0-9a-f]+):\s*(.*)", row)
+                if m:
+                    x = int(m.group(1), 16)
+                    print(f"{per.get(x, 0):>12,}  {m.group(2)}")
+        os.unlink(path)
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     ssa = {}
     opt, base = regions(sys.argv[1], ssa)
     per, total = costs(sys.argv[2])
+    if "--asm" in sys.argv:
+        at = sys.argv.index("--asm")
+        asm(opt, ssa, per, int(sys.argv[at + 1]), sys.argv[at + 2])
+        return
     if "--ops" in sys.argv:
         ops(opt, ssa, per, int(sys.argv[sys.argv.index("--ops") + 1]))
         return
