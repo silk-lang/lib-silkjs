@@ -16,13 +16,16 @@
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import ssa { Function, Op, NONE, edgeCount }
+import ssa { Function, Inst, Op, NONE, edgeCount, TARGET_KNOWN, TARGET_EXACT }
 import ssa_translate { FunctionInput, SiteShape, FIELD_KEYED, FIELD_CACHED, CallTarget }
 import ssa_verify { dominators }
+import ssa_calls as calls
+import silkjs.js_compiled as compiled
 
 /// In Shapes.facts: the site's object is known to be an object; and to have the key's shape.
 pub const FACT_OBJECT: u8 = 1
@@ -37,6 +40,12 @@ const NO_KEY: u64 = 18446744073709551615
 pub const FACT_HEDGED: u8 = 4
 /// A cached site whose object is known to have the shape of its pair n: (1 + n) << FACT_PAIR.
 pub const FACT_PAIR: u8 = 4
+/// A cached site with no shapes of its own whose method is known (knownTarget): the read is
+/// the known path or it leaves, so it runs nothing and proves the object (and its shape, when
+/// the method is known for one).
+pub const FACT_KNOWN: u8 = 8
+/// Instructions after a known read its callee test may be within (knownTarget).
+const KNOWN_WINDOW: u32 = 48
 
 /// By instruction: the constant key of a field site (shape version << 16 | slot), or 0 for
 /// an instruction lowered as before; and the FACT_* of its object. For a cached field site
@@ -45,7 +54,12 @@ pub const FACT_PAIR: u8 = 4
 /// same, by instruction: for a field read whose value an earlier value still holds (an
 /// earlier read of the same property of the same object, or what was stored there, with
 /// nothing since that could change it), that value: the read is a copy of it. NONE otherwise.
-pub struct Shapes { pub keys: List<u64>, pub facts: List<u8>, pub reads: List<u32>, pub sites: List<SiteShape>, pub same: List<u32> }
+/// proven, by instruction: the shape version the object of a field site or shape test is
+/// known to have there, or 0.
+/// adds: per field store whose site's inline key is no write key, that key as it was (0: none;
+/// x64_backend.addInPlace takes an add key); atoms: the property each field site names.
+pub struct Shapes { pub keys: List<u64>, pub facts: List<u8>, pub reads: List<u32>, pub sites: List<SiteShape>, pub same: List<u32>, pub proven: List<u64>,
+  pub adds: List<u64>, pub atoms: List<u32> }
 /// A property whose value a value holds: `atom` of the object `object` (the first value
 /// that was this object, Retain copies seen through) is in the slot of `value`.
 struct Known { object: u32, atom: u32, value: u32 }
@@ -54,7 +68,11 @@ impl Copy for Known {}
 const KNOWN: usize = 8
 
 impl Shapes {
-  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make(), reads: List<u32>.make(), sites: List<SiteShape>.make(), same: List<u32>.make() } }
+  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make(), reads: List<u32>.make(), sites: List<SiteShape>.make(), same: List<u32>.make(), proven: List<u64>.make(),
+    adds: List<u64>.make(), atoms: List<u32>.make() } }
+  pub fn add(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.adds.length() { return self.adds.get(u32.toUsize(inst)) } return 0 }
+  pub fn atom(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.atoms.length() { return self.atoms.get(u32.toUsize(inst)) } return 0 }
+  pub fn provenAt(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.proven.length() { return self.proven.get(u32.toUsize(inst)) } return 0 }
   pub fn sameAs(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.same.length() { return self.same.get(u32.toUsize(inst)) } return NONE }
   pub fn read(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.reads.length() { return self.reads.get(u32.toUsize(inst)) } return 0 }
   pub fn key(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.keys.length() { return self.keys.get(u32.toUsize(inst)) } return 0 }
@@ -63,13 +81,18 @@ impl Shapes {
 
 /// The key the field site at pc of code holds: 8 bytes after its atom, low byte first.
 fn keyAt(code: &[u8], pc: u32) -> u64 {
+  let key = rawKeyAt(code, pc)
+  // A version the code can compare as a sign-extended 32-bit immediate.
+  if key == NO_KEY || u64.shiftRight(key, 16) == 0 || u64.shiftRight(key, 16) >= 2147483648 { return 0 }
+  return key
+}
+/// keyAt as the site holds it, whatever it is (NO_KEY past the code).
+fn rawKeyAt(code: &[u8], pc: u32) -> u64 {
   let at = u32.toUsize(pc) + 5
-  if at + 8 > code.length { return 0 }
+  if at + 8 > code.length { return NO_KEY }
   let mut key: u64 = 0
   let mut b: usize = 8
   while b != 0 { b = b - 1 key = u64.bitOr(u64.shiftLeft(key, 8), u8.toU64(code[at + b])) }
-  // A version the code can compare as a sign-extended 32-bit immediate.
-  if key == NO_KEY || u64.shiftRight(key, 16) == 0 || u64.shiftRight(key, 16) >= 2147483648 { return 0 }
   return key
 }
 
@@ -84,20 +107,29 @@ fn siteAt(sites: &List<SiteShape>, pc: u32) -> SiteShape {
 
 /// What the field site at `pc` of inline target `id` has: its recorded shapes, its atom and its
 /// key. The target is one of `targets` or, an inlined body's own callee, one of theirs.
-struct InlinedSite { known: bool, site: SiteShape, atom: u32, key: u64 }
+struct InlinedSite { known: bool, site: SiteShape, atom: u32, key: u64, raw: u64 }
 impl Copy for InlinedSite {}
 fn inlinedSite(targets: &List<CallTarget>, id: u32, pc: u32) -> InlinedSite {
   let mut t: usize = 0
   while t < targets.length() {
     let target = &targets.asSlice()[t]
     if target.id == id {
-      return InlinedSite { known: true, site: siteAt(&target.input.siteShapes, pc), atom: atomAt(target.input.code.asSlice(), pc), key: keyAt(target.input.code.asSlice(), pc) }
+      return InlinedSite { known: true, site: siteAt(&target.input.siteShapes, pc), atom: atomAt(target.input.code.asSlice(), pc), key: keyAt(target.input.code.asSlice(), pc), raw: rawKeyAt(target.input.code.asSlice(), pc) }
     }
     let inner = inlinedSite(&target.input.targets, id, pc)
     if inner.known { return inner }
     t = t + 1
   }
-  return InlinedSite { known: false, site: SiteShape { pc: pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }, atom: 0, key: 0 }
+  return InlinedSite { known: false, site: SiteShape { pc: pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }, atom: 0, key: 0, raw: 0 }
+}
+/// The atom `inst`, a field read or store of `f` (whose input is `input`), names; 0 when
+/// it is not known.
+pub fn fieldAtom(f: &Function, input: &FunctionInput, inst: Inst) -> u32 {
+  if inst.frame == 0 { return atomAt(input.code.asSlice(), inst.pc) }
+  if u32.toUsize(inst.frame - 1) >= f.inlineTargets.length() { return 0 }
+  let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
+  if found.known { return found.atom }
+  return 0
 }
 /// The atom of the field site at pc of code: the 4 bytes after its opcode. 0: none.
 fn atomAt(code: &[u8], pc: u32) -> u32 {
@@ -146,6 +178,30 @@ effect fn remember(held: &mut List<Known>, k: Known) -> () ! OutOfMemoryError ? 
   run held.append(k)
 }
 
+/// The inline target whose method the cached field read at `index` reads when that method
+/// is known (ssa.TARGET_KNOWN, ssa.TARGET_EXACT): the target of the first `check.callee` of
+/// its result in the instructions that follow, with no `is.callee` of it before, when the
+/// read is the site the embedder marked it for. NONE otherwise.
+pub fn knownTarget(f: &Function, index: u32) -> u32 {
+  let read = f.inst(index)
+  if read.op != Op.GetField || read.result == NONE || (read.k & 1) != FIELD_CACHED { return NONE }
+  let mut at = index + 1
+  let end = usize.toU32(f.insts.length())
+  while at < end && at < index + 1 + KNOWN_WINDOW {
+    let next = f.inst(at)
+    at = at + 1
+    // Tests of several targets: their shape dispatch serves the read.
+    if next.op == Op.IsCallee && next.a == read.result { return NONE }
+    if next.op != Op.CheckCallee || next.a != read.result { continue }
+    let k = i32.wrappingToU32(next.k)
+    if u32.toUsize(k) >= f.inlineTargets.length() || next.frame != read.frame || f.inlineSites.get(u32.toUsize(k)) != read.pc { return NONE }
+    let id = f.inlineTargets.get(u32.toUsize(k))
+    if u32.bitAnd(id, TARGET_KNOWN) == 0 || u32.bitAnd(id, TARGET_EXACT) == 0 { return NONE }
+    return k
+  }
+  return NONE
+}
+
 /// Whether op leaves every object's shape as it is. Anything not listed may change one.
 /// A poll is listed: what it runs when the counter is out is the host's interrupt callback
 /// and the report of a hot function (js_interrupts.handle). Neither runs JavaScript or
@@ -165,7 +221,7 @@ fn quiet(op: Op) -> bool {
     || op == Op.Jump || op == Op.Branch || op == Op.Return || op == Op.This || op == Op.CheckTag || op == Op.TagIn || op == Op.TagIs
     || op == Op.AtomValue || op == Op.GetVar || op == Op.PutVar || op == Op.GetScope || op == Op.PutScope || op == Op.Truthy || op == Op.TypeofAtom
     || op == Op.CallArg || op == Op.CallResult || op == Op.CheckCallee || op == Op.IsCallee || op == Op.InlineFrame || op == Op.Removed
-    || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64 || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64
+    || op == Op.Equals || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64 || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64
     || op == Op.DivF64 || op == Op.CmpF64 || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.ToInt32
     || op == Op.ExactI32 || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.Mod
     || op == Op.Neg || op == Op.BitNot || op == Op.NotBool || op == Op.Imul
@@ -185,9 +241,13 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
   let mut read = List<SiteShape>.make()
   let mut same = List<u32>.make()
   run same.appendRepeated(NONE, count)
+  let mut proven = List<u64>.make()
+  run proven.appendRepeated(0, count)
   // The property each field site names.
   let mut atoms = List<u32>.make()
   run atoms.appendRepeated(0, count)
+  let mut adds = List<u64>.make()
+  run adds.appendRepeated(0, count)
   let mut any = false
   let mut i: usize = 0
   while i < count {
@@ -209,10 +269,18 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         reads.set(i, usize.toU32(read.length()))
         if hedged { facts.set(i, FACT_HEDGED) }
         any = true
-      }
+      } else if !hedged && knownTarget(f, usize.toU32(i)) != NONE { facts.set(i, FACT_KNOWN) any = true }
+    }
+    if inst.op == Op.CheckShape { any = true }
+    if inst.op == Op.Call && inst.frame == 0 && calls.kindOf(inst) == compiled.SITE_PUT_FIELD {
+      // A store that left before (a call that tries the helper, then steps): the add its
+      // inline key names may still go in place first.
+      let raw = rawKeyAt(input.code.asSlice(), inst.pc)
+      if raw != NO_KEY { adds.set(i, raw) atoms.set(i, atomAt(input.code.asSlice(), inst.pc)) }
     }
     if (inst.op == Op.GetField && inst.k == FIELD_KEYED) || inst.op == Op.PutField {
       let mut key: u64 = 0
+      let mut raw: u64 = 0
       // The own keys the site's inline key was filled with, when it had several.
       let mut site = SiteShape { pc: inst.pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }
       if inst.frame == 0 {
@@ -220,11 +288,15 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         let mut s: usize = 0
         while s < sites.length() { if sites.get(s) == inst.pc { left = true } s = s + 1 }
         if !left { key = keyAt(input.code.asSlice(), inst.pc) site = siteAt(&input.siteShapes, inst.pc) }
+        // The add the inline key names is tested in full where it runs (an add in place
+        // or the general way), so a site that left still has it.
+        raw = rawKeyAt(input.code.asSlice(), inst.pc)
         atoms.set(i, atomAt(input.code.asSlice(), inst.pc))
       } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
         let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
-        if found.known { key = found.key site = found.site atoms.set(i, found.atom) }
+        if found.known { key = found.key raw = found.raw site = found.site atoms.set(i, found.atom) }
       }
+      if inst.op == Op.PutField && key == 0 && site.count < 2 && raw != NO_KEY { adds.set(i, raw) }
       if site.count >= 2 {
         // Tested against each in turn, like a cached site's; any other shape leaves.
         run read.append(site)
@@ -234,7 +306,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
     }
     i = i + 1
   }
-  if !any { return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same } }
+  if !any { return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same, proven: move proven, adds: move adds, atoms: move atoms } }
   // The block each edge leaves.
   let blocks = u32.toUsize(f.blockCount())
   let values = u32.toUsize(f.valueCount())
@@ -285,7 +357,7 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
   let mut v0: usize = 0
   while v0 < values { run alias.append(usize.toU32(v0)) v0 = v0 + 1 }
   let mut clear: usize = 0
-  while clear < count { let fixed = u8.bitAnd(facts.get(clear), FACT_HEDGED) facts.set(clear, fixed) same.set(clear, NONE) clear = clear + 1 }
+  while clear < count { let fixed = u8.bitAnd(facts.get(clear), FACT_HEDGED | FACT_KNOWN) facts.set(clear, fixed) same.set(clear, NONE) proven.set(clear, 0) clear = clear + 1 }
   b = 0
   while b < blocks {
     // What every edge into the block agrees on; nothing when one comes from a block not
@@ -363,6 +435,10 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
       // that leaves on another shape.
       let plain = inst.op == Op.GetField && u32.toUsize(inst.a) < values && u32.toUsize(inst.result) < values
         && (key != 0 || (reads.get(index) != 0 && u8.bitAnd(facts.get(index), FACT_HEDGED) == 0))
+      if (inst.op == Op.GetField || inst.op == Op.PutField || inst.op == Op.CheckShape) && u32.toUsize(inst.a) < values {
+        proven.set(index, version.get(u32.toUsize(alias.get(u32.toUsize(inst.a)))))
+      }
+      let known = inst.op == Op.GetField && u8.bitAnd(facts.get(index), FACT_KNOWN) != 0 && u32.toUsize(inst.a) < values
       let mut copied = NONE
       if plain && atom != 0 { copied = knownValue(&held, alias.get(u32.toUsize(inst.a)), atom) }
       if copied != NONE && u32.toUsize(copied) < values {
@@ -371,6 +447,28 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
         let first = alias.get(u32.toUsize(copied))
         alias.set(u32.toUsize(inst.result), first)
         if object.get(u32.toUsize(first)) != 0 { let fact = u8.bitOr(facts.get(index), FACT_OBJECT) facts.set(index, fact) }
+      } else if inst.op == Op.CheckShape {
+        if u32.toUsize(inst.a) < values {
+          let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+          let mut fact: u8 = 0
+          if object.get(a) != 0 { fact = FACT_OBJECT }
+          if version.get(a) == i32.wrappingToU64(inst.k) { fact = u8.bitOr(fact, FACT_SHAPE) }
+          facts.set(index, fact)
+          object.set(a, 1)
+          version.set(a, i32.wrappingToU64(inst.k))
+        }
+      } else if known {
+        // The known path or an exit: the object is one, of a shape the method is known for.
+        let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+        let mut fact = FACT_KNOWN
+        if object.get(a) != 0 { fact = u8.bitOr(fact, FACT_OBJECT) }
+        facts.set(index, fact)
+        object.set(a, 1)
+        let k = knownTarget(f, usize.toU32(index))
+        if k != NONE && u32.toUsize(k) < f.inlineShapes.length() && version.get(a) == 0 {
+          let shapes = f.inlineShapes.get(u32.toUsize(k)).shapes
+          if shapes[0] != 0 && shapes[1] == 0 { version.set(a, u32.toU64(shapes[0])) }
+        }
       } else if inst.op == Op.CheckTag {
         if u32.toUsize(inst.a) < values {
           let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
@@ -446,5 +544,5 @@ pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) ->
   }
   pass = pass + 1
   }
-  return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same }
+  return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same, proven: move proven, adds: move adds, atoms: move atoms }
 }

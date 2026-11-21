@@ -95,7 +95,9 @@ pub struct Outcome {
   /// in code order; what is an instruction's opcode or a MARK_*.
   pub map: List<u32>,
   /// The construct entry's offset in the code.
-  pub construct: u32
+  pub construct: u32,
+  /// The resume entry's offset in the code, or 0 when the function has none.
+  pub resume: u32
 }
 pub const MARK_PROLOGUE: u32 = 0x1000
 pub const MARK_LEAVE: u32 = 0x1001
@@ -204,7 +206,15 @@ pub const STUB_LEAVE: u32 = 30
 /// rax:rdx, and ecx says how it went: 0 returned, 1 declined with nothing changed, 2 threw.
 pub const STUB_CALL_KEEP: u32 = 31
 pub const STUB_CALL_METHOD_KEEP: u32 = 32
-pub const STUB_COUNT: u32 = 33
+/// `new`: the function's cell at r14, new.target in the cell after it, then edx arguments;
+/// eax the offset after the instruction. The cells are lent and left as they are, but an
+/// argument the engine moved into the object, which is undefined then. The owned result
+/// comes back in rax:rdx, and ecx says how it went: 0 returned, 2 threw. A base
+/// constructor with baseline code and no plan runs through its construct entry on the
+/// receiver the engine makes (SERVICE_NEW), and that receiver is the result unless the
+/// function returned an object; the engine constructs anything else (SERVICE_CONSTRUCT).
+pub const STUB_CONSTRUCT: u32 = 33
+pub const STUB_COUNT: u32 = 34
 
 // ---- Bytecode steps -------------------------------------------------------------------
 
@@ -901,10 +911,8 @@ impl Emitter {
     let p = self.p
     // The construct entry: the prologue's head with the frame in the construct state, which
     // tells the engine that new.target is the function (js_baseline.build).
-    // The four bytes before it: how far on the resume entry is (compile writes it), or 0.
     // The entries run before the frame has its cell base.
     self.a.unalias()
-    run self.a.data32(0)
     run self.mark(0, MARK_CONSTRUCT)
     run self.a.push(Reg.Rbp)
     run self.a.mov(Width.W64, Reg.Rbp, Reg.Rsp)
@@ -1683,6 +1691,7 @@ impl Emitter {
       let again = run self.a.label()
       let released = run self.a.label()
       let known = run self.a.label()
+      let retarget = run self.a.label()
       run self.a.store(Width.W64, p.sf(f.currentPc), Reg.Rax)
       if method { run self.tagIs(next.word(), p.object(), declined) }
       else {
@@ -1760,10 +1769,36 @@ impl Emitter {
       run self.engineCall()
       run self.a.pop(Reg.Rcx)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.NotEqual, threw)
+      if method { run self.a.jcc(Cond.NotEqual, retarget) } else { run self.a.jcc(Cond.NotEqual, threw) }
       run self.a.load(Width.W64, Reg.Rax, p.rec(f.result))
       run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
       run self.a.jmp(after)
+      if method {
+        // `f.call(x, ...)` (engine.CALL_RETARGET): f, the receiver, is called on x, the
+        // first argument, and the arguments after it. The cells stay as they are.
+        self.a.bind(retarget)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(u64.wrappingToU32(engine.CALL_RETARGET)))
+        run self.a.jcc(Cond.NotEqual, threw)
+        run self.a.mov(Width.W32, Reg.Rdx, Reg.Rcx)
+        run self.a.load(Width.W64, Reg.Rdi, top.payload())
+        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
+        run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
+        run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R13, signed(f.table)))
+        run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.R14, 32))
+        run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.R14, 16))
+        run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R14, 24))
+        if p.count { run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.DIRECT_CALLS_OFFSET), 1) }
+        run self.a.push(Reg.R14)
+        run self.a.push(Reg.Rdx)
+        run self.a.push(Reg.Rdx)
+        run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rdx, 1)
+        run self.a.callMem(Mem.indexed(Reg.R10, Reg.Rax, Scale.Eight, -8))
+        run self.a.pop(Reg.Rcx)
+        run self.a.pop(Reg.Rcx)
+        run self.a.pop(Reg.R14)
+        run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.exception()))
+        run self.a.jcc(Cond.NotEqual, after)
+      }
       self.a.bind(threw)
       if keep { run self.a.movImm32(Reg.Rcx, 2) }
       else {
@@ -1820,6 +1855,91 @@ impl Emitter {
       self.a.bind(declined)
       if keep { run self.a.movImm32(Reg.Rcx, 1) run self.a.ret() }
       else { run self.stubDeclined() }
+      return ()
+    }
+    if index == STUB_CONSTRUCT {
+      // Six words below the return address, so rsp is as a stub's own; a call from here
+      // takes one more. [0]: the receiver; [16]: r14 and the count, then a result to drop.
+      let receiver = Cell { base: Reg.Rsp, at: 0 }
+      let dropped = Cell { base: Reg.Rsp, at: 16 }
+      let direct = run self.a.label()
+      let made = run self.a.label()
+      let threw = run self.a.label()
+      let left = run self.a.label()
+      let plain = run self.a.label()
+      run self.a.store(Width.W64, p.sf(f.currentPc), Reg.Rax)
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 48)
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, 16), Reg.R14)
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, 24), Reg.Rdx)
+      run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_NEW))
+      run self.a.mov(Width.W64, Reg.R8, Reg.R14)
+      run self.a.mov(Width.W32, Reg.R9, Reg.Rdx)
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.engineCall()
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u64.wrappingToI32(engine.NEW_RECEIVER))
+      run self.a.jcc(Cond.Equal, direct)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, made)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+      run self.a.jcc(Cond.Equal, threw)
+      // Declined: the engine constructs.
+      run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1)
+      run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_CONSTRUCT))
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.Rsp, 16))
+      run self.a.load(Width.W32, Reg.R9, Mem.at(Reg.Rsp, 24))
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.engineCall()
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.NotEqual, threw)
+      self.a.bind(made)
+      run self.a.load(Width.W64, Reg.Rax, p.rec(f.result))
+      run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
+      self.a.bind(left)
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 48)
+      run self.a.alu(Alu.Xor, Width.W32, Reg.Rcx, Reg.Rcx)
+      run self.a.ret()
+      self.a.bind(threw)
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 48)
+      run self.a.movImm32(Reg.Rcx, 2)
+      run self.a.ret()
+      // The function's code on the receiver, as a method call enters it, at its construct
+      // entry (the table's word after its code's).
+      self.a.bind(direct)
+      run self.a.load(Width.W64, Reg.Rcx, p.rec(f.result))
+      run self.a.load(Width.W64, Reg.R8, p.rec(f.result + 8))
+      run self.a.store(Width.W64, receiver.word(), Reg.Rcx)
+      run self.a.store(Width.W64, receiver.payload(), Reg.R8)
+      run self.a.load(Width.W64, Reg.R14, Mem.at(Reg.Rsp, 16))
+      run self.a.load(Width.W32, Reg.Rdx, Mem.at(Reg.Rsp, 24))
+      run self.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.R14, 8))
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
+      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
+      run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R13, signed(f.table)))
+      run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.R14, 32))
+      if p.count { run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.DIRECT_CALLS_OFFSET), 1) }
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.a.callMem(Mem.indexed(Reg.R10, Reg.Rax, Scale.Eight, 0))
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
+      run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.exception()))
+      run self.a.jcc(Cond.NotEqual, plain)
+      run self.releaseAt(receiver)
+      run self.a.jmp(threw)
+      // [[Construct]]'s result: the object the function returned, else the receiver.
+      self.a.bind(plain)
+      let other = run self.a.label()
+      run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.object()))
+      run self.a.jcc(Cond.NotEqual, other)
+      run self.releaseAt(receiver)
+      run self.a.jmp(left)
+      self.a.bind(other)
+      run self.a.store(Width.W64, dropped.word(), Reg.Rax)
+      run self.a.store(Width.W64, dropped.payload(), Reg.Rdx)
+      run self.releaseAt(dropped)
+      run self.a.load(Width.W64, Reg.Rax, receiver.word())
+      run self.a.load(Width.W64, Reg.Rdx, receiver.payload())
+      run self.a.jmp(left)
       return ()
     }
     if index == STUB_STEP {
@@ -2953,22 +3073,19 @@ impl Emitter {
       return true
     }
     if opcode == op.OP_call_constructor {
-      // Through the engine: function, new.target, arguments; the result replaces them.
+      // function, new.target, arguments; the result replaces them (STUB_CONSTRUCT).
       let argc = u16At(bytes, pc + 1)
       let callee = p.operandAt(depth - signed(argc) - 2)
       let threw = run self.exit(pc + 1, depth, true)
-      run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(usize.toU32(pc + 1)))
-      run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1)
-      run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_CONSTRUCT))
-      run self.a.lea(Width.W64, Reg.R8, word(callee))
-      run self.a.movImm32(Reg.R9, argc)
-      run self.engineCall()
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.lea(Width.W64, Reg.R14, word(callee))
+      run self.a.movImm32(Reg.Rdx, argc)
+      run self.a.movImm32(Reg.Rax, usize.toU32(pc + 1))
+      run self.a.callSymbol(STUB_CONSTRUCT)
+      run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
       run self.a.jcc(Cond.NotEqual, threw)
+      // Each release keeps rax:rdx.
       let mut index: u32 = 0
       while index < argc + 2 { run self.releaseCell(callee + signed(index * 16)) index = index + 1 }
-      run self.a.load(Width.W64, Reg.Rax, p.rec(f.result))
-      run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
       run self.a.store(Width.W64, word(callee), Reg.Rax)
       run self.a.store(Width.W64, payload(callee), Reg.Rdx)
       return true
@@ -3662,9 +3779,9 @@ impl Emitter {
 pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outcome ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
   let mut uncovered = List<u8>.make()
   let mut stepped = List<u8>.make()
-  if shape.codeWord == u32.MAX || shape.codeWord > 2040 { return Outcome { code: Option<Code>.none(), why: b"no word holds the code's address", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
-  if bytes.length == 0 || bytes.length > 1048576 { return Outcome { code: Option<Code>.none(), why: b"no code, or too much", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
-  if shape.arguments + shape.locals + shape.stack > 4096 { return Outcome { code: Option<Code>.none(), why: b"too many cells", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+  if shape.codeWord == u32.MAX || shape.codeWord > 2040 { return Outcome { code: Option<Code>.none(), why: b"no word holds the code's address", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
+  if bytes.length == 0 || bytes.length > 1048576 { return Outcome { code: Option<Code>.none(), why: b"no code, or too much", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
+  if shape.arguments + shape.locals + shape.stack > 4096 { return Outcome { code: Option<Code>.none(), why: b"too many cells", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
   // Depths: every instruction a template can reach, with the operands on its stack there.
   let mut depths = List<i32>.make()
   // The instructions a branch reaches.
@@ -3684,16 +3801,16 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
     let depth = depths.get(pc)
     let step = stepOf(bytes, pc)
     if bytes[pc] == op.OP_special_object && pc + 1 < bytes.length && bytes[pc + 1] == engine.LAZY_ARGUMENTS { lazy = true }
-    if step.size == 0 { return Outcome { code: Option<Code>.none(), why: b"bytes that are no instruction", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+    if step.size == 0 { return Outcome { code: Option<Code>.none(), why: b"bytes that are no instruction", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
     if step.kind == DEPART { continue }
-    if depth < step.needs { return Outcome { code: Option<Code>.none(), why: b"an operand stack underflow", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+    if depth < step.needs { return Outcome { code: Option<Code>.none(), why: b"an operand stack underflow", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
     let mut successors: [usize; 2] = [usize.MAX; 2]
     let mut entering: [i32; 2] = [0; 2]
     if step.kind == LEAP { continue }
     if step.kind == FALL || step.kind == BRANCH || step.kind == STEP { successors[0] = pc + step.size entering[0] = depth + step.fall }
     // A stepped instruction with a target is a catch: the engine brings the code to its handler.
     if step.kind == BRANCH || step.kind == JUMP || (step.kind == STEP && step.target != usize.MAX) {
-      if step.target == usize.MAX { return Outcome { code: Option<Code>.none(), why: b"a branch out of the code", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+      if step.target == usize.MAX { return Outcome { code: Option<Code>.none(), why: b"a branch out of the code", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
       successors[1] = step.target entering[1] = depth + step.taken
       if step.target < bytes.length { targets.set(step.target, true) }
     }
@@ -3702,12 +3819,12 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
       let successor = successors[k]
       k = k + 1
       if successor == usize.MAX { continue }
-      if successor >= bytes.length { return Outcome { code: Option<Code>.none(), why: b"code that runs off its end", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+      if successor >= bytes.length { return Outcome { code: Option<Code>.none(), why: b"code that runs off its end", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
       let entered = entering[k - 1]
-      if entered < 0 || entered > u32.wrappingToI32(shape.stack) { return Outcome { code: Option<Code>.none(), why: b"an operand stack out of bounds", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+      if entered < 0 || entered > u32.wrappingToI32(shape.stack) { return Outcome { code: Option<Code>.none(), why: b"an operand stack out of bounds", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
       let known = depths.get(successor)
       if known == -1 { depths.set(successor, entered) run work.append(successor) }
-      else if known != entered { return Outcome { code: Option<Code>.none(), why: b"two depths at one instruction", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 } }
+      else if known != entered { return Outcome { code: Option<Code>.none(), why: b"two depths at one instruction", uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 } }
     }
   }
   if !shape.plain {
@@ -3731,7 +3848,7 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
     else if shape.odd == 12 { why = b"not a plain function: known local with own scope" }
     else if shape.odd == 14 { why = b"not a plain function: known local with own scope and captured variables" }
     else if (shape.odd & 1) != 0 { why = b"not a plain function: its kind and more" }
-    return Outcome { code: Option<Code>.none(), why: why, uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0 }
+    return Outcome { code: Option<Code>.none(), why: why, uncovered: move uncovered, stepped: move stepped, map: List<u32>.make(), construct: 0, resume: 0 }
   }
   let mut a = Assembler.make()
   let finish = run a.label()
@@ -3828,15 +3945,6 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
         if map.get(place + 2) == MARK_RESUME { resume = map.get(place) }
         place = place + 3
       }
-      // The distance to the resume entry, in the word before the construct entry.
-      if resume > construct && construct >= 4 {
-        let distance = resume - construct
-        let word = u32.toUsize(construct) - 4
-        code.bytes.set(word, u32.wrappingToU8(distance & 0xff))
-        code.bytes.set(word + 1, u32.wrappingToU8(u32.shiftRight(distance, 8) & 0xff))
-        code.bytes.set(word + 2, u32.wrappingToU8(u32.shiftRight(distance, 16) & 0xff))
-        code.bytes.set(word + 3, u32.wrappingToU8(u32.shiftRight(distance, 24)))
-      }
       // The resume table: every instruction that has code of its own.
       place = 0
       while place + 2 < map.length() {
@@ -3852,7 +3960,7 @@ pub effect fn compile(settings: &Settings, shape: &Shape, bytes: &[u8]) -> Outco
         }
         place = place + 3
       }
-      return Outcome { code: Option<Code>.some(move code), why: b"", uncovered: move uncovered, stepped: move stepped, map: move map, construct: construct }
+      return Outcome { code: Option<Code>.some(move code), why: b"", uncovered: move uncovered, stepped: move stepped, map: move map, construct: construct, resume: resume }
     }
   }
 }

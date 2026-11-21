@@ -148,7 +148,7 @@ impl Options {
 /// compiles the optimized code it has had. learned is set when that code left at a site
 /// its next compile will know (a new one, or a field site recorded with a new shape);
 /// stale counts the times in a row it was given back without having learned one.
-struct BaselineInfo { entry: usize, code: *const u8, moved: u32, finish: u32, stepEnded: u32, tier: u8, compiles: u8, exits: u32, learned: bool, stale: u8 }
+struct BaselineInfo { entry: usize, code: *const u8, construct: *const u8, moved: u32, finish: u32, stepEnded: u32, tier: u8, compiles: u8, exits: u32, learned: bool, stale: u8 }
 impl Copy for BaselineInfo {}
 /// Optimized code that left at guards this often, and at more than one entry in EXIT_RATE
 /// (a loop's turns do not count: code that leaves on each is slow whatever its entries),
@@ -161,6 +161,9 @@ impl Copy for BaselineInfo {}
 const EXIT_BURST: u32 = 8
 const EXIT_RATE: u64 = 1000
 const OPTIMIZE_BACKOFF: u32 = 8
+/// Jit.leftHow: a compile kept the site general; code compiled so left there again.
+const LEFT_GENERAL: u8 = 1
+const LEFT_AGAIN: u8 = 2
 /// Sites remembered per function (Jit.leftAt).
 const MAX_LEFT: usize = 32
 const TIER_NONE: u8 = 0
@@ -260,6 +263,10 @@ pub struct Jit {
   /// recorded with more by the next compile learned a shape from leaving, and is compiled
   /// against its shapes again instead of kept general.
   leftSeen: List<u32>,
+  /// By leftAt entry: LEFT_GENERAL once a compile kept the site general, LEFT_AGAIN once
+  /// code compiled so left there again. Such a site is named twice to the next compile,
+  /// which has the engine run its instruction (ssa_translate.stepped).
+  leftHow: List<u8>,
   /// The Array.prototype push and pop natives optimized code tests callees against
   /// (inline.arrayNative): each is kept by the runtime from when it is first used.
   arrayNatives: List<usize>,
@@ -279,7 +286,7 @@ impl Jit {
     let mut env = run List<CompiledEnv>.makeWithCapacity(1)
     drop env.appendWithinCapacity(CompiledEnv.make())
     // Two entries a function (js_baseline.link).
-    let baselineTable = run List<?*const u8>.makeWithCapacity(CAPACITY * 2)
+    let baselineTable = run List<?*const u8>.makeWithCapacity(CAPACITY * engineBaseline.TABLE_WORDS)
     let mut baselineEnv = run List<BaselineEnv>.makeWithCapacity(1)
     drop baselineEnv.appendWithinCapacity(BaselineEnv.make())
     return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, activations: move activations, kept: move kept, siteShapes: move siteShapes, inlinedSites: 0, env: move env, blocks: List<CodeBlock>.make(),
@@ -289,7 +296,7 @@ impl Jit {
       osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0,
       baselineTable: move baselineTable, baselineEnv: move baselineEnv, baselineSettings: Option<BaselineSettings>.none(), baselineReady: false, baselineSymbols: List<usize>.make(),
       baselineCompiled: 0, baselineRefused: 0, baselineBytes: 0, baselineUncovered: 0,
-      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), leftSeen: List<u32>.make(), arrayNatives: List<usize>.make(), optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
+      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), leftSeen: List<u32>.make(), leftHow: List<u8>.make(), arrayNatives: List<usize>.make(), optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -617,7 +624,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
   }
   drop function
   match move outcome {
-    BaselineOutcome { code: made, why, uncovered, stepped, map, construct } => {
+    BaselineOutcome { code: made, why, uncovered, stepped, map, construct, resume } => {
       let mut code = match move made {
         Option<Code>.Some { value } => move value
         Option<Code>.None => {
@@ -645,10 +652,12 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       let entry = block.entry()
       run jit.blocks.append(move block)
       let constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(construct))
-      unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), entry, constructEntry)
+      let mut resumeEntry: ?*const u8 = Pointer.null<u8>()
+      if resume != 0 { resumeEntry = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(resume))) }
+      unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), entry, constructEntry, resumeEntry)
       // Where the tails optimized code leaves through are; the shared prologue counts the
       // entries until the function is reported for it.
-      let mut info = BaselineInfo { entry: Pointer.address<u8>(entry), code: entry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0, learned: false, stale: 0 }
+      let mut info = BaselineInfo { entry: Pointer.address<u8>(entry), code: entry, construct: constructEntry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0, learned: false, stale: 0 }
       let mut mark: usize = 0
       while mark + 2 < map.length() {
         if map.get(mark + 2) == baseline.MARK_MOVED { info.moved = map.get(mark) }
@@ -742,7 +751,7 @@ unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32) ->
   let entries = u32.toU64(4294967295 - function.hotness)
   drop function
   if linked == 0 { return () }
-  let index = u32.toUsize((linked - 1) / 2)
+  let index = engineBaseline.linkedIndex(linked)
   if index >= jit.baselineInfo.length() { return () }
   let mut info = jit.baselineInfo.get(index)
   // An activation that outlived its code's unlinking.
@@ -768,14 +777,19 @@ unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32) ->
   let mut l: usize = 0
   while l < jit.leftAt.length() {
     let left = jit.leftAt.get(l)
-    if left == site { known = true if seen > jit.leftSeen.get(l) && seen <= SITE_PAIRS { info.learned = true } }
+    if left == site {
+      known = true
+      if seen > jit.leftSeen.get(l) && seen <= SITE_PAIRS { info.learned = true }
+      // Kept general and left again: the next compile steps it.
+      if jit.leftHow.get(l) == LEFT_GENERAL { jit.leftHow.set(l, LEFT_AGAIN) info.learned = true }
+    }
     if u64.toUsize(u64.shiftRight(left, 32)) == index { own = own + 1 }
     l = l + 1
   }
-  if !known && own < MAX_LEFT { run jit.leftAt.append(site) run jit.leftSeen.append(seen) info.learned = true }
+  if !known && own < MAX_LEFT { run jit.leftAt.append(site) run jit.leftSeen.append(seen) run jit.leftHow.append(0) info.learned = true }
   info.exits = info.exits + 1
   if info.exits >= EXIT_BURST && u32.toU64(info.exits) * EXIT_RATE > entries {
-    unsafe engineBaseline.relink(rt, linked, info.code)
+    unsafe engineBaseline.relink(rt, linked, info.code, info.construct)
     jit.optimizeBacked = jit.optimizeBacked + 1
     info.exits = 0
     info.tier = TIER_NONE
@@ -808,13 +822,19 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let linked = function.baseline
   if linked == 0 { return () }
-  let index = u32.toUsize((linked - 1) / 2)
+  let index = engineBaseline.linkedIndex(linked)
   if index >= jit.baselineInfo.length() { return () }
   let mut info = jit.baselineInfo.get(index)
   if info.tier != TIER_NONE { return () }
   info.tier = TIER_REFUSED
   jit.baselineInfo.set(index, info)
-  if jit.options.dump { run say(b"jit: optimizing", b"") run unsafe dumpBytecode(&function) }
+  if jit.options.dump {
+    // `jit: optimizing <function>`, the index `jit: left:` names it by.
+    let mut line = List<u8>.make()
+    run decimal(&mut line, usize.toU64(index))
+    run say(b"jit: optimizing ", line.asSlice())
+    run unsafe dumpBytecode(&function)
+  }
   let settings = match jit.baselineSettings {
     Option<BaselineSettings>.Some { value } => value
     Option<BaselineSettings>.None => { return () }
@@ -853,7 +873,20 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
       // A field site that is recorded with more shapes than when it left learned one there:
       // it is tested against them all, and leaves on another.
       let now = unsafe inline.siteSeen(rt, bytecode, u64.wrappingToU32(left))
-      if now <= jit.leftSeen.get(l) || now > SITE_PAIRS { run sites.append(u64.wrappingToU32(left)) }
+      if jit.options.dump {
+        // `jit: kept general: <pc> how <0, 1, 2> seen <then> <now>`.
+        let mut line = List<u8>.make()
+        run decimal(&mut line, u64.shiftRight(u64.shiftLeft(left, 32), 32))
+        run line.appendSlice(b" how ") run decimal(&mut line, u8.toU64(jit.leftHow.get(l)))
+        run line.appendSlice(b" seen ") run decimal(&mut line, u32.toU64(jit.leftSeen.get(l)))
+        run line.append(32) run decimal(&mut line, u32.toU64(now))
+        run say(b"jit: kept general: ", line.asSlice())
+      }
+      if now <= jit.leftSeen.get(l) || now > SITE_PAIRS {
+        run sites.append(u64.wrappingToU32(left))
+        if jit.leftHow.get(l) == LEFT_AGAIN { run sites.append(u64.wrappingToU32(left)) }
+        else { jit.leftHow.set(l, LEFT_GENERAL) }
+      }
       else { jit.leftSeen.set(l, now) }
     }
     l = l + 1
@@ -892,6 +925,7 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
   run symbols.append(info.entry + u32.toUsize(info.finish))
   run symbols.append(info.entry)
   run symbols.append(info.entry + u32.toUsize(info.stepEnded))
+  run symbols.append(Pointer.address<u8>(info.construct))
   let mut inlinedSites: usize = 0
   if let Lowered.Code { inlined, .. } = &result {
     let mut k: usize = 0
@@ -943,8 +977,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
     run symbols.append(arrayObjects[1])
     inlinedSites = inlined.length()
   }
+  let mut construct: u32 = 0
   let mut code = match move result {
-    Lowered.Code { value, .. } => move value
+    Lowered.Code { value, construct: at, .. } => { construct = at move value }
     Lowered.Refused { reason } => {
       jit.optimizeRefused = jit.optimizeRefused + 1
       if jit.options.dump { run sayRefusal(&reason) }
@@ -958,7 +993,10 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
   }
   let entry = block.entry()
   run jit.blocks.append(move block)
-  unsafe engineBaseline.relink(rt, linked, entry)
+  // Constructs run the code too, through its own construct entry.
+  let mut constructEntry = info.construct
+  if construct != 0 { constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(construct)) }
+  unsafe engineBaseline.relink(rt, linked, entry, constructEntry)
   info.tier = TIER_OPTIMIZED
   if info.compiles < 255 { info.compiles = info.compiles + 1 }
   info.exits = 0
@@ -1532,6 +1570,13 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         run appendKnown(&mut holders, &found)
         if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
         if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
+        if jit.options.dump && !watch {
+          // `jit: chained target: <pc> <depth> <exact> <known shapes>`.
+          let mut line = List<u8>.make()
+          run decimal(&mut line, usize.toU64(pc)) run line.append(32) run decimal(&mut line, u32.toU64(depth)) run line.append(32)
+          run decimal(&mut line, if Pointer.isNull<HeapHeader>(object) { 0 } else { 1 }) run line.append(32) run decimal(&mut line, usize.toU64(found.count))
+          run say(b"jit: chained target: ", line.asSlice())
+        }
         if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch) }
         run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), known: knownShapes(&found) })
       }

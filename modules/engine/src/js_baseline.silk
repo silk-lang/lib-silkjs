@@ -70,6 +70,10 @@ pub const CALL_METHOD: u64 = 0x100
 /// interpreter's call instruction calls one, with no frames of the engine's around it
 /// (js_vm.baselineCallNative).
 pub const CALL_NATIVE: u64 = 0x200
+/// SERVICE_CALL's answer, with nothing changed, for `f.call(x, ...)`: the callee is the
+/// intrinsic Function.prototype.call and its receiver f a function with baseline code, so
+/// the code calls f itself on x and the arguments after it.
+pub const CALL_RETARGET: u64 = 3
 /// The realm's interrupt counter ran out: deliver hot functions and the host's interrupt.
 pub const SERVICE_POLL: u64 = 2
 /// The native stack has no room for the frame of the function at base (its closure object's
@@ -131,6 +135,15 @@ pub const SERVICE_INLINED: u64 = 10
 /// changed otherwise, and the call is made.
 pub const SERVICE_ARRAY: u64 = 11
 pub const ARRAY_POP: u64 = 0x100
+/// What `new` needs short of running the function: base is the function's cell, new.target
+/// the cell after it, then count arguments (borrowed), as for SERVICE_CONSTRUCT. 0 with the
+/// owned object in the record's result when the engine made all of it (`new Array()`: the
+/// empty Array); NEW_RECEIVER with the owned receiver there when the function is a base
+/// constructor with baseline code and no plan, which the code then runs on that receiver
+/// through its construct entry, taking the receiver for a result that is no object; 1 when
+/// making the receiver threw; 2 with nothing changed otherwise (SERVICE_CONSTRUCT then).
+pub const SERVICE_NEW: u64 = 12
+pub const NEW_RECEIVER: u64 = 3
 /// A service's answer that the frame is now at bytecode offset pc with sp operands on its
 /// stack: SERVICE_MOVED in the low byte, pc in bits 8 to 39, sp from bit 40.
 pub const SERVICE_MOVED: u64 = 3
@@ -600,19 +613,27 @@ pub unsafe fn serviced(runtime: *mut HeapHeader) -> bool {
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   return !Pointer.isNull<u8>(state.compiled.serviceEntry) && !Pointer.isNull<u8>(state.compiled.serviceAllocator)
 }
-/// Links bytecode to baseline code at address code, with its construct entry at construct, as
-/// function index (the next free one): table entries 2 index and 2 index + 1, and
-/// FunctionBytecode.baseline 2 index + 1, so that a call through table + 8 baseline - 8
-/// reaches the code and one through table + 8 baseline its construct entry.
+/// The words of CompiledTable.baseline each linked function takes: the entry its calls go
+/// through, its construct entry, and its resume entry (null when it has none).
+pub const TABLE_WORDS: usize = 3
+/// The table index of the function linked as baseline (FunctionBytecode.baseline, nonzero).
+pub fn linkedIndex(baseline: u32) -> usize { return (u32.toUsize(baseline) - 1) / TABLE_WORDS }
+/// Links bytecode to baseline code at address code, with its construct entry at construct and
+/// its resume entry at resume (or null), as function index (the next free one): table
+/// entries 3 index, 3 index + 1 and 3 index + 2, and FunctionBytecode.baseline 3 index + 1, so
+/// that a call through table + 8 baseline - 8 reaches the code and one through table + 8
+/// baseline its construct entry.
 /// Interpreted calls of it then leave the inline path and reach the code (js_vm.callInline),
 /// except a leaf's, which stay frameless.
-pub unsafe fn link(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u32, code: *const u8, construct: *const u8) -> () {
+pub unsafe fn link(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u32, code: *const u8, construct: *const u8, resume: ?*const u8) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   if index != state.compiled.baselineCount { Intrinsic.trap("baseline table invariant violated") }
   let table = unsafe Pointer.assumeManyMut<?*const u8>(unsafe Intrinsic.pointerRequalify<?*mut ?*const u8, *mut ?*const u8>(state.compiled.baseline))
-  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, u32.toUsize(index) * 2), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(code))
-  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, u32.toUsize(index) * 2 + 1), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(construct))
+  let first = u32.toUsize(index) * TABLE_WORDS
+  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, first), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(code))
+  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, first + 1), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(construct))
+  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, first + 2), resume)
   state.compiled.baselineCount = index + 1
   drop state
   let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
@@ -621,17 +642,18 @@ pub unsafe fn link(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u
   // and baseline callers reach the code through the index. Every other function is entered
   // through its code from now on (declined runs are what made such a leaf hot).
   if (owner.leaf & LEAF_CREDIT_MASK) != LEAF_CREDITS { owner.leaf = 0 owner.frameCells = STUB_FRAME_CELLS }
-  owner.baseline = index * 2 + 1
+  owner.baseline = index * usize.toU32(TABLE_WORDS) + 1
 }
 /// Gives the function linked as baseline (FunctionBytecode.baseline, nonzero) other code for
-/// its calls: code that runs on the same frame and takes the same registers (optimized code,
-/// docs/jit/optimizer.md). Its construct entry, and the resume entry found through it, stay
-/// the baseline code's.
-pub unsafe fn relink(runtime: *mut HeapHeader, baseline: u32, code: *const u8) -> () {
+/// its calls and for its `new`s: code that runs on the same frame and takes the same
+/// registers (optimized code, docs/jit/optimizer.md), at code and its construct entry at
+/// construct. The resume entry stays the baseline code's.
+pub unsafe fn relink(runtime: *mut HeapHeader, baseline: u32, code: *const u8, construct: *const u8) -> () {
   let anchor = ()
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let table = unsafe Pointer.assumeManyMut<?*const u8>(unsafe Intrinsic.pointerRequalify<?*mut ?*const u8, *mut ?*const u8>(state.compiled.baseline))
   unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, u32.toUsize(baseline) - 1), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(code))
+  unsafe Pointer.write<?*const u8>(unsafe Pointer.atMut<?*const u8>(table, u32.toUsize(baseline)), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(construct))
 }
 /// Sets the entries left before the shared prologue reports bytecode again (baseline.silk,
 /// STUB_PROLOGUE): its count runs down from REPORTED_FLOOR + entries, so the interpreter
@@ -707,21 +729,13 @@ pub struct Inlined {
   pub inner: ?*mut Inlined, pub method: bool, pub taken: bool, pub threw: bool
 }
 impl Copy for Inlined {}
-/// The resume entry of the function linked as baseline, or null when it has none: its code
-/// keeps the distance from the construct entry to it in the four bytes before that entry
-/// (0 for none). It is entered as the code is, with a Resume in place of the arguments and
-/// no argument count.
+/// The resume entry of the function linked as baseline, or null when it has none. It is
+/// entered as the code is, with a Resume in place of the arguments and no argument count.
 pub unsafe fn resumeOf(runtime: *mut HeapHeader, baseline: u32) -> ?*const u8 {
-  let construct = unsafe Pointer.assumeMany<u8>(unsafe entryOf(runtime, baseline, true))
-  // A little-endian u32, unaligned.
-  let mut distance: usize = 0
-  let mut index: usize = 1
-  while index <= 4 {
-    distance = usize.shiftLeft(distance, 8) | u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(construct, usize.wrappingSubtract(0, index))))
-    index = index + 1
-  }
-  if distance == 0 { return Pointer.null<u8>() }
-  return unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(unsafe Pointer.at<u8>(construct, distance))
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let table = unsafe Pointer.assumeMany<?*const u8>(unsafe Intrinsic.pointerRequalify<?*mut ?*const u8, *const ?*const u8>(state.compiled.baseline))
+  return unsafe Pointer.read<?*const u8>(unsafe Pointer.at<?*const u8>(table, u32.toUsize(baseline) + 1))
 }
 /// SERVICE_RESUME on the new frame of record: the prologue's arguments (the frame's own
 /// copies when the function writes a parameter or the activation has fewer than it

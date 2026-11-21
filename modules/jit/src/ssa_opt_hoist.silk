@@ -14,10 +14,21 @@
 //!   reached must not fail in front of it;
 //! - the same for `get.length`, `get.field`, `get.var` and `get.scope` whose result is a
 //!   borrow (ssa_opt_borrow, ssa_ownership.borrowFields; an owned result would need its
-//!   release moved too), in a loop without what could change the answer: a call (anything),
-//!   `put.elem` (an append changes a length), `put.field` (a field; a length; a global is a
-//!   property), `put.var` and `put.scope` (bindings);
+//!   release moved too), in a loop without what could change the answer: a call (anything,
+//!   and a `get.field` that steps the interpreter, which may run a getter), `put.elem` (an
+//!   append changes a length), `put.field` of the same name (a store or an add changes only
+//!   the property it names, and its helper runs no JavaScript: a setter leaves; a length;
+//!   a global is a property, so any store for `get.var`), `put.var` and `put.scope`
+//!   (bindings);
+//! - `check.callee` of an invariant callee, as a guard, and the borrowed copies an inlined
+//!   body makes of its receiver, from anywhere in the loop;
 //! - arithmetic and comparisons that cannot fail, from anywhere in the loop.
+//!
+//! An instruction of an inlined body moves too. One that reads its frame (a field site's
+//! cache, a variable) takes the `inline.frame` that names the body's closure with it, as a
+//! copy in front of it: the frame is built from that closure where a helper needs it. A loop
+//! of an inlined body moves its own the same way: the new exit names the bodies' frames as
+//! the latch's poll does, with the entry edge's values for what the latch passes back.
 //!
 //! A loop whose header is among `sites` (the offsets earlier code of this function
 //! deoptimized at, jit_recompile) is left alone: a hoisted guard that failed there says
@@ -27,7 +38,10 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Own, RootKind, Op, SlotMode, NONE, edgeCount, readsK }
+import ssa { Function, Own, RootKind, Op, Type, SlotMode, NONE, FIELD_STEPS, edgeCount, readsK }
+import ssa_translate { FunctionInput }
+import ssa_shapes { fieldAtom }
+import silkjs.js_atom_data as atoms
 import ssa_verify { readsA, readsB }
 import ssa_ownership { fixSlots }
 import ssa_opt_borrow { quiet }
@@ -35,8 +49,10 @@ import ssa_opt_borrow { quiet }
 /// Guards of invariant operands whose answer never changes.
 fn fixedGuard(op: Op) -> bool {
   return op == Op.Unbox || op == Op.UnboxBool || op == Op.UnboxF64 || op == Op.CheckTag || op == Op.Add || op == Op.Sub || op == Op.Mul
-    || op == Op.Shr || op == Op.Mod || op == Op.Neg || op == Op.ToInt32 || op == Op.ExactI32
+    || op == Op.Shr || op == Op.Mod || op == Op.Neg || op == Op.ToInt32 || op == Op.ExactI32 || op == Op.CheckCallee
 }
+/// Instructions that read the CompiledFrame of their `frame` (x64_backend.frameInto).
+fn readsFrame(op: Op) -> bool { return op == Op.GetField || op == Op.GetVar || op == Op.GetScope || op == Op.AtomValue }
 /// Operations that cannot fail and read nothing but their operands.
 fn pureOp(op: Op) -> bool {
   return op == Op.ToF64 || op == Op.Cmp || op == Op.CmpF64 || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64
@@ -126,7 +142,7 @@ fn has(list: &List<u32>, value: u32) -> bool {
 /// Moves what the module comment lists out of every loop of a compacted function, one loop
 /// level per call. Answers whether anything moved; the caller compacts, and may call again
 /// to move instructions out of the next loop around.
-pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
   let blockCount = f.blockCount()
   // Any retreating edge at all? Most functions have no loop.
   let mut loops = false
@@ -149,8 +165,10 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
   let mut released = List<u32>.make() run released.appendRepeated(0, values)
   let mut moved = List<u32>.make() run moved.appendRepeated(0, values)
   let mut stack = List<u32>.make()
-  let mut paramOf = List<u32>.make()
   let mut entryArgs = List<u32>.make()
+  // The names the loop stores to, and the inlined frames its front block names already.
+  let mut stored = List<u32>.make()
+  let mut framed = List<u32>.make()
   let mut serial: u32 = 0
   let mut changed = false
   // Inner loops first: their headers come later in reverse postorder.
@@ -198,6 +216,9 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
     // What the loop does that could change an answer, the values it releases, and a poll
     // (its exit is the state at the header, as a latch has it).
     let mut calls = false let mut putsElem = false let mut putsField = false let mut putsBinding = false
+    let mut putsUnknown = false
+    stored.clear()
+    framed.clear()
     let mut poll = NONE
     let mut b = h
     while b <= lastLatch {
@@ -208,8 +229,13 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
           let inst = f.inst(i)
           if inst.block == b {
             if !quiet(inst.op) { calls = true }
+            else if inst.op == Op.GetField && (inst.k & FIELD_STEPS) != 0 { calls = true }
             else if inst.op == Op.PutElem { putsElem = true }
-            else if inst.op == Op.PutField { putsField = true }
+            else if inst.op == Op.PutField {
+              putsField = true
+              let atom = fieldAtom(&f.*, input, inst)
+              if atom == 0 { putsUnknown = true } else if !has(&stored, atom) { run stored.append(atom) }
+            }
             else if inst.op == Op.PutVar || inst.op == Op.PutScope { putsBinding = true }
             else if inst.op == Op.Release && u32.toUsize(inst.a) < values { released.set(u32.toUsize(inst.a), serial) }
             else if inst.op == Op.Poll && inst.exit != NONE { poll = i }
@@ -222,10 +248,11 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
     }
     if poll == NONE { continue }
     let state = f.exit(f.inst(poll).exit)
-    // An inlined body's loop, or a state with values to drop, is not the header's plain state.
-    // Parameter slots (Function.argumentSlots) come after the stack in an exit but before it
-    // among a header's parameters, which the state mapping below does not follow.
-    if has(sites, state.pc) || state.drops != 0 || f.inst(poll).frame != 0 || f.argumentSlots != 0 { continue }
+    // A state with values to drop is not the header's plain state.
+    if has(sites, state.pc) || state.drops != 0 { continue }
+    // The poll's state is what its latch passes back to the header.
+    let back = backEdge(&f.*, f.inst(poll).block, h)
+    if back == NONE { continue }
     // The new block in front of the loop, made when the first instruction moves.
     let mut front = NONE
     let mut frontExit = NONE
@@ -240,13 +267,26 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
       while i < block.firstInst + block.instCount {
         let inst = f.inst(i)
         let op = inst.op
-        // An inlined body's instruction may read the frame `inline.frame` builds inside the loop.
-        let mut ok = inst.block == b && inst.frame == 0
+        let mut ok = inst.block == b
+        // An inlined body's read of its frame takes the closure the frame is built from.
+        let mut closure = NONE
+        if ok && inst.frame != 0 && readsFrame(op) {
+          closure = closureOf(&f.*, &member, &moved, serial, h, lastLatch, inst.frame - 1)
+          ok = closure != NONE
+        }
         let mut guard = !pureOp(op)
+        let copy = op == Op.Retain && inst.result != NONE && f.value(inst.result).own == Own.Borrowed
         if fixedGuard(op) { ok = ok && always }
-        else if op == Op.GetLength || op == Op.GetField || op == Op.GetVar || op == Op.GetScope {
-          ok = ok && always && !calls && !putsField && inst.result != NONE
-          if op == Op.GetLength { ok = ok && !putsElem } else { ok = ok && !putsBinding }
+        else if copy || op == Op.GetLength || op == Op.GetField || op == Op.GetVar || op == Op.GetScope {
+          if copy { guard = false ok = ok && inst.result != NONE }
+          else {
+            ok = ok && always && !calls && inst.result != NONE
+            if op == Op.GetLength { ok = ok && !putsElem && !(putsUnknown || has(&stored, atoms.JS_ATOM_length)) }
+            else if op == Op.GetField {
+              let atom = fieldAtom(&f.*, input, inst)
+              ok = ok && (inst.k & FIELD_STEPS) == 0 && atom != 0 && !putsUnknown && !has(&stored, atom)
+            } else { ok = ok && !putsField && !putsBinding }
+          }
           if ok {
             // Only a borrow, and one whose root lives through the loop.
             let info = f.value(inst.result)
@@ -261,46 +301,73 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
         if ok && readsB(op) { ok = outside(&f.*, &member, &moved, serial, inst.b) }
         if ok && readsK(op) { ok = outside(&f.*, &member, &moved, serial, i32.wrappingToU32(inst.k)) }
         if ok && guard && frontExit == NONE {
-          // The state at the header as the entry edge carries it: a slot whose parameter
-          // the header kept takes that parameter's argument on the entry edge; any other
-          // slot kept one value around the loop, which the latch's state names.
-          let header = f.blocks.get(u32.toUsize(h))
-          let slots = f.localCount + state.stackDepth
-          paramOf.clear()
-          run paramOf.appendRepeated(NONE, u32.toUsize(slots))
-          let mut p: u32 = 0
-          while p < header.paramCount {
-            let at = f.value(f.paramAt(header, p)).state
-            if at < slots { paramOf.set(u32.toUsize(at), p) } else { ok = false }
-            p = p + 1
-          }
+          // The state at the header as the entry edge carries it. A slot holds what the latch
+          // passes back to some parameters, and then takes what the entry edge passes them,
+          // or one value around the loop. A value the latch passes that also stays in a
+          // slot of its own, or passes to parameters the entry edge gives different values,
+          // leaves the slots ambiguous.
+          let paramCount = f.blocks.get(u32.toUsize(h)).paramCount
           let incoming = f.edge(entry)
-          if incoming.argCount != header.paramCount { ok = false }
+          let returning = f.edge(back)
+          if incoming.argCount != paramCount || returning.argCount != paramCount { ok = false }
+          let slots = f.slotCount(state)
           entryArgs.clear()
           let mut s: u32 = 0
           while ok && s < slots {
-            let at = paramOf.get(u32.toUsize(s))
-            let mut v = f.slot(state, s).value
-            if at != NONE { v = f.edgeArg(incoming, at) }
-            else if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
-            run entryArgs.append(v)
+            let v = f.slot(state, s).value
+            let mut mapped = NONE
+            let mut passed: u32 = 0
+            let mut p: u32 = 0
+            while p < paramCount {
+              if f.edgeArg(returning, p) == v {
+                passed = passed + 1
+                let given = f.edgeArg(incoming, p)
+                if mapped == NONE { mapped = given } else if mapped != given { ok = false }
+              }
+              p = p + 1
+            }
+            if passed == 0 {
+              if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
+              mapped = v
+            } else {
+              let mut held: u32 = 0
+              let mut t: u32 = 0
+              while t < slots { if f.slot(state, t).value == v { held = held + 1 } t = t + 1 }
+              if held != passed { ok = false }
+            }
+            run entryArgs.append(mapped)
             s = s + 1
           }
+          f.work = f.work + u32.toU64(slots) * u32.toU64(paramCount + slots)
           if !ok { stop = true break }
           if front == NONE { front = run split(&mut f, entry, h) }
           drop run f.exitFor(i, state.pc, state.stackDepth)
           frontExit = f.inst(i).exit
+          // The function's slots, the inlined bodies' frames, then their slots.
+          let outer = slots - state.inner
           s = 0
-          while s < slots { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
-          f.work = f.work + u32.toU64(slots)
+          while s < outer { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+          let mut n: u32 = 0
+          while n < state.frames { let frame = f.exitFrame(state, n) run f.frameAt(frame) n = n + 1 }
+          while s < slots { run f.innerAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
         }
         if ok {
           if front == NONE { front = run split(&mut f, entry, h) }
-          if guard {
-            let mut at = f.inst(i)
-            at.exit = frontExit
-            f.setInst(i, at)
+          if closure != NONE && !has(&framed, inst.frame) {
+            let named = f.inst(closure)
+            drop run f.emit(front, Op.InlineFrame, false, Type.I32, Own.Unboxed, named.a, NONE, named.k, named.pc)
+            let last = usize.toU32(f.insts.length() - 1)
+            let mut made = f.inst(last)
+            made.order = order made.frame = named.frame
+            f.setInst(last, made)
+            order = order + 2
+            run framed.append(inst.frame)
           }
+          let mut at = f.inst(i)
+          if guard { at.exit = frontExit }
+          // Only a read of the frame needs the body's: the others run the same anywhere.
+          if !readsFrame(op) { at.frame = 0 }
+          f.setInst(i, at)
           f.moveInst(i, front, order)
           order = order + 2
           if inst.result != NONE && u32.toUsize(inst.result) < values { moved.set(u32.toUsize(inst.result), serial) }
@@ -313,6 +380,41 @@ pub effect fn hoist(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryEr
   }
   if changed { run fixSlots(&mut f) }
   return changed
+}
+
+/// The `inline.frame` of the loop `serial` marks (blocks h to last) that names the closure of
+/// inlined callee `k`, when every one there names the same value and that value is defined
+/// outside the loop or moved out of it already; NONE otherwise.
+fn closureOf(f: &Function, member: &List<u32>, moved: &List<u32>, serial: u32, h: u32, last: u32, k: u32) -> u32 {
+  let mut found = NONE
+  let mut b = h
+  while b <= last {
+    if member.get(u32.toUsize(b)) == serial {
+      let block = f.blocks.get(u32.toUsize(b))
+      let mut i = block.firstInst
+      while i < block.firstInst + block.instCount {
+        let inst = f.inst(i)
+        if inst.op == Op.InlineFrame && inst.block == b && i32.wrappingToU32(inst.k) == k {
+          if found != NONE && f.inst(found).a != inst.a { return NONE }
+          if found == NONE { found = i }
+        }
+        i = i + 1
+      }
+    }
+    b = b + 1
+  }
+  if found == NONE || !outside(f, member, moved, serial, f.inst(found).a) { return NONE }
+  return found
+}
+
+/// The edge from `latch`'s terminator to `header`, or NONE.
+fn backEdge(f: &Function, latch: u32, header: u32) -> u32 {
+  let block = f.blocks.get(u32.toUsize(latch))
+  if block.instCount == 0 { return NONE }
+  let last = f.inst(block.firstInst + block.instCount - 1)
+  let mut e: u32 = 0
+  while e < edgeCount(last.op) { if f.edge(last.edge + e).target == header { return last.edge + e } e = e + 1 }
+  return NONE
 }
 
 /// Whether `v` is defined outside the loop `serial` marks, or moved out of it already.

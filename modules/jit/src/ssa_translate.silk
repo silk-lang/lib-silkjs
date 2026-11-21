@@ -163,7 +163,7 @@ fn withoutEffect(operation: Op) -> bool {
     || operation == Op.Cmp || operation == Op.Retain || operation == Op.Release || operation == Op.CheckTag
     || operation == Op.GetField || operation == Op.AtomValue || operation == Op.GetVar || operation == Op.GetScope
     || operation == Op.GetElem || operation == Op.GetLength || operation == Op.Truthy || operation == Op.TagIs || operation == Op.TypeofAtom
-    || operation == Op.CheckCallee || operation == Op.IsCallee || operation == Op.InlineFrame || operation == Op.Jump || operation == Op.Branch
+    || operation == Op.CheckCallee || operation == Op.CheckShape || operation == Op.IsCallee || operation == Op.InlineFrame || operation == Op.Jump || operation == Op.Branch
     || operation == Op.ConstF64 || ssa.isNumberOp(operation)
 }
 pub const CLOSURE_NONE: u8 = 0
@@ -274,6 +274,17 @@ pub fn iterationOpcode(opcode: u8) -> bool {
 /// stand-in in a local that the interpreter fills; a closure may take cells of the frame's
 /// slots, or promote the function's own scope, which CompiledFrame.scope holds unpromoted
 /// (and which compiled calls do not create: they run on the closure's scope).
+/// Arithmetic that reads its operands (the stack's top, locals, arguments) and pushes one
+/// result, with no other effect on the frame.
+/// The `+` of stackArithmetic, which a site that left even as doubles asks the engine's
+/// concatenation for (Translator.concatenation).
+fn addition(opcode: u8) -> bool {
+  return opcode == op.OP_add || opcode == op.OP_add_loc_loc8 || opcode == op.OP_add_top_loc8 || opcode == op.OP_add_top_arg8
+}
+fn stackArithmetic(opcode: u8) -> bool {
+  return opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_mul
+    || (opcode >= op.OP_add_loc_loc8 && opcode <= op.OP_mul_top_loc8) || (opcode >= op.OP_add_top_arg8 && opcode <= op.OP_mul_top_arg8)
+}
 effect fn frameAllowed(input: &FunctionInput, pc: usize) -> () ! Refusal {
   let opcode = byteAt(input, pc)
   let at = usize.toU32(pc)
@@ -1306,6 +1317,23 @@ impl Translator {
       run self.push(r)
       return ()
     }
+    if equality(opcode) && self.f.value(a).ty == Type.Value && self.f.value(b).ty == Type.Value {
+      // Two values of kinds nothing here tells: the identity test answers in place for
+      // objects, null and undefined as well as int32s, where a guard that both are int32s
+      // would leave at the first object.
+      let r = run self.equals(a, b, opcode == op.OP_strict_eq || opcode == op.OP_strict_neq, opcode == op.OP_neq || opcode == op.OP_strict_neq, pc)
+      drop self.pop() drop self.pop()
+      run self.release(a, pc) run self.release(b, pc)
+      run self.push(r)
+      return ()
+    }
+    if opcode == op.OP_add && self.concatenates(pc) {
+      let r = run self.concatenation(a, b, pc)
+      drop self.pop() drop self.pop()
+      run self.release(a, pc) run self.release(b, pc)
+      run self.push(r)
+      return ()
+    }
     if self.numberSite(pc, a, b) { run self.numberBinary(opcode, pc) return () }
     let x = run self.int(a, pc) let y = run self.int(b, pc)
     if x == NONE || y == NONE { fail refuse(pc, opcode, b"a boolean operand of arithmetic") }
@@ -1336,6 +1364,19 @@ impl Translator {
     let r = run self.f.emit(self.current, Op.Equals, true, Type.Bool, Own.Unboxed, x, y, k, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
     if negate { return run self.f.emit(self.current, Op.NotBool, true, Type.Bool, Own.Unboxed, r, NONE, 0, pc) }
+    return r
+  }
+
+  /// Whether the `+` at `pc` goes through the engine's concatenation: it left even as
+  /// doubles (stepped), on the function's own baseline frame.
+  fn concatenates(self: &Self, pc: u32) -> bool { return self.exits && self.leaves && self.depth == 0 && self.stepped(pc) }
+  /// `a + b` where a string took part (concatenates): a call the backend makes through the
+  /// engine's concatenation, stepping the instruction on the frame for other operands
+  /// (js_compiled.SITE_ADD). Its result is owned.
+  effect fn concatenation(self: &mut Self, a: u32, b: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let x = run self.boxed(a, pc) let y = run self.boxed(b, pc)
+    let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, x, y, calls.kAt(0, compiled.SITE_ADD), pc)
+    let last = self.f.lastInst() run self.exitHere(last, pc)
     return r
   }
 
@@ -1393,6 +1434,14 @@ impl Translator {
     let mut i: usize = 0
     while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { return true } i = i + 1 }
     return false
+  }
+  /// Whether the instruction at `pc` left code that had it widened too (named twice in the
+  /// sites, jit_runtime.LEFT_AGAIN): arithmetic there is the engine's, a step on the frame.
+  fn stepped(self: &Self, pc: u32) -> bool {
+    let mut n: u32 = 0
+    let mut i: usize = 0
+    while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { n = n + 1 } i = i + 1 }
+    return n >= 2
   }
   /// `v` as a double: itself, converted from an i32, or unboxed with a number guard at `pc`.
   /// NONE for a bool (refused by the caller).
@@ -1586,6 +1635,10 @@ impl Translator {
     let at = usize.toU32(pc)
     let size = sizeAt(input, pc)
     if opcode == op.OP_fuse_prefix { return true }
+    // Arithmetic that left even as doubles (a string concatenation): the engine's, on the
+    // frame. Only what reads its operands and pushes its result; a store to a local would
+    // leave the translation's local stale.
+    if self.exits && self.leaves && self.depth == 0 && stackArithmetic(opcode) && !addition(opcode) && self.stepped(at) { return run self.generic(input, pc) }
     if opcode == op.OP_push_i32 { let c = run self.constant(i32At(input, pc + 1), at) run self.push(c) return true }
     if opcode == op.OP_push_i8 { let c = run self.constant(i8At(input, pc + 1), at) run self.push(c) return true }
     if opcode == op.OP_push_i16 { let c = run self.constant(i16At(input, pc + 1), at) run self.push(c) return true }
@@ -1793,6 +1846,12 @@ impl Translator {
       } else {
         if rightIndex >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
         right = self.locals.get(rightIndex)
+      }
+      if operation == Op.Add && self.concatenates(at) {
+        let r = run self.concatenation(left, right, at)
+        if !twoLocals { drop self.pop() run self.release(left, at) }
+        run self.push(r)
+        return true
       }
       if self.numberSite(at, left, right) {
         let x = run self.number(left, at) let y = run self.number(right, at)
@@ -2276,6 +2335,7 @@ impl Translator {
     if !self.leaves { return false }
     let readPc = self.readOf(self.top(count + 1))
     let mut join = NONE
+    let mut lastK: i32 = 0
     let mut t: usize = 0
     while t < input.targets.length() {
       let target = &input.targets.asSlice()[t]
@@ -2304,7 +2364,16 @@ impl Translator {
       let function = self.top(count + 1)
       let mut receiver = NONE
       if method { receiver = self.top(count + 2) } else { receiver = run self.imm(Imm.Undefined, pc) }
+      // A method known for one receiver shape: the arm is for that shape, which the shape
+      // dispatch of the read proved already (x64_backend.knownArms) and the test proves on
+      // the general path; the body's reads of the receiver then know it (ssa_shapes).
+      let known = target.known
+      if method && self.exits && known.shapes[0] != 0 && known.shapes[1] == 0 && known.shapes[0] < 2147483648 {
+        drop run self.f.emit(self.current, Op.CheckShape, false, Type.I32, Own.Unboxed, receiver, NONE, u32.wrappingToI32(known.shapes[0]), pc)
+        let guarded = self.f.lastInst() run self.exitHere(guarded, pc)
+      }
       if run self.inlineOne(input, here, function, receiver, method, count, pc, false) {
+        lastK = k
         if join == NONE { join = run self.stateBlock() }
         run self.jumpInto(join, pc)
         run self.adoptState(miss, pc)
@@ -2318,6 +2387,24 @@ impl Translator {
     }
     if join == NONE { return false }
     let function = self.top(count + 1)
+    if self.exits && (self.depth != 0 || !self.widened(pc)) && insideLoop(input, pc) {
+      // No other callee was seen here, so in a loop another one leaves (the last target's
+      // test fails again): the code is compiled again with the call (widened; in an inlined
+      // body's loop, with the outermost call not inlined, as after any exit there), and
+      // until then the loop holds no call (ssa_opt_hoist).
+      drop run self.f.emit(self.current, Op.CheckCallee, false, Type.I32, Own.Unboxed, function, NONE, lastK, pc)
+      let guarded = self.f.lastInst() run self.exitHere(guarded, pc)
+      // Not reached: the operands go and the state the join takes is made up.
+      let mut depth = count + 1
+      if method { depth = depth + 1 }
+      let mut i: usize = 0
+      while i < depth { let v = self.pop() run self.release(v, pc) i = i + 1 }
+      let none = run self.imm(Imm.Undefined, pc)
+      run self.push(none)
+      run self.jumpInto(join, pc)
+      run self.adoptState(join, pc)
+      return true
+    }
     let mut receiver = NONE
     if method { receiver = self.top(count + 2) } else { receiver = run self.imm(Imm.Undefined, pc) }
     run self.plainCall(function, receiver, method, false, count, pc, 0)
@@ -3267,6 +3354,23 @@ pub effect fn loopRegion(input: &FunctionInput, header: u32) -> LoopRegion ! Out
     }
   }
   return LoopRegion { start: start, end: end }
+}
+
+/// Whether `pc` is inside a loop of `input`: between the target of a backward jump and it.
+fn insideLoop(input: &FunctionInput, pc: u32) -> bool {
+  let length = input.code.length()
+  let mut at: usize = 0
+  while at < length {
+    let opcode = byteAt(input, at)
+    let size = sizeAt(input, at)
+    if size == 0 || at + size > length { return false }
+    if (isBranch(opcode) || isGoto(opcode)) && at >= u32.toUsize(pc) {
+      let target = targetOf(input, at)
+      if target >= 0 && target <= u32.toI64(pc) { return true }
+    }
+    at = at + size
+  }
+  return false
 }
 
 /// The targets of backward jumps in `input`, each once, in code order: where on-stack
