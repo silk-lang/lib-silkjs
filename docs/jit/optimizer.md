@@ -353,6 +353,30 @@ compiled code knows: assignment, `defineProperty`, a getter, deletion, `Object.a
 `Reflect.set`, a swap between two prototypes, an own method on the receiver, another
 prototype, one in between, a method that replaces itself while its caller's loop runs.
 
+## Watched records
+
+`var Direction = new Object()` with three numbers in it, read as `Direction.FORWARD` by
+`input()` and `output()` in every turn of DeltaBlue's plan, is a record: an ordinary plain
+object of at most eight data properties, each an int32, a boolean, null or undefined,
+whose prototype is a plain object without one. When a compile finds one in a variable cell
+of a target's closure (`jit_runtime.watchRecords`, `js_compiled_inline.cellRecord`), it is
+watched as prototypes are: it takes the prototype role, whose only cost is epoch bumps, so
+that every path that ends a prototype's watch ends its own (`js_shapes.noteShapeChange`
+tests that role), and `watchHolder` gives it a shape of its own. No interpreter path
+changed.
+
+A keyed read whose inline key names a slot of a record's shape (as it is, or as it was
+before the watch: keys filled earlier hold that) is `check.shape` of the record's shape,
+which names the record alone while it is watched, `check.watched` (the watched bit, two
+instructions) and the slot's value as a constant: an unboxed i32 for a number, so the
+comparison after it is with an immediate. A changed record leaves at the test, and the
+next compile reads it again. `Jit.records` keeps what each compile found; a record no
+longer watched (`recordHolds`) gives no constants.
+
+On DeltaBlue x20 this took 83M instructions out of optimized code. A read of
+`Direction.FORWARD` and its `==` went from about 26 instructions to 19: the cell read and
+the two guards are what is left.
+
 ## Values in registers, cells and stores
 
 - **Fresh values.** A read leaves its value's two words in rax and r9 as well as in the slot
@@ -447,7 +471,9 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
   arms that leave or throw, chains two bodies deep, `t39` exact targets and owned cells, `t40`
   known methods (above), `t41` shape dispatch over four classes with every change of `t40`,
   receivers the site never saw and a scheduler loop, `t42` loops whose object changes shape or
-  prototype in a turn, and a prototype that starts being watched while a loop stores to it.
+  prototype in a turn, and a prototype that starts being watched while a loop stores to it,
+  `t50` watched records changed under inlined reads (a write, a getter, a delete, an add,
+  the variable set to another object).
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`

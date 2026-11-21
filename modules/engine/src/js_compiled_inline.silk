@@ -19,6 +19,7 @@ import js_class_data as classes
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
+import silk.core.ownership { Copy }
 
 /// The FunctionBytecode cell of the bytecode closure that the get_field2 at offset pc of
 /// bytecode last read from a prototype (its site cache entry, still current), or null: the
@@ -159,6 +160,13 @@ pub fn closureObject(value: ValueBits) -> ?*mut HeapHeader {
 /// a frame, and a binding is initialized once), at the same address while the closure lives:
 /// code that keeps the closure (keepClosure) may read the cell without a test.
 pub unsafe fn ownedCell(closure: *mut HeapHeader, index: u32) -> usize {
+  return match Pointer.nonNullMut<HeapHeader>(unsafe initializedCell(closure, index)) {
+    Option<*mut HeapHeader>.Some { value } => Pointer.address<HeapHeader>(value)
+    Option<*mut HeapHeader>.None => 0
+  }
+}
+/// Variable cell `index` of closure when it is detached and initialized (ownedCell), or null.
+unsafe fn initializedCell(closure: *mut HeapHeader, index: u32) -> ?*mut HeapHeader {
   let anchor = ()
   let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, closure)
   let mut cell = Pointer.null<HeapHeader>()
@@ -167,11 +175,11 @@ pub unsafe fn ownedCell(closure: *mut HeapHeader, index: u32) -> usize {
     _ => ()
   }
   drop data
-  let found = match Pointer.nonNullMut<HeapHeader>(cell) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return 0 } }
+  let found = match Pointer.nonNullMut<HeapHeader>(cell) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() } }
   let binding = unsafe HeapCell.payload<VarRef, ()>(&anchor, found)
   return match binding.state {
-    VarRefState.Detached { value } => match value { ValueBits.Uninitialized => 0 _ => Pointer.address<HeapHeader>(found) }
-    _ => 0
+    VarRefState.Detached { value } => match value { ValueBits.Uninitialized => Pointer.null<HeapHeader>() _ => cell }
+    _ => Pointer.null<HeapHeader>()
   }
 }
 /// The first byte of bytecode's code: what CompiledFrame.code holds for it.
@@ -283,6 +291,87 @@ pub unsafe effect fn watchHolder(runtime: *mut HeapHeader, holder: *mut HeapHead
     }
   }
   return true
+}
+/// A record's slot kinds (WatchedRecord.kinds): none (a slot compiled code does not take as
+/// a constant), an int32, a boolean, null, undefined.
+pub const RECORD_NONE: u8 = 0
+pub const RECORD_INT: u8 = 1
+pub const RECORD_BOOL: u8 = 2
+pub const RECORD_NULL: u8 = 3
+pub const RECORD_UNDEFINED: u8 = 4
+/// The most slots a record has.
+pub const RECORD_SLOTS: usize = 8
+/// A watched record (cellRecord): the object, its shape's version before the watch began
+/// (`before`; what the inline keys of reads filled earlier hold) and now, and each slot's
+/// value as compiled code takes it.
+pub struct WatchedRecord { pub object: ?*mut HeapHeader, pub before: u64, pub version: u64, pub count: usize, pub kinds: [u8; 8], pub values: [i32; 8] }
+impl Copy for WatchedRecord {}
+impl WatchedRecord {
+  pub fn none() -> Self { return Self { object: Pointer.null<HeapHeader>(), before: 0, version: 0, count: 0, kinds: [0; 8], values: [0; 8] } }
+}
+/// The record in variable cell `index` of closure, watched. A record is an ordinary plain
+/// object of at most RECORD_SLOTS data properties, each an int32, a boolean, null or
+/// undefined, whose prototype is a plain object without one (`var Direction = new Object()`
+/// with numbers in it): compiled code reads its slots as constants while the watch holds,
+/// testing its shape (its own while watched, so it names the object) and its watched bit.
+/// With `start` the watch begins here when it has not: the record takes the prototype role,
+/// which only costs epoch bumps, so that every path that ends a prototype's watch ends its
+/// own (js_shapes.noteShapeChange), and watchHolder gives it its own shape. The caller's
+/// rules are watchHolder's. False when the cell holds no record or it is not watched.
+pub unsafe effect fn cellRecord(runtime: *mut HeapHeader, closure: *mut HeapHeader, index: u32, start: bool, out: &mut WatchedRecord) -> bool ? &mut Allocator {
+  let cell = match Pointer.nonNullMut<HeapHeader>(unsafe initializedCell(closure, index)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let mut anchor = ()
+  let binding = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+  let object = match binding.state {
+    VarRefState.Detached { value } => match value { ValueBits.Object { reference } => reference _ => { return false } }
+    _ => { return false }
+  }
+  drop binding
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || data.slotCount() == 0 || data.slotCount() > RECORD_SLOTS { return false }
+  if !data.isWatched() && (!start || data.wasWatched() || data.isPrototype()) { return false }
+  let shapeAnchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
+  let before = shape.version
+  let parent = match Pointer.nonNullMut<HeapHeader>(shape.prototype) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  drop shape
+  let parentData = unsafe HeapCell.payload<ObjectData, ()>(&shapeAnchor, parent)
+  if parentData.classId() != classes.JS_CLASS_OBJECT || !Pointer.isNull<HeapHeader>((unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, parentData.shape)).prototype) { return false }
+  drop parentData
+  let mut found = WatchedRecord.none()
+  found.count = data.slotCount()
+  let mut i: usize = 0
+  while i < found.count {
+    match (unsafe data.slotUnchecked(i)).valueBits() {
+      ValueBits.Int { value } => { found.kinds[i] = RECORD_INT found.values[i] = value }
+      ValueBits.Bool { value } => { found.kinds[i] = RECORD_BOOL if value { found.values[i] = 1 } }
+      ValueBits.Null => { found.kinds[i] = RECORD_NULL }
+      ValueBits.Undefined => { found.kinds[i] = RECORD_UNDEFINED }
+      _ => { return false }
+    }
+    i = i + 1
+  }
+  if !data.isWatched() {
+    if !unsafe shapes.plainRecords(data.shape) { return false }
+    data.setIsPrototype(true)
+    drop data
+    if !run unsafe watchHolder(runtime, object) { return false }
+  } else { drop data }
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, (unsafe HeapCell.payload<ObjectData, ()>(&shapeAnchor, object)).shape)).version
+  found.object = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(object)
+  found.before = before
+  found.version = version
+  out.* = move found
+  return true
+}
+/// Whether the record cellRecord answered for as `version` still is watched, of that shape:
+/// what it took as constants is still in its slots. The watch keeps the record
+/// (watchHolder keeps it), so its address stays one.
+pub unsafe fn recordHolds(object: *mut HeapHeader, version: u64) -> bool {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if !data.isWatched() { return false }
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version == version
 }
 /// Pair `index` of the shapes the `get_field2` at pc of bytecode read by: its holder (a
 /// prototype of the receivers), the slot there and the version of the receivers' shape;

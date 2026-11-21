@@ -26,6 +26,7 @@ import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, 
 import ssa_calls as calls
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_objects as objects
+import silkjs.js_compiled_inline as inline
 import ssa
 
 /// What the translator reads about a function: plain numbers and the code bytes, nothing that
@@ -73,7 +74,15 @@ pub struct FunctionInput {
   /// for the array operation first (calls.NATIVE_PUSH). Read from the function's own input.
   pub arrayPush: u32,
   pub arrayPop: u32,
+  /// The slots of watched records (js_compiled_inline.cellRecord) the code may read as
+  /// constants, for the function and every body inlined into it.
+  pub records: List<RecordSlot>,
 }
+/// Slot `slot` of a watched record whose shape's version is `version` (`before`: what it
+/// was before the watch, as inline keys filled earlier hold it) holds a constant of `kind`
+/// (js_compiled_inline.RECORD_INT and the others) and `value`.
+pub struct RecordSlot { pub before: u32, pub version: u32, pub slot: u32, pub kind: u8, pub value: i32 }
+impl Copy for RecordSlot {}
 /// The `count` (1 to 4) shapes the cached field site at `pc` read a data property from:
 /// keys[i] is the shape's version << 16 with the slot (an own property) or
 /// js_core_types.FIELD_PROTO_KEY (one of the direct prototype, whose shape version << 16 |
@@ -164,7 +173,7 @@ fn withoutEffect(operation: Op) -> bool {
     || operation == Op.Cmp || operation == Op.Retain || operation == Op.Release || operation == Op.CheckTag
     || operation == Op.GetField || operation == Op.AtomValue || operation == Op.GetVar || operation == Op.GetScope
     || operation == Op.GetElem || operation == Op.GetLength || operation == Op.Truthy || operation == Op.TagIs || operation == Op.TypeofAtom
-    || operation == Op.CheckCallee || operation == Op.CheckShape || operation == Op.IsCallee || operation == Op.InlineFrame || operation == Op.Jump || operation == Op.Branch
+    || operation == Op.CheckCallee || operation == Op.CheckShape || operation == Op.CheckWatched || operation == Op.IsCallee || operation == Op.InlineFrame || operation == Op.Jump || operation == Op.Branch
     || operation == Op.ConstF64 || ssa.isNumberOp(operation)
 }
 pub const CLOSURE_NONE: u8 = 0
@@ -796,6 +805,8 @@ struct Translator {
   initialized: List<bool>,
   /// The upper half of a store's inline key for an add (FieldLayout.addKey).
   addKey: u32,
+  /// FunctionInput.records of the function being compiled.
+  records: List<RecordSlot>,
   /// The locals still to be read at each instruction of the code being translated, the
   /// function's own or an inlined body's (Liveness).
   liveness: Liveness,
@@ -957,12 +968,22 @@ effect fn livenessOf(input: &FunctionInput) -> Liveness ! OutOfMemoryError ? &mu
 /// Whether the field store at pc holds an add key (FieldLayout.addKey in its upper half):
 /// its last run added the property.
 fn addSite(input: &FunctionInput, pc: u32, addKey: u32) -> bool {
+  return u64.wrappingToU32(u64.shiftRight(inlineKey(input, pc), 32)) == addKey
+}
+/// The inline field-cache key of the field instruction at pc: 8 bytes after its atom, low
+/// byte first (all ones past the code, as an empty key).
+fn inlineKey(input: &FunctionInput, pc: u32) -> u64 {
   let at = u32.toUsize(pc) + 5
-  if at + 8 > input.code.length() { return false }
-  let mut high: u32 = 0
+  if at + 8 > input.code.length() { return u64.MAX }
+  let mut key: u64 = 0
   let mut b: usize = 8
-  while b > 4 { b = b - 1 high = u32.bitOr(u32.shiftLeft(high, 8), u8.toU32(byteAt(input, at + b))) }
-  return high == addKey
+  while b != 0 { b = b - 1 key = u64.bitOr(u64.shiftLeft(key, 8), u8.toU64(byteAt(input, at + b))) }
+  return key
+}
+effect fn copyRecords(from: &List<RecordSlot>) -> List<RecordSlot> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<RecordSlot>.make()
+  run out.appendSlice(from.asSlice())
+  return move out
 }
 
 /// The local an instruction writes (`written`) or marks uninitialized, or usize.MAX.
@@ -2776,6 +2797,33 @@ impl Translator {
     drop run self.f.emit(self.current, Op.CheckTag, false, Type.I32, Own.Unboxed, v, NONE, tag, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
   }
+  /// The constant a watched record holds where the keyed read at `pc` of `input` reads
+  /// `object`: the site's key names an own slot of a shape a record has or had (RecordSlot),
+  /// and guards that `object` is of the record's shape now (its own, so it is the record)
+  /// and still watched come first. NONE when no record slot is named.
+  effect fn recordConstant(self: &mut Self, input: &FunctionInput, object: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if !self.exits || self.records.length() == 0 { return NONE }
+    let key = inlineKey(input, pc)
+    // An own key: the shape's version above the slot, nothing in the top bit.
+    let version = u64.shiftRight(key, 16)
+    if version == 0 || version >= 2147483648 { return NONE }
+    let slot = u64.wrappingToU32(key & 65535)
+    let mut i: usize = 0
+    while i < self.records.length() {
+      let r = self.records.get(i)
+      i = i + 1
+      if r.slot != slot || (u32.toU64(r.before) != version && u32.toU64(r.version) != version) { continue }
+      drop run self.f.emit(self.current, Op.CheckShape, false, Type.I32, Own.Unboxed, object, NONE, u32.wrappingToI32(r.version), pc)
+      let shaped = self.f.lastInst() run self.exitHere(shaped, pc)
+      drop run self.f.emit(self.current, Op.CheckWatched, false, Type.I32, Own.Unboxed, object, NONE, 0, pc)
+      let watched = self.f.lastInst() run self.exitHere(watched, pc)
+      if r.kind == inline.RECORD_INT { return run self.constant(r.value, pc) }
+      if r.kind == inline.RECORD_BOOL { return run self.constBool(r.value != 0, pc) }
+      if r.kind == inline.RECORD_NULL { return run self.imm(Imm.Null, pc) }
+      return run self.imm(Imm.Undefined, pc)
+    }
+    return NONE
+  }
   /// The named property the instruction at `pc` reads from `object`, owned.
   effect fn getField(self: &mut Self, object: u32, how: i32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let mut k = how
@@ -2856,7 +2904,8 @@ impl Translator {
     if opcode == op.OP_get_field {
       let o = self.top(1)
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
-      let r = run self.getField(o, FIELD_KEYED, at)
+      let mut r = run self.recordConstant(input, o, at)
+      if r == NONE { r = run self.getField(o, FIELD_KEYED, at) }
       drop self.pop() run self.release(o, at) run self.push(r)
       return true
     }
@@ -2878,7 +2927,8 @@ impl Translator {
         o = run self.parameterValue(usize.toU32(index), at)
       }
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
-      let r = run self.getField(o, FIELD_KEYED, at)
+      let mut r = run self.recordConstant(input, o, at)
+      if r == NONE { r = run self.getField(o, FIELD_KEYED, at) }
       run self.push(r)
       return true
     }
@@ -3039,7 +3089,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), addKey: objects.fieldLayout().addKey, argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
@@ -3284,7 +3334,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make() }, addKey: objects.fieldLayout().addKey, argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make() }, addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
