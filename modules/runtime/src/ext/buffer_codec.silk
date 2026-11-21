@@ -181,6 +181,30 @@ unsafe fn decodeScalar(state: BufferState, index: &mut u64, end: u64) -> u32 {
   }
   return point
 }
+// decodeScalar over private bytes.
+fn privateScalar(bytes: &[u8], index: &mut usize) -> u32 {
+  let first = u8.toU32(bytes[index.*])
+  index.* = index.* + 1
+  if first < 0x80 { return first }
+  let mut count: u32 = 0
+  let mut point: u32 = 0
+  if first >= 0xc2 && first <= 0xdf { count = 1 point = first & 31 }
+  else if first >= 0xe0 && first <= 0xef { count = 2 point = first & 15 }
+  else if first >= 0xf0 && first <= 0xf4 { count = 3 point = first & 7 }
+  else { return 0xfffd }
+  let mut i: u32 = 0
+  while i < count {
+    if index.* == bytes.length { return 0xfffd }
+    let next = u8.toU32(bytes[index.*])
+    if next < 0x80 || next > 0xbf { return 0xfffd }
+    if i == 0 && ((first == 0xe0 && next < 0xa0) || (first == 0xed && next > 0x9f)
+      || (first == 0xf0 && next < 0x90) || (first == 0xf4 && next > 0x8f)) { return 0xfffd }
+    point = u32.shiftLeft(point, 6) | (next & 63)
+    index.* = index.* + 1
+    i = i + 1
+  }
+  return point
+}
 pub unsafe effect fn decode(state: BufferState, start: u64, end: u64, utf16: bool) -> ValueBits
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut builder = StringBuilder.make()
@@ -203,6 +227,20 @@ pub unsafe effect fn decode(state: BufferState, start: u64, end: u64, utf16: boo
       let mut i: usize = 0
       while i < bytes.length { if bytes[i] >= 0x80 { ascii = false break } i = i + 1 }
       if ascii { return run Strings.fromLatin1(bytes) }
+      // Mostly ASCII text (JSON) copies its ASCII runs whole and decodes the rest in place.
+      run builder.reserve(bytes.length, true)
+      run builder.appendLatin1(unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe buffers.dataAt(state.data, start)), i))
+      while i < bytes.length {
+        let mut stop = i
+        while stop < bytes.length && bytes[stop] < 0x80 { stop = stop + 1 }
+        if stop > i {
+          run builder.appendLatin1(unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe buffers.dataAt(state.data, start + usize.toU64(i))), stop - i))
+          i = stop
+        }
+        if i == bytes.length { break }
+        run builder.appendCodePoint(privateScalar(bytes, &mut i))
+      }
+      return run builder.finish()
     }
     // Reserve once and choose storage width before appending, so a non-ASCII
     // suffix cannot force a copy of a large ASCII prefix. Shared loads remain
@@ -271,6 +309,78 @@ unsafe fn readByte(state: BufferState, offset: u64, direct: bool) -> u32 {
   if direct { return u8.toU32(unsafe Pointer.read<u8>(unsafe buffers.dataAt(state.data, offset))) }
   return unsafe byte(state, offset)
 }
+// Operations 13, 14 and 15 over a Uint8Array's bytes start..end (clamped to the view).
+unsafe effect fn scan<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, argc: i32, argv: &FrameSlots, operation: u64) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let input = unsafe common.argument(argv, argc, 1)
+  if unsafe buffers.classId(input) != classes.JS_CLASS_UINT8_ARRAY {
+    return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Buffer codec requires a Uint8Array")
+  }
+  let start = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, 2))
+  let mut end = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, 3))
+  let object = (run typed.requireTypedArray(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(input))).header()
+  let mut count = unsafe buffers.count(object)
+  if unsafe buffers.isOutOfBounds(object) { count = 0 }
+  if end > count { end = count }
+  let view = unsafe buffers.span(object)
+  let state = view.bytes
+  let direct = state.physicalCapacity == 0
+  let from = view.offset + start
+  let to = view.offset + end
+  if operation == 15 {
+    run typed.validate(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(input))
+    let mask = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, 4))
+    let mut i = from
+    while i < to {
+      let shift = 24 - ((i - from) & 3) * 8
+      unsafe putByte(state, i, unsafe readByte(state, i, direct) ^ u64.toU32(u64.bitAnd(u64.shiftRight(mask, shift), 255)), direct)
+      i = i + 1
+    }
+    return ValueBits.Undefined
+  }
+  if start >= end { return ValueBits.Bool { value: true } }
+  if operation == 14 {
+    let mut i = from
+    while i < to {
+      if unsafe readByte(state, i, direct) >= 0x80 { return ValueBits.Bool { value: false } }
+      i = i + 1
+    }
+    return ValueBits.Bool { value: true }
+  }
+  let mut i = from
+  while i < to {
+    let first = unsafe readByte(state, i, direct)
+    i = i + 1
+    if first >= 0x80 {
+      let mut low: u32 = 0x80
+      let mut high: u32 = 0xbf
+      let mut remaining: u64 = 0
+      if first >= 0xc2 && first <= 0xdf { remaining = 1 }
+      else if first >= 0xe0 && first <= 0xef {
+        remaining = 2
+        if first == 0xe0 { low = 0xa0 }
+        if first == 0xed { high = 0x9f }
+      } else if first >= 0xf0 && first <= 0xf4 {
+        remaining = 3
+        if first == 0xf0 { low = 0x90 }
+        if first == 0xf4 { high = 0x8f }
+      } else { return ValueBits.Bool { value: false } }
+      if to - i < remaining { return ValueBits.Bool { value: false } }
+      let second = unsafe readByte(state, i, direct)
+      if second < low || second > high { return ValueBits.Bool { value: false } }
+      i = i + 1
+      remaining = remaining - 1
+      while remaining > 0 {
+        let next = unsafe readByte(state, i, direct)
+        if next < 0x80 || next > 0xbf { return ValueBits.Bool { value: false } }
+        i = i + 1
+        remaining = remaining - 1
+      }
+    }
+  }
+  return ValueBits.Bool { value: true }
+}
+
 unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits) -> u64
   ! JsException ? &mut Allocator {
   if value.isNumber() {
@@ -287,6 +397,9 @@ unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
 // 8: utf8 decode as 3, or undefined when the view or offsets need the generic path
 // 9: subarray (see subarray above)
 // 10/11/12: base64/base64url/hex encode(Uint8Array, start, end) -> string
+// 13: whether bytes start..end are well-formed UTF-8 (RFC 3629) -> boolean
+// 14: whether bytes start..end are all ASCII -> boolean
+// 15: XOR bytes start..end in place with the 32-bit big-endian mask (WebSocket masking)
 // Node's adjustOffset for a number; none for anything that needs coercion.
 fn adjustOffset(value: ValueBits, length: f64, fallback: f64, out: &mut f64) -> bool {
   match value { ValueBits.Undefined => { out.* = fallback return true } _ => () }
@@ -348,6 +461,7 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
     if start < end && end - start > 0x1fffffe8 { return ValueBits.Undefined }
     operation = 3
   }
+  if operation >= 13 && operation <= 15 { return run unsafe scan(&mut engine, context, argc, argv, operation) }
   if operation > 12 || operation == 9 { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown Buffer codec operation") }
   let writing = operation <= 2 || operation == 5
   if writing && !input.isString() { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Buffer codec requires a string") }

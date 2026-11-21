@@ -28,7 +28,24 @@ for (const bytes of malformed) {
 for (let first = 0; first < 256; first++) {
   for (const rest of [[], [0x80], [0xa0, 0x80], [0x90, 0x80, 0x80], [0xbf, 0x41]]) {
     record(['lead', first, rest], () => units(Buffer.from([first, ...rest]).toString()));
+    record(['isUtf8', first, rest], () => require('node:buffer').isUtf8(Buffer.from([first, ...rest])));
   }
+}
+// Validation and ASCII checks see only the view's bytes, also inside a larger buffer.
+{
+  const { isUtf8, isAscii } = require('node:buffer');
+  const fatal = new TextDecoder('utf-8', { fatal: true });
+  for (const bytes of malformed) {
+    const outer = Buffer.from([0x41, ...bytes, 0xff]);
+    const view = outer.subarray(1, 1 + bytes.length);
+    record(['isUtf8 view', bytes], () => isUtf8(view));
+    record(['isAscii view', bytes], () => isAscii(view));
+    record(['fatal decode', bytes], () => units(fatal.decode(view)));
+  }
+  assert.equal(isUtf8(Buffer.from('caf\u00e9 \u{1f600}')), true);
+  assert.equal(isUtf8(Buffer.from([0xed, 0xa0, 0x80])), false);
+  assert.equal(isAscii(Buffer.from('plain')), true);
+  assert.equal(isAscii(new Uint8Array([0x41, 0x80]).subarray(0, 1)), true);
 }
 const strings = ['', 'ASCII\0end', '\u0080\u07ff\u0800\uffff', '\ud800', '\udc00', '\ud800A', '\ud800\ud800\udc00', '\ud83d\ude00', '\ufeffA'];
 for (const string of strings) {
