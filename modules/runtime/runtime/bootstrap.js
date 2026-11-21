@@ -173,6 +173,8 @@ host.absentBuiltin = name => {
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
   if (!moduleHas('internal/source_maps') && !host.env.NODE_V8_COVERAGE) return undefined;
+  // A big script's source stays undecoded until read (script_metadata.lazySource).
+  if (source === undefined) source = (metadata.owner ?? metadata).source;
   return internalRequire('internal/source_maps').registerSource(filename, source, metadata);
 };
 // pathToFileURL(path).href for the plain absolute paths that need no escaping.
