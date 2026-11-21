@@ -364,6 +364,17 @@ prototype, one in between, a method that replaces itself while its caller's loop
 - **Moved stores.** A store followed by the release of the value it stored takes the value's
   own count: no count up, no release (`movedInto`). Taking the old value's last count is out
   of line (`OUT_PUT_LAST`), and the old value's words stay in registers for it.
+- **Dead stores.** A backward liveness pass over the bytecode (`ssa_translate.livenessOf`, one
+  bit per local, for code with at most 64 locals and no catch, finally or references to
+  locals) tells, at each instruction, which locals some path still reads. A `put_loc` or
+  `set_loc` to a local no path reads again stores undefined: `var c = list[i]; c.run()` is a
+  `set_loc` whose value stays on the stack, and the store's retain, the release of the old
+  value and the local's loop parameter all go. The pass runs on the function's own code and
+  on each inlined body. An exit names undefined for such a local, which nothing reads.
+  Two other uses of the same liveness measured no gain on DeltaBlue: releasing a local where
+  it dies (the release only moves), and taking the local's count at its last `get_loc` (on
+  a path that reads it last, while another path keeps it, the merge gets a new parameter
+  that costs more than the retain saved).
 
 ## Leaving too often
 

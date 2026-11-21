@@ -1,6 +1,5 @@
 import sys,re,bisect,collections
 # opsites.py DUMP CGOUT OPNAME [N]: the hottest instructions of one SSA operation across all optimized functions.
-exec(open(sys.argv[0].replace('opsites.py','cgprof_core.py')).read()) if False else None
 dump,cg,want=sys.argv[1:4]; N=int(sys.argv[4]) if len(sys.argv)>4 else 30
 funcs=[];cur=None;regions=[]
 for l in open(dump,errors='replace'):
