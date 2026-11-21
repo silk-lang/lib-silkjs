@@ -66,6 +66,9 @@ import jit_exit_state as state
 /// Bytes per SSA value slot and per ValueBits.
 pub const SLOT_BYTES: u32 = 16
 /// js_compiled.EXIT_*.
+/// How many instructions after a method read the callee test that names its target is
+/// looked for (knownRead): it follows the read at once unless the read was hoisted.
+const KNOWN_WINDOW: u32 = 48
 const EXIT_RETURNED: u32 = 0
 const EXIT_DEOPT: u32 = 1
 const EXIT_POLL: u32 = 2
@@ -137,13 +140,19 @@ struct PollSlow { slow: Label, back: Label, exit: u32, pc: u32 }
 impl Copy for PollSlow {}
 /// Code kept out of the way of what usually runs (Emitter.outs), placed after the blocks:
 /// it starts at `entry` and jumps `back`. `frame` is the Inst.frame it runs for.
-struct Out { kind: u32, entry: Label, back: Label, frame: u32, inst: u32, base: Reg, at: i32 }
+struct Out { kind: u32, entry: Label, back: Label, frame: u32, inst: u32, base: Reg, at: i32, flags: u32 }
 impl Copy for Out {}
 /// The last count of the ValueBits at `at` from `base`: R9 is its payload, whose count the
 /// code already dropped. The release helper takes it from there.
 const OUT_RELEASE: u32 = 1
 /// The variable read of instruction `inst` through its helper.
 const OUT_GET_VAR: u32 = 2
+/// A keyed store that displaces the last count of the old value (put.field): `at` is the
+/// slot's offset from R11, flags the PUT_* of the store.
+const OUT_PUT_LAST: u32 = 3
+/// The new value is in RAX and R9; the value's own count goes to the field.
+const PUT_HELD: u32 = 1
+const PUT_MOVED: u32 = 2
 
 pub struct Emitter {
   pub a: Assembler,
@@ -179,6 +188,12 @@ pub struct Emitter {
   cursor: u32,
   skipAt: u32,
   skipLabel: Label,
+  /// The instruction that emits nothing: a release whose count a store took (movedInto).
+  dropAt: u32,
+  /// By value: 1 + the inline target whose one closure the value is known to be, or 0
+  /// (presets); and the exit of the callee test that proves it.
+  preset: List<u32>,
+  presetGuard: List<u32>,
   /// `add.i32`/`sub.i32` done in place (result and first operand in one register): on
   /// overflow each jumps to its label here, where the operation is undone before the exit
   /// reads the operand.
@@ -365,7 +380,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel,
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
@@ -393,6 +408,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     n = n + 1
   }
   run emitter.countUses(&function)
+  run emitter.presets(&function)
   let mut b: u32 = 0
   while b < function.blockCount() { run emitter.blockLabels.append(run emitter.a.label()) b = b + 1 }
   let mut x: usize = 0
@@ -536,6 +552,9 @@ impl Emitter {
         run self.a.movSymbol(Reg.Rax, closure)
         if fresh { run self.a.alu(Alu.Cmp, Width.W64, Reg.Rax, Reg.R9) } else { run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, payloadOf(inst.a)) }
         run self.a.jcc(Cond.NotEqual, leave)
+        // A preset value holds no count from here on (presets): the read's goes back. It is
+        // never the last: the code keeps the closure.
+        if self.isPreset(inst.a) && function.value(inst.a).own == Own.Owned { run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rax, 0), 1) }
         return ()
       }
       run self.payloadInto(Reg.R11, inst.a)
@@ -749,6 +768,9 @@ impl Emitter {
       return ()
     }
     if op == Op.Release {
+      if self.dropAt == self.cursor { self.dropAt = NONE return () }
+      // A preset value holds no count (presets).
+      if self.isPreset(inst.a) { return () }
       let heap = (self.shapes.fact(self.cursor) & FACT_OBJECT) != 0
       run self.releaseAt(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES), heap)
       return ()
@@ -1012,7 +1034,7 @@ impl Emitter {
         // object leaves the code.
         let fact = self.shapes.fact(self.cursor)
         let miss = self.exitLabels.get(u32.toUsize(inst.exit))
-        run self.shapedSlots(inst.a, key, fact, miss)
+        run self.shapedSlots(inst.a, key, fact, miss, Reg.Rax)
         let at = u64.wrappingToI32(u64.bitAnd(key, 65535)) * 16
         run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, at))
         run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, at + 8))
@@ -1033,12 +1055,100 @@ impl Emitter {
         let hedged = (fact & FACT_HEDGED) != 0
         let mut miss = self.exitLabels.get(u32.toUsize(inst.exit))
         if hedged { miss = slow }
+        let mut target = NONE
+        if self.skipAt == NONE || self.isPreset(inst.result) { target = self.knownRead(&function, self.cursor) }
+        let mut joins = false
+        let mut after = miss
+        let mut arms = List<u32>.make()
+        if target == NONE && !hedged { run self.shapeArms(&function, self.cursor, &mut arms) }
+        if arms.length() != 0 {
+          // A site that reads several known methods, each for one shape, and is followed by
+          // nothing but the tests of what it read (shapeArms): the receiver's shape tells
+          // the callee. An object of an arm's shape that is not exotic, while the arm's
+          // prototype is watched, has the arm's closure as its method: that goes to the
+          // slot, with its count, and the code goes on in the arm's body. Any other
+          // receiver takes the read and the tests below.
+          let general = run self.a.label()
+          let layout = self.settings.layout
+          let fields = self.fields
+          if (fact & FACT_OBJECT) == 0 { run self.unlessTag(inst.a, layout.object(), general) }
+          run self.payloadInto(Reg.R11, inst.a)
+          run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.exotic))
+          run self.a.jcc(Cond.NotEqual, general)
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, u32.wrappingToI32(fields.shapeVersion)))
+          let mut arm: usize = 0
+          while arm < arms.length() {
+            let k = arms.get(arm)
+            let next = run self.a.label()
+            run self.a.aluImm(Alu.Cmp, Width.W64, Reg.R8, u32.wrappingToI32(function.inlineShapes.get(u32.toUsize(k))))
+            run self.a.jcc(Cond.NotEqual, next)
+            let holder = self.holderSymbol(&function, k)
+            run self.a.movSymbol(Reg.R10, holder)
+            run self.a.test8MemImm(Mem.at(Reg.R10, u32.wrappingToI32(fields.objectRoles)), u32.wrappingToU8(fields.watched))
+            run self.a.jcc(Cond.Equal, general)
+            run self.a.movImm64(Reg.Rax, layout.tagWord(layout.object()))
+            let closure = self.symbol(k * 3 + 2)
+            run self.a.movSymbol(Reg.R9, closure)
+            run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+            run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+            if !borrowed { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) }
+            run self.a.jmp(self.blockLabels.get(u32.toUsize(arms.get(arm + 1))))
+            self.a.bind(next)
+            arm = arm + 2
+          }
+          self.a.bind(general)
+        }
+        if target != NONE {
+          // The method is known (ssa.TARGET_KNOWN): an object of the site's one shape that
+          // is not exotic reads the target's closure while the prototype it was read from
+          // is watched. The read is then these tests and the closure as a constant, and a
+          // callee test right after it is passed over; any other case takes the read below.
+          let general = run self.a.label()
+          let layout = self.settings.layout
+          let fields = self.fields
+          if (fact & FACT_OBJECT) == 0 { run self.unlessTag(inst.a, layout.object(), general) }
+          run self.payloadInto(Reg.R11, inst.a)
+          if u8.shiftRight(fact, FACT_PAIR) == 0 {
+            run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
+            run self.a.aluStoreImm(Alu.Cmp, Width.W64, Mem.at(Reg.Rax, u32.wrappingToI32(fields.shapeVersion)), u64.wrappingToI32(versionOf(site.keys[0])))
+            run self.a.jcc(Cond.NotEqual, general)
+          }
+          run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.exotic))
+          run self.a.jcc(Cond.NotEqual, general)
+          let holder = self.holderSymbol(&function, target)
+          run self.a.movSymbol(Reg.R10, holder)
+          run self.a.test8MemImm(Mem.at(Reg.R10, u32.wrappingToI32(fields.objectRoles)), u32.wrappingToU8(fields.watched))
+          run self.a.jcc(Cond.Equal, general)
+          if !self.isPreset(inst.result) {
+            run self.a.movImm64(Reg.Rax, layout.tagWord(layout.object()))
+            let closure = self.symbol(target * 3 + 2)
+            run self.a.movSymbol(Reg.R9, closure)
+            run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+            run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+            // An owned result takes its count of the closure, an object.
+            if !borrowed { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) }
+          }
+          // A preset value's slot holds the closure already, and it takes no count (presets).
+          if self.calleeNext(&function, inst.block, inst.result, target) {
+            self.skipLabel = run self.a.label()
+            self.skipAt = self.cursor + 1
+            run self.a.jmp(self.skipLabel)
+          } else {
+            // Both ways leave the value in RAX and R9.
+            after = run self.a.label()
+            joins = true
+            run self.a.jmp(after)
+          }
+          self.a.bind(general)
+        }
         run self.siteSlot(inst.a, &site, fact, miss)
         run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
         run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
         run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
         run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
         if !borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
+        if joins { self.a.bind(after) }
         if !hedged { self.setFresh(inst.result) return () }
         run self.a.jmp(done)
       } else if how == 0 || how == 1 {
@@ -1314,7 +1424,7 @@ impl Emitter {
         run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
         if function.value(inst.result).own != Own.Borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
         self.a.bind(read)
-        run self.outs.append(Out { kind: OUT_GET_VAR, entry: slow, back: read, frame: self.frameOf, inst: self.cursor, base: Reg.Rsp, at: 0 })
+        run self.outs.append(Out { kind: OUT_GET_VAR, entry: slow, back: read, frame: self.frameOf, inst: self.cursor, base: Reg.Rsp, at: 0, flags: 0 })
         // The slow path comes back with the registers loaded too (out).
         self.setFresh(inst.result)
         return ()
@@ -1357,36 +1467,35 @@ impl Emitter {
         let miss = self.exitLabels.get(u32.toUsize(inst.exit))
         let last = run self.a.label()
         let fact = self.shapes.fact(self.cursor)
-        run self.shapedSlots(inst.a, key, fact, miss)
+        // The store takes the value's own count when its release is next (movedInto), and
+        // the value from RAX and R9 when it was just read: nothing below touches the two
+        // before the store.
+        let moved = self.movedInto(&function, self.cursor)
+        let held = self.isFresh(inst.b) && self.settings.layout.tagWidth == 1
+        run self.shapedSlots(inst.a, key, fact, miss, Reg.R8)
         let at = u64.wrappingToI32(u64.bitAnd(key, 65535)) * 16
-        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, at))
-        run self.heapTest(Reg.Rax, kept)
-        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, at + 8))
-        run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R9, 0), 1)
+        run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R11, at))
+        run self.heapTest(Reg.R8, kept)
+        run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R11, at + 8))
+        run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R10, 0), 1)
         if inst.k == 0 { run self.a.jcc(Cond.LessOrEqual, miss) } else { run self.a.jcc(Cond.LessOrEqual, last) }
-        run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R9, 0), 1)
+        run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R10, 0), 1)
         self.a.bind(kept)
-        run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
-        run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
-        run self.a.store(Width.W64, Mem.at(Reg.R11, at), Reg.Rax)
-        run self.a.store(Width.W64, Mem.at(Reg.R11, at + 8), Reg.R9)
-        run self.retainBits(Reg.Rax, Reg.R9)
-        if inst.k != 0 {
-          run self.a.jmp(done)
-          self.a.bind(last)
-          run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch), Reg.Rax)
-          run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch + 8), Reg.R9)
+        if !held {
           run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
           run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
-          run self.a.store(Width.W64, Mem.at(Reg.R11, at), Reg.Rax)
-          run self.a.store(Width.W64, Mem.at(Reg.R11, at + 8), Reg.R9)
-          run self.retainBits(Reg.Rax, Reg.R9)
-          run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rsp, self.scratch))
-          run self.callHelper(helpers.RELEASE)
         }
+        run self.a.store(Width.W64, Mem.at(Reg.R11, at), Reg.Rax)
+        run self.a.store(Width.W64, Mem.at(Reg.R11, at + 8), Reg.R9)
+        if !moved { run self.retainBits(Reg.Rax, Reg.R9) }
         self.a.bind(done)
+        let mut flags: u32 = 0
+        if held { flags = PUT_HELD }
+        if moved { flags = u32.bitOr(flags, PUT_MOVED) self.dropAt = self.cursor + 1 }
+        if inst.k != 0 { run self.outs.append(Out { kind: OUT_PUT_LAST, entry: last, back: done, frame: self.frameOf, inst: self.cursor, base: Reg.R11, at: at, flags: flags }) }
         return ()
       }
+      let moved = self.movedInto(&function, self.cursor)
       run self.fieldSlot(inst.a, inst.pc, slow)
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
       run self.heapTest(Reg.Rax, kept)
@@ -1399,8 +1508,15 @@ impl Emitter {
       run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
       run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
       run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
-      run self.retainBits(Reg.Rax, Reg.R9)
-      run self.a.jmp(done)
+      if moved {
+        // Past the value's release, which the helper's way below still runs.
+        self.skipLabel = run self.a.label()
+        self.skipAt = self.cursor + 1
+        run self.a.jmp(self.skipLabel)
+      } else {
+        run self.retainBits(Reg.Rax, Reg.R9)
+        run self.a.jmp(done)
+      }
       self.a.bind(slow)
       // A live borrowed field may alias the displaced value. In that case the helper
       // must return to the interpreter before removing its last reference.
@@ -1658,6 +1774,152 @@ impl Emitter {
     }
     return false
   }
+  /// The inline target whose method the get.field at `index` reads when that method is known
+  /// (ssa.TARGET_KNOWN) and the read is one the known path serves, or NONE. The site is cached
+  /// with one shape and a prototype, never left before, and the target is that of the first
+  /// `check.callee` of its result in the instructions that follow, when the read is the site
+  /// the embedder marked it for.
+  fn knownRead(self: &Self, function: &Function, index: u32) -> u32 {
+    let read = function.inst(index)
+    if !self.on || read.op != Op.GetField || read.result == NONE { return NONE }
+    if self.shapes.sameAs(index) != NONE || self.shapes.key(index) != 0 || self.shapes.read(index) == 0 { return NONE }
+    let site = self.shapes.sites.get(u32.toUsize(self.shapes.read(index) - 1))
+    if (self.shapes.fact(index) & FACT_HEDGED) != 0 || site.count != 1 || site.protoKeys[0] == 0 { return NONE }
+    let mut at = index + 1
+    let end = usize.toU32(function.insts.length())
+    while at < end && at < index + 1 + KNOWN_WINDOW {
+      let next = function.inst(at)
+      at = at + 1
+      if next.op != Op.CheckCallee || next.a != read.result { continue }
+      let k = i32.wrappingToU32(next.k)
+      if next.frame == read.frame && function.inlineSites.get(u32.toUsize(k)) == read.pc && self.known(function, k) && self.exact(function, k) { return k }
+      return NONE
+    }
+    return NONE
+  }
+  /// The arms of a shape dispatch at the cached read at `index` (pairs: an inline target, the
+  /// block its body begins in), in the order the code tests the callee. The read's block has
+  /// nothing after the read that is code but the test of what it read against a target and
+  /// the branch on it (a copy that borrows and the frames' names are none), and so has each
+  /// block the tests go on in; an arm is a test whose target's method is known for one
+  /// shape (ssa.TARGET_KNOWN, Function.inlineShapes) and whose edge passes nothing. The arms
+  /// end at the first block that does more.
+  effect fn shapeArms(self: &Self, function: &Function, index: u32, arms: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let read = function.inst(index)
+    if !self.on || read.op != Op.GetField || read.result == NONE || function.inlineShapes.length() == 0 { return () }
+    let mut block = read.block
+    let mut at = index + 1
+    let mut hops: u32 = 0
+    while hops < 4 {
+      let here = function.blocks.get(u32.toUsize(block))
+      if here.instCount == 0 { return () }
+      let last = here.firstInst + here.instCount - 1
+      let mut test = NONE
+      while at < last {
+        let inst = function.inst(at)
+        if inst.op == Op.IsCallee && inst.a == read.result && test == NONE && self.fusedCallee(function, inst) { test = at }
+        else if inst.op == Op.InlineFrame || inst.op == Op.Removed {}
+        else if inst.op == Op.Retain && inst.result != NONE && function.value(inst.result).own == Own.Borrowed && self.storage(inst.result) != inst.result {}
+        else { return () }
+        at = at + 1
+      }
+      if test == NONE { return () }
+      let tested = function.inst(test)
+      let branch = function.inst(last)
+      if branch.op != Op.Branch || branch.a != tested.result { return () }
+      let hit = function.edge(branch.edge)
+      let miss = function.edge(branch.edge + 1)
+      let k = i32.wrappingToU32(tested.k)
+      if hit.argCount == 0 && tested.frame == read.frame && u32.toUsize(k) < function.inlineShapes.length() && function.inlineShapes.get(u32.toUsize(k)) != 0
+        && function.inlineSites.get(u32.toUsize(k)) == read.pc && self.known(function, k) && self.exact(function, k) {
+        run arms.append(k)
+        run arms.append(hit.target)
+      }
+      if miss.argCount != 0 { return () }
+      block = miss.target
+      at = function.blocks.get(u32.toUsize(block)).firstInst
+      hops = hops + 1
+    }
+  }
+  /// Whether value v is known to be the one closure of an inline target from its callee
+  /// test on, in every exit but that test's own (`exit`): see presets.
+  pub fn presetAt(self: &Self, v: u32, exit: u32) -> bool {
+    return u32.toUsize(v) < self.preset.length() && self.preset.get(u32.toUsize(v)) != 0 && self.presetGuard.get(u32.toUsize(v)) != exit
+  }
+  fn isPreset(self: &Self, v: u32) -> bool { return u32.toUsize(v) < self.preset.length() && self.preset.get(u32.toUsize(v)) != 0 }
+  /// Finds the known methods whose value needs no read at all (Emitter.preset). The result
+  /// of a known read (knownRead) with its callee test right after it is, past that test, the
+  /// target's one closure: the known path proved it without the test, and the general path
+  /// by the test. When nothing reads the value but the test, the frames of the inlined body,
+  /// exits and its release, its slot is written once, where the function begins (enter),
+  /// the known path writes nothing and holds no count, and the general path gives back the
+  /// count its read took once the test passed. An exit after the test then adds the count
+  /// the interpreter's cell owns (x64_exits), and the release is no code. The test's own
+  /// exit is the general path's alone: there the slot holds what was read, with its count.
+  effect fn presets(self: &mut Self, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = u32.toUsize(function.valueCount())
+    run self.preset.appendRepeated(0, count)
+    run self.presetGuard.appendRepeated(NONE, count)
+    if !self.on || function.inlineTargets.length() == 0 { return () }
+    let mut quiet = List<u32>.make()
+    run quiet.appendRepeated(0, count)
+    let mut guards = List<u32>.make()
+    run guards.appendRepeated(0, function.exits.length())
+    let mut i: usize = 0
+    while i < function.insts.length() {
+      let inst = function.insts.get(i)
+      if (inst.op == Op.CheckCallee || inst.op == Op.InlineFrame || inst.op == Op.Release) && u32.toUsize(inst.a) < count {
+        let before = quiet.get(u32.toUsize(inst.a))
+        quiet.set(u32.toUsize(inst.a), before + 1)
+      }
+      if inst.op != Op.Removed && inst.exit != NONE && u32.toUsize(inst.exit) < guards.length() {
+        let before = guards.get(u32.toUsize(inst.exit))
+        guards.set(u32.toUsize(inst.exit), before + 1)
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < function.slots.length() {
+      let v = function.slots.get(i).value
+      if v != NONE && u32.toUsize(v) < count { let before = quiet.get(u32.toUsize(v)) quiet.set(u32.toUsize(v), before + 1) }
+      i = i + 1
+    }
+    i = 0
+    while i < function.insts.length() {
+      let index = usize.toU32(i)
+      i = i + 1
+      let target = self.knownRead(function, index)
+      if target == NONE { continue }
+      let read = function.inst(index)
+      let v = read.result
+      let block = function.blocks.get(u32.toUsize(read.block))
+      if index + 1 >= block.firstInst + block.instCount { continue }
+      let test = function.inst(index + 1)
+      if test.op != Op.CheckCallee || test.a != v || i32.wrappingToU32(test.k) != target || test.exit == NONE { continue }
+      if guards.get(u32.toUsize(test.exit)) != 1 || self.storage(v) != v { continue }
+      if self.uses.get(u32.toUsize(v)) != quiet.get(u32.toUsize(v)) { continue }
+      let own = function.value(v).own
+      if own != Own.Owned && own != Own.Borrowed { continue }
+      self.preset.set(u32.toUsize(v), target + 1)
+      self.presetGuard.set(u32.toUsize(v), test.exit)
+    }
+  }
+  /// Whether the instruction after the current one is the `check.callee` of v for target k.
+  fn calleeNext(self: &Self, function: &Function, block: u32, v: u32, k: u32) -> bool {
+    let inside = function.blocks.get(u32.toUsize(block))
+    if self.cursor + 1 >= inside.firstInst + inside.instCount { return false }
+    let next = function.inst(self.cursor + 1)
+    return next.op == Op.CheckCallee && next.a == v && i32.wrappingToU32(next.k) == k
+  }
+  /// Whether the instruction after the store at `index` releases the stored value: the store
+  /// then takes over the value's count in place of a count of its own and that release.
+  fn movedInto(self: &Self, function: &Function, index: u32) -> bool {
+    let store = function.inst(index)
+    let block = function.blocks.get(u32.toUsize(store.block))
+    if !self.on || index + 1 >= block.firstInst + block.instCount { return false }
+    let next = function.inst(index + 1)
+    return next.op == Op.Release && next.a == store.b && function.value(store.b).own == Own.Owned
+  }
   /// Whether `read` (a get.elem) is followed in its block by the unbox of its result, the
   /// only reader of that result but for the unbox's own exit.
   fn fusedUnbox(self: &Self, function: &Function, read: Inst) -> bool {
@@ -1787,6 +2049,14 @@ impl Emitter {
     i = i + 1
     while i < last { if function.inst(i).op != Op.Release { return false } i = i + 1 }
     return true
+  }
+  /// Whether inline target k's method is known while a watched object stays watched
+  /// (ssa.TARGET_KNOWN), and the relocation symbol of that object.
+  fn known(self: &Self, function: &Function, k: u32) -> bool {
+    return u32.bitAnd(function.inlineTargets.get(u32.toUsize(k)), ssa.TARGET_KNOWN) != 0
+  }
+  fn holderSymbol(self: &Self, function: &Function, k: u32) -> u32 {
+    return self.symbol(usize.toU32(function.inlineTargets.length()) * 3 + usize.toU32(self.ownedCells.length()) + k)
   }
   /// Whether inline target k is tested by its one closure (ssa.TARGET_EXACT).
   fn exact(self: &Self, function: &Function, k: u32) -> bool {
@@ -2014,7 +2284,7 @@ impl Emitter {
     run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R9, 0), 1)
     run self.a.jcc(Cond.LessOrEqual, last)
     self.a.bind(skip)
-    run self.outs.append(Out { kind: OUT_RELEASE, entry: last, back: skip, frame: self.frameOf, inst: self.cursor, base: base, at: at })
+    run self.outs.append(Out { kind: OUT_RELEASE, entry: last, back: skip, frame: self.frameOf, inst: self.cursor, base: base, at: at, flags: 0 })
   }
   /// The code of `out`, after the blocks.
   effect fn out(self: &mut Self, function: &Function, out: Out) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -2028,6 +2298,25 @@ impl Emitter {
       return ()
     }
     let inst = function.inst(out.inst)
+    if out.kind == OUT_PUT_LAST {
+      // R11: the object's slots; R8 and R10: the displaced value, whose last count this is.
+      // It goes through the release helper once the new value is in place.
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch), Reg.R8)
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch + 8), Reg.R10)
+      if (out.flags & PUT_HELD) == 0 {
+        // The slot the value is in: a copy has none of its own (storage).
+        let from = self.storage(inst.b)
+        run self.a.load(Width.W64, Reg.Rax, slotOf(from))
+        run self.a.load(Width.W64, Reg.R9, payloadOf(from))
+      }
+      run self.a.store(Width.W64, Mem.at(Reg.R11, out.at), Reg.Rax)
+      run self.a.store(Width.W64, Mem.at(Reg.R11, out.at + 8), Reg.R9)
+      if (out.flags & PUT_MOVED) == 0 { run self.retainBits(Reg.Rax, Reg.R9) }
+      run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rsp, self.scratch))
+      run self.callHelper(helpers.RELEASE)
+      run self.a.jmp(out.back)
+      return ()
+    }
     // get_var(env, frame, index, out) -> 1 when done.
     run self.frameInto(Reg.Rsi)
     let mut index = i32.wrappingToU32(inst.k & (ssa.VAR_OWNED - 1))
@@ -2054,14 +2343,14 @@ impl Emitter {
   /// R11 = the slots of the object in value's slot, or a jump to miss: value is not an
   /// object, or its shape's version is not key's (key >> 16). fact tells which of the two
   /// tests earlier code already made (ssa_shapes). Clobbers RAX, R8 and R11.
-  effect fn shapedSlots(self: &mut Self, value: u32, key: u64, fact: u8, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn shapedSlots(self: &mut Self, value: u32, key: u64, fact: u8, miss: Label, via: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let fields = self.fields
     if (fact & FACT_OBJECT) == 0 { run self.unlessTag(value, layout.object(), miss) }
     run self.payloadInto(Reg.R11, value)
     if (fact & FACT_SHAPE) == 0 {
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
-      run self.a.aluStoreImm(Alu.Cmp, Width.W64, Mem.at(Reg.Rax, u32.wrappingToI32(fields.shapeVersion)), u64.wrappingToI32(u64.shiftRight(key, 16)))
+      run self.a.load(Width.W64, via, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
+      run self.a.aluStoreImm(Alu.Cmp, Width.W64, Mem.at(via, u32.wrappingToI32(fields.shapeVersion)), u64.wrappingToI32(u64.shiftRight(key, 16)))
       run self.a.jcc(Cond.NotEqual, miss)
     }
     run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectSlots)))
@@ -2960,6 +3249,20 @@ impl Emitter {
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, compiled.DIRECT_CLOSURE_BYTECODE))
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(p.f.bytecodeRealm)))
       run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.realmAt), Reg.Rax)
+    }
+    // The slots of the values that are a known closure whenever they are read (presets).
+    let mut first = true
+    let mut v: usize = 0
+    while v < self.preset.length() {
+      let k = self.preset.get(v)
+      if k != 0 {
+        if first { let layout = self.settings.layout run self.a.movImm64(Reg.Rax, layout.tagWord(layout.object())) first = false }
+        let closure = self.symbol((k - 1) * 3 + 2)
+        run self.a.movSymbol(Reg.R9, closure)
+        run self.a.store(Width.W64, slotOf(usize.toU32(v)), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(usize.toU32(v)), Reg.R9)
+      }
+      v = v + 1
     }
   }
   /// Frame mode's out-of-line code: the prologue's overflow and the polls' slow paths.

@@ -1,6 +1,6 @@
 # The optimizer on the baseline tier
 
-Status on 2026-11-20: step 3 of the plan of 20 November, in progress. The SSA compiler
+Status on 2026-11-21: step 3 of the plan of 20 November. The SSA compiler
 (`docs/jit/ssa.md`) now lowers for the baseline tier's frame (`docs/jit/baseline.md`) instead
 of the compiled-entry ABI: optimized code is a second body of a function that already has
 baseline code, on the same frame, and it leaves into that baseline code. It is opt-in
@@ -9,7 +9,7 @@ baseline code, on the same frame, and it leaves into that baseline code. It is o
 The gate of the step is Richards at 5x the interpreter on the clock, under 1 exit per 1,000
 calls after warm-up, and no function refused for good. Where it stands:
 
-| Richards, fixed work x20, CPU ms (median of 7 interleaved rounds) | Time | Against the interpreter |
+| Richards, fixed work x20, CPU ms (medians of interleaved rounds) | Time | Against the interpreter |
 | --- | ---: | ---: |
 | Interpreter | 798 | 1.00x |
 | Baseline tier | 595 | 1.34x |
@@ -22,27 +22,55 @@ calls after warm-up, and no function refused for good. Where it stands:
 | with repeated reads as copies | 308 | 2.8x |
 | with borrows across blocks, copies without code, fused tag tests | 269 | 3.2x |
 | with exits and calls inside inlined bodies | 237 | 3.2x |
-| with the guarded chain, loops in inlined bodies, bodies up to 260 bytes (this state) | 209 | 3.6x |
-| V8 (node, JIT on) | 75 | 10x |
+| with the guarded chain, loops in inlined bodies, bodies up to 260 bytes | 209 | 3.6x |
+| with callees tested by address, values kept in registers, owned cells, bodies up to 460 bytes five deep | 168 | 4.2x |
+| with known methods, moved stores, preset closures, shape dispatch | 145 | 4.7x to 5.0x |
+| with bodies seven deep, shapes kept over loop turns and shared between copies (this state) | 129 | 5.6x |
+| V8 (node, JIT on) | 70 | 10x |
 
-The rows were measured in different rounds against an interpreter between 709 and 861 ms; the
-host swings 10 to 15 percent between runs, so only rows of one round compare exactly (the
-last round, nine interleaved runs: interpreter 709 then 755 over six more, the row before 237,
-this state 209, V8 75). In this state the long run has 23 functions optimized, none refused,
-59 call sites inlined, 2.66 million calls left of 7.95 million, no exit and no step after
-warm-up. The exit and refusal parts of the gate hold; the clock does not yet.
+The rows were measured in different rounds against an interpreter between 667 and 861 ms; the
+host swings 10 to 15 percent between runs and its runs fall in two clusters, so only rows of
+one round compare exactly. The last three rounds, fifteen interleaved runs each:
 
-Single runs of optimized code swing more than the interpreter's: 24 runs of this state under
-one address layout took 172 to 288 ms in three clusters, with the same counters and the same
-share of samples in every function. The cause is the host, not the code; rows are medians.
+| Round | Interpreter | Row before the last | This state | V8 | By medians | By fastest runs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (this state without its last two cuts) | 717 (581) | 146 (120) | 133 (110) | | 5.4x | 5.3x |
+| 2 | 729 (601) | 145 (119) | 131 (109) | 72 (64) | 5.6x | 5.5x |
+| 3 | 723 (591) | 145 (120) | 129 (108) | 70 (59) | 5.6x | 5.5x |
+
+Medians, fastest runs in brackets. The row before the last was 4.7x in an earlier round and
+5.0x in these.
+
+Instruction counts do not swing (cachegrind, the whole process, release builds):
+
+| Richards, fixed work x20 | Instructions | Against the interpreter |
+| --- | ---: | ---: |
+| Interpreter | 10,403M | 1.00x |
+| Optimizer at 168 ms (`e9e831f5`) | 2,218M | 4.7x |
+| with known methods | 2,118M | 4.9x |
+| with moved stores, preset closures, shape dispatch, borrowed copies | 1,883M | 5.5x |
+| with bodies seven deep | 1,728M | 6.0x |
+| with shapes kept over loop turns and shared between copies (this state) | 1,680M | 6.2x |
+
+The interpreter was 10,428M for the rows before the last; see Known methods for what changed
+it.
+
+In this state the long run has 114 call sites inlined, no real call left in the scheduler's
+loop, no exit and no step after warm-up, nothing refused, 378 KB of code and 16 to 18 ms of
+compiling. All three parts of the gate hold.
+
+Single runs of optimized code swing more than the interpreter's: 24 runs of the 209 ms state
+under one address layout took 172 to 288 ms in three clusters, with the same counters and the
+same share of samples in every function. The cause is the host, not the code; rows are
+medians, and a change is kept on its instruction count, not on one round of the clock.
 
 Code: `modules/jit/src/x64_backend.silk` (frame mode: `lowerOnFrame`, `callOnFrame`,
 `stepOnFrame`, `siteSlot`, `stored`), `x64_frame_exit.silk` (the exit helper), `x64_exits.silk`
 (exit records and stubs), `ssa_shapes.silk` (shape facts and remembered properties),
 `ssa_ownership.silk` (`borrowFields`), `jit_runtime.silk` (`jitTierUp`, `compileOptimized`,
-`noteLeft`, `siteShapesOf`), `baseline.silk` (the stubs and tails optimized code uses); in the
-engine `js_core_types.silk` (`SiteShapes`, `noteSiteShape`) and `js_compiled_inline.silk`
-(`siteShapes`, `methodTargets`). Inlined bodies: `ssa_translate.silk` (`inlineOne`,
+`noteLeft`, `siteShapesOf`, `candidates`), `baseline.silk` (the stubs and tails optimized code uses); in the
+engine `js_core_types.silk` (`SiteShapes`, `noteSiteShape`, the watch bits of `ObjectData`) and
+`js_compiled_inline.silk` (`siteShapes`, `methodTargets`, `watchHolder`, `knownMethod`). Inlined bodies: `ssa_translate.silk` (`inlineOne`,
 `callChain`, `inlineExit`), `x64_backend.silk` (`callInBody`, `bodyRecords`, `calleeFlags`),
 `x64_frame_exit.silk` (the frames of an exit), and the engine's `js_baseline.Inlined`,
 `callInlined` and `resumeInlined`.
@@ -68,8 +96,10 @@ code hands the frame over.
   built on demand.
 
 The code's symbols are the shared stubs, then the function's baseline `moved` tail, `finish`
-tail, entry and step tail (`MARK_MOVED`, `MARK_FINISH`, `MARK_STEP_ENDED`), then the inline
-targets. No address is in the code.
+tail, entry and step tail (`MARK_MOVED`, `MARK_FINISH`, `MARK_STEP_ENDED`), then three per
+inline target (its cell, its code, its closure), the owned variable cells, and one per target
+for the prototype that holds it. No address is in the code as emitted: the symbols are
+resolved when the code is placed.
 
 ## Exits
 
@@ -104,9 +134,28 @@ against that version and slot as constants, and a miss is an exit: no helper ans
 what the test proved stays true after it. `ssa_shapes.analyze` runs forward over the blocks
 and gives each site what earlier sites and tag checks proved of its object: that it is an
 object (no tag test) and that it has the key's shape (no shape test). A fact dies at anything
-that may change a shape (a call, a helper that can run a getter, setter or conversion), and a
-loop header starts with none. Richards went from 430 to 371 ms and the optimized code from
-85,001 to 61,943 bytes.
+that may change a shape (a call, a helper that can run a getter, setter or conversion).
+Richards went from 430 to 371 ms and the optimized code from 85,001 to 61,943 bytes.
+
+The pass walks the blocks twice. In the first walk a loop header starts with no shape, since
+its back edge is not known yet; in the second it keeps what the code before the loop and the
+end of every turn agree on. That a value is an object is kept in the first walk already: a
+value never stops being one, so a header takes it from the blocks before the loop when the
+only edges not walked yet are back edges (the header dominates their blocks,
+`ssa_verify.dominators`).
+
+What is known of an object is kept under the first value that was that object, with `retain`
+copies and repeated reads seen through: a test of the inlined `this` proves the shape for the
+caller's receiver and for every other copy, the ones made before the test too.
+
+A poll changes no shape. What it runs when its counter is out is the host's interrupt callback
+and the report of a hot function (`js_interrupts.handle`), which run no JavaScript (a rule for
+hosts, stated there: a callback that has to run script needs the optimizer off); the report
+compiles baseline code only. So the shapes a loop's turns agree on hold at its header, and the
+scheduler's loop tests the shape of `this` once before the loop instead of once a turn. This
+rests on where a prototype starts being watched (see Known methods): only in the optimizer's
+compile at a function's entry, which is inside a call, where every fact has died. Optimized
+code made from a poll, as on-stack replacement would, must not start a watch there.
 
 ## Recorded shapes
 
@@ -141,7 +190,9 @@ the copy is read. What the copy owns stays its own: an owned copy is one count o
 slot, a borrowed copy is no code.
 
 `borrowFields` lets a field read or a copy borrow until its release in a later block, at most
-twelve blocks on: the receiver, the method closure and the inlined `this` of an inlined call
+twelve blocks on (512 for a copy of an argument or of a value the function owns, which no
+store, call or poll in between can free: the receiver and the arguments of an inlined call are
+such copies, and a body with inlined calls of its own is many blocks): the receiver, the method closure and the inlined `this` of an inlined call
 are released where the body's paths meet, and none of the three takes a count now. A call, a
 poll or a way back to the definition ends the attempt. A store crossed by the borrow leaves the
 code before it would take a field's last count, and that alone was not enough: another owner of
@@ -155,10 +206,15 @@ A `tag.is` whose only reader is the branch after it is that branch's flags (`fus
 
 ## Inlined bodies
 
-A call whose target is known and short (260 bytes of bytecode, 24 blocks, three bodies deep,
-32 sites a function) is its callee's body in the caller's code, behind a test of the callee
+A call whose target is known and short (460 bytes of bytecode, 24 blocks, seven bodies deep,
+64 sites a function; the embedder looks up at most 128 candidates, six levels down) is its callee's body in the caller's code, behind a test of the callee
 (`check.callee`: an object of the closure class with that bytecode). The body has no frame.
 What makes that sound is what happens when the body has to stop being inlined.
+
+The depth was three, then five, then seven: at five the scheduler's loop still made 0.87
+million real calls a run from bodies at the fifth level, each about 70 instructions through
+the stub and the prologue. At seven none is left, the code grew from 368 to 380 KB, and of the
+other seven V8 benchmarks only Splay inlines more (33 sites for 27).
 
 **Leaving.** An exit before the body's first effect restarts the call in baseline code: the
 state of the call instruction is written and nothing is lost. After an effect (a store, a
@@ -207,10 +263,107 @@ that cannot be inlined (too long, or the limits) leaves its callee to the plain 
 with no arm at all is a plain call. A site with one target and no other shape keeps the single
 `check.callee` form, whose miss is an exit.
 
+**Shape dispatch.** The chain's tests ask which closure the read returned, after a read that
+already tested the receiver's shape against each recorded pair. When nothing but the fused
+callee tests and their branches stands between the read and the arms (`shapeArms`), the read
+does both at once: it loads the receiver's shape version, and for each arm compares it with
+the shape that arm's method was recorded for (`Function.inlineShapes`), tests the watched bit
+of the prototype that holds the method, puts the closure constant in the value's slot and
+jumps into the arm's body. A shape of no arm, or a prototype no longer watched, falls to the
+general read and the tests, which are still there. An argument worked out between the read
+and the call (`o.run(i & 15)`) is code in between and keeps the tests; the scheduler's
+`this.currentTcb.run()` and a call whose arguments are at hand dispatch.
+
 Larger bodies without the chain were slower (342 ms against 239): the last target of
 `task.run` was inlined behind a `check.callee` inside `run` inside `schedule`, the test failed
 for three tasks in four, and each failure left `schedule` in baseline code for the rest of its
 activation, which is one loop of ten thousand turns. See on-stack replacement under Open.
+
+## Exact targets and known methods
+
+**Exact targets.** A target the embedder knows as one closure (`ssa.TARGET_EXACT`) is tested by
+the closure's address, a symbol of the code, instead of by class and bytecode. The closure is
+kept alive for the code (`inline.keepClosure`).
+
+**Known methods.** A method read through the prototype cost about twenty instructions: the
+receiver's shape, the prototype's shape, the slot's two words, then the callee test. When the
+prototype is watched, the read is the receiver's tag, its shape version, its exotic bit and
+one byte test of the prototype, and the closure is a constant: no load from the prototype and
+no callee test (`knownRead`, `TARGET_KNOWN`, `Function.inlineSites`).
+
+- `watchHolder` marks a plain prototype object (`OBJECT_ROLE_WATCHED`) and gives it a shape of
+  its own with a new version, so that no store key filled before can prove a store to it. The
+  field caches that name it as a direct prototype by the old version are moved to the new one.
+- Every write of a slot of the object (`ObjectData.setSlot*`) and every change of its shape
+  clears the bit. The compiled test reads the bit each time, so code compiled for the method
+  falls to the general read from the first write on, and the callee test after it decides.
+- An object is watched at most once in its life (`OBJECT_ROLE_WAS_WATCHED`): after a write,
+  store keys may hold its version, and a second watch would need a third version.
+- A store compiled code makes with a constant key tests the shape version, which the watch
+  changed, so it leaves to the interpreter's store, which clears the bit. A store whose shape
+  test a fact removed would not: hence the rule under Shape facts about where a watch starts.
+- The receiver's shape names its prototype (as the interpreter's cached read relies on), so
+  another prototype, an own property of that name or a prototype in between is another shape
+  and misses the first test.
+
+**Preset closures.** Where the callee test follows the read at once and the closure has no
+other reader than the inlined frame, the exits and its release (`presets`), the value's slot
+is written once at function entry. The known path then writes nothing and counts nothing; the
+general path gives the count it took back once the test has passed; the release is no code;
+an exit that names the value takes a count of its own for the interpreter's cell.
+
+**What the interpreter pays.** The watch is a test of the roles byte in the slot writers the
+interpreter does not reach by a key: `setSlot`, `setSlotUnchecked` and the list accessors.
+The others have none:
+
+- a store proved by a key: the inline key of a store instruction (`setSlotKeyedUnchecked`),
+  and the site entry `define_field` fills for itself (`setSlotKeyed`). A key is filled only
+  after a tested store, and a watched object's version is in no key filled before its watch;
+- an object that is being made (`setSlotFresh`, `setSlotFreshUnchecked`, `setSlotsFresh`:
+  constructor plans, literals, new arrays), and one being destroyed (`takeSlotsLast`);
+- a change of shape, which tests the bit under the prototype mark it tested already
+  (`noteShapeChange`, `swapAdd`): only a marked prototype is watched.
+
+A leaf function's store (`js_vm_leaf.store`) probed the shape by name and so needed the test;
+it now goes by the instruction's key first, as the interpreter's own `put_field` does, and
+probes only when the key misses. That is fewer instructions than before the watch.
+
+Interpreter instruction counts, fixed work, against the build before the JIT work began and
+against the one before the watch (`e9e831f5`):
+
+| Benchmark | Since before the JIT work | Since before the watch |
+| --- | ---: | ---: |
+| Richards | +0.02% | -0.15% |
+| DeltaBlue | +0.16% | -0.21% |
+| Crypto | +0.01% | +0.01% |
+| RayTrace | +0.21% | +0.05% |
+| EarleyBoyer | +0.12% | 0.00% |
+| RegExp | +0.20% | +0.15% |
+| Splay | +0.27% | +0.07% |
+| NavierStokes | +0.01% | 0.00% |
+
+The rule is 0.5 percent. With the test in every writer EarleyBoyer was at +0.55 percent since
+before the watch and Splay at +0.49. One caution for later measurements: the dispatch loop's
+code on DeltaBlue's paths comes out 0.19 percent (1.48M instructions) longer or shorter from
+one build to the next after edits elsewhere in the loop, so a single benchmark that moves by
+that much with no change on its path is the compiler's layout, not the change.
+
+`modules/jit/tests/baseline/t40.js` goes through every way a method stops being the function
+compiled code knows: assignment, `defineProperty`, a getter, deletion, `Object.assign`,
+`Reflect.set`, a swap between two prototypes, an own method on the receiver, another
+prototype, one in between, a method that replaces itself while its caller's loop runs.
+
+## Values in registers, cells and stores
+
+- **Fresh values.** A read leaves its value's two words in rax and r9 as well as in the slot
+  (`setFresh`, `isFresh`). The next instruction takes them from there when no code and no jump
+  target came between: a tag test, an unboxing, the object of the next read, the value of a
+  store. A read from the slot right after its store would wait for the store.
+- **Owned cells.** A variable of an enclosing scope whose cell is detached and initialized
+  (`ssa.VAR_OWNED`) is read by the cell's address, a symbol of the code: two loads.
+- **Moved stores.** A store followed by the release of the value it stored takes the value's
+  own count: no count up, no release (`movedInto`). Taking the old value's last count is out
+  of line (`OUT_PUT_LAST`), and the old value's words stay in registers for it.
 
 ## Leaving too often
 
@@ -254,7 +407,7 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (38 scripts) through
+- `modules/jit/tests/baseline/*.js` (42 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -262,44 +415,63 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
   shapes, `t34` borrowed fields with stores and other owners around them, `t35` exits after effects in
   inlined bodies, `t36` calls made by inlined methods (throws, stack traces, depth), `t37`
   loops in inlined methods, `t38` chains of two to four targets, late callees of other kinds,
-  arms that leave or throw, chains two bodies deep.
+  arms that leave or throw, chains two bodies deep, `t39` exact targets and owned cells, `t40`
+  known methods (above), `t41` shape dispatch over four classes with every change of `t40`,
+  receivers the site never saw and a scheduler loop, `t42` loops whose object changes shape or
+  prototype in a turn, and a prototype that starts being watched while a loop stores to it.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
+- For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
+  in `modules/engine` after its release build, and the interpreter's instruction counts on
+  the eight V8 benchmarks against the build before the JIT work (see Known methods). Its
+  native suite passes 566 of 568: `forInAllocationFailuresReleaseInputSnapshotsAndVisitedState`
+  and `forInFailSafeAndFastCompletionAreNotPermanentlyLatched` fail on main too (0c137cf1),
+  since own-only for-in.
+- The eight V8 benchmarks at fixed work with `--jit-opt=20 --jit-threshold=20 --jit-stats`:
+  each must print its `done` line. The long Richards run caught a count bug the scripts and
+  the differential did not.
+
+Instruction counts of optimized code by SSA operation: run the dev shell under
+`valgrind --tool=callgrind --dump-instr=yes` with `--jit-dump`, and join the counts with the
+dump's `jit: optimized code at` addresses and `jit: optimized map` offsets. A dev shell emits
+the same code as a release one, but its own total includes a slow compiler: compare the
+optimized code's count between dev shells, and whole-process totals between release builds.
 
 ## Where the time is
 
-Samples of Richards in this state (24 runs, 209 ms median): 85 percent in optimized code, 5
-percent in baseline code, 9 percent in the engine and the compiler (compiling is 18 ms of a
-run, three times what it was before the bodies grew). `schedule` with its loop, the task
-control block's `run`, three of the four task `run` methods and what they call inlined is 44
-percent; the handler task's `run`, too long to inline and reached through the chain's call, is
-19 percent. A turn of the scheduler's loop is about 49 ns against V8's 18.
+Instructions of Richards in this state, by SSA operation, in the optimized code (1,423M of the
+run's 1,680M): field reads 39 percent, field stores 18, unboxing 8, branches 6, releases 6,
+variable reads 6, jumps 4, element reads 2. A turn of the scheduler's loop with the task it
+runs is about 335 instructions and 30 ns, against V8's 17 ns.
 
-The loop's code is straight but long. Every value read from a field is stored to its slot and
-read back by the next instruction (a tag byte from the slot, the payload from the slot), which
-puts a store and a load on every step of the pointer chains the benchmark is made of. A global
-read is eleven instructions, a method read through the prototype about twenty with its callee
-test, and the four-way read of `task.run` repeats the prototype test in each arm before the
-chain tests the callee three times.
+What a turn still pays for:
 
-Earlier measurements still hold: the time follows the number of instructions, and the counts
-more than their share (taking six count updates out of the loop's short path gave 9 percent).
+- Every value read from a field is stored to its slot, because any exit after it may name the
+  slot. An int32 read to be unboxed is two stores and a tag test from memory before the
+  register has it (113M a run for the unboxings, more for the stores).
+- Some arms of the task's body read or write an element, which is not known to keep shapes:
+  what was proved of other objects before such an arm is tested again after it.
+- The four-way dispatch is about 21 instructions a call (49M), the known read of
+  `isHeldOrSuspended` 12 (46M), a field store 9 to 16.
+- A bitwise operation on registers is three instructions where one would do, and a comparison
+  whose result is passed to the next block is made into a value and tested again.
 
 ## Open
 
 In the order they are planned:
 
-1. Code volume: values kept in registers between a read and its test, a chain that tests the
-   receiver's shape once instead of the shape and then the callee, global reads.
-2. On-stack replacement into optimized code. An exit in a long loop leaves the activation in
+1. On-stack replacement into optimized code. An exit in a long loop leaves the activation in
    baseline code until it returns, and a function entered once is optimized only at its next
-   entry.
-3. Feedback for guards inside inlined bodies. A failure is recorded at the outer function's
+   entry. A watch must not start at a poll (Shape facts).
+2. Unboxed reads: an int32 field read whose only reader unboxes it, without the slot stores
+   (the exits after it name the int32 instead).
+3. Element reads and writes that leave on a miss instead of calling a helper, so that shapes
+   survive them.
+4. Shape dispatch when code stands between the read and the call; a preset closure for a read
+   that is not directly before its test.
+5. Feedback for guards inside inlined bodies. A failure is recorded at the outer function's
    call instruction, so the recompile stops inlining the call instead of widening the one site
    in the body.
-4. Compile time and code size: `schedule` is 60 KB of code with a 6.5 KB frame, and four
-   functions carry most of 251 KB.
-5. The interpreter's cost of the epoch change in `destroyObject` (a byte test per destroyed
-   object) has to be measured against the 0.5 percent rule.
-6. The call path: 70 instructions from the site through the stub and the prologue to the body.
+6. Compile time and code size: the scheduler's function is 150 KB of code, and four functions
+   carry most of 380 KB.
 7. `SERVICE_QUICK` for literals; deeper prototype chains in `SiteShapes`.

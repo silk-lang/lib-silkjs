@@ -9,9 +9,14 @@ import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import silk.core.option { Option }
-import js_core_types { RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FunctionKind, VarRef, VarRefState, FIELD_PROTO_KEY, FIELD_PASS_THROUGH, fieldCacheIndex, SiteShapes, SITE_SHAPES, siteShapeIndex }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, FunctionBytecode, FunctionKind, VarRef, VarRefState, FIELD_PROTO_KEY, FIELD_PASS_THROUGH, fieldCacheIndex, SiteShapes, SITE_SHAPES, siteShapeIndex }
 import js_gc { HeapHooks }
 import js_gc as gc
+import js_shapes as shapes
+import js_class_data as classes
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
 
 /// The FunctionBytecode cell of the bytecode closure that the get_field2 at offset pc of
 /// bytecode last read from a prototype (its site cache entry, still current), or null: the
@@ -201,6 +206,163 @@ pub unsafe fn keepClosure(runtime: *mut HeapHeader, closure: *mut HeapHeader) ->
   drop state
   unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, count), unsafe (ValueBits.Object { reference: closure }).retained())
   return true
+}
+/// Starts watching holder, a prototype object (ObjectData.isWatched): from then on compiled
+/// code may take what a slot of it holds now for what it holds, while the object's watched
+/// bit is set. True when it is watched on return. False changes nothing: it is not a plain
+/// object with plain data records that is marked as a prototype (a change of shape ends
+/// the watch under that mark's test, shapes.noteShapeChange), it was watched before and a write ended that (store keys
+/// may hold its version, and a second change of version would strand code compiled for the
+/// first), nothing more can be kept, or memory ran out.
+///
+/// The holder gets a shape of its own with a new version (shapes.ownShape), so that no
+/// store key filled before can prove a store to it, and the caches that name it as a
+/// direct prototype by the old version are moved to the new one: the records are the same,
+/// so what they say stays true.
+///
+/// Compiled code that is running may hold the old version as a proven fact
+/// (ssa_shapes) and store to the holder without a test, which would not end the watch:
+/// call this only where such facts are dead, which is inside a call the running code made
+/// (the optimizer's compile at a function's entry), never from a poll.
+pub unsafe effect fn watchHolder(runtime: *mut HeapHeader, holder: *mut HeapHeader) -> bool ? &mut Allocator {
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, holder)
+  if object.isWatched() { return true }
+  if object.wasWatched() || !object.isPrototype() || object.isExotic() || object.classId() != classes.JS_CLASS_OBJECT || !unsafe shapes.plainRecords(object.shape) { return false }
+  let shapeAnchor = ()
+  let before = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, object.shape)
+  let old = before.version
+  let hashed = before.isHashed
+  drop before
+  let roomAnchor = ()
+  let room = unsafe HeapCell.payload<RuntimeState, ()>(&roomAnchor, runtime)
+  if room.compiled.keptCount >= room.compiled.keptCapacity { return false }
+  drop room
+  match run Effect.result(unsafe shapes.ownShape(runtime, &mut object, hashed)) {
+    Result<(), OutOfMemoryError>.Failure { .. } => { return false }
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+  }
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, object.shape)).version
+  object.watch()
+  drop object
+  let _kept = unsafe keepClosure(runtime, holder)
+  // A version that does not fit the tests compiled code makes would only miss there.
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let mut i: usize = 0
+  while i < 4096 {
+    let entry = &mut state.fieldCache[i]
+    if Pointer.address<HeapHeader>(entry.holder) == Pointer.address<HeapHeader>(holder) && u64.bitAnd(entry.key, FIELD_PROTO_KEY) != 0 && u64.shiftRight(entry.protoKey, 16) == old {
+      entry.protoKey = u64.bitOr(u64.shiftLeft(version, 16), u64.bitAnd(entry.protoKey, 65535))
+    }
+    i = i + 1
+  }
+  if let Option<*mut SiteShapes>.Some { value: table } = Pointer.nonNullMut<SiteShapes>(state.compiled.siteShapes) {
+    let entries = unsafe Pointer.assumeManyMut<SiteShapes>(table)
+    let count = state.compiled.siteShapeMask + 1
+    let mut n: usize = 0
+    while n < count {
+      let mut entryAnchor = ()
+      let entry = unsafe Pointer.borrowMut<(), SiteShapes>(&mut entryAnchor, unsafe Pointer.atMut<SiteShapes>(entries, n))
+      let mut pair: usize = 0
+      while pair < SITE_SHAPES && pair < entry.seen {
+        if Pointer.address<HeapHeader>(entry.holders[pair]) == Pointer.address<HeapHeader>(holder) && u64.shiftRight(entry.protoKeys[pair], 16) == old {
+          entry.protoKeys[pair] = u64.bitOr(u64.shiftLeft(version, 16), u64.bitAnd(entry.protoKeys[pair], 65535))
+        }
+        pair = pair + 1
+      }
+      n = n + 1
+    }
+  }
+  return true
+}
+/// Pair `index` of the shapes the `get_field2` at pc of bytecode read by, as siteShapes
+/// answers them: its holder (the direct prototype), the slot there and the version of the
+/// receivers' shape; `count` is how many pairs the site has. Null when the pair is none, an
+/// own property, one further up, or not current.
+unsafe fn pairAt(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32, index: usize, slot: &mut usize, version: &mut u64, count: &mut usize) -> ?*mut HeapHeader {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let site = Pointer.address<u8>(unsafe code.code.start()) + u32.toUsize(pc) + 1
+  drop code
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut key: u64 = 0
+  let mut protoKey: u64 = 0
+  let mut holder = Pointer.null<HeapHeader>()
+  let mut epoch: u64 = 0
+  let mut found = false
+  count.* = 0
+  if let Option<*mut SiteShapes>.Some { value: table } = Pointer.nonNullMut<SiteShapes>(state.compiled.siteShapes) {
+    let entry = unsafe Pointer.read<SiteShapes>(unsafe Pointer.atMut<SiteShapes>(unsafe Pointer.assumeManyMut<SiteShapes>(table), siteShapeIndex(site, state.compiled.siteShapeMask)))
+    if entry.site == site && entry.seen != 0 {
+      // More shapes than the entry holds: nothing is told of the site.
+      if entry.seen > SITE_SHAPES || index >= entry.seen { return Pointer.null<HeapHeader>() }
+      count.* = entry.seen
+      key = entry.keys[index] protoKey = entry.protoKeys[index] holder = entry.holders[index] epoch = entry.epochs[index]
+      found = true
+    }
+  }
+  if !found {
+    let entry = &state.fieldCache[fieldCacheIndex(site)]
+    if entry.site != site { return Pointer.null<HeapHeader>() }
+    count.* = 1
+    if index != 0 { return Pointer.null<HeapHeader>() }
+    key = entry.key protoKey = entry.protoKey holder = entry.holder epoch = entry.epoch
+  }
+  if u64.bitAnd(key, FIELD_PROTO_KEY) == 0 || u64.shiftRight(key, 62) == 3 || u64.bitAnd(protoKey, 65535) == FIELD_PASS_THROUGH || epoch != state.shapeEpoch {
+    return Pointer.null<HeapHeader>()
+  }
+  slot.* = u64.toUsize(u64.bitAnd(protoKey, 65535))
+  // The shape version of a key: above its low 16 bits, below its top one.
+  version.* = u64.shiftRight(u64.shiftLeft(key, 1), 17)
+  return holder
+}
+/// Watches the objects the `get_field2` at pc of bytecode reads from, for each shape it saw
+/// that reads a slot of its direct prototype (watchHolder). A compiler calls this for
+/// every site of the code it is about to compile, before it asks what the sites read
+/// (siteShapes, methodTarget): a watch changes the holder's version, which those answer.
+pub unsafe effect fn watchSite(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32) -> () ? &mut Allocator {
+  let mut index: usize = 0
+  let mut count: usize = 1
+  while index < count {
+    let mut slot: usize = 0
+    let mut version: u64 = 0
+    if let Option<*mut HeapHeader>.Some { value: holder } = Pointer.nonNullMut<HeapHeader>(unsafe pairAt(runtime, bytecode, pc, index, &mut slot, &mut version, &mut count)) {
+      let _watched = run unsafe watchHolder(runtime, holder)
+    }
+    index = index + 1
+  }
+}
+/// The watched object whose slot holds closure for the `get_field2` at pc of bytecode, or
+/// null; `shape` is then the version of the receivers' shape it holds for. An object of
+/// that shape that is not exotic reads closure there while the holder's watched bit is set:
+/// the shape fixes the holder as its prototype and has no record of the name; a write to a
+/// slot of the holder, or a change of its records, clears the bit. `several`: the site may
+/// have seen other shapes too (they read what they read); otherwise it saw this one alone.
+pub unsafe fn knownMethod(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: u32, closure: *mut HeapHeader, several: bool, shape: &mut u64) -> ?*mut HeapHeader {
+  let mut index: usize = 0
+  let mut count: usize = 1
+  while index < count {
+    let mut slot: usize = 0
+    let mut version: u64 = 0
+    let found = unsafe pairAt(runtime, bytecode, pc, index, &mut slot, &mut version, &mut count)
+    index = index + 1
+    if !several && count != 1 { return Pointer.null<HeapHeader>() }
+    let holder = match Pointer.nonNullMut<HeapHeader>(found) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { continue } }
+    let anchor = ()
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+    if !object.isWatched() || slot >= object.slotCount() { continue }
+    match (unsafe object.slotUnchecked(slot)).valueBits() {
+      ValueBits.Object { reference } => {
+        if Pointer.address<HeapHeader>(reference) == Pointer.address<HeapHeader>(closure) {
+          shape.* = version
+          return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(holder)
+        }
+      }
+      _ => ()
+    }
+  }
+  return Pointer.null<HeapHeader>()
 }
 /// Releases every kept value (destroyRuntime).
 pub unsafe fn releaseKept<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
