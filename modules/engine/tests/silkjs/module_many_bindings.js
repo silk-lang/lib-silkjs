@@ -26,6 +26,8 @@ function bundle(count) {
   lines.push(`var ${names.join(", ")};`);
   for (let i = 0; i < 2000; i++) lines.push(`function f${i}() { return v${count - 1 - i}; }`);
   for (let i = 0; i < 2000; i++) lines.push(`var d${i} = ${i};`);
+  // A name declared again keeps its first binding.
+  lines.push(`var d7;`, `var d8 = 80;`);
   for (let c = 0; c < count; c += 500) {
     const body = [];
     for (let i = c; i < Math.min(count, c + 500); i++) body.push(`v${i} = ${i};`);
@@ -33,7 +35,7 @@ function bundle(count) {
   }
   for (let c = 0; c < count; c += 500) lines.push(`init${c}();`);
   lines.push(`export function read(i) { return [${names.filter((_, i) => i % 997 == 0).join(", ")}][i]; }`);
-  lines.push(`export const last = v${count - 1}, first = f0(), direct = d1999, globals = typeof Object.keys;`);
+  lines.push(`export const last = v${count - 1}, first = f0(), direct = d1999, globals = typeof Object.keys, again = [d7, d8];`);
   lines.push(`export function bump() { v${count - 1} += 1; return v${count - 1}; }`);
   return lines.join("\n");
 }
@@ -46,6 +48,7 @@ try {
   assert(m.first, 69999, "function declaration reading a high binding");
   assert(m.direct, 1999, "initialized var stored by the module itself");
   assert(m.globals, "function", "global named by the module's own code");
+  assert(m.again.join(), "7,80", "a var declared again");
   assert(m.read(70), 70 * 997, "high binding read by an exported function");
   assert(m.bump(), 70000, "high binding written by an exported function");
 } finally {
