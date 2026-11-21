@@ -22,7 +22,7 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import silkjs.js_atom_data as atoms
-import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, NONE, ELEM_STEP, ELEM_TRY, FIELD_STEPS }
+import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, KnownShapes, NONE, ELEM_STEP, ELEM_TRY, FIELD_STEPS }
 import ssa_calls as calls
 import silkjs.js_compiled as compiled
 import ssa
@@ -67,6 +67,11 @@ pub struct FunctionInput {
   /// engine to go on with in a frame of its own (ssa.Exit.frames): code on a baseline frame
   /// can. Without it a guard after an effect in a body fails the inlining.
   pub leavesBodies: bool,
+  /// The atoms Array.prototype's own push and pop are under in the function's realm
+  /// (js_compiled_inline.arrayNative), or 0: a method call under one of these names asks
+  /// for the array operation first (calls.NATIVE_PUSH). Read from the function's own input.
+  pub arrayPush: u32,
+  pub arrayPop: u32,
 }
 /// The `count` (1 to 4) shapes the cached field site at `pc` read a data property from:
 /// keys[i] is the shape's version << 16 with the slot (an own property) or
@@ -91,9 +96,9 @@ pub struct CallTarget { pub pc: u32, pub id: u32, pub input: FunctionInput,
   /// Bit i: the target is exact (ssa.TARGET_EXACT) and variable cell i of its closure owns
   /// an initialized value, which the body reads without a test (ssa.VAR_OWNED).
   pub owned: u64,
-  /// The target's method is known (ssa.TARGET_KNOWN) for receivers whose shape has this
-  /// version; 0 otherwise.
-  pub shape: u32 }
+  /// The receivers' shapes the target's method is known for (ssa.TARGET_KNOWN); none
+  /// otherwise.
+  pub known: KnownShapes }
 
 /// The call that began an inlined body: at `pc` of its caller's code with `argc` arguments,
 /// the instruction after it at `after`; the caller's `locals` locals and `stack` operands at
@@ -804,6 +809,9 @@ struct Translator {
   calls: List<InlineCall>,
   /// FunctionInput.leavesBodies.
   leaves: bool,
+  /// FunctionInput.arrayPush and arrayPop of the function being compiled.
+  arrayPush: u32,
+  arrayPop: u32,
   /// How many of the inlined bodies being translated, the current one and those around it,
   /// have a loop.
   bodyLoops: u32,
@@ -2162,12 +2170,21 @@ impl Translator {
     // A body's own call: code that can leave the body part way through makes it (its exit
     // names the body's frame, ssa.Exit.frames).
     if self.depth != 0 && (construct || !self.leaves || self.lazyApply(method, count)) { fail refuse(at, opcode, b"a call inside an inlined body") }
-    run self.plainCall(function, receiver, method, construct, count, at)
+    // `x.push(v)` and `x.pop()` by name: the array operation when the callee is the native.
+    let mut native: i32 = 0
+    let readPc = self.readOf(function)
+    if method && self.leaves && readPc != NONE && u32.toUsize(readPc) + 5 <= input.code.length() {
+      let at1 = u32.toUsize(readPc) + 1
+      let atom = u8.toU32(byteAt(input, at1)) | u32.shiftLeft(u8.toU32(byteAt(input, at1 + 1)), 8) | u32.shiftLeft(u8.toU32(byteAt(input, at1 + 2)), 16) | u32.shiftLeft(u8.toU32(byteAt(input, at1 + 3)), 24)
+      if atom != 0 && atom == self.arrayPush && count == 1 { native = calls.NATIVE_PUSH }
+      else if atom != 0 && atom == self.arrayPop && count == 0 { native = calls.NATIVE_POP }
+    }
+    run self.plainCall(function, receiver, method, construct, count, at, native)
     return true
   }
   /// The call at `pc` of `function` with the `count` operands on the stack as arguments (and
   /// `receiver`, or new.target for a `new`): the operands go, the result takes their place.
-  effect fn plainCall(self: &mut Self, function: u32, receiver: u32, method: bool, construct: bool, count: usize, at: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn plainCall(self: &mut Self, function: u32, receiver: u32, method: bool, construct: bool, count: usize, at: u32, native: i32) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut depth = count + 1
     if method || construct { depth = depth + 1 }
     let mut i: usize = 0
@@ -2181,6 +2198,7 @@ impl Translator {
     if self.depth == 0 && self.widened(at) { k = k | calls.ALWAYS }
     if self.depth != 0 && method { k = k | calls.METHOD }
     if self.lazyApply(method, count) { k = k | calls.LAZY_ARGUMENTS }
+    else { k = k | i32.shiftLeft(native, calls.NATIVE_SHIFT) }
     let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, function, receiver, k, at)
     let last = self.f.lastInst() run self.exitHere(last, at)
     i = 0
@@ -2243,7 +2261,7 @@ impl Translator {
     // receiver is the boxed operand; the body reads the operand itself.
     if method && receiver == NONE { return false }
     let t = self.inlineTarget(input, function, pc)
-    if t == usize.MAX { run self.f.inlineMisses.append(InlineMiss { pc: pc, opcode: 0, why: self.missed }) return false }
+    if t == usize.MAX { run self.f.inlineMisses.append(InlineMiss { pc: pc, depth: self.depth, opcode: 0, why: self.missed }) return false }
     if input.targets.asSlice()[t].chained { return run self.callChain(input, method, count, pc) }
     return run self.inlineOne(input, t, function, receiver, method, count, pc, true)
   }
@@ -2302,7 +2320,7 @@ impl Translator {
     let function = self.top(count + 1)
     let mut receiver = NONE
     if method { receiver = self.top(count + 2) } else { receiver = run self.imm(Imm.Undefined, pc) }
-    run self.plainCall(function, receiver, method, false, count, pc)
+    run self.plainCall(function, receiver, method, false, count, pc, 0)
     run self.jumpInto(join, pc)
     run self.adoptState(join, pc)
     return true
@@ -2359,7 +2377,7 @@ impl Translator {
     let mut readAt = NONE
     if !target.atCall { readAt = target.pc }
     run self.f.inlineSites.append(readAt)
-    run self.f.inlineShapes.append(target.shape)
+    run self.f.inlineShapes.append(target.known)
     if guard {
       drop run self.f.emit(self.current, Op.CheckCallee, false, Type.I32, Own.Unboxed, function, NONE, k, pc)
       let guarded = self.f.lastInst() run self.exitHere(guarded, pc)
@@ -2421,7 +2439,7 @@ impl Translator {
       self.locals = move savedLocals
       self.stack = move savedStack
       self.held = move savedHeld
-      run self.f.inlineMisses.append(InlineMiss { pc: pc, opcode: stopped, why: why })
+      run self.f.inlineMisses.append(InlineMiss { pc: pc, depth: self.depth, opcode: stopped, why: why })
       return false
     }
     // The caller's state as the block the body ended in has it.
@@ -2801,7 +2819,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
   if t.lazySlot != usize.MAX { t.lazyAlias = lazyArgumentsCopy(input, t.lazySlot) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -3046,7 +3064,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0

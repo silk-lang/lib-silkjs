@@ -734,10 +734,51 @@ pub unsafe fn releaseLast<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
 @inlineNever
 unsafe fn releaseLastShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   unsafe leave(runtime, node)
-  // Cycle removal may be destroying this shape's prototype, so nothing is kept then.
   let mut doomed: ?*mut HeapHeader = node
   if unsafe phase(runtime) != GcPhase.RemoveCycles { doomed = unsafe js_shapes.park(runtime, node) }
+  // Cycle removal releases the shapes of the garbage it destroys. One whose prototype
+  // goes in the same collection goes with it; the others stay for the next object.
+  else if !unsafe prototypeIsGarbage(node) { unsafe mark(node, 0) doomed = unsafe js_shapes.park(runtime, node) }
   unsafe destroyShape(&mut hooks, runtime, doomed)
+}
+/// Whether the prototype of shape is garbage of the running collection, after its
+/// restore pass: marked 1, or MARK_ZOMBIE once cycle removal has destroyed it.
+@inlineAlways
+unsafe fn prototypeIsGarbage(shape: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).prototype
+  return match Pointer.nonNullMut<HeapHeader>(prototype) {
+    Option<*mut HeapHeader>.Some { value } => unsafe markOf(value) != 0
+    Option<*mut HeapHeader>.None => false
+  }
+}
+/// The parked shapes in a collection. A parked shape is no member, but the count it
+/// holds of its prototype must not keep the prototype alive: a shape lives as long as
+/// its prototype, not the other way round. So the collection takes each parked shape's
+/// count away after the decrement pass (operation Decrement) and gives it back once
+/// reachability is settled (RestoreUnreachable), as it does for the edges of its members.
+unsafe fn parkedEdges(runtime: *mut HeapHeader, tracer: &mut Tracer, operation: MarkOperation) -> () {
+  let anchor = ()
+  let mut cursor = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).parkedShapes.first
+  while let Option<*mut HeapHeader>.Some { value: shape } = Pointer.nonNullMut<HeapHeader>(cursor) {
+    cursor = unsafe linkedNext(shape)
+    let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).prototype
+    if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(prototype) { unsafe tracer.edgeAs(value, operation) }
+  }
+}
+/// In phase RemoveCycles, before cycle removal: destroys the parked shapes whose
+/// prototype is garbage. The others stay parked over the collection, so the next object
+/// of their kind takes the same shape, under the version sites and compiled code know.
+unsafe fn dropDeadParked<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let anchor = ()
+  let mut cursor = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).parkedShapes.first
+  while let Option<*mut HeapHeader>.Some { value: shape } = Pointer.nonNullMut<HeapHeader>(cursor) {
+    cursor = unsafe linkedNext(shape)
+    if unsafe prototypeIsGarbage(shape) {
+      unsafe js_shapes.unparkOne(runtime, shape)
+      unsafe destroyShape(&mut hooks, runtime, shape)
+    }
+  }
 }
 @inlineNever
 unsafe fn enqueueZeroOutOfLine<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
@@ -1240,7 +1281,8 @@ unsafe fn forgetLiteralSite<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   drop state
   unsafe releaseOptional(&mut hooks, runtime, old.shape)
 }
-/// Destroys every parked shape so the collector sees only live references.
+/// Destroys every parked shape, releasing the prototypes they hold: for teardown, and for
+/// tests that count cells.
 pub unsafe fn flushParkedShapes<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   let mut shape = unsafe js_shapes.unpark(runtime)
   while !Pointer.isNull<HeapHeader>(shape) {
@@ -1640,7 +1682,6 @@ unsafe effect fn collectCells<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   unsafe releaseRetired(&mut hooks, runtime)
   unsafe releaseLiterals(&mut hooks, runtime)
   unsafe drainPending(&mut hooks, runtime)
-  unsafe flushParkedShapes(&mut hooks, runtime)
   require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)) && Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 3)))
   require(unsafe zeroQueueEmpty(runtime))
   // event bit 0: 0 start, 1 end; bit 1: a young-generation collection.
@@ -1653,12 +1694,15 @@ unsafe effect fn collectCells<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack), young: young,
     deferred: 0, round: false, resolved: false }
   unsafe decrementPass(&mut hooks, runtime, &mut tracer)
+  unsafe parkedEdges(runtime, &mut tracer, MarkOperation.Decrement)
   tracer.operation = MarkOperation.RestoreReachable
   unsafe restorePass(&mut hooks, runtime, &mut tracer)
   if tracer.deferred != 0 { unsafe ephemeronRounds(&mut hooks, runtime, &mut tracer) }
   tracer.operation = MarkOperation.RestoreUnreachable
+  unsafe parkedEdges(runtime, &mut tracer, MarkOperation.RestoreUnreachable)
   unsafe unreachablePass(&mut hooks, runtime, &mut tracer)
   unsafe setPhase(runtime, GcPhase.RemoveCycles)
+  unsafe dropDeadParked(&mut hooks, runtime)
   if tracer.deferred != 0 { run unsafe clearEphemerons(&mut hooks, runtime) }
   unsafe removeCycles(&mut hooks, runtime)
   unsafe setPhase(runtime, GcPhase.None)
@@ -4144,7 +4188,11 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   names.lexerNames.clear()
   drop names
   drop nameAtoms
+  // Parked shapes hold prototypes: they go before the last collection, and the ones it
+  // parks (shapes of no prototype, whose objects died in cycles) after it.
+  unsafe flushParkedShapes(&mut hooks, runtime)
   run unsafe collect(&mut hooks, runtime, false)
+  unsafe flushParkedShapes(&mut hooks, runtime)
   let finalState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   require(finalState.gcObjects.isEmpty() && finalState.zeroReferenceObjects.isEmpty() && finalState.temporaryGcObjects.isEmpty()
     && finalState.zombieGcObjects.isEmpty() && finalState.zeroPending == 0)

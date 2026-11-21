@@ -20,6 +20,7 @@ import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_value { ValueBits }
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_inline as inline
+import silkjs.js_compiled_inline { KnownMethod }
 import ssa_translate { CallTarget, SiteShape }
 import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, SiteShapes }
 import silkjs.js_runtime as runtime
@@ -35,7 +36,7 @@ import jit_recompile { History }
 import jit_recompile as recompile
 import ssa_input { inputOf }
 import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, Refusal as TranslateRefusal }
-import ssa { Function, TARGET_EXACT, TARGET_KNOWN, TARGET_FLAGS }
+import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_FLAGS, KNOWN_SYMBOLS }
 import jit_helpers { CompiledEnv }
 import jit_cost { Cost, now }
 import baseline
@@ -70,7 +71,9 @@ pub const ACTIVATION_WORDS: usize = 262144
 pub const KEPT_CAPACITY: usize = 16384
 /// Entries of the table the runtime records cached field sites' shapes in for the optimizer
 /// (js_compiled_inline.setSiteShapes): a power of two.
-pub const SITE_SHAPE_ENTRIES: usize = 2048
+pub const SITE_SHAPE_ENTRIES: usize = 4096
+/// The most shapes a site is compiled against (js_core_types.SITE_SHAPES).
+const SITE_PAIRS: u32 = 4
 /// Candidates looked up for one compilation, nested ones included, and how deep they nest.
 const MAX_CANDIDATES: usize = 128
 const CANDIDATE_DEPTH: u32 = 6
@@ -142,15 +145,19 @@ impl Options {
 /// runs, where its `moved` and `finish` tails are in it (optimized code's exits go on
 /// there), and what came of its report to the optimizer (TIER_*).
 /// exits counts the guard failures of its optimized code since that was linked, and
-/// compiles the optimized code it has had.
-struct BaselineInfo { entry: usize, code: *const u8, moved: u32, finish: u32, stepEnded: u32, tier: u8, compiles: u8, exits: u32 }
+/// compiles the optimized code it has had. learned is set when that code left at a site
+/// its next compile will know (a new one, or a field site recorded with a new shape);
+/// stale counts the times in a row it was given back without having learned one.
+struct BaselineInfo { entry: usize, code: *const u8, moved: u32, finish: u32, stepEnded: u32, tier: u8, compiles: u8, exits: u32, learned: bool, stale: u8 }
 impl Copy for BaselineInfo {}
 /// Optimized code that left at guards this often, and at more than one entry in EXIT_RATE
 /// (a loop's turns do not count: code that leaves on each is slow whatever its entries),
 /// gives the function back to its baseline code. It is optimized again, with the sites it
 /// left at kept general (a site that left once is stepped where it would leave again,
-/// x64_backend.stepOnFrame), once it ran OPTIMIZE_BACKOFF times longer than before, up to
-/// some sixteen million entries: no function keeps its baseline code for good.
+/// x64_backend.stepOnFrame): after the usual wait when leaving taught its next compile a
+/// site (each compile then leaves at fewer, and a function has at most MAX_LEFT), else
+/// once it ran OPTIMIZE_BACKOFF times longer than the time before, up to some sixteen
+/// million entries. No function keeps its baseline code for good.
 const EXIT_BURST: u32 = 8
 const EXIT_RATE: u64 = 1000
 const OPTIMIZE_BACKOFF: u32 = 8
@@ -248,6 +255,14 @@ pub struct Jit {
   /// Where optimized code left at a guard: a function's index in baselineInfo in the high
   /// half, the bytecode offset in the low. Its next compilation keeps those sites general.
   leftAt: List<u64>,
+  /// By leftAt entry: how many shapes the site was recorded with (inline.siteSeen) when
+  /// code first left there, then when a compile last took it as learned. A field site
+  /// recorded with more by the next compile learned a shape from leaving, and is compiled
+  /// against its shapes again instead of kept general.
+  leftSeen: List<u32>,
+  /// The Array.prototype push and pop natives optimized code tests callees against
+  /// (inline.arrayNative): each is kept by the runtime from when it is first used.
+  arrayNatives: List<usize>,
   /// Functions given back to their baseline code for leaving too often.
   pub optimizeBacked: u64,
   pub optimized: u64,
@@ -274,7 +289,7 @@ impl Jit {
       osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0,
       baselineTable: move baselineTable, baselineEnv: move baselineEnv, baselineSettings: Option<BaselineSettings>.none(), baselineReady: false, baselineSymbols: List<usize>.make(),
       baselineCompiled: 0, baselineRefused: 0, baselineBytes: 0, baselineUncovered: 0,
-      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
+      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), leftSeen: List<u32>.make(), arrayNatives: List<usize>.make(), optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -633,7 +648,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), entry, constructEntry)
       // Where the tails optimized code leaves through are; the shared prologue counts the
       // entries until the function is reported for it.
-      let mut info = BaselineInfo { entry: Pointer.address<u8>(entry), code: entry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0 }
+      let mut info = BaselineInfo { entry: Pointer.address<u8>(entry), code: entry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0, learned: false, stale: 0 }
       let mut mark: usize = 0
       while mark + 2 < map.length() {
         if map.get(mark + 2) == baseline.MARK_MOVED { info.moved = map.get(mark) }
@@ -733,16 +748,31 @@ unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32) ->
   // An activation that outlived its code's unlinking.
   if info.tier != TIER_OPTIMIZED { return () }
   let site = u64.bitOr(u64.shiftLeft(usize.toU64(index), 32), u32.toU64(pc))
+  if jit.options.dump {
+    // `jit: left: <function> <pc> <opcode>`.
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+    let bytes = unsafe code.code.asSlice()
+    let mut line = List<u8>.make()
+    run decimal(&mut line, usize.toU64(index))
+    run line.append(32)
+    run decimal(&mut line, u32.toU64(pc))
+    run line.append(32)
+    if u32.toUsize(pc) < bytes.length { run line.appendSlice(op.opcodeName(bytes[u32.toUsize(pc)], true)) }
+    run line.appendSlice(b" shapes ")
+    run decimal(&mut line, u32.toU64(unsafe inline.siteSeen(rt, bytecode, pc)))
+    run say(b"jit: left: ", line.asSlice())
+  }
   let mut known = false
   let mut own: usize = 0
+  let seen = unsafe inline.siteSeen(rt, bytecode, pc)
   let mut l: usize = 0
   while l < jit.leftAt.length() {
     let left = jit.leftAt.get(l)
-    if left == site { known = true }
+    if left == site { known = true if seen > jit.leftSeen.get(l) && seen <= SITE_PAIRS { info.learned = true } }
     if u64.toUsize(u64.shiftRight(left, 32)) == index { own = own + 1 }
     l = l + 1
   }
-  if !known && own < MAX_LEFT { run jit.leftAt.append(site) }
+  if !known && own < MAX_LEFT { run jit.leftAt.append(site) run jit.leftSeen.append(seen) info.learned = true }
   info.exits = info.exits + 1
   if info.exits >= EXIT_BURST && u32.toU64(info.exits) * EXIT_RATE > entries {
     unsafe engineBaseline.relink(rt, linked, info.code)
@@ -751,8 +781,10 @@ unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32) ->
     info.tier = TIER_NONE
     let mut wait = jit.options.optimizeEntries
     if wait == 0 { wait = 1 }
+    if info.learned { info.stale = 0 } else if info.stale < 255 { info.stale = info.stale + 1 }
+    info.learned = false
     let mut n: u8 = 0
-    while n < info.compiles && wait < 16777216 { wait = wait * OPTIMIZE_BACKOFF n = n + 1 }
+    while n < info.stale && wait < 16777216 { wait = wait * OPTIMIZE_BACKOFF n = n + 1 }
     unsafe engineBaseline.countFrom(bytecode, wait)
     if jit.options.dump {
       let mut line = List<u8>.make()
@@ -817,11 +849,34 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
   let mut l: usize = 0
   while l < jit.leftAt.length() {
     let left = jit.leftAt.get(l)
-    if u64.toUsize(u64.shiftRight(left, 32)) == index { run sites.append(u64.wrappingToU32(left)) }
+    if u64.toUsize(u64.shiftRight(left, 32)) == index {
+      // A field site that is recorded with more shapes than when it left learned one there:
+      // it is tested against them all, and leaves on another.
+      let now = unsafe inline.siteSeen(rt, bytecode, u64.wrappingToU32(left))
+      if now <= jit.leftSeen.get(l) || now > SITE_PAIRS { run sites.append(u64.wrappingToU32(left)) }
+      else { jit.leftSeen.set(l, now) }
+    }
     l = l + 1
   }
   let read = run unsafe siteShapesOf(rt, bytecode)
-  let lowered = run Effect.result(unsafe lower.lowerOnFrame(&function, &sites, move targets, &none, move read, FramePlan.of(settings.frame, &shape), &mut cost))
+  // The realm's Array.prototype push and pop, and the names they are under: a method call
+  // under one of them is the array operation when its callee is that native.
+  let mut arrayAtoms: [u32; 2] = [0, 0]
+  let mut arrayObjects: [usize; 2] = [0, 0]
+  let mut which: u32 = 0
+  while which < 2 {
+    let mut atom: u32 = 0
+    if let Option<*mut HeapHeader>.Some { value: native } = Pointer.nonNullMut<HeapHeader>(unsafe inline.arrayNative(bytecode, which, &mut atom)) {
+      let address = Pointer.address<HeapHeader>(native)
+      let mut kept = false
+      let mut n: usize = 0
+      while n < jit.arrayNatives.length() { if jit.arrayNatives.get(n) == address { kept = true } n = n + 1 }
+      if !kept && unsafe inline.keepClosure(rt, native) { run jit.arrayNatives.append(address) kept = true }
+      if kept { arrayAtoms[u32.toUsize(which)] = atom arrayObjects[u32.toUsize(which)] = address }
+    }
+    which = which + 1
+  }
+  let lowered = run Effect.result(unsafe lower.lowerOnFrame(&function, &sites, move targets, &none, move read, FramePlan.of(settings.frame, &shape), arrayAtoms[0], arrayAtoms[1], &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost optimized", &cost) }
   drop function
@@ -870,14 +925,22 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader) -> (
         run symbols.append(cell)
       }
     }
-    // The watched object of each known target (the engine keeps it since the watch).
+    // The watched objects of each known target (the engine keeps them since the watch).
     k = 0
     while k < inlined.length() {
-      let mut holder: usize = 0
-      if u32.bitAnd(inlined.get(k), TARGET_KNOWN) != 0 { holder = Pointer.address<HeapHeader>(holders.get(u32.toUsize(u32.bitAnd(inlined.get(k), u32.bitNot(TARGET_FLAGS))))) }
-      run symbols.append(holder)
+      let first = u32.toUsize(u32.bitAnd(inlined.get(k), u32.bitNot(TARGET_FLAGS))) * u32.toUsize(KNOWN_SYMBOLS)
+      let mut n: usize = 0
+      while n < u32.toUsize(KNOWN_SYMBOLS) {
+        let mut holder: usize = 0
+        if u32.bitAnd(inlined.get(k), TARGET_KNOWN) != 0 { holder = Pointer.address<HeapHeader>(holders.get(first + n)) }
+        run symbols.append(holder)
+        n = n + 1
+      }
       k = k + 1
     }
+    // The realm's Array.prototype push and pop (x64_backend.arraySymbol).
+    run symbols.append(arrayObjects[0])
+    run symbols.append(arrayObjects[1])
     inlinedSites = inlined.length()
   }
   let mut code = match move result {
@@ -1423,9 +1486,9 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         let id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(Pointer.null<HeapHeader>())
-        run holders.append(Pointer.null<HeapHeader>())
+        run appendKnown(&mut holders, &KnownMethod.none())
         if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch) }
-        run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0, shape: 0 })
+        run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
       }
     }
   }
@@ -1462,22 +1525,23 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         let mut id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(object)
-        // Known for the shape whose watched prototype holds it (ssa.TARGET_KNOWN): the
-        // receiver's shape then tells the callee, with no read and no test of it.
-        let mut holder = Pointer.null<HeapHeader>()
-        let mut shape: u64 = 0
-        if let Option<*mut HeapHeader>.Some { value: closure } = Pointer.nonNullMut<HeapHeader>(object) { holder = unsafe inline.knownMethod(rt, bytecode, usize.toU32(pc), closure, true, &mut shape) }
-        // A version the code compares as a 32-bit immediate.
-        if shape == 0 || shape >= 2147483648 { holder = Pointer.null<HeapHeader>() shape = 0 }
-        run holders.append(holder)
+        // Known for the shapes that read it through watched prototypes (ssa.TARGET_KNOWN):
+        // the receiver's shape then tells the callee, with no read and no test of it.
+        let mut found = KnownMethod.none()
+        if let Option<*mut HeapHeader>.Some { value: closure } = Pointer.nonNullMut<HeapHeader>(object) { unsafe inline.knownMethod(rt, bytecode, usize.toU32(pc), closure, &mut found) }
+        run appendKnown(&mut holders, &found)
         if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
-        if !Pointer.isNull<HeapHeader>(holder) { id = u32.bitOr(id, TARGET_KNOWN) }
+        if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
         if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch) }
-        run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), shape: u64.wrappingToU32(shape) })
+        run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), known: knownShapes(&found) })
       }
     } else if opcode == op.OP_get_field2 {
-      let mut object = Pointer.null<HeapHeader>()
-      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc), &mut object)) {
+      // The one method every shape the site saw reads, else (nothing recorded of the site)
+      // what its site cache entry names.
+      let mut object = objects[0]
+      let mut single = several[0]
+      if known == 0 { single = unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc), &mut object) }
+      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(single) {
         if !exact { object = Pointer.null<HeapHeader>() }
         let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
         if (unsafe callee.code.asSlice()).length <= CANDIDATE_BYTES {
@@ -1486,16 +1550,15 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           let mut id = usize.toU32(cells.length())
           run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
           run closures.append(object)
-          // The method of a watched prototype is known without the read (ssa.TARGET_KNOWN).
-          let mut holder = Pointer.null<HeapHeader>()
-          let mut shape: u64 = 0
-          if let Option<*mut HeapHeader>.Some { value: closure } = Pointer.nonNullMut<HeapHeader>(object) { holder = unsafe inline.knownMethod(rt, bytecode, usize.toU32(pc), closure, false, &mut shape) }
-          if shape == 0 || shape >= 2147483648 { shape = 0 }
-          run holders.append(holder)
+          // The method read through watched prototypes is known without the read
+          // (ssa.TARGET_KNOWN).
+          let mut found = KnownMethod.none()
+          if let Option<*mut HeapHeader>.Some { value: closure } = Pointer.nonNullMut<HeapHeader>(object) { unsafe inline.knownMethod(rt, bytecode, usize.toU32(pc), closure, &mut found) }
+          run appendKnown(&mut holders, &found)
           if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
-          if !Pointer.isNull<HeapHeader>(holder) { id = u32.bitOr(id, TARGET_KNOWN) }
+          if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
           if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch) }
-          run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), shape: u64.wrappingToU32(shape) })
+          run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), known: knownShapes(&found) })
         } else if jit.options.dump && depth == 0 && !watch { run say(b"jit: no inline target: ", b"the method is too long") }
       } else if jit.options.dump && depth == 0 && !watch {
         let why = unsafe inline.methodMiss(rt, bytecode, usize.toU32(pc))
@@ -1513,6 +1576,18 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
   return move targets
 }
 
+/// The watched objects of one candidate, KNOWN_SYMBOLS of them, into holders.
+effect fn appendKnown(holders: &mut List<?*mut HeapHeader>, known: &KnownMethod) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut n: usize = 0
+  while n < u32.toUsize(KNOWN_SYMBOLS) { run holders.append(known.chain[n]) n = n + 1 }
+}
+/// known as an inline target carries it (ssa.KnownShapes).
+fn knownShapes(known: &KnownMethod) -> KnownShapes {
+  let mut shapes = KnownShapes.none()
+  let mut n: usize = 0
+  while n < known.count { shapes.shapes[n] = u64.wrappingToU32(known.shapes[n]) shapes.lengths[n] = known.lengths[n] n = n + 1 }
+  return shapes
+}
 /// What the runtime recorded of each get_field2 of bytecode (FunctionInput.siteShapes).
 unsafe effect fn siteShapesOf(rt: *mut HeapHeader, bytecode: *mut HeapHeader) -> List<SiteShape> ! OutOfMemoryError ? &mut Allocator {
   let mut found = List<SiteShape>.make()
@@ -1528,6 +1603,17 @@ unsafe effect fn siteShapesOf(rt: *mut HeapHeader, bytecode: *mut HeapHeader) ->
       let mut site = SiteShape { pc: usize.toU32(pc), count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }
       site.count = unsafe inline.siteShapes(rt, bytecode, site.pc, &mut site.keys, &mut site.protoKeys)
       if site.count != 0 { run found.append(site) }
+    }
+    if opcode == op.OP_get_field || opcode == op.OP_get_loc_field8 || opcode == op.OP_get_arg_field8
+      || opcode == op.OP_put_field || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 {
+      // A site with an inline key: the own keys it was filled with, when there are several
+      // (one shape is what the key itself says).
+      let mut site = SiteShape { pc: usize.toU32(pc), count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0] }
+      site.count = unsafe inline.siteShapes(rt, bytecode, site.pc, &mut site.keys, &mut site.protoKeys)
+      let mut own = site.count >= 2
+      let mut n: usize = 0
+      while n < u32.toUsize(site.count) { if site.protoKeys[n] != 0 || u64.shiftRight(site.keys[n], 63) != 0 { own = false } n = n + 1 }
+      if own { run found.append(site) }
     }
     pc = pc + size
   }
