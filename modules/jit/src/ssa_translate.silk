@@ -25,6 +25,7 @@ import silkjs.js_atom_data as atoms
 import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, KnownShapes, NONE, ELEM_STEP, ELEM_TRY, FIELD_STEPS }
 import ssa_calls as calls
 import silkjs.js_compiled as compiled
+import silkjs.js_compiled_objects as objects
 import ssa
 
 /// What the translator reads about a function: plain numbers and the code bytes, nothing that
@@ -793,6 +794,8 @@ struct Translator {
   /// parameters (by value) are proven initialized.
   tdz: Tdz,
   initialized: List<bool>,
+  /// The upper half of a store's inline key for an add (FieldLayout.addKey).
+  addKey: u32,
   /// The locals still to be read at each instruction of the code being translated, the
   /// function's own or an inlined body's (Liveness).
   liveness: Liveness,
@@ -949,6 +952,17 @@ effect fn livenessOf(input: &FunctionInput) -> Liveness ! OutOfMemoryError ? &mu
   out.tracked = true
   out.all = all
   return move out
+}
+
+/// Whether the field store at pc holds an add key (FieldLayout.addKey in its upper half):
+/// its last run added the property.
+fn addSite(input: &FunctionInput, pc: u32, addKey: u32) -> bool {
+  let at = u32.toUsize(pc) + 5
+  if at + 8 > input.code.length() { return false }
+  let mut high: u32 = 0
+  let mut b: usize = 8
+  while b > 4 { b = b - 1 high = u32.bitOr(u32.shiftLeft(high, 8), u8.toU32(byteAt(input, at + b))) }
+  return high == addKey
 }
 
 /// The local an instruction writes (`written`) or marks uninitialized, or usize.MAX.
@@ -1426,7 +1440,7 @@ impl Translator {
       run self.push(r)
       return ()
     }
-    if opcode == op.OP_add && self.concatenates(pc) {
+    if opcode == op.OP_add && self.concatenates(pc, a, b) {
       let r = run self.concatenation(a, b, pc)
       drop self.pop() drop self.pop()
       run self.release(a, pc) run self.release(b, pc)
@@ -1466,9 +1480,17 @@ impl Translator {
     return r
   }
 
-  /// Whether the `+` at `pc` goes through the engine's concatenation: it left even as
-  /// doubles (stepped), on the function's own baseline frame.
-  fn concatenates(self: &Self, pc: u32) -> bool { return self.exits && self.leaves && self.depth == 0 && self.stepped(pc) }
+  /// Whether the `+` at `pc` of `a` and `b` goes through the engine's concatenation, on the
+  /// function's own baseline frame: it left even as doubles (stepped), or an operand is a
+  /// string constant, which no number guard would let through.
+  fn concatenates(self: &Self, pc: u32, a: u32, b: u32) -> bool {
+    return self.exits && self.leaves && self.depth == 0 && (self.stepped(pc) || self.stringConstant(a) || self.stringConstant(b))
+  }
+  /// Whether `v` is a string constant (push_atom_value, push_empty_string).
+  fn stringConstant(self: &Self, v: u32) -> bool {
+    let def = self.f.value(v).def
+    return def != NONE && self.f.inst(def).op == Op.AtomValue
+  }
   /// `a + b` where a string took part (concatenates): a call the backend makes through the
   /// engine's concatenation, stepping the instruction on the frame for other operands
   /// (js_compiled.SITE_ADD). Its result is owned.
@@ -1955,7 +1977,7 @@ impl Translator {
         if rightIndex >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
         right = self.locals.get(rightIndex)
       }
-      if operation == Op.Add && self.concatenates(at) {
+      if operation == Op.Add && self.concatenates(at, left, right) {
         let r = run self.concatenation(left, right, at)
         if !twoLocals { drop self.pop() run self.release(left, at) }
         run self.push(r)
@@ -2764,10 +2786,12 @@ impl Translator {
     return r
   }
   /// The named property store of the instruction at `pc` of `value` into `object`.
-  effect fn putField(self: &mut Self, object: u32, value: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn putField(self: &mut Self, input: &FunctionInput, object: u32, value: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let bits = run self.boxed(value, pc)
-    if self.exits && self.depth == 0 && self.widened(pc) {
-      // It deoptimized before (an add, a setter): a call exit runs what the helper cannot.
+    if self.exits && self.depth == 0 && (self.widened(pc) || addSite(input, pc, self.addKey)) {
+      // It deoptimized before (an add, a setter), or it adds: a call exit runs what the
+      // helper cannot. An add the site's memo does not cover (another starting shape, as
+      // a constructor run for several subclasses meets) is stepped instead of leaving.
       let r = run self.f.emit(self.current, Op.Call, true, Type.Value, Own.Owned, object, bits, calls.kAt(0, compiled.SITE_PUT_FIELD), pc)
       let last = self.f.lastInst() run self.exitHere(last, pc)
       run self.release(r, pc)
@@ -2976,7 +3000,7 @@ impl Translator {
       let v = self.top(1)
       let o = self.top(2)
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
-      run self.putField(o, v, at)
+      run self.putField(input, o, v, at)
       drop self.pop() drop self.pop()
       run self.release(v, at) run self.release(o, at)
       return true
@@ -2995,7 +3019,7 @@ impl Translator {
         v = run self.parameterValue(usize.toU32(source), at)
       }
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"a property of an unboxed number") }
-      run self.putField(o, v, at)
+      run self.putField(input, o, v, at)
       return true
     }
     fail refuse(at, opcode, b"opcode outside the subset")
@@ -3015,7 +3039,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), addKey: objects.fieldLayout().addKey, argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
@@ -3260,7 +3284,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make() }, argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make() }, addKey: objects.fieldLayout().addKey, argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)

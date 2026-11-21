@@ -386,6 +386,24 @@ already knew how to widen: arithmetic to doubles, a store to a helper call, an e
 the general one, a call to one that is not inlined. The wait tops out near sixteen million
 entries and there is no last compilation: no function keeps its baseline code for good.
 
+Every such round compiles a function again, and on DeltaBlue at `--jit-opt=20` compiling
+is about 8 percent of the run. Two kinds of site are widened from the first compilation,
+where an exit is certain or likely:
+
+- A `+` with a string constant operand (`"v" + i`) is the engine's concatenation at once.
+  It used to leave as an int32 add, then again as a double add, before it was stepped: two
+  recompiles of the function per site.
+- A field store whose inline key is an add key (its last run added the property) is the
+  helper call with a step behind it, which adds in place first as `put.field` does. A
+  constructor run for several subclasses (`BinaryConstraint` through
+  `superConstructor.call`) adds from starting shapes the site's memo does not cover, and
+  `put.field` left for each.
+
+DeltaBlue x60 went from 79 compilations, 29 unlinks and 234 exits to 67, 18 and 144. The
+exits left are mostly method calls inlined for one receiver shape, whose `check.shape`
+fails for a subclass seen later: going on with the call there would save the recompile
+but keep the call for good.
+
 ## Steps
 
 A site that left once must not leave again, and an instruction without a template must not
