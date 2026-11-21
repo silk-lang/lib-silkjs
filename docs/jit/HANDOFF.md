@@ -1,6 +1,6 @@
 # SilkJS JIT handoff
 
-**Resume from the [19 November x86-64 handoff](handoff-2026-11-19.md).** It identifies the local milestone branch, the measured gap to V8, and the nested HTTP call to investigate next. The coordination history below starts on 16 November.
+**Resume from the [21 November handoff](handoff-2026-11-21.md)** (baseline tier and optimizer, step 4 of the plan). The [19 November x86-64 handoff](handoff-2026-11-19.md) is older. It identifies the local milestone branch, the measured gap to V8, and the nested HTTP call to investigate next. The coordination history below starts on 16 November.
 
 Updated 2026-11-16. Working branch: `claude/sweet-ptolemy-f5t7na`, based on `main` at `d1973537`.
 It replaces `t3/jit-compiler-plan` (based on the older `86c3e4db`) as the coordination branch.

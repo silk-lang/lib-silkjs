@@ -1,0 +1,183 @@
+diff --git a/modules/jit/src/ssa_translate.silk b/modules/jit/src/ssa_translate.silk
+index a2d9bf6b..5ea0b473 100644
+--- a/modules/jit/src/ssa_translate.silk
++++ b/modules/jit/src/ssa_translate.silk
+@@ -793,6 +793,8 @@ struct Translator {
+   /// parameters (by value) are proven initialized.
+   tdz: Tdz,
+   initialized: List<bool>,
++  /// The function's own locals still to be read at each instruction (Liveness).
++  liveness: Liveness,
+   // ---- inlining (docs/jit/inlining.md): the state of the inlined body being translated.
+   /// How many inlined bodies deep the translator is; 0 in the function's own code.
+   depth: u32,
+@@ -860,6 +862,96 @@ struct Translator {
+ /// `tracked` is false when the code has no `set_loc_uninitialized`: nothing is ever uninitialized.
+ struct Tdz { tracked: bool, locals: usize, slot: List<u32>, maybe: List<bool> }
+ 
++/// Which locals the code may still read, at each instruction start (docs/jit/optimizer.md,
++/// "Dead locals"). `live` holds a bit per local at each pc: set when some path from the
++/// instruction there reads the local before it writes it. A local the code will not read
++/// again holds no value in the translation: its count goes when it dies, edges carry
++/// nothing for it and an exit writes undefined in its cell. Untracked (every local live
++/// everywhere) for more than 64 locals and for code with try regions, finally blocks or
++/// references to locals.
++struct Liveness { tracked: bool, all: u64, live: List<u64> }
++
++/// The locals the instruction at pc reads (`gen`) and writes without reading (`kill`), as
++/// bits under all. An opcode not known here reads every local.
++fn localEffect(input: &FunctionInput, pc: usize, all: u64) -> LocalEffect {
++  let opcode = byteAt(input, pc)
++  let mut gen: u64 = 0
++  let mut kill: u64 = 0
++  if opcode == op.OP_get_loc || opcode == op.OP_get_loc_check || opcode == op.OP_get_loc_checkthis || opcode == op.OP_put_loc_check
++    || opcode == op.OP_put_loc_check_init { gen = localBit(u16.toUsize(u16At(input, pc + 1))) }
++  else if opcode == op.OP_put_loc || opcode == op.OP_set_loc || opcode == op.OP_set_loc_uninitialized { kill = localBit(u16.toUsize(u16At(input, pc + 1))) }
++  else if opcode == op.OP_get_loc8 || opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_add_loc || opcode == op.OP_step_loc8
++    || (opcode >= op.OP_add_top_loc8 && opcode <= op.OP_mul_top_loc8) || opcode == op.OP_get_loc_length8 || opcode == op.OP_get_loc_el_arg8 {
++    gen = localBit(u8.toUsize(byteAt(input, pc + 1)))
++  }
++  else if opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8 { kill = localBit(u8.toUsize(byteAt(input, pc + 1))) }
++  else if opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3 { gen = localBit(u8.toUsize(opcode - op.OP_get_loc0)) }
++  else if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { kill = localBit(u8.toUsize(opcode - op.OP_put_loc0)) }
++  else if (opcode >= op.OP_add_loc_loc8 && opcode <= op.OP_mul_loc_loc8) || opcode == op.OP_get_loc_el8 {
++    gen = localBit(u8.toUsize(byteAt(input, pc + 1))) | localBit(u8.toUsize(byteAt(input, pc + 2)))
++  }
++  else if opcode == op.OP_get_arg_el8 { gen = localBit(u8.toUsize(byteAt(input, pc + 2))) }
++  else if opcode == op.OP_get_loc_field8 || opcode == op.OP_put_loc_field_arg8 { gen = localBit(u8.toUsize(byteAt(input, pc + 13))) }
++  else if opcode == op.OP_put_loc_field_loc8 { gen = localBit(u8.toUsize(byteAt(input, pc + 13))) | localBit(u8.toUsize(byteAt(input, pc + 14))) }
++  else if !supported(opcode) || localOpcode(opcode) { gen = all }
++  // A local past the tracked ones is an argument slot (or out of range, which the
++  // translator refuses).
++  return LocalEffect { gen: gen & all, kill: kill & all }
++}
++struct LocalEffect { gen: u64, kill: u64 }
++impl Copy for LocalEffect {}
++fn localBit(index: usize) -> u64 { if index >= 64 { return 0 } return u64.shiftLeft(1, usize.toU64(index)) }
++/// The opcodes besides those localEffect decodes that name a local: they read all of them.
++fn localOpcode(opcode: u8) -> bool { return opcode == op.OP_close_loc || opcode == op.OP_make_loc_ref }
++
++effect fn livenessOf(input: &FunctionInput) -> Liveness ! OutOfMemoryError ? &mut Allocator {
++  let length = input.code.length()
++  let locals = u32.toUsize(input.localCount)
++  let mut out = Liveness { tracked: false, all: 0, live: List<u64>.make() }
++  if locals == 0 || locals > 64 { return move out }
++  let mut all: u64 = u64.MAX
++  if locals < 64 { all = u64.shiftLeft(1, usize.toU64(locals)) - 1 }
++  // Instruction starts, in order; code that the walk cannot decode, or whose control flow
++  // this does not follow, keeps every local live.
++  let mut starts = List<u32>.make()
++  let mut pc: usize = 0
++  while pc < length {
++    let opcode = byteAt(input, pc)
++    let size = sizeAt(input, pc)
++    if size == 0 || pc + size > length { return move out }
++    if opcode == op.OP_catch || opcode == op.OP_gosub || opcode == op.OP_ret || localOpcode(opcode) { return move out }
++    run starts.append(usize.toU32(pc))
++    pc = pc + size
++  }
++  run out.live.appendRepeated(0, length + 1)
++  let mut changed = true
++  while changed {
++    changed = false
++    let mut n = starts.length()
++    while n > 0 {
++      n = n - 1
++      let at = u32.toUsize(starts.get(n))
++      let opcode = byteAt(input, at)
++      let next = at + sizeAt(input, at)
++      let mut after: u64 = 0
++      if isReturn(opcode) || isThrow(opcode) { after = 0 }
++      else if isBranch(opcode) || isGoto(opcode) {
++        let target = targetOf(input, at)
++        if target < 0 || target >= usize.toI64(length) { after = all }
++        else { after = out.live.get(i64.toUsize(target)) }
++        if isBranch(opcode) { after = after | out.live.get(next) }
++      } else if next >= length { after = all }
++      else { after = out.live.get(next) }
++      let touched = localEffect(input, at, all)
++      let before = touched.gen | (after & u64.bitNot(touched.kill))
++      if before != out.live.get(at) { out.live.set(at, before) changed = true }
++    }
++  }
++  out.tracked = true
++  out.all = all
++  return move out
++}
++
+ /// The local an instruction writes (`written`) or marks uninitialized, or usize.MAX.
+ fn tdzLocal(input: &FunctionInput, pc: usize, opcode: u8) -> usize {
+   if opcode == op.OP_set_loc_uninitialized || opcode == op.OP_put_loc || opcode == op.OP_set_loc || opcode == op.OP_get_loc_check
+@@ -1224,6 +1316,11 @@ impl Translator {
+   effect fn enter(self: &mut Self, pc: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+     let block = self.blockAt.get(pc)
+     run self.adopt(block, 0, usize.toU32(pc))
++    if self.depth == 0 && self.liveness.tracked {
++      let all = self.liveness.all
++      let dead = u64.bitNot(self.liveness.live.get(pc)) & all
++      run self.dropDead(dead, usize.toU32(pc))
++    }
+     if self.depth == 0 && self.tdz.tracked {
+       let index = self.tdz.slot.get(pc)
+       let params = run self.f.paramsOf(block)
+@@ -1235,6 +1332,34 @@ impl Translator {
+       }
+     }
+   }
++  /// The locals of `dead` (Liveness bits) hold nothing from here on: each one's value goes,
++  /// undefined takes its place. The lazy arguments local keeps its stand-in.
++  effect fn dropDead(self: &mut Self, dead: u64, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
++    if dead == 0 { return () }
++    let mut undefined = NONE
++    let mut i: usize = 0
++    while i < 64 && i < u32.toUsize(self.f.localCount) {
++      if (u64.shiftRight(dead, usize.toU64(i)) & 1) != 0 && !self.lazyLocal(i) && !self.isUndefined(self.locals.get(i)) {
++        if undefined == NONE { undefined = run self.imm(Imm.Undefined, pc) }
++        run self.store(i, undefined, pc)
++      }
++      i = i + 1
++    }
++  }
++  /// After the instruction at `pc` of the function's own code, which went on to `next`: the
++  /// locals that died there (dropDead).
++  effect fn afterInstruction(self: &mut Self, input: &FunctionInput, pc: usize, next: usize) -> () ! OutOfMemoryError ? &mut Allocator {
++    if self.depth != 0 || !self.liveness.tracked || next >= self.liveness.live.length() { return () }
++    let touched = localEffect(input, pc, self.liveness.all)
++    let died = (self.liveness.live.get(pc) | touched.kill) & u64.bitNot(self.liveness.live.get(next)) & self.liveness.all
++    run self.dropDead(died, usize.toU32(pc))
++  }
++  fn isUndefined(self: &Self, v: u32) -> bool {
++    let info = self.f.value(v)
++    if info.def == NONE { return false }
++    let def = self.f.inst(info.def)
++    return def.op == Op.Imm && def.k == u8.toI32(Imm.value(Imm.Undefined))
++  }
+   /// Records that value `v` (a block parameter) is proven not to be Uninitialized.
+   effect fn markInitialized(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+     let at = u32.toUsize(v)
+@@ -2904,7 +3029,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
+     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
+     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
+     returns: run copyList(&shapeOf.returns),
+-    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
++    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
+     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
+   t.lazySlot = lazyArgumentsLocal(input)
+@@ -2953,6 +3078,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
+           open = run t.instruction(input, at)
+           previous = at
+           at = at + sizeAt(input, at)
++          if open { run t.afterInstruction(input, previous, at) }
+         }
+       }
+     }
+@@ -3149,7 +3275,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
+     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
+     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
+     returns: run copyList(&shapeOf.returns),
+-    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
++    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make() }, argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
+     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
+   run t.blockAt.appendRepeated(NONE, length + 1)
