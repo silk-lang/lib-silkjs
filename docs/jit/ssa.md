@@ -104,6 +104,8 @@ high word preserves the conservative behavior. [Ownership pass](../../modules/ji
 | `imm undefined` / `null` / `true` / `false` / `uninitialized` | `value`, `imm` | |
 | `unbox.i32 v` | `i32` | Guard: exits when `v` is not an `Int` |
 | `unbox.bool v` | `bool` | Guard: exits when `v` is not a `Bool` |
+| `truthy v` | `bool` | ToBoolean of boxed `v`; no exit |
+| `put.key o, v, k` | none | Stores `v` into `o` under boxed key `k` (frame mode); may run code |
 | `box.i32 x`, `box.bool c` | `value`, `imm` | |
 | `add.i32`, `sub.i32`, `mul.i32 x, y` | `i32` | Guard: exits on overflow; `mul` also exits when the result is `-0` (zero with a negative operand), where the interpreter makes a Float64 |
 | `lt`, `le`, `gt`, `ge`, `eq`, `ne` `.i32 x, y` | `bool` | Signed |
@@ -209,7 +211,7 @@ operand of an arithmetic or comparison instruction is unboxed with a guard unles
 `i32` or a boxed `i32`; results stay unboxed until something needs them boxed (a local holding an
 `i32` is an `i32` value; the exit's mode is `int`). A branch on a comparison result branches on
 the `bool`, a branch on an `i32` on `ne.i32 x, 0`, and a branch on a boxed value on
-`unbox.bool`, a guard. `post_inc`/`post_dec` and every other opcode not listed are refused. Loop headers get one parameter per
+`truthy`, ToBoolean with no exit (docs/jit/optimizer.md, Conditions and keyed elements). `post_inc`/`post_dec` and every other opcode not listed are refused. Loop headers get one parameter per
 local and live stack slot, typed after the whole function has been seen (see below).
 
 **Speculation.** Every guard records the bytecode offset of its instruction. The first subset

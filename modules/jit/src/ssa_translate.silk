@@ -322,7 +322,8 @@ pub fn genericResults(input: &FunctionInput, pc: usize) -> usize {
   let opcode = byteAt(input, pc)
   if opcode == op.OP_for_of_start || opcode == op.OP_for_in_next { return 3 }
   if opcode == op.OP_for_of_next { return 5 + u8.toUsize(byteAt(input, pc + 1)) }
-  if opcode == op.OP_define_array_el || opcode == op.OP_append || opcode == op.OP_check_ctor_return { return 2 }
+  if opcode == op.OP_define_array_el || opcode == op.OP_append || opcode == op.OP_check_ctor_return || opcode == op.OP_get_array_el2 { return 2 }
+  if opcode == op.OP_get_array_el3 { return 3 }
   return 0
 }
 /// The operand cells of such an instruction it leaves as they were (calls.KEPT_SHIFT, bit c:
@@ -330,8 +331,8 @@ pub fn genericResults(input: &FunctionInput, pc: usize) -> usize {
 /// array and position (js_vm_control.forOfNext), not the marker or the values above it.
 pub fn genericKeptCells(input: &FunctionInput, pc: usize) -> i32 {
   let opcode = byteAt(input, pc)
-  if opcode == op.OP_define_array_el { return 3 }
-  if opcode == op.OP_append || opcode == op.OP_check_ctor_return { return 1 }
+  if opcode == op.OP_define_array_el || opcode == op.OP_get_array_el3 { return 3 }
+  if opcode == op.OP_append || opcode == op.OP_check_ctor_return || opcode == op.OP_get_array_el2 { return 1 }
   if opcode == op.OP_for_of_next { return i32.shiftLeft(i32.shiftLeft(1, u8.toI32(byteAt(input, pc + 1)) + 1) - 1, 2) }
   return 0
 }
@@ -1528,7 +1529,7 @@ impl Translator {
   }
 
   /// The truth of `v` for a branch: a bool as it is, an i32 compared with 0, a boxed value
-  /// guarded to be a Bool.
+  /// through ToBoolean.
   effect fn condition(self: &mut Self, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let ty = self.f.value(v).ty
     if ty == Type.Bool { return v }
@@ -1542,11 +1543,9 @@ impl Translator {
       let magnitude = run self.f.emit(self.current, Op.AbsF64, true, Type.F64, Own.Unboxed, v, NONE, 0, pc)
       return run self.f.emit(self.current, Op.CmpF64, true, Type.Bool, Own.Unboxed, magnitude, zero, u8.toI32(Cmp.value(Cmp.Gt)), pc)
     }
-    // A site that deoptimized here before saw something other than a boolean: ToBoolean.
-    if self.widened(pc) { return run self.f.emit(self.current, Op.Truthy, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc) }
-    let c = run self.f.emit(self.current, Op.UnboxBool, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc)
-    let last = self.f.lastInst() run self.exitHere(last, pc)
-    return c
+    // A boxed value: ToBoolean, with no exit. Guessing a Bool costs a recompile for each
+    // condition on an object or undefined (`options || {}`), one site at a time.
+    return run self.f.emit(self.current, Op.Truthy, true, Type.Bool, Own.Unboxed, v, NONE, 0, pc)
   }
   /// The condition a branch tests: undefined/null for the nullish branches, else ToBoolean.
   effect fn branchTest(self: &mut Self, opcode: u8, v: u32, pc: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
@@ -2178,6 +2177,21 @@ impl Translator {
       return true
     }
     if opcode == op.OP_for_of_next && !self.osr && self.depth == 0 && !self.widened(at) && run self.standInStep(input, pc) { return true }
+    if opcode == op.OP_get_scope0_el && self.leaves && self.exits && self.depth == 0 && !self.stepped(at) {
+      // this[kState]: the key from the function's own scope (get_scope0_check), then a read
+      // by key on the element site cache (get.key). Both leave before the instruction, with
+      // the object still on the stack; one that left twice is the interpreter's.
+      let o = self.top(1)
+      if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"an element of an unboxed number") }
+      let k = u16.toI32(u8.toU16(byteAt(input, pc + 1)) | u16.shiftLeft(u8.toU16(byteAt(input, pc + 2)), 8)) | 0x10000
+      let key = run self.f.emit(self.current, Op.GetScope, true, Type.Value, Own.Owned, NONE, NONE, k, at)
+      let read = self.f.lastInst() run self.exitHere(read, at)
+      let r = run self.f.emit(self.current, Op.GetKey, true, Type.Value, Own.Owned, o, key, 0, at)
+      let last = self.f.lastInst() run self.exitHere(last, at)
+      run self.release(key, at)
+      drop self.pop() run self.release(o, at) run self.push(r)
+      return true
+    }
     if objectOpcode(opcode) { return run self.object(input, pc) }
     if callOpcode(opcode) { return run self.call(input, pc) }
     if numberOpcode(opcode) { return run self.numberInstruction(input, pc) }
@@ -2880,6 +2894,9 @@ impl Translator {
     drop run self.f.emit(self.current, Op.PutField, false, Type.I32, Own.Unboxed, object, bits, 1, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
   }
+  /// Whether the element read at `pc` left code that read it by key too (named twice in the
+  /// sites): on a baseline frame the interpreter runs it from then on.
+  fn keyedStep(self: &Self, pc: u32) -> bool { return self.leaves && self.exits && self.depth == 0 && self.stepped(pc) }
   /// Element `index` of `object` for the instruction at `pc`, owned; refuses a boolean index.
   effect fn getElem(self: &mut Self, object: u32, index: u32, pc: u32, opcode: u8) -> u32 ! Refusal | OutOfMemoryError ? &mut Allocator {
     if self.f.value(object).ty != Type.Value { fail refuse(pc, opcode, b"an element of an unboxed number") }
@@ -2898,7 +2915,11 @@ impl Translator {
   }
   effect fn getLength(self: &mut Self, object: u32, pc: u32, opcode: u8) -> u32 ! Refusal | OutOfMemoryError ? &mut Allocator {
     if self.f.value(object).ty != Type.Value { fail refuse(pc, opcode, b"the length of an unboxed number") }
-    let r = run self.f.emit(self.current, Op.GetLength, true, Type.Value, Own.Owned, object, NONE, 0, pc)
+    // It left compiled code before: on a baseline frame what the helpers decline (a getter,
+    // a proxy) is stepped (FIELD_STEPS).
+    let mut k: i32 = 0
+    if self.leaves && self.exits && self.depth == 0 && self.widened(pc) { k = FIELD_STEPS }
+    let r = run self.f.emit(self.current, Op.GetLength, true, Type.Value, Own.Owned, object, NONE, k, pc)
     let last = self.f.lastInst() run self.exitHere(last, pc)
     return r
   }
@@ -2925,11 +2946,13 @@ impl Translator {
       run self.push(r) return true
     }
     if opcode == op.OP_push_this {
-      // Only an object receiver: anything else needs the interpreter's mode checks.
+      // Only an object receiver: anything else needs the interpreter's mode checks. Strict
+      // code takes the receiver as it is, so once something else made it leave there (a
+      // plain call, `undefined` as this) it is not tested again.
       let t = run self.f.emit(self.current, Op.This, true, Type.Value, Own.Borrowed, NONE, NONE, 0, at)
       let receiver = self.f.argumentCount
       self.f.setOwnership(t, Own.Borrowed, RootKind.Argument, receiver)
-      run self.checkTag(t, -1, at)
+      if !(input.strict && self.widened(at)) { run self.checkTag(t, -1, at) }
       let r = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, t, NONE, 0, at)
       run self.push(r) return true
     }
@@ -2965,6 +2988,7 @@ impl Translator {
       return true
     }
     if opcode == op.OP_get_array_el {
+      if self.keyedStep(at) { return run self.generic(input, pc) }
       let i = self.top(1)
       let o = self.top(2)
       let r = run self.getElem(o, i, at, opcode)
@@ -2976,6 +3000,7 @@ impl Translator {
     // get_array_el2 keeps the object below the element (a[i] op= ...), get_array_el3 the
     // object and the key (a[i]++).
     if opcode == op.OP_get_array_el2 || opcode == op.OP_get_array_el3 {
+      if self.keyedStep(at) { return run self.generic(input, pc) }
       let i = self.top(1)
       let o = self.top(2)
       let r = run self.getElem(o, i, at, opcode)
@@ -2984,6 +3009,7 @@ impl Translator {
       return true
     }
     if opcode == op.OP_get_loc_el8 || opcode == op.OP_get_arg_el8 || opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8 {
+      if self.keyedStep(at) { return run self.generic(input, pc) }
       let o = run self.slotValue(opcode == op.OP_get_arg_el8 || opcode == op.OP_get_arg_el_arg8, u8.toUsize(byteAt(input, pc + 1)), at, opcode)
       let i = run self.slotValue(opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8, u8.toUsize(byteAt(input, pc + 2)), at, opcode)
       let r = run self.getElem(o, i, at, opcode)
@@ -3008,10 +3034,20 @@ impl Translator {
       let i = self.top(2)
       let o = self.top(3)
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"an element of an unboxed number") }
-      let x = run self.int(i, at)
-      if x == NONE { fail refuse(at, opcode, b"a boolean index") }
-      let bits = run self.boxed(v, at)
-      drop run self.f.emit(self.current, Op.PutElem, false, Type.I32, Own.Unboxed, o, bits, u32.wrappingToI32(x), at)
+      if self.leaves && self.exits && self.depth == 0 && (self.f.elementKindAt(at) == u8.toU32(feedback.ELEMENT_ORDINARY)
+        || (self.f.value(i).ty == Type.Value && self.widened(at))) {
+        // A key that is not an index (this[kState] = v), as baseline code met at the site or
+        // as made the code leave there before: stored by key, never guessed an Int.
+        if self.stepped(at) { return run self.generic(input, pc) }
+        let key = run self.boxed(i, at)
+        let bits = run self.boxed(v, at)
+        drop run self.f.emit(self.current, Op.PutKey, false, Type.I32, Own.Unboxed, o, bits, u32.wrappingToI32(key), at)
+      } else {
+        let x = run self.int(i, at)
+        if x == NONE { fail refuse(at, opcode, b"a boolean index") }
+        let bits = run self.boxed(v, at)
+        drop run self.f.emit(self.current, Op.PutElem, false, Type.I32, Own.Unboxed, o, bits, u32.wrappingToI32(x), at)
+      }
       let last = self.f.lastInst() run self.exitHere(last, at)
       drop self.pop() drop self.pop() drop self.pop()
       run self.release(v, at) run self.release(i, at) run self.release(o, at)

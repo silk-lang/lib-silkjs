@@ -498,6 +498,43 @@ exits left are mostly method calls inlined for one receiver shape, whose `check.
 fails for a subclass seen later: going on with the call there would save the recompile
 but keep the call for good.
 
+## Conditions and keyed elements
+
+The HTTP order service runs mostly Node's own stream and HTTP modules, and two guesses that
+suit benchmarks made its functions leave over and over: about 40 functions were unlinked and
+compiled again 4 to 7 times each, and in steady state the optimizer still compiled one
+function every six orders.
+
+- **A condition on a boxed value is ToBoolean** (`truthy`), with no exit. It used to be
+  `unbox.bool`, a guard that the value is a Bool, widened to `truthy` only at the site that
+  left. `options || {}`, `if (cb)` and `!this.destroyed` test objects, undefined and
+  numbers, so each such site cost an exit, an unlink and a compile, one site per round.
+  `truthy` tests the Bool tag first, so a real boolean costs what the guard did; Int,
+  Float64, Null, Undefined and Symbol are decided from the tag, anything else is a helper.
+- **An element site that met a key other than an index is read and stored by key.** Node
+  keeps a stream's state under Symbol keys (`this[kState] |= kFlag`). The optimizer guessed
+  an Int index there, and `put_array_el` had no wider form, so the site left at every run of
+  every compile. Now `jit_runtime.keyedSites` reads baseline code's element site cache
+  (`BaselineEnv.elements`) at compile time: a site with an entry has met a Symbol key, and
+  goes to the function's input as `ELEMENT_ORDINARY`. Such a read is `get.key`, a store is
+  `put.key`, and so is a store whose boxed key made the code leave before.
+  On a baseline frame both test the same cache entry the baseline templates do (the
+  operand's address and the object's shape version pick it; the symbol and the slot's
+  `version << 16 | slot` must match) and read or write the slot inline, about 25
+  instructions. A miss is the engine's element read or store on that cache
+  (`ELEMENT_OF`, `STORE_ELEMENT` = `js_baseline.storeElementOf`), which notes the entry
+  for next time. What the store declines (a setter, a frozen object, a new property) is
+  stepped on the frame; a read that declines leaves, and one that left twice is stepped
+  from then on. `put.key` may run the program's code, so passes treat it as a call.
+  `get_scope0_el` (`obj[kState]` with the key in the function's own scope, as a module
+  keeps it) is `get.scope` of the key and then `get.key`; it was a step.
+- **A length the inline test does not answer** goes to baseline code's length helper
+  (`js_vm_property_ops.quickLength`: a typed array's, a plain `length` property) before it
+  leaves, and a site that left before steps what that declines (a getter). The parser
+  path reads `buf[buf.length - 1]` of a `Uint8Array`.
+- **`this` in strict code** is not tested to be an object again once something else made
+  the code leave there: strict code takes the receiver as it is.
+
 ## Steps
 
 A site that left once must not leave again, and an instruction without a template must not
@@ -525,12 +562,18 @@ What is stepped:
 - A store and an equality that left before (`SITE_PUT_FIELD`, `SITE_EQUAL`): the helper
   first, the step for a setter, a new property, a coercion.
 
-A step costs a state write and an interpreter entry. Literals in a hot optimized function are
-slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
+A step costs a state write and an interpreter entry: every local and operand goes into the
+cells with a count, and back. On the HTTP service that was about 870 instructions a step.
+What the engine makes without the interpreter (`SERVICE_QUICK`: an object literal, its
+`define_field`s and `__proto__`, an array literal, rest parameters) skips both: the code
+writes only the instruction's operands into their cells, each with a count the instruction
+consumes, asks for `SERVICE_QUICK` as baseline code does, and takes the one value it leaves
+(`STEP_QUICK` in the step entry). What the engine declines changes nothing; the counts go
+again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (42 scripts) through
+- `modules/jit/tests/baseline/*.js` (56 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -547,7 +590,15 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
   prototype while the chain changes (the middle prototype gains the property, the holder's
   is replaced, the middle prototype's prototype changes, a receiver shadows it), `t52` a
   function's own methods called through a variable while they are replaced, deleted, made
-  a getter and the variable is set to another object.
+  a getter and the variable is set to another object, `t53` Symbol-keyed state read and
+  stored while a property becomes a setter or a getter, an object is frozen, a property is
+  deleted or moves to the prototype, and an array or a plain object takes the receiver's
+  place, `t54` lengths of typed arrays, of objects with a length property or getter, and
+  strict functions called with `this` undefined, a primitive or an object, `t55` Symbol
+  keys read from the function's own scope (`get_scope0_el`) while the property becomes a
+  getter, goes missing, moves to the prototype, or the receiver is a proxy or a primitive,
+  `t56` object and array literals, `__proto__` literals and rest parameters while an accessor
+  appears on `Object.prototype` and the prototype is a primitive or has a getter.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
