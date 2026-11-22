@@ -59,6 +59,22 @@ In this state the long run has 114 call sites inlined, no real call left in the 
 loop, no exit and no step after warm-up, nothing refused, 378 KB of code and 16 to 18 ms of
 compiling. All three parts of the gate hold.
 
+Step 4's gate is DeltaBlue at 4x the interpreter. Instruction counts on a Firecracker VM
+(cachegrind, the whole process, release builds, `--jit-opt=20 --jit-threshold=20`); the
+interpreter is 14,447M:
+
+| DeltaBlue, fixed work x20 | Instructions | Against the interpreter |
+| --- | ---: | ---: |
+| `d74b8e9` (handoff of 21 November) | 4,147.8M | 3.48x |
+| dead stores | 4,083.6M | 3.54x |
+| fewer recompiles and compactions | 4,023.4M | 3.59x |
+| watched records (`Direction.FORWARD`) | 3,949.0M | 3.66x |
+| array push in place, dispatch past inline frames | 3,877.8M | 3.73x |
+| waits for unrun calls, reads traced through arms | 3,860.2M | 3.74x |
+| holders two prototypes up | 3,747.4M | 3.86x |
+| a function's own methods through a variable | 3,670.9M | 3.94x |
+| and off `this` in such a method; one load less per watched test | 3,603.0M | 4.01x |
+
 Single runs of optimized code swing more than the interpreter's: 24 runs of the 209 ms state
 under one address layout took 172 to 288 ms in three clusters, with the same counters and the
 same share of samples in every function. The cause is the host, not the code; rows are
@@ -302,13 +318,16 @@ kept alive for the code (`inline.keepClosure`).
 **A function's own methods.** `Strength.stronger(a, b)` reads a method that is an own
 property of the object a variable holds, which no site cache entry names as a target (it
 is not a prototype hit). When the read comes straight after the `get_var`, the compile
-reads the variable through the function's closure (`js_baseline.variableMethod`) and takes
-the closure the property holds as an exact target, tested against the callee as any other.
-A read off `this` inside such a method (`this.weaker` in `Strength.weakestOf`) is not
-resolved yet.
+reads the variable through the function's closure (`js_baseline.variableObject`) and takes
+the closure the object holds there (`ownMethod`) as an exact target, tested against the
+callee as any other. Inside a method inlined so, `this` is that object as far as the
+compile knows: a read off `this` (`this.weaker` in `Strength.weakestOf`), or off the local
+`push_this; put_loc` puts it in when nothing else writes that local (`thisLocal`), takes its
+target from the object too. A different `this` at run time reads its own method, which the
+callee test then sees.
 The prologue passes its closure to the optimizer for this (`jitTierUp`'s third argument,
-null for a known local function). On DeltaBlue this inlined 23 more calls and took 77M
-instructions off.
+null for a known local function). On DeltaBlue the variable reads inlined 23 more calls
+and took 77M instructions off, the reads off `this` 8 more and 56M.
 
 **Known methods.** A method read through the prototype cost about twenty instructions: the
 receiver's shape, the prototype's shape, the slot's two words, then the callee test. When the

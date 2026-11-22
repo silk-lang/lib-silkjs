@@ -881,9 +881,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     let mut firstCells = List<?*mut HeapHeader>.make()
     let mut firstClosures = List<?*mut HeapHeader>.make()
     let mut firstHolders = List<?*mut HeapHeader>.make()
-    let _watched = run unsafe candidates(&jit, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure)
+    let _watched = run unsafe candidates(&jit, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>())
     run unsafe watchRecords(&mut jit, rt, &firstClosures)
-    targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure)
+    targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>())
   }
   let none = List<u32>.make()
   // Where its earlier code left at guards.
@@ -1245,7 +1245,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let mut closures = List<?*mut HeapHeader>.make()
   let mut targets = List<CallTarget>.make()
   let mut holders = List<?*mut HeapHeader>.make()
-  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>()) }
+  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()) }
   let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &plan.elements, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
@@ -1581,6 +1581,49 @@ unsafe fn unseenCalls(rt: *mut HeapHeader, bytecode: *mut HeapHeader) -> u32 {
   return unseen
 }
 
+/// The local `push_this; put_loc` puts `this` in where the code starts, when no other
+/// instruction writes or refers to it (so it holds `this` for good), else usize.MAX.
+fn thisLocal(bytes: &[u8]) -> usize {
+  if bytes.length < 2 || bytes[0] != op.OP_push_this { return usize.MAX }
+  let first = writtenLocal(bytes, 1)
+  if first == usize.MAX || first == usize.MAX - 1 { return usize.MAX }
+  let mut pc: usize = 1 + u8.toUsize(op.opcodeInfo(bytes[1], true).size)
+  while pc < bytes.length {
+    let size = u8.toUsize(op.opcodeInfo(bytes[pc], true).size)
+    if size == 0 || pc + size > bytes.length { return usize.MAX }
+    let written = writtenLocal(bytes, pc)
+    if written == first || written == usize.MAX - 1 { return usize.MAX }
+    pc = pc + size
+  }
+  return first
+}
+/// The local the instruction at pc writes, usize.MAX - 1 for one that may write or refer
+/// to any (references to locals), usize.MAX for none.
+fn writtenLocal(bytes: &[u8], pc: usize) -> usize {
+  let opcode = bytes[pc]
+  if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { return u8.toUsize(opcode - op.OP_put_loc0) }
+  if opcode == op.OP_put_loc8 || opcode == op.OP_set_loc8 || opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_add_loc || opcode == op.OP_step_loc8 {
+    if pc + 1 >= bytes.length { return usize.MAX - 1 }
+    return u8.toUsize(bytes[pc + 1])
+  }
+  if opcode == op.OP_put_loc || opcode == op.OP_set_loc || opcode == op.OP_put_loc_check || opcode == op.OP_set_loc_check
+    || opcode == op.OP_put_loc_check_init || opcode == op.OP_set_loc_uninitialized {
+    if pc + 2 >= bytes.length { return usize.MAX - 1 }
+    return u8.toUsize(bytes[pc + 1]) | usize.shiftLeft(u8.toUsize(bytes[pc + 2]), 8)
+  }
+  if opcode == op.OP_close_loc || opcode == op.OP_make_loc_ref { return usize.MAX - 1 }
+  return usize.MAX
+}
+/// The local the instruction at `at`, which ends at `next`, reads onto the stack (get_loc
+/// and its short forms), or usize.MAX.
+fn readLocal(bytes: &[u8], at: usize, next: usize) -> usize {
+  let opcode = bytes[at]
+  if opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3 && at + 1 == next { return u8.toUsize(opcode - op.OP_get_loc0) }
+  if opcode == op.OP_get_loc8 && at + 2 == next { return u8.toUsize(bytes[at + 1]) }
+  if opcode == op.OP_get_loc && at + 3 == next { return u8.toUsize(bytes[at + 1]) | usize.shiftLeft(u8.toUsize(bytes[at + 2]), 8) }
+  return usize.MAX
+}
+
 /// CallTarget.owned for a target whose one closure is closure (null: none): which of its
 /// first 64 variable cells own an initialized value.
 unsafe fn ownedCells(closure: ?*mut HeapHeader) -> u64 {
@@ -1599,8 +1642,10 @@ unsafe fn ownedCells(closure: ?*mut HeapHeader) -> u64 {
 /// while depth allows. cells receives each one's FunctionBytecode cell address, at its id.
 /// closures receives, at the same place, the closure of a target that is one closure (exact:
 /// its id carries ssa.TARGET_EXACT), or null. owner is bytecode's closure when it is known
-/// (null else): the variables it reads are its, and a method read off one is a target too.
-unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
+/// (null else): the variables it reads are its, and a method read off one is a target too;
+/// receiver is the object its `this` is when that is known (an own method read off a
+/// variable, inlined there), and a method read off `this` is a target too.
+unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, receiver: ?*mut HeapHeader) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
   let mut targets = List<CallTarget>.make()
   let rt = match Pointer.nonNullMut<HeapHeader>(jit.runtime) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return move targets } }
   let anchor = ()
@@ -1630,14 +1675,17 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(Pointer.null<HeapHeader>())
         run appendKnown(&mut holders, &KnownMethod.none())
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>()) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()) }
         run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
       }
     }
   }
   let mut pc: usize = 0
-  // Where the instruction before pc starts (usize.MAX at the first).
+  // Where the instruction before pc starts (usize.MAX at the first), and the local that
+  // holds `this` for good when the code has one (thisLocal).
   let mut previous: usize = usize.MAX
+  let mut this = usize.MAX
+  if !Pointer.isNull<HeapHeader>(receiver) { this = thisLocal(bytes) }
   while pc < bytes.length && cells.length() < MAX_CANDIDATES {
     let opcode = bytes[pc]
     let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
@@ -1684,7 +1732,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           run decimal(&mut line, if Pointer.isNull<HeapHeader>(object) { 0 } else { 1 }) run line.append(32) run decimal(&mut line, usize.toU64(found.count))
           run say(b"jit: chained target: ", line.asSlice())
         }
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, Pointer.null<HeapHeader>()) }
         run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), known: knownShapes(&found) })
       }
     } else if opcode == op.OP_get_field2 {
@@ -1694,14 +1742,22 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
       let mut single = several[0]
       if known == 0 { single = unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc), &mut object) }
       // A function's own method, read off the object a variable of this code holds
-      // (`Strength.stronger(a, b)`): the closure there now, which the call tests its callee
-      // against.
-      if known == 0 && Pointer.isNull<HeapHeader>(single) && previous != usize.MAX && previous + 3 == pc && bytes[previous] == op.OP_get_var {
-        if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
-          let index = u8.toU32(bytes[previous + 1]) | u32.shiftLeft(u8.toU32(bytes[previous + 2]), 8)
+      // (`Strength.stronger(a, b)`), or off `this` when this code's `this` is known to be
+      // such an object: the closure there now, which the call tests its callee against.
+      // holder is that object: the target's `this`.
+      let mut holder = Pointer.null<HeapHeader>()
+      if known == 0 && Pointer.isNull<HeapHeader>(single) && previous != usize.MAX {
+        if previous + 3 == pc && bytes[previous] == op.OP_get_var {
+          if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
+            holder = unsafe engineBaseline.variableObject(reader, u8.toU32(bytes[previous + 1]) | u32.shiftLeft(u8.toU32(bytes[previous + 2]), 8))
+          }
+        } else if previous + 1 == pc && bytes[previous] == op.OP_push_this { holder = receiver }
+        else if this != usize.MAX && readLocal(bytes, previous, pc) == this { holder = receiver }
+        if let Option<*mut HeapHeader>.Some { value: from } = Pointer.nonNullMut<HeapHeader>(holder) {
           let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
-          object = unsafe engineBaseline.variableMethod(reader, index, atom, bytecode)
+          object = unsafe engineBaseline.ownMethod(from, atom, bytecode)
           if let Option<*mut HeapHeader>.Some { value: method } = Pointer.nonNullMut<HeapHeader>(object) { single = unsafe inline.closureBytecode(ValueBits.Object { reference: method }) }
+          else { holder = Pointer.null<HeapHeader>() }
         }
       }
       if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(single) {
@@ -1720,7 +1776,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           run appendKnown(&mut holders, &found)
           if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
           if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
-          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object) }
+          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, holder) }
           run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), known: knownShapes(&found) })
         } else if jit.options.dump && depth == 0 && !watch { run say(b"jit: no inline target: ", b"the method is too long") }
       } else if jit.options.dump && depth == 0 && !watch {
