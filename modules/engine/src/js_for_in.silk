@@ -53,8 +53,10 @@ import js_invariant { invariant }
 struct State {
   object: Value, index: usize, count: usize, inPrototypeChain: bool,
   isArray: bool, atoms: List<PropertyEnum>,
-  /// The table lists every key the loop visits (ownTable made it): the
-  /// prototype chain had no enumerable property, so it is not walked.
+  /// The table lists the receiver's own enumerable keys (ownTable made it):
+  /// the prototype chain had no enumerable property, so it is not walked while
+  /// it stays so (quietReceiver); once it does not, completion walks it as for
+  /// any other receiver.
   ownOnly: bool,
   /// The version of the object's shape when ownTable listed it: while the
   /// object still has a shape of this version, every listed key is still an
@@ -289,6 +291,21 @@ fn sameShape<'o>(object: ValueRef<'o>, version: u64) -> bool {
   let anchor = () let data = ObjectRef.of(object).data(&anchor)
   return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version == version
 }
+/// Whether for-in over object still visits only its own keys: no object on the
+/// chain from its shape's prototype has an enumerable property. Answered from
+/// the shape's quietEpoch while RuntimeState.shapeEpoch and the shape's version
+/// have not moved, so a prototype that gained a key since ownTable, or a
+/// receiver given another prototype (in place, which renews only the version),
+/// is seen. True for a receiver already let go of (not an object).
+unsafe fn quietReceiver(runtime: *mut HeapHeader, object: ValueBits) -> bool {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return true } }
+  let anchor = ()
+  let shapeNode = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).shape
+  let epoch = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).shapeEpoch
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
+  if shape.quietEpoch == epoch && shape.enumVersion == shape.version { return true }
+  return unsafe quietChain(shape.prototype)
+}
 fn installTable<'a, 's>(realm: Realm<'a>, snapshot: Snapshot<'s>, table: List<PropertyEnum>, reset: bool) -> () {
   let mut anchor = () let state = snapshot.getMut(&mut anchor)
   let old = Intrinsic.replace(state.atoms, move table)
@@ -435,8 +452,13 @@ pub unsafe effect fn build<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHook
   hold.release(&mut hooks)
   return match move result { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } }
 }
+/// Walks the chain for its first object with an enumerable key (true: none),
+/// then records every own key as visited, so inherited keys it shadows are
+/// skipped. relist: the table does not hold them all (a fast array's elements
+/// are counted, an own-only table holds only enumerable keys), so the own
+/// names are listed now.
 effect fn prepare<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>, snapshot: Snapshot<'b>) -> bool ! JsException ? &mut Allocator {
+  memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>, snapshot: Snapshot<'b>, relist: bool) -> bool ! JsException ? &mut Allocator {
   let anchor = () let mut cursor = snapshot.get(&anchor).object.dup()
   while true {
     let object = move cursor
@@ -448,9 +470,8 @@ effect fn prepare<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coerc
     run interrupts.poll(&mut hooks, memory, realm)
   }
   drop cursor
-  let state = snapshot.get(&anchor)
-  let array = state.isArray let object = state.object.borrow() drop state
-  if array {
+  let object = snapshot.get(&anchor).object.borrow()
+  if relist {
     let table = run ownNames(&mut hooks, realm, object, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
     installTable(realm, snapshot, move table, false)
   }
@@ -516,13 +537,15 @@ effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coerc
   while true {
     let mut anchor = () let state = snapshot.getMut(&mut anchor)
     if state.index >= state.count {
-      let object = state.object.view() let inherited = state.inPrototypeChain drop state
+      let object = state.object.view() let inherited = state.inPrototypeChain
+      let ownOnly = state.ownOnly let relist = state.isArray || ownOnly drop state
       if object.tag() == 2 || object.tag() == 3 { return Next { value: ValueBits.Undefined, done: true } }
-      if snapshot.get(&anchor).ownOnly { return Next { value: ValueBits.Undefined, done: true } }
+      if ownOnly && unsafe quietReceiver(realm.runtime(), object) { return Next { value: ValueBits.Undefined, done: true } }
       if !inherited {
-        if run prepare(&mut hooks, memory, realm, iterator, snapshot) { return Next { value: ValueBits.Undefined, done: true } }
+        if run prepare(&mut hooks, memory, realm, iterator, snapshot, relist) { return Next { value: ValueBits.Undefined, done: true } }
+        // The loop now lists prototypes' keys: the own-only answers stop.
         let prepared = snapshot.getMut(&mut anchor)
-        prepared.inPrototypeChain = true
+        prepared.inPrototypeChain = true prepared.ownOnly = false prepared.version = 0
         drop prepared
       }
       let owned = snapshot.get(&anchor).object.dup()
@@ -561,7 +584,8 @@ effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coerc
 /// string retained and advances the iterator, or Uninitialized having changed
 /// nothing, and the caller runs next. An own-only iterator (ownTable) answers
 /// each listed key while the object keeps the shape it was listed from, and
-/// Undefined once they are all visited (done).
+/// Undefined once they are all visited (done) while its prototype chain is
+/// still quiet (quietReceiver); next walks a chain that is not.
 pub unsafe fn quickNext(runtime: *mut HeapHeader, iterator: ValueBits) -> ValueBits {
   let node = match iterator { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
@@ -576,6 +600,7 @@ pub unsafe fn quickNext(runtime: *mut HeapHeader, iterator: ValueBits) -> ValueB
   if state.ownOnly {
     // Done, or a listed key the object still holds under the same shape.
     if index >= state.count {
+      if !unsafe quietReceiver(runtime, state.object.view()) { return ValueBits.Uninitialized }
       // Done: let go of the object now unless that would free it (which
       // needs the collector's hooks); a later reuse or collection does then.
       if unsafe gc.releaseIfShared(state.object.view()) { let _released = state.object.take().intoBits() }
