@@ -169,8 +169,17 @@ version and the holder's version and slot for a property of the direct prototype
 `siteSlot` lowers the read against the pairs as constants: the receiver's shape, then for a
 prototype pair the holder's shape (the receiver's shape fixes its prototype, as the
 interpreter's own cached read relies on). A miss is an exit; a site that left once keeps the
-helper and the step behind the tests. Deeper chains, getters and absent properties are not
-recorded, and such a site reads through the helper.
+helper and the step behind the tests.
+
+A holder one further up, the prototype's own prototype (DeltaBlue's constraints read
+`output`, `input` and `recalculate` from `BinaryConstraint.prototype` through
+`EqualityConstraint.prototype`), is lowered too: the receiver's version fixes the prototype,
+the prototype's version (`SiteShape.firstKeys`, read when the code is compiled while the
+pair's epoch still holds) proves it lacks the name and fixes the holder, and the holder's
+version fixes the slot. Such a site used to be refused whole, and read through the field
+cache's one entry and the helper; DeltaBlue took 113M instructions less with it. Holders
+further up, getters and absent properties are still not lowered, and such a site reads
+through the helper.
 
 ## Remembered properties
 
@@ -504,7 +513,9 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
   receivers the site never saw and a scheduler loop, `t42` loops whose object changes shape or
   prototype in a turn, and a prototype that starts being watched while a loop stores to it,
   `t50` watched records changed under inlined reads (a write, a getter, a delete, an add,
-  the variable set to another object).
+  the variable set to another object), `t51` reads whose holder is the prototype's
+  prototype while the chain changes (the middle prototype gains the property, the holder's
+  is replaced, the middle prototype's prototype changes, a receiver shadows it).
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
@@ -560,4 +571,4 @@ In the order they are planned:
    in the body.
 6. Compile time and code size: the scheduler's function is 150 KB of code, and four functions
    carry most of 380 KB.
-7. `SERVICE_QUICK` for literals; deeper prototype chains in `SiteShapes`.
+7. `SERVICE_QUICK` for literals; holders more than two prototypes up in `SiteShapes`.
