@@ -112,6 +112,23 @@ on the edge alone). A temporary written at the top of each iteration (`var l = a
 header parameter for its exits only, boxed at every latch; a loop counter dead after the
 loop was passed to the exit block. Both go.
 
+**Boxes for one exit edge.** A loop's exit edge often passes its numbers boxed, to a block
+whose parameters stay boxed because it is also reached from in front of the loop. Those
+boxes ran on every iteration, between the loop's compare and its branch, which then could
+not branch on the compare's flags. `sinkBoxes` moves a box whose one reader is an argument
+of one edge of a branch onto that edge, in a new block (Crypto's `am3`: five boxes and the
+compare's setcc, store and test per iteration).
+
+## Repeated element reads
+
+`a[i]` read twice in one block, with nothing between that could change an array (only
+arithmetic, compares, boxes, unboxes and tag tests), reads the same element: the second read
+and its `unbox.i32` take the first's (`ssa_opt_unboxed.repeatedReads`,
+`ssa_tests.repeatedElementReadOnce`). Only a plain read (`k` 0, whose misses exit: no getter
+runs in it) of a borrowed result; the array is matched through borrowed copies of it, so
+`this_array[i]` read once from the local and once from the copy the loop's front block made
+is one read.
+
 ## Exits name the unboxed number
 
 After `u = unbox.i32 v` passed, `v` is an Int and `u` is its number. An exit later in the

@@ -17,7 +17,8 @@ import silk.num.u32
 import silk.num.usize
 import silkjs.js_class_data as classes
 import silkjs.js_feedback as feedback
-import ssa { Function, Own, Op, RootKind, Slot, SlotMode, NONE, readsK }
+import ssa { Function, Own, Op, RootKind, Slot, SlotMode, NONE, readsK, isNumberOp }
+import ssa_ownership { Forward }
 import ssa_verify { readsA, readsB }
 
 /// Rewrites the exit slots described above; answers whether any changed. Linear in the
@@ -174,4 +175,84 @@ fn previousExit(sites: &List<u32>, pc: u32) -> bool {
   let mut i: usize = 0
   while i < sites.length() { if sites.get(i) == pc { return true } i = i + 1 }
   return false
+}
+
+// ---- repeated element reads ----
+//
+// `a[i]` read twice in one block with nothing between that could change an array (no store,
+// call, step, poll or release) reads the same element: the second read, and its unbox,
+// take the first's. A plain element read (k 0) exits where it would need the engine (not a
+// fast element, a getter), so it has no effect of its own to repeat. The array is matched
+// through borrowed copies of it (an inlined `this_array` and the local it came from), the
+// index as a value. Crypto's am3 reads `this_array[i]` twice per turn.
+
+/// Instructions that change no array and run no code (repeatedReads keeps its reads over
+/// them).
+fn keepsElements(op: Op) -> bool {
+  return isNumberOp(op) || op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.CheckTag || op == Op.TagIs || op == Op.TagIn || op == Op.Removed
+}
+/// The value whose bits `v` borrows, through borrowed copies (RootKind.Value), or v.
+fn arrayRoot(f: &Function, v: u32) -> u32 {
+  let mut x = v
+  let mut steps = 0
+  while steps < 8 {
+    let info = f.value(x)
+    if info.own != Own.Borrowed || info.rootKind != RootKind.Value || info.root == NONE || u32.toUsize(info.root) >= f.values.length() { return x }
+    let def = info.def
+    if def == NONE || f.inst(def).op != Op.Retain { return x }
+    x = info.root
+    steps = steps + 1
+  }
+  return x
+}
+/// Replaces repeated element reads as described above; answers whether any went. The caller
+/// compacts.
+pub effect fn repeatedReads(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut forward = run Forward.make(&f.*)
+  let mut changed = false
+  // The reads kept since the block's start or its last barrier: array, index, result, and
+  // the result's i32 unbox (NONE until one is seen).
+  let mut arrays = List<u32>.make() let mut indexes = List<u32>.make()
+  let mut results = List<u32>.make() let mut unboxes = List<u32>.make()
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    arrays.clear() indexes.clear() results.clear() unboxes.clear()
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if inst.op == Op.GetElem && inst.k == 0 && inst.result != NONE && f.value(inst.result).own == Own.Borrowed {
+        let array = arrayRoot(&f.*, forward.resolve(inst.a))
+        let index = forward.resolve(inst.b)
+        let mut j: usize = 0
+        while j < arrays.length() && !(arrays.get(j) == array && indexes.get(j) == index) { j = j + 1 }
+        if j < arrays.length() {
+          run forward.replace(inst.result, results.get(j))
+          let mut gone = inst gone.op = Op.Removed f.setInst(i, gone)
+          changed = true
+        } else {
+          run arrays.append(array) run indexes.append(index) run results.append(inst.result) run unboxes.append(NONE)
+        }
+      } else if inst.op == Op.Unbox && inst.k == 0 && inst.result != NONE {
+        let read = forward.resolve(inst.a)
+        let mut j: usize = 0
+        while j < results.length() && results.get(j) != read { j = j + 1 }
+        if j < results.length() {
+          if unboxes.get(j) != NONE {
+            run forward.replace(inst.result, unboxes.get(j))
+            let mut gone = inst gone.op = Op.Removed f.setInst(i, gone)
+            changed = true
+          } else { unboxes.set(j, inst.result) }
+        }
+      } else if !keepsElements(inst.op) {
+        arrays.clear() indexes.clear() results.clear() unboxes.clear()
+      }
+      i = i + 1
+    }
+    f.work = f.work + u32.toU64(block.instCount)
+    b = b + 1
+  }
+  forward.apply(&mut f)
+  return changed
 }
