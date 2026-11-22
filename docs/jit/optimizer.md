@@ -441,6 +441,19 @@ where an exit is certain or likely:
   `superConstructor.call`) adds from starting shapes the site's memo does not cover, and
   `put.field` left for each.
 
+A method call the function's code has not run yet when it is first optimized (no shape
+recorded for its read, the field cache entry another site's: `jit_runtime.unseenCalls`)
+stays a call in that code for good, since no exit there teaches a later compile its
+target. The first optimization waits for it, at most twice (`UNSEEN_WAITS`), four times
+longer each time, while baseline code runs it: in DeltaBlue, `addConstraintsConsumingTo`
+runs `c.isSatisfied()` and `coll.add(c)` only once a variable has a constraint besides
+the one that determines it.
+
+A method read whose value is held through an inlined call's arms (`this.take(d.out(), k)`
+with `d.out()` a chain) reaches the call as the parameter of the block where the arms
+meet, and of the blocks of each arm's body. `readOf` follows such parameters to the one
+value every edge passes (`sourceOf`), so the call still finds its target.
+
 DeltaBlue x60 went from 79 compilations, 29 unlinks and 234 exits to 67, 18 and 144. The
 exits left are mostly method calls inlined for one receiver shape, whose `check.shape`
 fails for a subclass seen later: going on with the call there would save the recompile
