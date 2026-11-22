@@ -387,9 +387,15 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   // each body around the deepest such call or poll (js_baseline.FRAME_BARE_INLINED).
   let mut bodyCells: u32 = 0
   let mut bodyDepth: u32 = 0
+  let mut getters = false
   let mut calling: usize = 0
   while on && calling < function.insts.length() {
     let inst = function.insts.get(calling)
+    // A field read that may call a getter (getterCall) takes the receiver and function cells.
+    if inst.op == Op.GetField && inst.frame == 0 && (inst.k & FIELD_STEPS) != 0 && calling < steps.length() && steps.get(calling) != 0 {
+      getters = true
+      if bodyCells < 2 { bodyCells = 2 }
+    }
     if (inst.op == Op.Call || inst.op == Op.Poll) && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
       if inst.op == Op.Call && calls.countOf(inst) + 2 > bodyCells { bodyCells = calls.countOf(inst) + 2 }
       if function.exit(inst.exit).frames > bodyDepth { bodyDepth = function.exit(inst.exit).frames }
@@ -398,7 +404,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   }
   let callAt = ((raw + 15) / 16) * 16
   let recordBytes = i32.wrappingToU32(0 - plan.record)
-  if bodyDepth != 0 { raw = callAt + bodyCells * SLOT_BYTES + bodyDepth * (recordBytes + 16) }
+  if bodyDepth != 0 || getters { raw = callAt + bodyCells * SLOT_BYTES + bodyDepth * (recordBytes + 16) }
   let mut frame = u32.wrappingToI32(((raw + 15) / 16) * 16 - 8 - pushes * 8)
   if on { frame = plan.below + u32.wrappingToI32(((raw + 15) / 16) * 16) }
   let mut assembler = Assembler.make()
@@ -1245,9 +1251,11 @@ impl Emitter {
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       let step = self.stepAt()
       if step != 0 && !borrowed {
-        // It left before: the interpreter reads what the helper declines (a primitive's
-        // property, a getter), and its value is on top of the stack afterwards.
+        // It left before: a function getter is called from here (getterCall); the
+        // interpreter reads what is left (a primitive's property, a native getter), and its
+        // value is on top of the stack afterwards.
         run self.a.jcc(Cond.NotEqual, done)
+        if self.on && inst.frame == 0 { run self.getterCall(&function, inst, done) }
         let after = self.depthAfter(&function, inst, step)
         run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
       } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
@@ -4464,6 +4472,48 @@ impl Emitter {
       run self.stepOnFrame(&function, inst, step, leaving.stepShape(0, 0, 0, after), NONE)
     } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
     self.a.bind(done)
+  }
+  /// get.field past its helper, at a site that left before (frame mode, the function's own
+  /// code): the function getter the read finds (baseline_env.GETTER, as baseline code asks
+  /// for it) is called as a method of the object with no arguments, through the baseline
+  /// call stub, in the call area's cells (the receiver lent, the getter with its count), and
+  /// its result is the read's; then on to done. Where there is no such getter it falls
+  /// through. A call the stub declines or that threw leaves at the read's exit, as a call
+  /// does (the baseline code then reads, or the engine unwinds). Clobbers every register a
+  /// call does.
+  effect fn getterCall(self: &mut Self, function: &Function, inst: Inst, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run self.a.label()
+    let left = run self.a.label()
+    let callee = self.callAt + SLOT_BYTES
+    // getter(env, ip, object cell, out) -> 1 with the function in out.
+    run self.codeInto(Reg.Rsi)
+    run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rsi, u32.wrappingToI32(inst.pc + 1)))
+    run self.a.mov(Width.W64, Reg.Rdi, Reg.R12)
+    run self.a.lea(Width.W64, Reg.Rdx, slotOf(inst.a))
+    run self.a.lea(Width.W64, Reg.Rcx, word(Reg.Rsp, callee))
+    run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.GETTER)))
+    run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+    run self.a.jcc(Cond.Equal, none)
+    run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rsp, callee - SLOT_BYTES)
+    // The stub's site, as callOnFrame's: r14 the callee's cell, edx the count, eax the pc a
+    // frame the callee publishes is at.
+    run self.a.lea(Width.W64, Reg.R14, word(Reg.Rsp, callee))
+    run self.a.movImm32(Reg.Rdx, 0)
+    run self.a.movImm32(Reg.Rax, inst.pc + 1)
+    run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP)
+    // ecx: 0 returned, HOW_DECLINED, HOW_CALL_THREW.
+    run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
+    run self.a.jcc(Cond.NotEqual, left)
+    run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+    run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rdx)
+    run self.releaseAt(Reg.Rsp, u32.wrappingToI32(callee), true)
+    run self.a.jmp(done)
+    self.a.bind(left)
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.scratch), Reg.Rcx)
+    run self.releaseAt(Reg.Rsp, u32.wrappingToI32(callee), true)
+    run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.Rsp, self.scratch))
+    run self.a.jmp(self.exitWith.get(u32.toUsize(inst.exit)))
+    self.a.bind(none)
   }
   /// Whether the `count` instructions before the one being lowered are its call.args, in
   /// order.

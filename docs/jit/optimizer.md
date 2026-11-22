@@ -582,6 +582,15 @@ What is stepped:
 - A field read that left before (`FIELD_STEPS` on `get.field`): the inline test and the helper
   first, the step for what the helper declines (a primitive's property, a getter). Its result
   is always owned.
+- A field read that finds a function getter, at a site that left before (or that baseline
+  code noted where it asked for a getter): the getter is called from the code, not stepped
+  (`getterCall`). Past the inline test and the helper, the getter helper baseline code uses
+  (`baseline_env.GETTER`) gives the function, and the code makes a method call with no
+  arguments through `STUB_CALL_METHOD_KEEP`, with the receiver lent and the function in
+  the call area's two cells. A call the stub declines or that threw leaves at the read's
+  exit, as a call does. Such a read is a call for the register allocator: baseline code's
+  r14 and r15 do not survive it. On the HTTP service these were most of the 34 field steps
+  per order.
 - A store and an equality that left before (`SITE_PUT_FIELD`, `SITE_EQUAL`): the helper
   first, the step for a setter, a new property, a coercion.
 
@@ -596,7 +605,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (58 scripts) through
+- `modules/jit/tests/baseline/*.js` (59 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -624,7 +633,10 @@ again and the interpreter steps it.
   appears on `Object.prototype` and the prototype is a primitive or has a getter, `t57`
   element reads and stores by index past the end, at holes, on strings, plain objects and
   typed arrays, and under index accessors on the prototypes, `t58` adds that join strings
-  at sites that also add numbers, doubles, objects with `valueOf` and values that throw.
+  at sites that also add numbers, doubles, objects with `valueOf` and values that throw,
+  `t59` getters that optimized code calls (on the prototype and own, reading other getters,
+  recursing into the reader, throwing, native ones) while one is replaced, made a data
+  property or a throwing one, and a primitive or a proxy takes the object's place.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
