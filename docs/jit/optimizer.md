@@ -540,7 +540,7 @@ function every six orders.
 - **Baseline code says which element sites miss.** Each round of an exit, an unlink and a
   compile taught the optimizer one site, so a function with five such sites compiled six
   times. Baseline code's element helpers run exactly where its inline read or store misses;
-  they now note the instruction's operand address in `BaselineEnv.misses` (512 entries, one
+  they now note the instruction's operand address in `BaselineEnv.misses` (4096 entries, one
   per `missIndex`), unless the miss is an Int key into a typed array or an arguments object,
   which optimized code reads inline (`js_baseline.elementMissNoted`). At compile time
   `jit_runtime.missedSites` adds the function's noted element instructions to the sites it
@@ -551,13 +551,22 @@ function every six orders.
   `SERVICE_CONCAT`); such an add is named twice in the sites, so the optimizer joins
   there from the start (`concatenates`) instead of guessing int32, then double. This is
   feedback from baseline code in its smallest form: one word written on a path that already
-  calls into the engine, nothing in the fast path and nothing in the interpreter.
+  calls into the engine, nothing in the fast path and nothing in the interpreter. A note has
+  to live until its function is optimized, which in a server is often thousands of requests
+  later (a first compile waits for method calls not yet run), while every getter the
+  runtime's streams read is noted too, hence 4096 entries.
 - `put.key` with an Int key stores over an element of a fast Array inline, as `put.elem`
   does, so a widened `a[i] = v` keeps its fast case.
 - **A method read on a string, number or boolean** (`str.slice(...)`, a `get_field2` of a
   primitive) is read from its class prototype in the frame's realm by the optimizer's
   field helper too (`js_compiled_objects.readField`), as baseline code's
-  `readFieldCached` does; it used to decline and leave.
+  `readFieldCached` does; it used to decline and leave. Baseline code reads such a method
+  from the class prototype as the receiver, so the site records that prototype's shape; a
+  site whose shapes include the shape of the realm's String, Number or Boolean prototype
+  (`js_compiled_inline.primitiveReceiver`) is compiled as a cached read without shape tests,
+  for a test against the prototype's shape fails on every string and left: `s.toLowerCase()`
+  and `s.charCodeAt(0)` in one function compiled it three times, as in the HTTP parser's
+  `_addHeaderLine`.
 - **A string literal is a linked constant.** `atom.value` named the atom only by its pc,
   so each `push_atom_value` built a frame record and called a helper that looked the atom
   up, about 2% of the optimizer's samples on the HTTP service. The translator now puts a
@@ -623,7 +632,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (64 scripts) through
+- `modules/jit/tests/baseline/*.js` (65 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -662,7 +671,9 @@ again and the interpreter steps it.
   results that outlive their call and operands, own and inlined, while their functions
   are replaced, `t63` concatenation into locals of literals, numbers, objects whose
   conversion runs or throws, `t64` lengths of typed arrays, `arguments`, plain objects whose
-  length is a number, a string or an object, and a getter that throws.
+  length is a number, a string or an object, and a getter that throws, `t65` method reads
+  on strings, numbers and booleans and sites that see a primitive and an object, while the
+  prototypes' methods are replaced, deleted and made getters.
 - `silk test` in `modules/jit`: 97 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
