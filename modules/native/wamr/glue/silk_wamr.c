@@ -44,6 +44,7 @@ static void store_destroy(SilkWasmStore *store)
     if (store->next_thread_store)
         store->next_thread_store->previous_thread_store = store->previous_thread_store;
     silk_wasm_reference_context_destroy(store);
+    if (!thread_stores) wasm_interp_invocation_release_cache();
     wasm_runtime_destroy();
     free(store);
 }
