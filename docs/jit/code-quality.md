@@ -119,6 +119,36 @@ not branch on the compare's flags. `sinkBoxes` moves a box whose one reader is a
 of one edge of a branch onto that edge, in a new block (Crypto's `am3`: five boxes and the
 compare's setcc, store and test per iteration).
 
+## Array checks in front of the loop
+
+An element access (`get.elem` with `k` 0, `put.elem`) of an Array the loop does not
+define tests the object's tag, its class and its fast flag on every turn: seven
+instructions before the index test. `ssa_opt_hoist` puts one `check.array` per such Array
+on the loop's entry edge, with an exit of its own at the header, and marks the accesses
+trusted (`Inst.trusted`): they load the object, compare the index with the count and leave
+where it is not below it. Their helper never runs, but a trusted store of a counted value
+below the count, which keeps the Array fast.
+
+Nothing else in the loop may change what kind of object the Array is: no call and no
+stepped read (they run the program's code), no store of a field or a binding, and every
+element store is trusted (an untrusted store's helper may append past the end, and an
+append far enough out ends the fast kind; it could be this Array under another name). The
+access must run on every turn and its site must never have left compiled code. With
+recorded kinds (code made off a baseline frame) the site saw fast Arrays alone; on a
+baseline frame, where no kinds are recorded, it saw no keyed reads (ELEMENT_ORDINARY).
+
+A `check.array` that fails (a typed array, a string, `arguments`) leaves at the header
+with a record that says so (`jit_exit_state.CODE_ARRAY_CHECK`). `jit_runtime.noteLeft`
+remembers the header's pc with `ssa.SITE_ARRAY`, and the next compile trusts nothing in
+that loop but keeps the rest of its hoisting, where a failure of the other hoisted guards
+keeps all of them in the loop. `tests/baseline/t67.js` runs such loops on arrays, typed
+arrays, strings, `arguments`, frozen, holey and getter-holding arrays, past the end and
+with stores that append.
+
+Crypto's `am3`: 143 instructions an iteration where there were 164; Crypto at scale 4,
+3.26G instructions where there were 3.48G. At scale 20 the optimizer takes 1,019 ms (V8:
+325), where before this and the fragile registers it took 1,256.
+
 ## Repeated element reads
 
 `a[i]` read twice in one block, with nothing between that could change an array (only
@@ -154,7 +184,8 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   compares, constants, boxes and unboxes of numbers, jumps and branches, none of which
   touch rsi or rdi or call out) takes one. The temporaries of a loop's arithmetic go there,
   the callee-saved three to the values that live across element accesses and polls. On
-  Crypto's `am3` loop: 164 instructions an iteration where there were 217. Keeping rsi and
+  Crypto's `am3` loop: 164 instructions an iteration where there were 168 (Crypto in all:
+  3.47G instructions at scale 4, from 3.57G). Keeping rsi and
   rdi over the slow paths of element accesses and polls (so longer values could take them
   too) measured worse, 167, and is not done.
 

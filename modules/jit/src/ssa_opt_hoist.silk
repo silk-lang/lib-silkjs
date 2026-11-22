@@ -37,11 +37,13 @@ import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
+import silk.num.u8
 import silk.num.usize
-import ssa { Function, Exit, Own, RootKind, Op, Type, SlotMode, NONE, FIELD_STEPS, UNBOX_EXACT, edgeCount, readsK, steppedRead }
+import ssa { Function, Exit, Own, RootKind, Op, Type, SlotMode, NONE, FIELD_STEPS, SITE_ARRAY, UNBOX_EXACT, edgeCount, readsK, steppedRead }
 import ssa_translate { FunctionInput }
 import ssa_shapes { fieldAtom }
 import silkjs.js_atom_data as atoms
+import silkjs.js_feedback as feedback
 import ssa_verify { readsA, readsB }
 import ssa_ownership { fixSlots }
 import ssa_opt_borrow { quiet }
@@ -169,6 +171,9 @@ pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>, 
   // The names the loop stores to, and the inlined frames its front block names already.
   let mut stored = List<u32>.make()
   let mut framed = List<u32>.make()
+  // The element accesses a loop's `check.array` serves, and the Arrays it checks.
+  let mut trusted = List<u32>.make()
+  let mut checked = List<u32>.make()
   let mut serial: u32 = 0
   let mut changed = false
   // Inner loops first: their headers come later in reverse postorder.
@@ -332,6 +337,69 @@ pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>, 
         i = i + 1
       }
       b = b + 1
+    }
+    // Element accesses of an invariant fast Array: one `check.array` in front of the loop,
+    // and the accesses trust it (Inst.trusted). Nothing in the loop may make the Array
+    // another kind of object: no call or stepped read (which run the program's code), no
+    // store of a field or a binding, and every element store is one of these (an untrusted
+    // one's helper may append past the end, which can end the fast kind). A trusted access
+    // leaves where its index is not below the count, so its helper never runs either, but
+    // for a store of a counted value below the count, which keeps the kind. An access is
+    // trusted where it runs on every turn, its site never left compiled code (sites), and it
+    // saw fast Arrays alone (js_feedback ELEMENT_FAST), or on a baseline frame, where kinds
+    // are not recorded, nothing else (no ELEMENT_ORDINARY). Each check has an exit of its own
+    // at the header: one that fails is remembered apart (ssa.SITE_ARRAY, jit_runtime.noteLeft)
+    // and the next compile trusts nothing in this loop but keeps the rest of its hoisting.
+    if !stop && !calls && !putsField && !putsBinding && !has(sites, u32.bitOr(state.pc, SITE_ARRAY)) {
+      trusted.clear()
+      let mut every = true
+      b = h
+      while b <= lastLatch && every {
+        if member.get(u32.toUsize(b)) == serial {
+          let always = dominates(&graph.idom, b, common)
+          let block = f.blocks.get(u32.toUsize(b))
+          let mut i = block.firstInst
+          while i < block.firstInst + block.instCount {
+            let inst = f.inst(i)
+            // One trusted in an earlier round has its check already.
+            if inst.block == b && (inst.op == Op.GetElem || inst.op == Op.PutElem) && !inst.trusted {
+              let kind = f.elementKind(&inst)
+              let ok = always && inst.frame == 0 && (inst.op == Op.PutElem || inst.k == 0) && !has(sites, inst.pc)
+                && (kind == u8.toU32(feedback.ELEMENT_FAST) || (kind == 0 && input.leavesBodies)) && outside(&f.*, &member, &moved, serial, inst.a)
+              if ok { run trusted.append(i) } else if inst.op == Op.PutElem { every = false }
+            } else if inst.block == b && inst.op == Op.PutElemF64 { every = false }
+            i = i + 1
+          }
+        }
+        b = b + 1
+      }
+      if every && trusted.length() > 0 && frontExit == NONE {
+        // The state at the header (entryArgs), as the guards' exit would have it.
+        let incoming = entryEdge(&f.*, entry, front)
+        every = run entryState(&mut f, &member, serial, state, incoming, back, &mut entryArgs)
+      }
+      if every && trusted.length() > 0 {
+        if front == NONE { front = run split(&mut f, entry, h) }
+        let pc = f.inst(f.blocks.get(u32.toUsize(h)).firstInst).pc
+        checked.clear()
+        let mut t: usize = 0
+        while t < trusted.length() {
+          let at = trusted.get(t)
+          let mut access = f.inst(at)
+          if !has(&checked, access.a) {
+            drop run f.emit(front, Op.CheckArray, false, Type.I32, Own.Unboxed, access.a, NONE, 0, pc)
+            let check = f.lastInst()
+            let mut made = f.inst(check) made.order = order made.frame = 0 f.setInst(check, made)
+            order = order + 2
+            drop run entryExit(&mut f, check, state, &entryArgs)
+            run checked.append(access.a)
+          }
+          access.trusted = true
+          f.setInst(at, access)
+          t = t + 1
+        }
+        changed = true
+      }
     }
     // A parameter the loop unboxes on every turn and passes back as a box of an i32 (a
     // counter, an index, an accumulator) whose entry value is no box (an argument): its
