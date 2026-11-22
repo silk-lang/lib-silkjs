@@ -34,7 +34,7 @@ import silk.num.u16
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
-import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, FIELD_STEPS }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS }
 import ssa_verify { readsA, readsB }
 import ssa
 import value_layout { ValueLayout }
@@ -300,6 +300,7 @@ pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FrameP
     let mut wanted = false
     if inst.frame == 0 && inst.exit != NONE {
       if inst.op == Op.GetField || inst.op == Op.GetLength { wanted = (inst.k & FIELD_STEPS) != 0 }
+      else if inst.op == Op.GetElem || inst.op == Op.GetKey { wanted = inst.k == ELEM_STEPS }
       else if inst.op == Op.PutField || inst.op == Op.PutKey { wanted = true }
       else if inst.op == Op.Call { wanted = (inst.k & calls.GENERIC) != 0 || calls.kindOf(inst) != compiled.SITE_CALL }
     }
@@ -1254,7 +1255,7 @@ impl Emitter {
       return ()
     }
     if op == Op.GetKey && self.on {
-      run self.getKey(inst)
+      run self.getKey(&function, inst)
       return ()
     }
     if op == Op.GetKey {
@@ -1419,6 +1420,17 @@ impl Emitter {
         let index = self.at(inst.b) run getI32(&mut self.a, Reg.Rdx, index)
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
         if borrowed { run self.callHelper(helpers.GET_ELEM_BORROWED) } else { run self.callHelper(helpers.GET_ELEM) }
+        let step = self.stepAt()
+        if step != 0 && !borrowed {
+          // It left before (ELEM_STEPS): the interpreter reads what the helper declines,
+          // and its value is on top of the stack afterwards.
+          run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jcc(Cond.NotEqual, done)
+          let after = self.depthAfter(&function, inst, step)
+          run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
+          self.a.bind(done)
+          return ()
+        }
       } else if op == Op.PutElem {
         let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
@@ -2900,6 +2912,11 @@ impl Emitter {
   /// or a jump to miss: not a fast Array, or the index is negative or past its elements.
   /// Clobbers R8 and R11.
   effect fn elementSlot(self: &mut Self, value: u32, index: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let place = self.at(index)
+    run self.elementSlotAt(value, place, miss)
+  }
+  /// elementSlot with the index's i32 at place.
+  effect fn elementSlotAt(self: &mut Self, value: u32, place: Place, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let fields = self.fields
     run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(value * SLOT_BYTES + layout.tagOffset)))
@@ -2920,7 +2937,6 @@ impl Emitter {
       run self.a.testImm(Width.W32, Reg.R8, u32.wrappingToI32(fields.fastArray))
       run self.a.jcc(Cond.Equal, miss)
     }
-    let place = self.at(index)
     run getI32(&mut self.a, Reg.R8, place)
     run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)))
     run self.a.jcc(Cond.AboveOrEqual, miss)
@@ -4314,7 +4330,7 @@ impl Emitter {
   /// site cache entry names for the object's shape version is read inline; anything else
   /// is the engine's read on the same cache (baseline_env.ELEMENT_OF), which leaves where
   /// user code would run (a getter, a proxy).
-  effect fn getKey(self: &mut Self, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn getKey(self: &mut Self, function: &Function, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let fields = self.fields
     let done = run self.a.label()
@@ -4353,10 +4369,17 @@ impl Emitter {
     run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
     run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.ELEMENT_OF)))
     run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-    run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+    let step = self.stepAt()
+    if step != 0 {
+      // It left before (ELEM_STEPS): the interpreter reads what the engine declines.
+      run self.a.jcc(Cond.NotEqual, done)
+      let after = self.depthAfter(&function, inst, step)
+      run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
+    } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
     self.a.bind(done)
   }
-  /// put.key (frame mode): a Symbol key the site's element site cache entry names for an own
+  /// put.key (frame mode): an Int key over an element of a fast Array as put.elem stores
+  /// it, and a Symbol key the site's element site cache entry names for an own
   /// writable slot of the object's shape version, in an object without a [[Set]] of its own,
   /// is stored inline (the displaced value drops its count, never its last here). Anything
   /// else goes to the engine's store (baseline_env.STORE_ELEMENT), and what that declines is
@@ -4368,6 +4391,26 @@ impl Emitter {
     let done = run self.a.label()
     let slow = run self.a.label()
     let kept = run self.a.label()
+    let symbolic = run self.a.label()
+    let oldPlain = run self.a.label()
+    let newPlain = run self.a.label()
+    // An Int key: an element of a fast Array below its length, a value that is no heap
+    // reference over one that is none (as put.elem stores it).
+    run self.unlessTag(key, layout.int(), symbolic)
+    run self.elementSlotAt(inst.a, regalloc.spilled(payloadOf(key)), slow)
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+    run self.heapTest(Reg.Rax, oldPlain)
+    run self.a.jmp(slow)
+    self.a.bind(oldPlain)
+    run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+    run self.heapTest(Reg.Rax, newPlain)
+    run self.a.jmp(slow)
+    self.a.bind(newPlain)
+    run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+    run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+    run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
+    run self.a.jmp(done)
+    self.a.bind(symbolic)
     run self.unlessTag(inst.a, layout.object(), slow)
     run self.unlessTag(key, layout.tagOf(0 - 8), slow)
     run self.a.load(Width.W64, Reg.Rsi, payloadOf(inst.a))
