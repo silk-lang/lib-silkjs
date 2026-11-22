@@ -65,13 +65,18 @@ const XMM_COUNT: usize = 14
 /// The integer registers a scan hands out, in order: `count` of `registers`. Bit n of
 /// overCalls: register n keeps its value over a call (Op.Call), so a value live across one
 /// may take it. pollCalls: a poll may call out (callsOut), so no double lives across one.
-pub struct Pool { pub registers: [Reg; 5], pub count: usize, pub overCalls: u32, pub pollCalls: bool }
+/// fragile: register n is caller-saved and kept by none but the gentle instructions
+/// (gentle): a value whose interval holds anything else does not take it.
+pub struct Pool { pub registers: [Reg; 5], pub count: usize, pub overCalls: u32, pub pollCalls: bool, pub fragile: u32 }
 impl Copy for Pool {}
 /// x64_backend's: rbx, r12 to r15, none of them over a call (an exit and a re-entry).
-pub fn entryPool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R12, Reg.R13, Reg.R14, Reg.R15], count: 5, overCalls: 0, pollCalls: false } }
+pub fn entryPool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R12, Reg.R13, Reg.R14, Reg.R15], count: 5, overCalls: 0, pollCalls: false, fragile: 0 } }
 /// x64_frame's, on a baseline frame (r12 and r13 are pinned there): rbx, which every callee
-/// restores, then r14 and r15, which baseline code and its stubs use freely.
-pub fn framePool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R14, Reg.R15, Reg.R14, Reg.R15], count: 3, overCalls: 1, pollCalls: true } }
+/// restores, then r14 and r15, which baseline code and its stubs use freely, then rsi and
+/// rdi, which only the helper calls and frame services of the lowering touch (fragile): a
+/// temporary of the arithmetic between them takes those, the callee-saved three go to the
+/// values that live longer.
+pub fn framePool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R14, Reg.R15, Reg.Rsi, Reg.Rdi], count: 5, overCalls: 1, pollCalls: true, fragile: 24 } }
 
 /// The integer pool, in the order the scan hands it out.
 pub fn gprAt(index: usize) -> Reg {
@@ -279,8 +284,47 @@ pub effect fn allocateIn(f: &Function, pool: Pool) -> Allocation ! OutOfMemoryEr
     }
     c = c + 1
   }
+  // Whether each value's interval holds gentle instructions alone (Pool.fragile): a prefix
+  // count of the others over the instructions, which an interval's positions index.
+  let mut harsh = List<u32>.make()
+  run harsh.append(0)
+  c = 0
+  while c < f.insts.length() {
+    let before = harsh.get(c)
+    if gentle(f.insts.get(c).op) { run harsh.append(before) } else { run harsh.append(before + 1) }
+    c = c + 1
+  }
+  let mut calm = List<bool>.make()
+  run calm.appendRepeated(false, u32.toUsize(values))
+  if pool.fragile != 0 {
+    v = 0
+    while v < values {
+      let index = u32.toUsize(v)
+      let start = starts.get(index)
+      if start != NONE {
+        // From the instruction that defines v (a parameter: the one before its block, the
+        // jump that writes it) to the last that reads it.
+        let mut low: u32 = 0
+        if start >= 3 { low = (start - 3) / 2 }
+        let mut high = (ends.get(index) - 2) / 2
+        if ends.get(index) < 2 { high = 0 }
+        if u32.toUsize(high) >= f.insts.length() { high = usize.toU32(f.insts.length() - 1) }
+        if low <= high { calm.set(index, harsh.get(u32.toUsize(high) + 1) == harsh.get(u32.toUsize(low))) }
+      }
+      v = v + 1
+    }
+  }
   let weights = run weigh(&f)
-  return run scan(&f, move starts, move ends, &across, &weights, pool)
+  return run scan(&f, move starts, move ends, &across, &calm, &weights, pool)
+}
+/// Instructions whose lowering touches neither rsi nor rdi and calls nothing (Pool.fragile):
+/// integer arithmetic and compares, constants, boxes and unboxes of numbers, and the moves
+/// of jumps and branches (rax, rcx, r8 to r11 and a scratch slot are theirs).
+fn gentle(op: Op) -> bool {
+  return op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.BitNot || op == Op.Neg || op == Op.NotBool
+    || op == Op.Jump || op == Op.Branch || op == Op.Removed
 }
 /// What a value's interval allows: any register of its pool, only one that lasts over a
 /// call, or none.
@@ -345,7 +389,7 @@ fn addWeight(weights: &mut List<u64>, v: u32, heat: u64) -> () {
 
 fn poolKind(double: bool) -> u8 { if double { return XMM } return GPR }
 
-effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u8>, weights: &List<u64>, pool: Pool) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u8>, calm: &List<bool>, weights: &List<u64>, pool: Pool) -> Allocation ! OutOfMemoryError ? &mut Allocator {
   let values = f.valueCount()
   let mut kinds = List<u8>.make()
   run kinds.appendRepeated(SPILL, u32.toUsize(values))
@@ -398,6 +442,7 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u
     // The registers this value may take: all of its pool, or those that last over a call.
     let mut allowed: u32 = u32.MAX
     if !double && across.get(u32.toUsize(v)) == OVER_CALL { allowed = pool.overCalls }
+    if !double && !calm.get(u32.toUsize(v)) { allowed = u32.bitAnd(allowed, u32.bitXor(pool.fragile, u32.MAX)) }
     // Expire what ended before this start; take a free register.
     let mut free = usize.MAX
     let mut r = first

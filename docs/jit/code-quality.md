@@ -148,6 +148,16 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   immediate, or from its slot, so the three integer registers of code on a baseline frame
   go to values.
 
+- **Two more registers on a baseline frame.** Code on a baseline frame had three integer
+  registers (rbx, r14, r15). rsi and rdi join them as fragile registers (`Pool.fragile`):
+  only a value whose interval holds nothing but gentle instructions (integer arithmetic,
+  compares, constants, boxes and unboxes of numbers, jumps and branches, none of which
+  touch rsi or rdi or call out) takes one. The temporaries of a loop's arithmetic go there,
+  the callee-saved three to the values that live across element accesses and polls. On
+  Crypto's `am3` loop: 164 instructions an iteration where there were 217. Keeping rsi and
+  rdi over the slow paths of element accesses and polls (so longer values could take them
+  too) measured worse, 167, and is not done.
+
 - **`add.i32` and `sub.i32` in place.** When the result takes the first operand's register
   the operation runs there, two instructions where there were four. The exit state reads
   the operand, so the overflow jump goes to a short piece after the blocks that undoes the
