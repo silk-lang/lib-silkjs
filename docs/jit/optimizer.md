@@ -551,6 +551,18 @@ function every six orders.
   calls into the engine, nothing in the fast path and nothing in the interpreter.
 - `put.key` with an Int key stores over an element of a fast Array inline, as `put.elem`
   does, so a widened `a[i] = v` keeps its fast case.
+- **A method read on a string, number or boolean** (`str.slice(...)`, a `get_field2` of a
+  primitive) is read from its class prototype in the frame's realm by the optimizer's
+  field helper too (`js_compiled_objects.readField`), as baseline code's
+  `readFieldCached` does; it used to decline and leave.
+- **A string literal is a linked constant.** `atom.value` named the atom only by its pc,
+  so each `push_atom_value` built a frame record and called a helper that looked the atom
+  up, about 2% of the optimizer's samples on the HTTP service. The translator now puts a
+  string atom below 2^30 in `k`, the code links the atom's own string cell
+  (`Function.linkedAtoms`, `x64_backend.atomSymbol`, `js_compiled_inline.atomString`) and
+  pushes it with a count: a load, an add and two stores. The cell lives as long as the
+  atom, which the bytecode naming it keeps, and an inlined body's bytecode is kept by the
+  code that inlines it.
 - **A length the inline test does not answer** goes to baseline code's length helper
   (`js_vm_property_ops.quickLength`: a typed array's, a plain `length` property) before it
   leaves, and a site that left before steps what that declines (a getter). The parser
@@ -606,7 +618,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (60 scripts) through
+- `modules/jit/tests/baseline/*.js` (62 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -639,7 +651,11 @@ again and the interpreter steps it.
   recursing into the reader, throwing, native ones) while one is replaced, made a data
   property or a throwing one, and a primitive or a proxy takes the object's place, `t60`
   setters that optimized code calls while one is replaced, throws or becomes a data
-  property, an object is frozen and a proxy with a set trap takes an object's place.
+  property, an object is frozen and a proxy with a set trap takes an object's place, `t61`
+  method reads on strings, numbers and booleans while the prototypes' methods are
+  replaced, made getters, deleted and shadowed, `t62` string literals as values, keys,
+  results that outlive their call and operands, own and inlined, while their functions
+  are replaced.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
