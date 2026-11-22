@@ -99,6 +99,12 @@ entry edge too, with the moved guards' exit, and has the edge pass `box.i32` of 
 number; the ownership pass then runs again (`ssa_opt.pipeline`) and unboxes the parameter,
 which ends the boxing at the latch and the unbox at the top of each iteration
 (`ssa_tests.argumentCounterUnboxedOnEntry`; Crypto's `am3` carries `i`, `j` and `c` so).
+An entry value the code owns (an argument copied into a local, as in Crypto's
+`bnpDRShiftTo`) is no longer passed on, so the front block releases it after its last exit
+(`ssa_tests.ownedCounterReleasedOnEntry`, `tests/baseline/t68.js`). Without that release
+the verifier refused bnpDRShiftTo, montReduce and bnpFromString from the change that brought
+these unboxes in until this one: montReduce ran its baseline code, and half of `am3`'s calls
+went through the baseline call stubs.
 The entry unbox takes a Float64 holding an exact int32 too (`ssa.UNBOX_EXACT`, x64_backend):
 a value of double arithmetic that is an integer runs the loop as an Int instead of failing
 in front of it. What it refuses exits at the header and costs the one more compile above.
