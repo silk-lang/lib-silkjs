@@ -98,6 +98,12 @@ struct SilkWasmStore {
     void *gc_pool;
     SilkWasmHandle *reference_instance;
     WASMExecEnv *reference_exec_env;
+    /* Bumped whenever a handle appears or goes, or an owner's edges are
+     * resynced: either can change what another owner's graph projects to. */
+    uint64_t edge_generation;
+    uint64_t synced_generation;
+    uint64_t synced_ref_writes;
+    bool edges_synced;
     bool syncing_edges;
     bool reference_visit_failed;
     bool closed;

@@ -295,6 +295,12 @@ silk_exec_env_give(WASMExecEnv *env)
     wasm_exec_env_destroy_internal(env);
 }
 
+uint64
+wasm_interp_ref_writes(void)
+{
+    return silk_ref_writes;
+}
+
 void
 wasm_interp_invocation_release_cache(void)
 {

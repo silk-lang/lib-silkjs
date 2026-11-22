@@ -77,6 +77,7 @@ SilkWasmHandle *silk_wasm_new_handle(SilkWasmStore *store, uint32_t kind)
     if (handle->next) handle->next->previous = &handle->next;
     store->handles = handle;
     ++store->handle_count;
+    ++store->edge_generation;
     return handle;
 }
 
@@ -158,6 +159,7 @@ static void destroy_shell(SilkWasmHandle *handle)
     SilkWasmStore *store = handle->store;
     *handle->previous = handle->next;
     if (handle->next) handle->next->previous = handle->previous;
+    ++store->edge_generation;
     if (handle->kind == SILK_WASM_MODULE) {
         silk_wasm_compile_options_destroy(handle);
         silk_wasm_js_types_destroy(handle);
@@ -175,6 +177,7 @@ void silk_wasm_free(SilkWasmHandle *handle)
     if (!handle || handle->finalized) return;
     handle->host = NULL;
     handle->finalized = true;
+    ++handle->store->edge_generation;
     /* Pin the shell across recursive edge release. Native payload teardown
      * occurs while its module and imports are still retained. Module payloads
      * are separately kept until every incoming native owner edge disappears. */
