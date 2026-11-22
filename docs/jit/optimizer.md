@@ -299,6 +299,17 @@ activation, which is one loop of ten thousand turns. See on-stack replacement un
 the closure's address, a symbol of the code, instead of by class and bytecode. The closure is
 kept alive for the code (`inline.keepClosure`).
 
+**A function's own methods.** `Strength.stronger(a, b)` reads a method that is an own
+property of the object a variable holds, which no site cache entry names as a target (it
+is not a prototype hit). When the read comes straight after the `get_var`, the compile
+reads the variable through the function's closure (`js_baseline.variableMethod`) and takes
+the closure the property holds as an exact target, tested against the callee as any other.
+A read off `this` inside such a method (`this.weaker` in `Strength.weakestOf`) is not
+resolved yet.
+The prologue passes its closure to the optimizer for this (`jitTierUp`'s third argument,
+null for a known local function). On DeltaBlue this inlined 23 more calls and took 77M
+instructions off.
+
 **Known methods.** A method read through the prototype cost about twenty instructions: the
 receiver's shape, the prototype's shape, the slot's two words, then the callee test. When the
 prototype is watched, the read is the receiver's tag, its shape version, its exotic bit and
@@ -515,7 +526,9 @@ slower this way than through baseline's `SERVICE_QUICK`; that path is open work.
   `t50` watched records changed under inlined reads (a write, a getter, a delete, an add,
   the variable set to another object), `t51` reads whose holder is the prototype's
   prototype while the chain changes (the middle prototype gains the property, the holder's
-  is replaced, the middle prototype's prototype changes, a receiver shadows it).
+  is replaced, the middle prototype's prototype changes, a receiver shadows it), `t52` a
+  function's own methods called through a variable while they are replaced, deleted, made
+  a getter and the variable is set to another object.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
