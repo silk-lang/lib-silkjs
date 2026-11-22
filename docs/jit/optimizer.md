@@ -541,7 +541,12 @@ function every six orders.
   per `missIndex`), unless the miss is an Int key into a typed array or an arguments object,
   which optimized code reads inline (`js_baseline.elementMissNoted`). At compile time
   `jit_runtime.missedSites` adds the function's noted element instructions to the sites it
-  keeps general, so they get the helper and the step from the first compile. This is
+  keeps general, so they get the helper and the step from the first compile. Field reads
+  and stores note their site where they ask for a getter or a setter
+  (`baselineGetter`, `baselineSetter`), which the optimizer's field helpers decline too,
+  and an add notes its site where it joins a string (`baseline.noteSite`, before
+  `SERVICE_CONCAT`); such an add is named twice in the sites, so the optimizer joins
+  there from the start (`concatenates`) instead of guessing int32, then double. This is
   feedback from baseline code in its smallest form: one word written on a path that already
   calls into the engine, nothing in the fast path and nothing in the interpreter.
 - `put.key` with an Int key stores over an element of a fast Array inline, as `put.elem`
@@ -591,7 +596,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (57 scripts) through
+- `modules/jit/tests/baseline/*.js` (58 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -618,7 +623,8 @@ again and the interpreter steps it.
   `t56` object and array literals, `__proto__` literals and rest parameters while an accessor
   appears on `Object.prototype` and the prototype is a primitive or has a getter, `t57`
   element reads and stores by index past the end, at holes, on strings, plain objects and
-  typed arrays, and under index accessors on the prototypes.
+  typed arrays, and under index accessors on the prototypes, `t58` adds that join strings
+  at sites that also add numbers, doubles, objects with `valueOf` and values that throw.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
