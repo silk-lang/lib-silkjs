@@ -711,9 +711,11 @@ opcode, service calls and direct calls per order.
   handle. The benchmarks step most on the `regexp` literal (RegExp), on `get_length`,
   `special_object` and element reads (EarleyBoyer), on element reads and stores outside the
   fast case (Crypto) and on `mod` (RayTrace).
-- Each function's code starts on a page of its own, and the cold half of it (step requests,
-  resume tables, exits, finish tails) sits between the templates' pages. Packed pages and a
-  cold region would cut what an order touches further (On the clock).
+- The cold half of a function's code (step requests, resume tables, exits, finish tails)
+  sits between its templates. A cold region would cut what an order touches further (On the
+  clock). Functions no longer start on pages of their own: all code is published packed
+  (`CodeMemory.allocatePacked`), each block at the next cache line after the last, so
+  blocks share pages and their entry points do not all fall in the same cache sets.
 - A call between baseline code and an interpreted function goes through the engine in both
   directions, about 240 ns, so a program that is half compiled pays for the seam.
 - A call that leaves baseline code for a native, a construction or a callee without code
