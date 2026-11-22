@@ -471,9 +471,12 @@ Every such round compiles a function again, and on DeltaBlue at `--jit-opt=20` c
 is about 8 percent of the run. Two kinds of site are widened from the first compilation,
 where an exit is certain or likely:
 
-- A `+` with a string constant operand (`"v" + i`) is the engine's concatenation at once.
-  It used to leave as an int32 add, then again as a double add, before it was stepped: two
-  recompiles of the function per site.
+- A `+` with a string operand (`"v" + i`, or what a concatenation made) is the engine's
+  concatenation at once. It used to leave as an int32 add, then again as a double add,
+  before it was stepped: two recompiles of the function per site. `s += text` (`add_loc`)
+  joins into the local the same way; it leaves where neither is a string, for a step would
+  store into the frame's local behind the code's. It had no concatenation before: on the
+  HTTP service a `local += "literal"` site recompiled its function in the steady state.
 - A field store whose inline key is an add key (its last run added the property) is the
   helper call with a step behind it, which adds in place first as `put.field` does. A
   constructor run for several subclasses (`BinaryConstraint` through
@@ -565,7 +568,9 @@ function every six orders.
   code that inlines it.
 - **A length the inline test does not answer** goes to baseline code's length helper
   (`js_vm_property_ops.quickLength`: a typed array's, a plain `length` property) before it
-  leaves, and a site that left before steps what that declines (a getter). The parser
+  leaves, and a site that left before steps what that declines (a getter). A borrowed
+  length (`ssa_opt_borrow`) takes the same helper and gives the count back, where it used
+  to have the jit helper, which knows strings and Arrays only, and leave. The parser
   path reads `buf[buf.length - 1]` of a `Uint8Array`.
 - **`this` in strict code** is not tested to be an object again once something else made
   the code leave there: strict code takes the receiver as it is.
@@ -618,7 +623,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (62 scripts) through
+- `modules/jit/tests/baseline/*.js` (64 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -655,8 +660,10 @@ again and the interpreter steps it.
   method reads on strings, numbers and booleans while the prototypes' methods are
   replaced, made getters, deleted and shadowed, `t62` string literals as values, keys,
   results that outlive their call and operands, own and inlined, while their functions
-  are replaced.
-- `silk test` in `modules/jit`: 94 tests.
+  are replaced, `t63` concatenation into locals of literals, numbers, objects whose
+  conversion runs or throws, `t64` lengths of typed arrays, `arguments`, plain objects whose
+  length is a number, a string or an object, and a getter that throws.
+- `silk test` in `modules/jit`: 97 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
   in `modules/engine` after its release build, and the interpreter's instruction counts on
