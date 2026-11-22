@@ -489,7 +489,10 @@ stays a call in that code for good, since no exit there teaches a later compile 
 target. The first optimization waits for it, at most twice (`UNSEEN_WAITS`), four times
 longer each time, while baseline code runs it: in DeltaBlue, `addConstraintsConsumingTo`
 runs `c.isSatisfied()` and `coll.add(c)` only once a variable has a constraint besides
-the one that determines it.
+the one that determines it. A wait that ran none of them is the last (`BaselineInfo.unseen`):
+those calls are on paths the function does not take, and in the HTTP service per-request
+functions with such calls waited 500, 2,000 and 8,000 entries, some ten
+thousand requests, before their first compile.
 
 A method read whose value is held through an inlined call's arms (`this.take(d.out(), k)`
 with `d.out()` a chain) reaches the call as the parameter of the block where the arms
