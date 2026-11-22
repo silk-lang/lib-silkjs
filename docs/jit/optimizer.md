@@ -590,7 +590,8 @@ What is stepped:
   the call area's two cells. A call the stub declines or that threw leaves at the read's
   exit, as a call does. Such a read is a call for the register allocator: baseline code's
   r14 and r15 do not survive it. On the HTTP service these were most of the 34 field steps
-  per order.
+  per order. A store that finds a function setter (`SITE_PUT_FIELD` past its helper) calls
+  it the same way with the value as its argument and drops its result (`setterCall`).
 - A store and an equality that left before (`SITE_PUT_FIELD`, `SITE_EQUAL`): the helper
   first, the step for a setter, a new property, a coercion.
 
@@ -605,7 +606,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (59 scripts) through
+- `modules/jit/tests/baseline/*.js` (60 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -636,7 +637,9 @@ again and the interpreter steps it.
   at sites that also add numbers, doubles, objects with `valueOf` and values that throw,
   `t59` getters that optimized code calls (on the prototype and own, reading other getters,
   recursing into the reader, throwing, native ones) while one is replaced, made a data
-  property or a throwing one, and a primitive or a proxy takes the object's place.
+  property or a throwing one, and a primitive or a proxy takes the object's place, `t60`
+  setters that optimized code calls while one is replaced, throws or becomes a data
+  property, an object is frozen and a proxy with a set trap takes an object's place.
 - `silk test` in `modules/jit`: 94 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
