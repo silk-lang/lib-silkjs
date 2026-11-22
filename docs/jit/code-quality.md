@@ -91,6 +91,27 @@ earlier code of the function deoptimized at (`jit_recompile` sites) is not hoist
 the guard stays in the loop, the next deopt names the instruction, and the compilation
 after that widens it.
 
+**Counters that enter boxed.** A header parameter the loop unboxes as an i32 on every
+iteration and passes back as `box.i32` of a number (an index, a counter, an accumulator)
+would still be a boxed value if its entry value is no box, typically an argument: the
+ownership pass unboxes only parameters fed by boxes. So the pass puts that unbox on the
+entry edge too, with the moved guards' exit, and has the edge pass `box.i32` of its
+number; the ownership pass then runs again (`ssa_opt.pipeline`) and unboxes the parameter,
+which ends the boxing at the latch and the unbox at the top of each iteration
+(`ssa_tests.argumentCounterUnboxedOnEntry`; Crypto's `am3` carries `i`, `j` and `c` so).
+The entry unbox takes a Float64 holding an exact int32 too (`ssa.UNBOX_EXACT`, x64_backend):
+a value of double arithmetic that is an integer runs the loop as an Int instead of failing
+in front of it. What it refuses exits at the header and costs the one more compile above.
+The latch's state names a box's number where the latch passes the box (an exit writes
+`int x` for `box.i32 x`), and the entry state maps such a slot through the box.
+
+**Locals a block does not read.** An edge passes a local as `undefined` when no path from
+its target's offset reads the local before writing it (the translator's liveness), and its
+value holds no count (a number, an immediate, a borrow: an owned value would need a release
+on the edge alone). A temporary written at the top of each iteration (`var l = a[i]`) was a
+header parameter for its exits only, boxed at every latch; a loop counter dead after the
+loop was passed to the exit block. Both go.
+
 ## Exits name the unboxed number
 
 After `u = unbox.i32 v` passed, `v` is an Int and `u` is its number. An exit later in the
@@ -101,6 +122,14 @@ the ownership rules count that), and only exits one instruction uses: an exit sh
 instruction in front of the unbox (the front block of a hoist) runs before `u` exists.
 
 ## In the backend
+
+- **Constant operands are immediates.** `and`, `or` and `xor` with a constant, and
+  shifts by a constant, read it as an immediate (`sar eax, 28`); such a shift needs no
+  `cl` and no save of `rcx`; `x >>> c` with a count that is not 0 has no sign test, as its
+  result is below 2^31. `mul.i32` by a positive constant is `imul` with an immediate and
+  no -0 test. A `const.i32` takes no register (x64_regalloc): its readers take it as an
+  immediate, or from its slot, so the three integer registers of code on a baseline frame
+  go to values.
 
 - **`add.i32` and `sub.i32` in place.** When the result takes the first operand's register
   the operation runs there, two instructions where there were four. The exit state reads

@@ -3,7 +3,7 @@
 
 Runs the JIT shell once under callgrind (--dump-instr=yes) with --jit-dump, maps the executed
 instruction addresses onto the code blocks the dump places (`jit: code at <address> <bytes>`,
-`jit: osr code at ...`) and prints, hottest first, each block's share and its disassembly with
+`jit: osr code at ...`, `jit: optimized code at ...`, `jit: baseline code at ...`) and prints, hottest first, each block's share and its disassembly with
 an execution count per instruction. Compiled code lives in an anonymous mapping, so no symbol
 tool sees it; the dump is what names it.
 
@@ -84,10 +84,11 @@ def parse_dump(path):
                 else:
                     ssa.append(line.rstrip("\n"))
                     continue
-            match = re.match(r"jit: (osr )?code at (\d+) ([0-9a-f]+)", line)
+            match = re.match(r"jit: (osr |optimized |baseline )?code at (\d+) ([0-9a-f]+)", line)
             if match:
+                kind = {"osr ": "osr", "optimized ": "optimized", "baseline ": "baseline"}.get(match.group(1), "entry")
                 blocks.append({"address": int(match.group(2)), "bytes": bytes.fromhex(match.group(3)),
-                               "kind": "osr" if match.group(1) else "entry", "bytecode": bytecode, "ssa": list(ssa)})
+                               "kind": kind, "bytecode": bytecode, "ssa": list(ssa)})
     return blocks
 
 

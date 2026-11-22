@@ -635,7 +635,7 @@ again and the interpreter steps it.
 
 ## Checks
 
-- `modules/jit/tests/baseline/*.js` (65 scripts) through
+- `modules/jit/tests/baseline/*.js` (66 scripts) through
   `modules/jit/scripts/baseline_scripts.py <shell>`: each script's output and exit status under
   baseline and under the optimizer at three thresholds against the interpreter's. `t30` and
   `t31` cover shape misses and recompiles, `t32` steps and throws inside them, `t33`
@@ -676,8 +676,10 @@ again and the interpreter steps it.
   conversion runs or throws, `t64` lengths of typed arrays, `arguments`, plain objects whose
   length is a number, a string or an object, and a getter that throws, `t65` method reads
   on strings, numbers and booleans and sites that see a primitive and an object, while the
-  prototypes' methods are replaced, deleted and made getters.
-- `silk test` in `modules/jit`: 97 tests.
+  prototypes' methods are replaced, deleted and made getters, `t66` integer operations with
+  a constant operand (shift counts 0 to 33, `x >>> 0` of a negative, overflowing constant
+  products, -0) in Crypto's am3 loop.
+- `silk test` in `modules/jit`: 98 tests.
 - `modules/engine/scripts/differential.py --configs plain,baseline,opt,opt-eager`.
 - For a change in the engine (the watch bits, the slot writers): `python3 scripts/check.py`
   in `modules/engine` after its release build, and the interpreter's instruction counts on

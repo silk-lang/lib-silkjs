@@ -33,8 +33,8 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.usize
 import silk.core.option { Option }
-import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
-import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS }
+import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS, UNBOX_EXACT }
 import ssa_verify { readsA, readsB }
 import ssa
 import value_layout { ValueLayout }
@@ -284,6 +284,21 @@ pub effect fn lower(function: &Function, settings: Settings) -> Lowering ! OutOf
 /// the entry of the function's baseline code, its `stepEnded` tail and its construct entry,
 /// then the inline targets (FRAME_SYMBOLS on). The code has a construct entry of its own
 /// (Lowering.Code.construct).
+/// Whether inst reads its second operand, when that is a constant, as an immediate.
+fn immediateOperand(function: &Function, inst: Inst) -> bool {
+  let op = inst.op
+  if op == Op.Add || op == Op.Sub || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.Shl || op == Op.Sar || op == Op.Shr { return true }
+  if op == Op.Mul {
+    let def = function.value(inst.b).def
+    return def != NONE && function.inst(def).op == Op.ConstI32 && function.inst(def).k > 0
+  }
+  return false
+}
+/// The constant when it is positive, else 0.
+fn positiveConstant(constant: Option<i32>) -> i32 {
+  return match constant { Option<i32>.Some { value } => if value > 0 { value } else { 0 } Option<i32>.None => 0 }
+}
 pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FramePlan, code: &[u8], shapes: Shapes) -> Lowering ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
   let mut methods = List<u32>.make()
   let mut i: usize = 0
@@ -678,6 +693,35 @@ impl Emitter {
         return ()
       }
       let tag = self.settings.layout.int()
+      if inst.k == UNBOX_EXACT {
+        // An Int, or a Float64 that is exactly an int32 and not -0 (the interpreter's numbers
+        // are one kind): a loop's entry guard (ssa_opt_hoist), for a value made by double
+        // arithmetic, which the loop's own unbox of it would have taken as a double add.
+        let floatTag = self.settings.layout.float64()
+        let float = run self.a.label()
+        let done = run self.a.label()
+        let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+        run self.unlessTag(inst.a, tag, float)
+        run self.a.load(Width.W32, Reg.Rax, payloadOf(inst.a))
+        run self.a.jmp(done)
+        self.a.bind(float)
+        run self.unlessTag(inst.a, floatTag, exit)
+        run self.a.loadDouble(Xmm.Xmm0, payloadOf(inst.a))
+        run self.a.doubleToInt(Width.W32, Reg.Rax, Xmm.Xmm0)
+        run self.a.intToDouble(Width.W32, Xmm.Xmm1, Reg.Rax)
+        run self.a.packed(PackedOp.Ucomisd, Xmm.Xmm0, Xmm.Xmm1)
+        run self.a.jcc(Cond.Parity, exit)
+        run self.a.jcc(Cond.NotEqual, exit)
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.NotEqual, done)
+        run self.a.load(Width.W64, Reg.R8, payloadOf(inst.a))
+        run self.a.test(Width.W64, Reg.R8, Reg.R8)
+        run self.a.jcc(Cond.Sign, exit)
+        self.a.bind(done)
+        run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+        let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
+        return ()
+      }
       run self.tagGuard(inst.a, tag, inst.exit)
       // A 32-bit load zero-extends: the place holds the i32.
       let out = self.at(inst.result)
@@ -782,6 +826,17 @@ impl Emitter {
       let place102 = self.at(inst.result) run putI32(&mut self.a, place102, Reg.Rax)
       return ()
     }
+    if op == Op.Mul && inst.b != NONE && positiveConstant(self.constants.get(u32.toUsize(inst.b))) > 0 {
+      // By a positive constant: no -0, for a zero product has a zero first operand.
+      let factor = positiveConstant(self.constants.get(u32.toUsize(inst.b)))
+      let place = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place)
+      run self.stressGuard(inst.exit)
+      run self.a.imulImm(Width.W32, Reg.Rax, Reg.Rax, factor)
+      run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
+      run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+      let out = self.at(inst.result) run putI32(&mut self.a, out, Reg.Rax)
+      return ()
+    }
     if op == Op.Mul {
       let place5 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place5)
       let place6 = self.at(inst.b) run getI32(&mut self.a, Reg.R8, place6)
@@ -863,6 +918,9 @@ impl Emitter {
       let place9 = self.at(inst.a) run getBits(&mut self.a, Reg.Rax, place9)
       run self.boxDoubleInto(Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
       return ()
+    }
+    if (op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr) && inst.b != NONE {
+      if let Option<i32>.Some { value } = self.constants.get(u32.toUsize(inst.b)) { run self.withImmediate(inst, value) return () }
     }
     if isNumberOp(op) || op == Op.ConstF64 {
       let mut exit = self.blockLabels.get(0)
@@ -2136,7 +2194,7 @@ impl Emitter {
       if readsK(inst.op) { self.read(i32.wrappingToU32(inst.k)) }
       if inst.b != NONE && inst.b < function.valueCount() {
         self.read(inst.b)
-        if (inst.op == Op.Add || inst.op == Op.Sub || inst.op == Op.Cmp) && self.constant(&function, inst.b) {
+        if immediateOperand(&function, inst) && self.constant(&function, inst.b) {
           let at = u32.toUsize(inst.b)
           let before = self.immediateUses.get(at)
           self.immediateUses.set(at, before + 1)
@@ -2540,6 +2598,29 @@ impl Emitter {
     run self.operate(Alu.Cmp, dst, compare.b)
   }
   /// dst = dst op b, with b an immediate when it is a constant.
+  /// A bitwise operation or a shift of inst.a by the constant value: an immediate operand,
+  /// or a count of its own (JavaScript takes it modulo 32).
+  effect fn withImmediate(self: &mut Self, inst: Inst, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let op = inst.op
+    let place = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place)
+    if op == Op.BitAnd { run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, value) }
+    else if op == Op.BitOr { run self.a.aluImm(Alu.Or, Width.W32, Reg.Rax, value) }
+    else if op == Op.BitXor { run self.a.aluImm(Alu.Xor, Width.W32, Reg.Rax, value) }
+    else {
+      let count = i32.wrappingToU8(value & 31)
+      let mut shift = Shift.Shl
+      if op == Op.Sar { shift = Shift.Sar } else if op == Op.Shr { shift = Shift.Shr }
+      if count != 0 { run self.a.shiftImm(shift, Width.W32, Reg.Rax, count) }
+      else if op == Op.Shr {
+        // `x >>> 0` of a negative x is past the int32 maximum: a double in the interpreter.
+        // A nonzero count leaves the sign bit clear.
+        run self.stressGuard(inst.exit)
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.Sign, self.exitLabels.get(u32.toUsize(inst.exit)))
+      }
+    }
+    let out = self.at(inst.result) run putI32(&mut self.a, out, Reg.Rax)
+  }
   effect fn operate(self: &mut Self, alu: Alu, dst: Reg, b: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     match self.constants.get(u32.toUsize(b)) {
       Option<i32>.Some { value } => { run self.a.aluImm(alu, Width.W32, dst, value) return () }

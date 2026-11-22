@@ -38,7 +38,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Own, RootKind, Op, Type, SlotMode, NONE, FIELD_STEPS, edgeCount, readsK, steppedRead }
+import ssa { Function, Exit, Own, RootKind, Op, Type, SlotMode, NONE, FIELD_STEPS, UNBOX_EXACT, edgeCount, readsK, steppedRead }
 import ssa_translate { FunctionInput }
 import ssa_shapes { fieldAtom }
 import silkjs.js_atom_data as atoms
@@ -142,7 +142,7 @@ fn has(list: &List<u32>, value: u32) -> bool {
 /// Moves what the module comment lists out of every loop of a compacted function, one loop
 /// level per call. Answers whether anything moved; the caller compacts, and may call again
 /// to move instructions out of the next loop around.
-pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>, unboxedEntries: &mut bool) -> bool ! OutOfMemoryError ? &mut Allocator {
   let blockCount = f.blockCount()
   // Any retreating edge at all? Most functions have no loop.
   let mut loops = false
@@ -301,55 +301,11 @@ pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>) 
         if ok && readsB(op) { ok = outside(&f.*, &member, &moved, serial, inst.b) }
         if ok && readsK(op) { ok = outside(&f.*, &member, &moved, serial, i32.wrappingToU32(inst.k)) }
         if ok && guard && frontExit == NONE {
-          // The state at the header as the entry edge carries it. A slot holds what the latch
-          // passes back to some parameters, and then takes what the entry edge passes them,
-          // or one value around the loop. A value the latch passes that also stays in a
-          // slot of its own, or passes to parameters the entry edge gives different values,
-          // leaves the slots ambiguous.
-          let paramCount = f.blocks.get(u32.toUsize(h)).paramCount
-          let incoming = f.edge(entry)
-          let returning = f.edge(back)
-          if incoming.argCount != paramCount || returning.argCount != paramCount { ok = false }
-          let slots = f.slotCount(state)
-          entryArgs.clear()
-          let mut s: u32 = 0
-          while ok && s < slots {
-            let v = f.slot(state, s).value
-            let mut mapped = NONE
-            let mut passed: u32 = 0
-            let mut p: u32 = 0
-            while p < paramCount {
-              if f.edgeArg(returning, p) == v {
-                passed = passed + 1
-                let given = f.edgeArg(incoming, p)
-                if mapped == NONE { mapped = given } else if mapped != given { ok = false }
-              }
-              p = p + 1
-            }
-            if passed == 0 {
-              if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
-              mapped = v
-            } else {
-              let mut held: u32 = 0
-              let mut t: u32 = 0
-              while t < slots { if f.slot(state, t).value == v { held = held + 1 } t = t + 1 }
-              if held != passed { ok = false }
-            }
-            run entryArgs.append(mapped)
-            s = s + 1
-          }
-          f.work = f.work + u32.toU64(slots) * u32.toU64(paramCount + slots)
+          let incoming = entryEdge(&f.*, entry, front)
+          ok = run entryState(&mut f, &member, serial, state, incoming, back, &mut entryArgs)
           if !ok { stop = true break }
           if front == NONE { front = run split(&mut f, entry, h) }
-          drop run f.exitFor(i, state.pc, state.stackDepth)
-          frontExit = f.inst(i).exit
-          // The function's slots, the inlined bodies' frames, then their slots.
-          let outer = slots - state.inner
-          s = 0
-          while s < outer { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
-          let mut n: u32 = 0
-          while n < state.frames { let frame = f.exitFrame(state, n) run f.frameAt(frame) n = n + 1 }
-          while s < slots { run f.innerAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+          frontExit = run entryExit(&mut f, i, state, &entryArgs)
         }
         if ok {
           if front == NONE { front = run split(&mut f, entry, h) }
@@ -377,9 +333,145 @@ pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>) 
       }
       b = b + 1
     }
+    // A parameter the loop unboxes on every turn and passes back as a box of an i32 (a
+    // counter, an index, an accumulator) whose entry value is no box (an argument): its
+    // unbox goes onto the entry edge too, with the guards' exit, and the edge passes the
+    // number boxed, so that the ownership pass unboxes the parameter (unboxParams) and the
+    // loop stops boxing it at its latch. The entry unbox takes a Float64 holding an exact
+    // int32 as well (UNBOX_EXACT): the loop runs on it as on an Int. A value it refuses (a
+    // fraction, a string) exits at the header, which teaches a recompile nothing to widen;
+    // the next compile keeps the guard in the loop (the header is among its sites) and
+    // learns there, one compile later than a guard left in the loop would have.
+    let header = f.blocks.get(u32.toUsize(h))
+    let mut g: u32 = 0
+    while !stop && g < header.paramCount {
+      let p = f.paramAt(header, g)
+      let returned = f.edgeArg(f.edge(back), g)
+      let into = entryEdge(&f.*, entry, front)
+      if f.value(p).ty == Type.Value && defOp(&f.*, returned) == Op.BoxI32 && f.edge(into).argCount == header.paramCount {
+        let given = f.edgeArg(f.edge(into), g)
+        if f.value(given).ty == Type.Value && defOp(&f.*, given) != Op.BoxI32 && unboxedAlways(&f.*, &graph.idom, &member, serial, h, lastLatch, common, p) {
+          if frontExit == NONE && !run entryState(&mut f, &member, serial, state, into, back, &mut entryArgs) { stop = true }
+          if !stop {
+            if front == NONE { front = run split(&mut f, entry, h) }
+            let pc = f.inst(f.blocks.get(u32.toUsize(h)).firstInst).pc
+            let number = run f.emit(front, Op.Unbox, true, Type.I32, Own.Unboxed, given, NONE, UNBOX_EXACT, pc)
+            let unbox = f.lastInst()
+            let mut made = f.inst(unbox) made.order = order made.frame = 0 f.setInst(unbox, made)
+            order = order + 2
+            if frontExit == NONE { frontExit = run entryExit(&mut f, unbox, state, &entryArgs) }
+            else { made = f.inst(unbox) made.exit = frontExit f.setInst(unbox, made) }
+            let boxed = run f.emit(front, Op.BoxI32, true, Type.Value, Own.Imm, number, NONE, 0, pc)
+            let box = f.lastInst()
+            made = f.inst(box) made.order = order made.frame = 0 f.setInst(box, made)
+            order = order + 2
+            let through = entryEdge(&f.*, entry, front)
+            let edge = f.edge(through)
+            f.setEdgeArg(edge.firstArg + g, boxed)
+            changed = true
+            unboxedEntries.* = true
+          }
+        }
+      }
+      g = g + 1
+    }
   }
   if changed { run fixSlots(&mut f) }
   return changed
+}
+
+/// The number v boxes (box.i32, box.bool, box.f64), or NONE.
+fn boxedFrom(f: &Function, v: u32) -> u32 {
+  let op = defOp(f, v)
+  if op == Op.BoxI32 || op == Op.BoxBool || op == Op.BoxF64 { return f.inst(f.value(v).def).a }
+  return NONE
+}
+fn defOp(f: &Function, v: u32) -> Op {
+  if v == NONE || u32.toUsize(v) >= f.values.length() { return Op.Removed }
+  let def = f.value(v).def
+  if def == NONE { return Op.Removed }
+  return f.inst(def).op
+}
+/// The edge that carries the loop's entry arguments: `entry`, or once the entry edge was split
+/// (front), the new block's jump to the header.
+fn entryEdge(f: &Function, entry: u32, front: u32) -> u32 {
+  if front == NONE { return entry }
+  // The block is new, not compacted: its instructions are found by their block.
+  let mut i: usize = 0
+  let mut last = NONE
+  while i < f.insts.length() { let inst = f.insts.get(i) if inst.block == front && inst.op == Op.Jump { last = inst.edge } i = i + 1 }
+  return last
+}
+/// Whether a block of the loop `serial` marks (h to last) that runs on every turn (it
+/// dominates the latches' common dominator) unboxes p as an i32.
+fn unboxedAlways(f: &Function, idom: &List<u32>, member: &List<u32>, serial: u32, h: u32, last: u32, common: u32, p: u32) -> bool {
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Unbox && inst.a == p && inst.block >= h && inst.block <= last && member.get(u32.toUsize(inst.block)) == serial
+      && dominates(idom, inst.block, common) { return true }
+    i = i + 1
+  }
+  return false
+}
+/// The state at loop header h as edge `incoming` carries it, into entryArgs, from `state` (a
+/// latch's poll: the state the back edge carries). A slot holds what the latch passes back to
+/// some parameters, and then takes what the entry edge passes them, or one value around the
+/// loop. A value the latch passes that also stays in a slot of its own, or passes to
+/// parameters the entry edge gives different values, leaves the slots ambiguous: false.
+effect fn entryState(f: &mut Function, member: &List<u32>, serial: u32, state: Exit, incoming: u32, back: u32, entryArgs: &mut List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  let into = f.edge(incoming)
+  let returning = f.edge(back)
+  let paramCount = f.blocks.get(u32.toUsize(into.target)).paramCount
+  if into.argCount != paramCount || returning.argCount != paramCount { return false }
+  let slots = f.slotCount(state)
+  entryArgs.clear()
+  let mut ok = true
+  let mut s: u32 = 0
+  while ok && s < slots {
+    let v = f.slot(state, s).value
+    let mut mapped = NONE
+    let mut passed: u32 = 0
+    let mut p: u32 = 0
+    while p < paramCount {
+      // An exit names a box's number (ssa_ownership); the latch passes the box.
+      let back = f.edgeArg(returning, p)
+      if back == v || boxedFrom(&f.*, back) == v {
+        passed = passed + 1
+        let given = f.edgeArg(into, p)
+        if mapped == NONE { mapped = given } else if mapped != given { ok = false }
+      }
+      p = p + 1
+    }
+    if passed == 0 {
+      if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
+      mapped = v
+    } else {
+      let mut held: u32 = 0
+      let mut t: u32 = 0
+      while t < slots { if f.slot(state, t).value == v { held = held + 1 } t = t + 1 }
+      if held != passed { ok = false }
+    }
+    run entryArgs.append(mapped)
+    s = s + 1
+  }
+  f.work = f.work + u32.toU64(slots) * u32.toU64(paramCount + slots)
+  return ok
+}
+/// Gives instruction i an exit at the header: state's pc and frames, entryArgs its slots.
+effect fn entryExit(f: &mut Function, i: u32, state: Exit, entryArgs: &List<u32>) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  drop run f.exitFor(i, state.pc, state.stackDepth)
+  let exit = f.inst(i).exit
+  // The function's slots, the inlined bodies' frames, then their slots.
+  let slots = f.slotCount(state)
+  let outer = slots - state.inner
+  let mut s: u32 = 0
+  while s < outer { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+  let mut n: u32 = 0
+  while n < state.frames { let frame = f.exitFrame(state, n) run f.frameAt(frame) n = n + 1 }
+  while s < slots { run f.innerAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+  return exit
 }
 
 /// The `inline.frame` of the loop `serial` marks (blocks h to last) that names the closure of
