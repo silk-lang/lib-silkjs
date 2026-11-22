@@ -274,6 +274,11 @@ general read and the tests, which are still there. An argument worked out betwee
 and the call (`o.run(i & 15)`) is code in between and keeps the tests; the scheduler's
 `this.currentTcb.run()` and a call whose arguments are at hand dispatch.
 
+An arm whose method is known for one receiver shape starts with `check.shape` of the
+receiver, which the dispatch has just proved: the dispatch jumps past it, also when the
+arm's `inline.frame`s (no code) stand before it (`armShapeAt`). In DeltaBlue's plan loop that
+test ran every turn before.
+
 Larger bodies without the chain were slower (342 ms against 239): the last target of
 `task.run` was inlined behind a `check.callee` inside `run` inside `schedule`, the test failed
 for three tasks in four, and each failure left `schedule` in baseline code for the rest of its
@@ -352,6 +357,19 @@ that much with no change on its path is the compiler's layout, not the change.
 compiled code knows: assignment, `defineProperty`, a getter, deletion, `Object.assign`,
 `Reflect.set`, a swap between two prototypes, an own method on the receiver, another
 prototype, one in between, a method that replaces itself while its caller's loop runs.
+
+## Array push in place
+
+A method call under the name of Array.prototype's push whose callee is that native
+(`arrayCall`) pushes in place when it can (`pushInPlace`, as `arraySupport.pushInto` does):
+the receiver is a fast Array, extensible and not watched, of a fresh array's shape
+(`js_compiled_inline.arrayShapeVersion`, in `Function.arrayShape`: `length` is its writable
+slot 0, the realm's Array.prototype its prototype), the prototype still leaves element
+reads to arrays' own elements (`ObjectData.isStandardArrayPrototype`), the length is the
+element count and the elements have room for one more. The element takes a count of its
+own and a heap value clears the plain flag (`FieldLayout.elementMeta`, `elementPlain`,
+`standardPrototype`). About 40 instructions where the helper and `pushOne` were about 100;
+a push that needs more room goes to the helper and the engine as before.
 
 ## Watched records
 

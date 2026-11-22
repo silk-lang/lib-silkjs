@@ -1069,7 +1069,7 @@ impl Emitter {
         run self.a.aluStoreImm(Alu.Cmp, Width.W64, Mem.at(Reg.Rax, u32.wrappingToI32(fields.shapeVersion)), inst.k)
         run self.a.jcc(Cond.NotEqual, miss)
       }
-      if function.blocks.get(u32.toUsize(inst.block)).firstInst == self.cursor { self.a.bind(self.armLabels.get(u32.toUsize(inst.block))) }
+      if armShapeAt(&function, inst.block) == self.cursor { self.a.bind(self.armLabels.get(u32.toUsize(inst.block))) }
       return ()
     }
     if op == Op.CheckWatched {
@@ -2201,6 +2201,7 @@ impl Emitter {
     run self.a.movSymbol(Reg.R10, object)
     run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R10, Mem.at(base, callee + 8))
     run self.a.jcc(Cond.NotEqual, general)
+    if native == calls.NATIVE_PUSH { run self.pushInPlace(function, base, callee, inst.result, done) }
     // A fast Array that needs no more room: the helper's, with no service.
     run self.a.lea(Width.W64, Reg.Rsi, Mem.at(base, callee - 16))
     if native == calls.NATIVE_POP {
@@ -2226,6 +2227,75 @@ impl Emitter {
     run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rdx)
     run self.a.jmp(done)
     self.a.bind(general)
+  }
+  /// `push` of the one argument after the callee's cell at base + callee onto the receiver
+  /// in the cell before it, in place, as arraySupport.pushInto does it: when the receiver is
+  /// a fast Array that is extensible and not watched, of a fresh array's shape
+  /// (Function.arrayShape: `length` is its writable slot 0, of the realm's prototype), whose
+  /// prototype leaves element reads to arrays' own elements, whose length is its element
+  /// count and whose elements have room for one more. The element takes a count of its own
+  /// (the cell keeps the code's), a heap value clears the plain flag, and the new length is
+  /// the result, then `done`. Anything else falls through to the helper.
+  effect fn pushInPlace(self: &mut Self, function: &Function, base: Reg, callee: i32, result: u32, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let fields = self.fields
+    let layout = self.settings.layout
+    if function.arrayShape == 0 || fields.objectClass != fields.objectFlags + 2 || fields.arrayClass >= 65536 || fields.fastArray >= 256 || fields.extensibleFlag >= 256 { return () }
+    let slow = run self.a.label()
+    let plainKept = run self.a.label()
+    run self.loadTag(Reg.R8, Mem.at(base, callee - 16 + u32.wrappingToI32(layout.tagOffset)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.load(Width.W64, Reg.R11, Mem.at(base, callee - 8))
+    // Class Array with the fast-array and extensible flags: the flags byte and the 16-bit
+    // class share one 32-bit word (as elementSlot tests them).
+    let flags = u32.bitOr(fields.fastArray, fields.extensibleFlag)
+    run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)))
+    run self.a.aluImm(Alu.And, Width.W32, Reg.R8, u32.wrappingToI32(u32.bitOr(0xffff0000, flags)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(u32.bitOr(u32.shiftLeft(fields.arrayClass, 16), flags)))
+    run self.a.jcc(Cond.NotEqual, slow)
+    // Writing slot 0 ends a watch (setSlot): a watched array is the helper's.
+    run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectRoles)), u32.wrappingToU8(fields.watched))
+    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectShape)))
+    run self.a.aluStoreImm(Alu.Cmp, Width.W64, Mem.at(Reg.R10, u32.wrappingToI32(fields.shapeVersion)), u32.wrappingToI32(function.arrayShape))
+    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R10, u32.wrappingToI32(fields.shapePrototype)))
+    run self.a.test(Width.W64, Reg.R10, Reg.R10)
+    run self.a.jcc(Cond.Equal, slow)
+    run self.a.test8MemImm(Mem.at(Reg.R10, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.standardPrototype))
+    run self.a.jcc(Cond.Equal, slow)
+    // The length, an Int in slot 0, is the element count, and there is room for one more.
+    run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectSlots)))
+    run self.loadTag(Reg.R8, Mem.at(Reg.R9, u32.wrappingToI32(layout.tagOffset)))
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R9, 8))
+    run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.Rax, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)))
+    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.load(Width.W32, Reg.Rcx, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementMeta)))
+    run self.a.aluImm(Alu.And, Width.W32, Reg.Rcx, u32.wrappingToI32(fields.capacityMask))
+    run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.Rcx)
+    run self.a.jcc(Cond.AboveOrEqual, slow)
+    // The element's own count; a heap value makes the elements not plain (noteStored).
+    run self.a.load(Width.W64, Reg.Rdx, Mem.at(base, callee + 16))
+    run self.a.load(Width.W64, Reg.Rsi, Mem.at(base, callee + 24))
+    run self.heapTest(Reg.Rdx, plainKept)
+    run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.Rsi, 0), 1)
+    run self.a.alu(Alu.Xor, Width.W32, Reg.Rcx, Reg.Rcx)
+    run self.a.store8(Mem.at(Reg.R11, u32.wrappingToI32(fields.elementPlain)), Reg.Rcx)
+    self.a.bind(plainKept)
+    run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.elements)))
+    run self.a.mov(Width.W32, Reg.Rcx, Reg.Rax)
+    run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rcx, 4)
+    run self.a.alu(Alu.Add, Width.W64, Reg.R8, Reg.Rcx)
+    run self.a.store(Width.W64, Mem.at(Reg.R8, 0), Reg.Rdx)
+    run self.a.store(Width.W64, Mem.at(Reg.R8, 8), Reg.Rsi)
+    run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)), 1)
+    run self.a.aluImm(Alu.Add, Width.W32, Reg.Rax, 1)
+    run self.a.store(Width.W64, Mem.at(Reg.R9, 8), Reg.Rax)
+    run self.boxInto(false, Reg.Rax, Reg.Rsp, result * SLOT_BYTES)
+    run self.a.jmp(done)
+    self.a.bind(slow)
   }
   /// The tests of a known method's shapes for inline target k, with the shape's version in
   /// R8 (or proved to be `proven`, when not 0): falls through when the object has one of
@@ -2296,11 +2366,12 @@ impl Emitter {
   }
   /// Whether `block`, an arm of a shape dispatch for inline target k (knownArms) on the
   /// object in `object`'s storage, begins with the `check.shape` of that object for k's one
-  /// shape: the dispatch proved it, and goes past it (armLabels).
+  /// shape (after `inline.frame`s, which make no code): the dispatch proved it, and goes
+  /// past it (armLabels).
   fn armEntry(self: &Self, function: &Function, block: u32, object: u32, k: u32) -> bool {
-    let here = function.blocks.get(u32.toUsize(block))
-    if here.instCount == 0 { return false }
-    let first = function.inst(here.firstInst)
+    let at = armShapeAt(function, block)
+    if at == NONE { return false }
+    let first = function.inst(at)
     if first.op != Op.CheckShape || self.storage(first.a) != object { return false }
     let shapes = function.inlineShapes.get(u32.toUsize(k)).shapes
     return shapes[1] == 0 && u32.wrappingToI32(shapes[0]) == first.k
@@ -4284,4 +4355,14 @@ fn condition(k: i32) -> Cond {
   if k == 3 { return Cond.GreaterOrEqual }
   if k == 4 { return Cond.Equal }
   return Cond.NotEqual
+}
+
+/// The first instruction of block b that is not an `inline.frame` (which makes no code), when
+/// it is a `check.shape`: where a shape dispatch's arm starts (Emitter.armEntry). NONE else.
+fn armShapeAt(function: &Function, b: u32) -> u32 {
+  let block = function.blocks.get(u32.toUsize(b))
+  let mut i = block.firstInst
+  while i < block.firstInst + block.instCount && function.inst(i).op == Op.InlineFrame { i = i + 1 }
+  if i < block.firstInst + block.instCount && function.inst(i).op == Op.CheckShape { return i }
+  return NONE
 }
