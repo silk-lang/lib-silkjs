@@ -144,6 +144,8 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
     i = i + 1
   }
   let mut tables = run Tables.make()
+  let mut vSymAt = List<usize>.make()
+  let mut vSymId = List<u32>.make()
   let chunkSize = u32.toUsize(state.CHUNK)
   let mut x: usize = 0
   while x < exitCount {
@@ -152,9 +154,20 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
     // Kind and operand per entry: one per slot, one per slot of the inlined frames the exit
     // leaves part way through, then the releases.
     let mut entries = List<u32>.make()
+    let mut localVirtuals = List<u32>.make()
     let mut s: u32 = 0
     while s < count + exit.inner {
       let slot = function.slot(exit, s)
+      if slot.mode == SlotMode.Virtual {
+        let voIdx = slot.value
+        let mut li: usize = 0
+        while li < localVirtuals.length() && localVirtuals.get(li) != voIdx { li = li + 1 }
+        if li == localVirtuals.length() { run localVirtuals.append(voIdx) }
+        run entries.append(state.ENTRY_VIRTUAL)
+        run entries.append(usize.toU32(li))
+        s = s + 1
+        continue
+      }
       let v = slot.value
       let info = function.value(v)
       let kind = e.places.kind(v)
@@ -194,6 +207,9 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
       }
       s = s + 1
     }
+    let vCount = usize.toU32(localVirtuals.length())
+    if vCount > 16 { Intrinsic.trap("x64_exits: too many virtual objects in one exit") }
+    if exit.frames > 0xffff { Intrinsic.trap("x64_exits: too many inlined frames in one exit") }
     let total = usize.toU32(entries.length() / 2)
     run tables.recordAt.append(usize.toU32(tables.records.length()))
     run tables.records.append(exit.pc)
@@ -203,7 +219,7 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
     run tables.records.append(codes.get(x))
     run tables.records.append(count)
     run tables.records.append(total)
-    run tables.records.append(exit.frames)
+    run tables.records.append(u32.bitOr(exit.frames, u32.shiftLeft(vCount, 16)))
     let mut at: usize = 0
     while at < entries.length() {
       let mut words: [u32; 16] = [0; 16]
@@ -233,6 +249,48 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
         run tables.records.append(frame.depth)
         run tables.records.append(frame.pc)
         n = n + 1
+      }
+    }
+    if vCount != 0 {
+      let mut vi: usize = 0
+      while vi < localVirtuals.length() {
+        let voIdx = localVirtuals.get(vi)
+        let vo = function.virtualObjs.get(u32.toUsize(voIdx))
+        run vSymAt.append(tables.records.length())
+        run vSymId.append(e.constructSymbol(function, vo.constructSite))
+        run tables.records.append(0)
+        run tables.records.append(0)
+        run tables.records.append(vo.slotCount)
+        let mut fk: u32 = 0
+        while fk < vo.slotCount {
+          let fv = vo.fields[u32.toUsize(fk)]
+          let finfo = function.value(fv)
+          let fkind = e.places.kind(fv)
+          let mut fentry = state.ENTRY_VALUE
+          let mut foperand = e.storage(fv) * SLOT_BYTES
+          if finfo.ty == Type.I32 || finfo.ty == Type.Bool {
+            let boolean = finfo.ty == Type.Bool
+            match e.constants.get(u32.toUsize(fv)) {
+              Option<i32>.Some { value } => { fentry = state.ENTRY_INT_CONST foperand = i32.wrappingToU32(value) }
+              Option<i32>.None => {
+                if fkind == GPR {
+                  foperand = u8.toU32(e.places.register(fv))
+                  if boolean { fentry = state.ENTRY_BOOL_REGISTER } else { fentry = state.ENTRY_INT_REGISTER }
+                } else if boolean { fentry = state.ENTRY_BOOL_FRAME } else { fentry = state.ENTRY_INT_FRAME }
+              }
+            }
+          } else if finfo.ty == Type.F64 {
+            if fkind == XMM { foperand = u8.toU32(e.places.register(fv)) fentry = state.ENTRY_F64_REGISTER }
+            else { fentry = state.ENTRY_F64_FRAME }
+          } else if finfo.own != Own.Imm {
+            // Materialized objects always need their own count independent of other exit slots.
+            fentry = state.ENTRY_VALUE_RETAIN
+          }
+          run tables.records.append(fentry)
+          run tables.records.append(foperand)
+          fk = fk + 1
+        }
+        vi = vi + 1
       }
     }
     x = x + 1
@@ -348,21 +406,28 @@ pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryErro
   let recordWords = usize.toU32(tables.records.length())
   x = 0
   let mut word: usize = 0
+  let mut vSymCursor: usize = 0
   while x < exitCount {
     let start = tables.recordAt.get(x)
     e.a.bind(e.records.get(x))
     let mut end = recordWords
     if x + 1 < exitCount { end = tables.recordAt.get(x + 1) }
-    // The chunk words, one per CHUNK entries; an exit's frames follow them as they are.
+    // The chunk words, one per CHUNK entries; an exit's frames and virtuals follow them.
     let chunked = start + state.RECORD_HEAD + (tables.records.get(u32.toUsize(start) + 4) + state.CHUNK - 1) / state.CHUNK
     while usize.toU32(word) < end {
-      let mut value = tables.records.get(word)
-      if usize.toU32(word) >= start + state.RECORD_HEAD && usize.toU32(word) < chunked {
-        if u32.bitAnd(value, TAIL) != 0 { value = (recordWords + usize.toU32(tables.chunks.length()) + u32.bitAnd(value, TAIL - 1) - start) * 4 }
-        else { value = (recordWords + value * usize.toU32(CHUNK_WORDS) - start) * 4 }
+      if vSymCursor < vSymAt.length() && word == vSymAt.get(vSymCursor) {
+        run e.a.dataSymbol64(vSymId.get(vSymCursor))
+        vSymCursor = vSymCursor + 1
+        word = word + 2
+      } else {
+        let mut value = tables.records.get(word)
+        if usize.toU32(word) >= start + state.RECORD_HEAD && usize.toU32(word) < chunked {
+          if u32.bitAnd(value, TAIL) != 0 { value = (recordWords + usize.toU32(tables.chunks.length()) + u32.bitAnd(value, TAIL - 1) - start) * 4 }
+          else { value = (recordWords + value * usize.toU32(CHUNK_WORDS) - start) * 4 }
+        }
+        run e.a.data32(value)
+        word = word + 1
       }
-      run e.a.data32(value)
-      word = word + 1
     }
     x = x + 1
   }

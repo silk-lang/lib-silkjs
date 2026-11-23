@@ -500,7 +500,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
       getters = true
       if bodyCells < 3 { bodyCells = 3 }
     }
-    if (inst.op == Op.Call || inst.op == Op.Poll || inst.op == Op.NewObject) && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
+    if (inst.op == Op.Call || inst.op == Op.Poll || inst.op == Op.NewObject || inst.op == Op.CheckConstruct) && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
       if inst.op == Op.Call && calls.countOf(inst) + 2 > bodyCells { bodyCells = calls.countOf(inst) + 2 }
       if function.exit(inst.exit).frames > bodyDepth { bodyDepth = function.exit(inst.exit).frames }
     }
@@ -693,9 +693,10 @@ fn supported(function: &Function, on: bool, stress: u32, steps: &List<u32>) -> O
     if on && inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_CALL && (inst.k & calls.LAZY_ARGUMENTS) != 0 { return Option<&'static [u8]>.some(b"a lazy arguments call on a baseline frame") }
     if inst.op == Op.PutKey && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a keyed store off the function's own baseline frame") }
     if inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_ADD && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a concatenation off the function's own baseline frame") }
-    if !on && (inst.op == Op.NewObject || inst.op == Op.InitSlot) { return Option<&'static [u8]>.some(b"inlined construct off a baseline frame") }
+    if !on && (inst.op == Op.NewObject || inst.op == Op.InitSlot || inst.op == Op.CheckConstruct || inst.op == Op.KnownMethod) { return Option<&'static [u8]>.some(b"inlined construct off a baseline frame") }
     i = i + 1
   }
+  if !on && function.virtualObjs.length() != 0 { return Option<&'static [u8]>.some(b"virtual object off a baseline frame") }
   return Option<&'static [u8]>.none()
 }
 
@@ -871,6 +872,17 @@ impl Emitter {
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
       let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
+      return ()
+    }
+    if op == Op.Typeof {
+      run self.stressGuard(inst.exit)
+      // typeof_str(env, frame, value, out) -> 1 with owned string in out, 0 for a proxy.
+      run self.ownFrame(Reg.Rsi)
+      run self.a.lea(Width.W64, Reg.Rdx, slotOf(inst.a))
+      run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
+      run self.callHelper(helpers.TYPEOF_STR)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
       return ()
     }
     if op == Op.Equals {
@@ -2013,6 +2025,68 @@ impl Emitter {
       run self.polls.append(PollSlow { slow: pollSlow, back: retry, exit: inst.exit, pc: function.exit(inst.exit).pc })
       return ()
     }
+    if op == Op.CheckConstruct {
+      run self.stressGuard(inst.exit)
+      let layout = self.settings.layout
+      let miss = self.exitLabels.get(u32.toUsize(inst.exit))
+      let retry = run self.a.label()
+      let pollSlow = run self.a.label()
+      let done = run self.a.label()
+      let sym = self.constructSymbol(&function, i32.wrappingToU32(inst.k))
+      run self.unlessTag(inst.a, layout.object(), miss)
+      run self.payloadInto(Reg.R8, inst.a)
+      run self.a.movSymbol(Reg.Rsi, sym)
+      run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.Rsi, 0))
+      run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.R10)
+      run self.a.jcc(Cond.NotEqual, miss)
+      if inst.b != inst.a {
+        run self.unlessTag(inst.b, layout.object(), miss)
+        run self.payloadInto(Reg.R8, inst.b)
+        run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.R10)
+        run self.a.jcc(Cond.NotEqual, miss)
+      }
+      self.a.bind(retry)
+      run self.a.movSymbol(Reg.Rsi, sym)
+      run self.callHelper(helpers.CHECK_CONSTRUCT)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+      run self.a.jcc(Cond.Equal, done)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 2)
+      run self.a.jcc(Cond.NotEqual, miss)
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, self.realmAt))
+      run self.a.jmp(pollSlow)
+      self.a.bind(done)
+      run self.polls.append(PollSlow { slow: pollSlow, back: retry, exit: inst.exit, pc: function.exit(inst.exit).pc })
+      return ()
+    }
+    if op == Op.KnownMethod {
+      run self.stressGuard(inst.exit)
+      let layout = self.settings.layout
+      let fields = self.fields
+      let target = i32.wrappingToU32(inst.k & 0xffffff)
+      let pair = i32.toUsize(i32.shiftRight(inst.k, 24) & 3)
+      let known = function.inlineShapes.get(u32.toUsize(target))
+      let miss = self.exitLabels.get(u32.toUsize(inst.exit))
+      let mut j: u32 = 0
+      while j < u8.toU32(known.lengths[pair]) {
+        let watched = self.chainSymbol(&function, target, usize.toU32(pair), j)
+        run self.a.movSymbol(Reg.R10, watched)
+        run self.a.test8MemImm(Mem.at(Reg.R10, u32.wrappingToI32(fields.objectRoles)), u32.wrappingToU8(fields.watched))
+        run self.a.jcc(Cond.Equal, miss)
+        j = j + 1
+      }
+      if !self.isPreset(inst.result) {
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.object()))
+        let closure = self.symbol(target * 3 + 2)
+        run self.a.movSymbol(Reg.R9, closure)
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        if function.value(inst.result).own != Own.Borrowed { run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1) }
+      }
+      if self.calleeNext(&function, inst.block, inst.result, target) {
+        self.omitAt = self.cursor + 1
+      }
+      return ()
+    }
     if op == Op.InitSlot {
       run self.payloadInto(Reg.R11, inst.a)
       run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(self.fields.objectSlots)))
@@ -2383,17 +2457,20 @@ impl Emitter {
     }
     i = 0
     while i < function.slots.length() {
-      let v = function.slots.get(i).value
-      if v != NONE && u32.toUsize(v) < count { let before = quiet.get(u32.toUsize(v)) quiet.set(u32.toUsize(v), before + 1) }
+      let slot = function.slots.get(i)
+      if slot.mode != SlotMode.Virtual {
+        let v = slot.value
+        if v != NONE && u32.toUsize(v) < count { let before = quiet.get(u32.toUsize(v)) quiet.set(u32.toUsize(v), before + 1) }
+      }
       i = i + 1
     }
     i = 0
     while i < function.insts.length() {
       let index = usize.toU32(i)
       i = i + 1
-      let target = self.knownRead(function, index)
-      if target == NONE { continue }
       let read = function.inst(index)
+      let target = if read.op == Op.KnownMethod { i32.wrappingToU32(read.k & 0xffffff) } else { self.knownRead(function, index) }
+      if target == NONE || read.result == NONE { continue }
       let v = read.result
       let block = function.blocks.get(u32.toUsize(read.block))
       if index + 1 >= block.firstInst + block.instCount { continue }
@@ -2444,7 +2521,11 @@ impl Emitter {
     let exit = function.exit(unbox.exit)
     let mut readers: u32 = 1
     let mut s: u32 = 0
-    while s < function.slotCount(exit) { if function.slot(exit, s).value == read.result { readers = readers + 1 } s = s + 1 }
+    while s < function.slotCount(exit) {
+      let slot = function.slot(exit, s)
+      if slot.mode != SlotMode.Virtual && slot.value == read.result { readers = readers + 1 }
+      s = s + 1
+    }
     return self.uses.get(u32.toUsize(read.result)) == readers
   }
   effect fn countUses(self: &mut Self, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -2481,13 +2562,29 @@ impl Emitter {
     while i < function.edgeArgs.length() { self.read(function.edgeArgs.get(i)) i = i + 1 }
     i = 0
     while i < function.slots.length() {
-      let v = function.slots.get(i).value
-      self.read(v)
-      // An exit writes a constant from its immediate (valueInto), so it needs no register.
-      if v != NONE && v < function.valueCount() && self.constant(&function, v) {
-        let at = u32.toUsize(v)
-        let before = self.immediateUses.get(at)
-        self.immediateUses.set(at, before + 1)
+      let slot = function.slots.get(i)
+      if slot.mode == SlotMode.Virtual {
+        let vo = function.virtualObjs.get(u32.toUsize(slot.value))
+        let mut fk: u32 = 0
+        while fk < vo.slotCount {
+          let fv = vo.fields[u32.toUsize(fk)]
+          self.read(fv)
+          if fv != NONE && fv < function.valueCount() && self.constant(&function, fv) {
+            let at = u32.toUsize(fv)
+            let before = self.immediateUses.get(at)
+            self.immediateUses.set(at, before + 1)
+          }
+          fk = fk + 1
+        }
+      } else {
+        let v = slot.value
+        self.read(v)
+        // An exit writes a constant from its immediate (valueInto), so it needs no register.
+        if v != NONE && v < function.valueCount() && self.constant(&function, v) {
+          let at = u32.toUsize(v)
+          let before = self.immediateUses.get(at)
+          self.immediateUses.set(at, before + 1)
+        }
       }
       i = i + 1
     }
@@ -2611,7 +2708,7 @@ impl Emitter {
   fn atomSymbol(self: &Self, function: &Function, n: u32) -> u32 { return self.arraySymbol(function, 2) + n }
   /// The relocation symbol of construct descriptor k (Function.constructTargets), after the
   /// linked atoms'.
-  fn constructSymbol(self: &Self, function: &Function, k: u32) -> u32 { return self.atomSymbol(function, usize.toU32(self.atoms.length())) + k }
+  pub fn constructSymbol(self: &Self, function: &Function, k: u32) -> u32 { return self.atomSymbol(function, usize.toU32(self.atoms.length())) + k }
   /// The relocation symbol of the realm's Array.prototype push (which 0) or pop (1), a
   /// native function object, or of nothing when the realm has none.
   fn arraySymbol(self: &Self, function: &Function, which: u32) -> u32 {
@@ -4197,7 +4294,11 @@ impl Emitter {
     // The realm, for the polls and for an inlined callee's CompiledFrame.
     let mut needed = function.inlineTargets.length() != 0 || function.constructTargets.length() != 0
     let mut i: usize = 0
-    while i < function.insts.length() { if function.insts.get(i).op == Op.Poll { needed = true } i = i + 1 }
+    while i < function.insts.length() {
+      let op = function.insts.get(i).op
+      if op == Op.Poll || op == Op.CheckConstruct { needed = true }
+      i = i + 1
+    }
     if needed {
       run self.a.load(Width.W64, Reg.Rax, p.sf(p.f.currentFunction + 8))
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, compiled.DIRECT_CLOSURE_BYTECODE))
@@ -4938,8 +5039,13 @@ impl Emitter {
       let stack = pointer - recordBytes + p.f.frame
       let closure = function.slot(exit, stackAt + depth - frame.argc - 1).value
       run self.valueInto(&function, closure, SlotMode.Imm, Reg.Rsp, stack + p.f.currentFunction)
+      let mut hasReceiver = false
+      let mut receiver: u32 = 0
       if frame.method {
-        let receiver = function.slot(exit, stackAt + depth - frame.argc - 2).value
+        let rslot = function.slot(exit, stackAt + depth - frame.argc - 2)
+        if rslot.mode != SlotMode.Virtual { hasReceiver = true receiver = rslot.value }
+      }
+      if hasReceiver {
         run self.valueInto(&function, receiver, SlotMode.Imm, Reg.Rsp, stack + p.f.thisValue)
       } else {
         run self.a.movImm64(Reg.Rax, layout.tagWord(layout.undefined()))

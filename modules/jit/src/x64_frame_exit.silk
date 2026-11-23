@@ -9,12 +9,15 @@ import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
+import silkjs.js_heap { HeapHeader }
 import silkjs.js_value { ValueBits }
 import silkjs.js_gc as gc
 import silkjs.js_baseline { BaselineFrame, Inlined }
 import silk.mem.layout { Layout }
 import silkjs.js_baseline as engine
 import baseline_env { BaselineEnv }
+import jit_helpers { ConstructDesc }
+import jit_helpers as helpers
 import jit_exit_state as state
 
 /// How the code left, in the stub's ecx and `jitFrameExit`'s last argument.
@@ -80,8 +83,13 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
   let count = u32.toUsize(unsafe wordAt(words, 4))
   // The inlined bodies the exit leaves part way through: their words follow the chunks',
   // their values' entries the slots', and the code's area for them has a
-  // js_baseline.Inlined each, then a cell per value.
-  let frames = u32.toUsize(unsafe wordAt(words, 5))
+  // js_baseline.Inlined each, then a cell per value. The high 16 bits of word [5] hold
+  // `vCount`, the number of virtual objects described in the virtual trailer after frames.
+  let word5 = unsafe wordAt(words, 5)
+  let frames = u32.toUsize(word5 & 0xffff)
+  let vCount = u32.toUsize(u32.shiftRight(word5, 16))
+  if vCount != 0 && lend { Intrinsic.trap("virtual object in step exit") }
+  if vCount > 16 { Intrinsic.trap("jitFrameExit: too many virtual objects") }
   let described = u32.toUsize(state.RECORD_HEAD) + (count + u32.toUsize(state.CHUNK) - 1) / u32.toUsize(state.CHUNK)
   let mut inner: usize = 0
   let mut area: usize = 0
@@ -94,6 +102,36 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
       let at = described + 1 + n * u32.toUsize(state.FRAME_WORDS)
       inner = inner + u32.toUsize(unsafe wordAt(words, at + 2)) + u32.toUsize(unsafe wordAt(words, at + 3))
       n = n + 1
+    }
+  }
+  let mut virtuals: [ValueBits; 16] = [ValueBits.Undefined; 16]
+  if vCount != 0 {
+    let mut vPos = described
+    if frames != 0 { vPos = vPos + 1 + frames * u32.toUsize(state.FRAME_WORDS) }
+    let rtAnchor = ()
+    let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>((unsafe Pointer.borrow<(), BaselineEnv>(&rtAnchor, env)).runtime)
+    let mut vi: usize = 0
+    while vi < vCount {
+      let lo = unsafe wordAt(words, vPos)
+      let hi = unsafe wordAt(words, vPos + 1)
+      let descBits = u64.bitOr(u32.toU64(lo), u64.shiftLeft(u32.toU64(hi), 32))
+      let descPtr = unsafe Pointer.read<*mut ConstructDesc>(unsafe Intrinsic.pointerReinterpret<*const u64, *const *mut ConstructDesc>(Pointer.fromRef<u64>(&descBits)))
+      let fCount = u32.toUsize(unsafe wordAt(words, vPos + 2))
+      if fCount > 8 { Intrinsic.trap("jitFrameExit: virtual object has too many fields") }
+      vPos = vPos + 3
+      let mut fVals: [ValueBits; 8] = [ValueBits.Undefined; 8]
+      let mut fi: usize = 0
+      while fi < fCount {
+        let fKind = unsafe wordAt(words, vPos)
+        let fOp = unsafe wordAt(words, vPos + 1)
+        let mut fVal = unsafe state.decode(fKind, fOp, bytes, registers)
+        if fKind == state.ENTRY_VALUE_RETAIN { fVal = unsafe fVal.retained() }
+        fVals[fi] = fVal
+        vPos = vPos + 2
+        fi = fi + 1
+      }
+      virtuals[vi] = unsafe helpers.materializeConstruct(rt, descPtr, Pointer.fromRef<ValueBits>(&fVals[0]), fCount)
+      vi = vi + 1
     }
   }
   let kept = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(
@@ -118,7 +156,7 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
       let operand = unsafe wordAt(chunk, within * 2 + 1)
       if index >= slotCount && index < slotCount + inner {
         if pass == 0 {
-          let mut value = unsafe state.decode(kind, operand, bytes, registers)
+          let mut value = if kind == state.ENTRY_VIRTUAL { unsafe virtuals[u32.toUsize(operand)].retained() } else { unsafe state.decode(kind, operand, bytes, registers) }
           if kind == state.ENTRY_VALUE_RETAIN { value = unsafe value.retained() }
           unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(kept, index - slotCount), value)
         }
@@ -127,21 +165,30 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
         if pass == 2 && !lend { unsafe gc.releaseDeferred(unsafe state.decode(state.ENTRY_VALUE, operand, bytes, registers)) }
       } else if index < frame.locals + depth {
         if pass == 0 {
-          let mut value = unsafe state.decode(kind, operand, bytes, registers)
+          let mut value = if kind == state.ENTRY_VIRTUAL { unsafe virtuals[u32.toUsize(operand)].retained() } else { unsafe state.decode(kind, operand, bytes, registers) }
           if kind == state.ENTRY_VALUE_RETAIN || (lend && kind == state.ENTRY_VALUE) { value = unsafe value.retained() }
           unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, frame.arguments + index), value)
         }
       } else if pass == 1 {
-        if kind == state.ENTRY_VALUE_RETAIN || (lend && kind == state.ENTRY_VALUE) { drop unsafe (unsafe state.decode(kind, operand, bytes, registers)).retained() }
+        if kind == state.ENTRY_VIRTUAL { drop unsafe virtuals[u32.toUsize(operand)].retained() }
+        else if kind == state.ENTRY_VALUE_RETAIN || (lend && kind == state.ENTRY_VALUE) { drop unsafe (unsafe state.decode(kind, operand, bytes, registers)).retained() }
       } else if pass == 2 {
         let at = unsafe Pointer.atMut<ValueBits>(cells, index - frame.locals - depth)
         let old = unsafe Pointer.read<ValueBits>(at)
-        unsafe Pointer.write<ValueBits>(at, unsafe state.decode(kind, operand, bytes, registers))
+        let val = if kind == state.ENTRY_VIRTUAL { virtuals[u32.toUsize(operand)] } else { unsafe state.decode(kind, operand, bytes, registers) }
+        unsafe Pointer.write<ValueBits>(at, val)
         unsafe gc.releaseDeferred(old)
       }
       index = index + 1
     }
     pass = pass + 1
+  }
+  if vCount != 0 {
+    let mut vi: usize = 0
+    while vi < vCount {
+      unsafe gc.releaseDeferred(virtuals[vi])
+      vi = vi + 1
+    }
   }
   if lend { return usize.toU64(depth) }
   let mut anchor = ()

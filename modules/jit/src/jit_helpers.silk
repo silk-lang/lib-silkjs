@@ -5,9 +5,13 @@
 //! the code bytes hold no process-local pointer (ahead-of-time compilation). The JIT fills the
 //! table once per runtime. Indices are partitioned by workstream so they can be added without
 //! colliding: J (objects) 0-31, H (calls) 32-63, I (loops) 64-95, K (numbers) 96-127.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
 import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
 import silk.num.f64
 import silk.num.i32
 import silk.num.u8
@@ -98,6 +102,13 @@ pub const ARRAY_POP: u32 = 16
 /// planned constructor descriptor and allocates a fresh inline object from a spare cell
 /// with `desc.stores` uninitialized slots ready for Op.InitSlot; returns 1 on hit else 0.
 pub const NEW_OBJECT: u32 = 17
+/// check_construct(env, desc: *mut ConstructDesc) -> u32: validates a planned constructor
+/// descriptor without allocating (escape-eliminated construct); returns 1 on hit, 2 on
+/// interrupt poll due, 0 on guard miss.
+pub const CHECK_CONSTRUCT: u32 = 18
+/// typeof_str(env, frame, value: *const ValueBits, out: *mut ValueBits) -> u32: the string
+/// typeof answers for value, owned in out; 0 for a proxy (out untouched).
+pub const TYPEOF_STR: u32 = 19
 
 /// Runtime validation descriptor for an inlined `new C(...)` site (Op.NewObject).
 /// `ctor` MUST stay at offset 0: generated machine code loads `[desc + 0]` to guard the
@@ -109,6 +120,7 @@ pub struct ConstructDesc {
   pub fnProto: ?*mut HeapHeader,
   pub applyFn: ?*mut HeapHeader,
   pub realm: ?*mut HeapHeader,
+  pub finalShapePtr: ?*mut HeapHeader,
   pub ctorVersion: u64,
   pub targetVersion: u64,
   pub fnProtoVersion: u64,
@@ -237,6 +249,10 @@ impl CompiledEnv {
     env.helpers[u32.toUsize(MOD_F64)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, u64, u64) -> u64, *const ?*const u8>(Pointer.fromRef(&modF64)))
     let newObj: extern "C" fn(*mut CompiledEnv, *mut ConstructDesc, *mut ValueBits) -> u32 = jitNewObject
     env.helpers[u32.toUsize(NEW_OBJECT)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *mut ConstructDesc, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&newObj)))
+    let checkConstruct: extern "C" fn(*mut CompiledEnv, *mut ConstructDesc) -> u32 = jitCheckConstruct
+    env.helpers[u32.toUsize(CHECK_CONSTRUCT)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *mut ConstructDesc) -> u32, *const ?*const u8>(Pointer.fromRef(&checkConstruct)))
+    let typeofStr: extern "C" fn(*mut CompiledEnv, *const CompiledFrame, *const ValueBits, *mut ValueBits) -> u32 = jitTypeofStr
+    env.helpers[u32.toUsize(TYPEOF_STR)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const CompiledFrame, *const ValueBits, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&typeofStr)))
     return env
   }
 }
@@ -408,6 +424,19 @@ export "C" fn jitTypeof(env: *mut CompiledEnv, frame: *const CompiledFrame, valu
   let anchor = ()
   let running = unsafe Pointer.borrow<(), CompiledFrame>(&anchor, frame)
   return unsafe objects.typeofAtom(&running, unsafe Pointer.read<ValueBits>(value))
+}
+
+export "C" fn jitTypeofStr(env: *mut CompiledEnv, frame: *const CompiledFrame, value: *const ValueBits, out: *mut ValueBits) -> u32 {
+  let anchor = ()
+  let running = unsafe Pointer.borrow<(), CompiledFrame>(&anchor, frame)
+  let atom = unsafe objects.typeofAtom(&running, unsafe Pointer.read<ValueBits>(value))
+  if atom == 0 { return 0 }
+  let rt = unsafe nonnullHeader((unsafe Pointer.borrow<(), CompiledEnv>(&anchor, env)).runtime)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let strVal = state.atoms.storedAtomValue(atom)
+  drop state
+  unsafe Pointer.write<ValueBits>(out, strVal)
+  return 1
 }
 
 export "C" fn jitEquals(env: *mut CompiledEnv, left: *const ValueBits, right: *const ValueBits, strict: u32) -> u32 {
@@ -633,32 +662,148 @@ unsafe fn tryRecycleZero(rt: *mut HeapHeader, final: *mut HeapHeader, stores: us
   return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(chosen)
 }
 
-export "C" fn jitNewObject(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, out: *mut ValueBits) -> u32 {
+struct FreshCell { node: *mut HeapHeader }
+
+effect fn allocateFreshCell(tailBytes: usize) -> FreshCell ! OutOfMemoryError ? &mut Allocator {
+  return FreshCell { node: run HeapCell.allocateUninitWithTail<ObjectData>(HeapKind.Object, tailBytes) }
+}
+
+/// Cold fallback allocator for a plain inline object of `final` shape with `stores` slots
+/// and inline capacity `tail`, allocating a fresh cell directly from the system allocator.
+@inlineNever
+unsafe fn allocFreshNewObject(rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
+  let mut headerAnchor = ()
+  let shapeHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, final)
+  if shapeHeader.referenceCount <= 0 { return Pointer.null<HeapHeader>() }
+  drop shapeHeader
+  let mut tailBytes = tail * Layout.of<SlotBits>().bytes
+  let reused = Layout.of<ObjectPayload>().bytes - CONSTRUCT_PAYLOAD_TAG_BYTES
+  if tailBytes > reused { tailBytes = tailBytes - reused } else { tailBytes = 0 }
+  let mut system = Allocator.systemAllocatorProvider()
+  let allocated = run Effect.result(allocateFreshCell(tailBytes)) |> Effect.provideMut<Allocator>(&mut system)
+  let node = match move allocated {
+    Result<FreshCell, OutOfMemoryError>.Success { value } => value.node
+    Result<FreshCell, OutOfMemoryError>.Failure { .. } => { return Pointer.null<HeapHeader>() }
+  }
+  let mut retainAnchor = ()
+  let finalHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut retainAnchor, final)
+  finalHeader.referenceCount = i32.wrappingAdd(finalHeader.referenceCount, 1)
+  drop finalHeader
+  unsafe census.censusBump(rt, census.CENSUS_OBJECTS_ALLOCATED, 1)
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let payload = Pointer.fromMutRef<ObjectPayload>(&mut data.payload)
+  unsafe Pointer.put<ObjectPayload>(payload, ObjectPayload.Empty)
+  let slotPtr = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(
+    unsafe Intrinsic.pointerReinterpret<*mut ObjectPayload, *mut u8>(payload)), CONSTRUCT_PAYLOAD_TAG_BYTES))
+  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotPtr, tail)
+  unsafe slots.extendFilled(stores)
+  unsafe data.putSlots(move slots)
+  data.setIsStandardArrayPrototype(false)
+  data.setExtensible(true)
+  data.setFreeMark(false)
+  data.setIsExotic(false)
+  data.setFastArray(false)
+  data.setIsConstructor(false)
+  data.setHasImmutablePrototype(false)
+  data.setIsHtmlDda(false)
+  data.clearRoles()
+  data.setClassId(classes.JS_CLASS_OBJECT)
+  data.weakRefCount = 0
+  data.shape = final
+  drop data
+  unsafe gc.publishObject(rt, node)
+  if unsafe gc.observesFresh(rt) { unsafe gc.noteFreshObserved(rt, node) }
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(node)
+}
+
+/// Allocates one plain object with shape `final` and `stores` Undefined slots (`rc == 1`),
+/// pinned in the runtime's kept table by `commitConstructDesc` so `final` stays alive for
+/// the runtime's entire lifetime (including deopt materialization).
+pub unsafe fn allocSentinelPlain(rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
+  let mut nodeOpt = unsafe tryRecycleZero(rt, final, stores, tail)
+  if Pointer.isNull<HeapHeader>(nodeOpt) { nodeOpt = unsafe allocSpareNewObject(rt, final, stores, tail) }
+  if Pointer.isNull<HeapHeader>(nodeOpt) { nodeOpt = unsafe allocFreshNewObject(rt, final, stores, tail) }
+  let node = match Pointer.nonNullMut<HeapHeader>(nodeOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+  }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let mut i: usize = 0
+  while i < stores {
+    data.setSlotFresh(i, SlotBits.value(ValueBits.Undefined))
+    i = i + 1
+  }
+  drop data
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(node)
+}
+
+/// Materializes an escape-eliminated virtual object on deoptimization exit (`x64_frame_exit`).
+/// Allocates an object of `desc.finalShapePtr` via the 3-tier allocator (zeroStack recycle ->
+/// spare cell -> fresh cell) and moves caller-owned `fields[0..slotCount]` into its slots
+/// (filling any remaining slots up to `desc.stores` with Undefined). Returns an owned
+/// `ValueBits.Object` (`rc == 1`).
+pub unsafe fn materializeConstruct(rt: *mut HeapHeader, descPtr: *mut ConstructDesc, fields: *const ValueBits, slotCount: usize) -> ValueBits {
+  let anchor = ()
+  let desc = unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)
+  let stores = desc.stores
+  let tail = desc.tail
+  let finalOpt = desc.finalShapePtr
+  drop desc
+  let final = match Pointer.nonNullMut<HeapHeader>(finalOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { Intrinsic.trap("materializeConstruct: construct descriptor has no final shape") }
+  }
+  let mut fresh = false
+  let mut nodeOpt = unsafe tryRecycleZero(rt, final, stores, tail)
+  if Pointer.isNull<HeapHeader>(nodeOpt) { nodeOpt = unsafe allocSpareNewObject(rt, final, stores, tail) }
+  if Pointer.isNull<HeapHeader>(nodeOpt) { nodeOpt = unsafe allocFreshNewObject(rt, final, stores, tail) fresh = true }
+  let node = match Pointer.nonNullMut<HeapHeader>(nodeOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { Intrinsic.trap("materializeConstruct: out of memory materializing virtual object") }
+  }
+  if !fresh && unsafe gc.observesFresh(rt) { unsafe gc.noteFreshObserved(rt, node) }
+  let fieldMany = unsafe Pointer.assumeMany<ValueBits>(fields)
+  let mut dataAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut dataAnchor, node)
+  let mut s: usize = 0
+  while s < stores {
+    let val = if s < slotCount { unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(fieldMany, s)) } else { ValueBits.Undefined }
+    data.setSlotFresh(s, SlotBits.value(val))
+    s = s + 1
+  }
+  drop data
+  return ValueBits.Object { reference: node }
+}
+
+/// Validates a planned constructor descriptor and ticks its interrupt counter if required.
+/// Returns 1 on hit (setting `outFinal`), 2 when an interrupt poll is due, or 0 on guard miss.
+@inlineAlways
+unsafe fn validateConstruct(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, outFinal: &mut ?*mut HeapHeader) -> u32 {
   let anchor = ()
   let rt = unsafe nonnullHeader((unsafe Pointer.borrow<(), CompiledEnv>(&anchor, env)).runtime)
   if unsafe gc.observesFresh(rt) { return 0 }
   let desc = unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)
   let ctor = unsafe nonnullHeader(desc.ctor)
   let proto = unsafe nonnullHeader(desc.proto)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
-  let zeroCount = state.zeroStackCount
-  let epoch = state.shapeEpoch
   let recvSlot = desc.receiverSlot
-  if state.receiverFunctions[recvSlot] != Pointer.address<HeapHeader>(ctor) { return 0 }
-  let entryFinal = state.receiverCache[recvSlot].final
-  let entryEmpty = state.receiverCache[recvSlot].empty
-  drop state
   let ctorVersion = desc.ctorVersion
   let protoSlot = desc.protoSlot
   let forward = desc.forward
   let fromEmpty = desc.fromEmpty
   let finalAddr = desc.finalShape
-  let stores = desc.stores
-  let tail = desc.tail
   let checkInterrupt = desc.checkInterrupt
+  let descEpoch = desc.shapeEpoch
   let realm = unsafe nonnullHeader(desc.realm)
-  if epoch != desc.shapeEpoch {
-    drop desc
+  drop desc
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let epoch = state.shapeEpoch
+  if state.receiverFunctions[recvSlot] != Pointer.address<HeapHeader>(ctor) { return 0 }
+  let entryFinal = state.receiverCache[recvSlot].final
+  let entryEmpty = state.receiverCache[recvSlot].empty
+  drop state
+  if epoch != descEpoch {
     if !unsafe revalidateConstructEpoch(descPtr, epoch) { return 0 }
   }
   let ctorData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, ctor)
@@ -708,7 +853,6 @@ export "C" fn jitNewObject(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, o
     finalOpt = unsafe resolveFromEmpty(rt, descPtr, entryEmpty)
   }
   if Pointer.isNull<HeapHeader>(finalOpt) { return 0 }
-  let final = unsafe nonnullHeader(finalOpt)
   if checkInterrupt != 0 {
     let counter = unsafe interrupts.counter(realm)
     let next = i32.wrappingSubtract(unsafe Pointer.read<i32>(counter), 1)
@@ -718,6 +862,27 @@ export "C" fn jitNewObject(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, o
     }
     unsafe Pointer.write<i32>(counter, next)
   }
+  outFinal.* = finalOpt
+  return 1
+}
+
+export "C" fn jitCheckConstruct(env: *mut CompiledEnv, descPtr: *mut ConstructDesc) -> u32 {
+  let mut finalOpt = Pointer.null<HeapHeader>()
+  return unsafe validateConstruct(env, descPtr, &mut finalOpt)
+}
+
+export "C" fn jitNewObject(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, out: *mut ValueBits) -> u32 {
+  let mut finalOpt = Pointer.null<HeapHeader>()
+  let status = unsafe validateConstruct(env, descPtr, &mut finalOpt)
+  if status != 1 { return status }
+  let anchor = ()
+  let rt = unsafe nonnullHeader((unsafe Pointer.borrow<(), CompiledEnv>(&anchor, env)).runtime)
+  let desc = unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)
+  let stores = desc.stores
+  let tail = desc.tail
+  drop desc
+  let zeroCount = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)).zeroStackCount
+  let final = unsafe nonnullHeader(finalOpt)
   if let Option<*mut HeapHeader>.Some { value: recycled } = Pointer.nonNullMut<HeapHeader>(unsafe tryRecycleZero(rt, final, stores, tail)) {
     unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: recycled })
     return 1

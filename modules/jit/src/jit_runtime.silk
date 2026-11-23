@@ -46,6 +46,8 @@ import ssa_input { inputOf }
 import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, Refusal as TranslateRefusal }
 import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_FLAGS, KNOWN_SYMBOLS, SITE_ARRAY }
 import jit_helpers { CompiledEnv, ConstructDesc }
+import jit_helpers as helpers
+import silkjs.js_gc as gc
 import jit_cost { Cost, now }
 import baseline
 import baseline { Settings as BaselineSettings, Outcome as BaselineOutcome, Stubs as BaselineStubs }
@@ -88,6 +90,9 @@ const MAX_CANDIDATES: usize = 128
 const CANDIDATE_DEPTH: u32 = 6
 /// A callee longer than this many bytes of code is not a candidate (ssa_translate's limit).
 const CANDIDATE_BYTES: usize = 460
+/// Tighter limits for `OP_get_var` -> `OP_call` candidates so large/looped global helpers stay out-of-line.
+const VAR_CALL_BYTES: usize = 96
+const VAR_CALL_DEPTH: u32 = 2
 /// Address space reserved for machine code.
 const CODE_BYTES: usize = 67108864
 
@@ -641,6 +646,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
     Result<BaselineOutcome, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
     Result<BaselineOutcome, OutOfMemoryError | UnboundLabelError>.Failure { .. } => { jit.failed = jit.failed + 1 return () }
   }
+  let wait = if jit.options.optimize { tierUpWait(jit.options.optimizeEntries, bytes) } else { jit.options.optimizeEntries }
   drop function
   match move outcome {
     BaselineOutcome { code: made, why, uncovered, stepped, map, construct, resume } => {
@@ -685,7 +691,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
         mark = mark + 3
       }
       run jit.baselineInfo.append(info)
-      if jit.options.optimize { unsafe engineBaseline.countFrom(bytecode, jit.options.optimizeEntries) }
+      if jit.options.optimize { unsafe engineBaseline.countFrom(bytecode, wait) }
       jit.baselineCompiled = jit.baselineCompiled + 1
       jit.baselineBytes = jit.baselineBytes + usize.toU64(code.bytes.length())
       jit.baselineUncovered = jit.baselineUncovered + usize.toU64(uncovered.length())
@@ -2055,10 +2061,11 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
             if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.closureBytecode(ValueBits.Object { reference: calleeObj })) {
               if Pointer.address<HeapHeader>(cell) != Pointer.address<HeapHeader>(bytecode) {
                 let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
-                let codeLen = (unsafe callee.code.asSlice()).length
+                let calleeBytes = unsafe callee.code.asSlice()
+                let codeLen = calleeBytes.length
                 if callee.scopeSlots == 0
                   && Pointer.address<HeapHeader>(callee.realm) == Pointer.address<HeapHeader>(function.realm)
-                  && codeLen > 0 && codeLen <= CANDIDATE_BYTES {
+                  && codeLen > 0 && codeLen <= VAR_CALL_BYTES && !hasBackEdge(calleeBytes) {
                   let mut input = run inputOf(&callee)
                   input.doubleSites = run calleeDoubleSites(jit, &callee)
                   input.siteShapes = run unsafe siteShapesOf(rt, cell)
@@ -2067,7 +2074,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
                   run closures.append(calleeOpt)
                   run appendKnown(&mut holders, &KnownMethod.none())
                   let mut childConstructs = List<ConstructTarget>.make()
-                  if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, calleeOpt, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+                  if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, calleeOpt, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
                   input.constructs = move childConstructs
                   run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: unsafe ownedCells(calleeOpt), known: KnownShapes.none() })
                 }
@@ -2186,6 +2193,63 @@ effect fn markJumpTargets(bytes: &[u8]) -> List<bool> ! OutOfMemoryError ? &mut 
     pc = pc + size
   }
   return move targets
+}
+
+fn hasBackEdge(bytes: &[u8]) -> bool {
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    let mut target: i64 = -1
+    if (opcode == op.OP_if_false8 || opcode == op.OP_if_true8 || opcode == op.OP_goto8) && size == 2 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 1]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 1) + disp
+    } else if opcode == op.OP_goto16 && size == 3 {
+      let raw = u32.toI64(u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8))
+      let disp = if raw >= 32768 { raw - 65536 } else { raw }
+      target = usize.toI64(pc + 1) + disp
+    } else if (opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_goto || opcode == op.OP_catch || opcode == op.OP_gosub) && size == 5 {
+      let raw = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
+      target = usize.toI64(pc + 1) + i32.toI64(u32.wrappingToI32(raw))
+    } else if (opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8) && size == 3 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 2]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 2) + disp
+    } else if (opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8) && size == 4 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 2]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 2) + disp
+    } else if opcode == op.OP_if_not_nullish_keep8 && size == 5 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 3]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 3) + disp
+    }
+    if target >= 0 && target <= usize.toI64(pc) { return true }
+    pc = pc + size
+  }
+  return false
+}
+
+fn tierUpWait(optimizeEntries: u32, bytes: &[u8]) -> u32 {
+  if optimizeEntries != OPTIMIZE_ENTRIES || bytes.length <= 160 { return optimizeEntries }
+  if hasBackEdge(bytes) { return optimizeEntries }
+  let mut callCount: u32 = 0
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    if opcode == op.OP_call || (opcode >= op.OP_call0 && opcode <= op.OP_call3)
+      || opcode == op.OP_call_method || opcode == op.OP_call_constructor {
+      callCount = callCount + 1
+    }
+    pc = pc + size
+  }
+  if bytes.length > 320 && callCount >= 4 { return optimizeEntries * 6 }
+  if callCount >= 4 || bytes.length > 240 { return optimizeEntries * 4 }
+  return optimizeEntries
 }
 
 const CTOR_FORM_STORES: u8 = 1
@@ -2502,6 +2566,7 @@ unsafe effect fn buildConstruct(rt: *mut HeapHeader, ctor: *mut HeapHeader, read
     fnProto: fnProtoOpt,
     applyFn: applyOpt,
     realm: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(realm),
+    finalShapePtr: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(final),
     ctorVersion: ctorVersion,
     targetVersion: targetVersion,
     fnProtoVersion: fnProtoVersion,
@@ -2573,6 +2638,19 @@ unsafe fn commitConstructDesc(jit: &mut Jit, rt: *mut HeapHeader, desc: Construc
     if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.protoObjs[p]) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
     p = p + 1
   }
+  // Pin one sentinel plain object holding `desc.finalShapePtr` in the runtime's kept table
+  // so the final shape stays alive (referenceCount >= 1) for deopt materialization.
+  let finalShape = match Pointer.nonNullMut<HeapHeader>(desc.finalShapePtr) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return 0 }
+  }
+  let sentinel = match Pointer.nonNullMut<HeapHeader>(unsafe helpers.allocSentinelPlain(rt, finalShape, desc.stores, desc.tail)) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return 0 }
+  }
+  let keptSentinel = unsafe inline.keepClosure(rt, sentinel)
+  unsafe gc.releaseDeferred(ValueBits.Object { reference: sentinel })
+  if !keptSentinel { return 0 }
   let slot = jit.constructDescs.length()
   if !jit.constructDescs.appendWithinCapacity(desc) { return 0 }
   return Pointer.address<ConstructDesc>(Pointer.fromMutRef<ConstructDesc>(&mut jit.constructDescs.asMutSlice()[slot]))
