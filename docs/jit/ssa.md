@@ -287,7 +287,7 @@ the count the caller receives.
 
 What workstream E consumes, all in `ssa.silk`:
 
-- `Function.blocks` in their final order: reverse postorder, entry first. `Block.params` and the
+- `Function.blocks` in their final order: reverse postorder, entry first, with a branch's successor in fewer loops searched first so each loop's blocks follow its header (`Function.compact`, `loopDepths`). `Block.params` and the
   instruction range are indices into `Function.params` and `Function.insts`.
 - `Inst`: `op`, `result` (a value index or `NONE`), operands `a`, `b`, the immediate `k`
   (constant, argument index, comparison, immediate tag), `edge` (first edge of a terminator),

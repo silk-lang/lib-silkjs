@@ -171,6 +171,21 @@ call stubs (about 230 instructions a call) and its prologue. Crypto at scale 4 w
 seed: 2.01G instructions where there were 2.44G; at scale 20, about 680 ms where there
 were 810 (medians of 15 runs; node 322).
 
+## Loops in one piece
+
+`Function.compact` orders blocks in reverse postorder. Its search used to take a branch's
+edges in order, so a loop whose continuing edge comes first (`while (--n >= 0)`, an inlined
+`am3`) had its latch placed after everything the loop exits to: in montReduce, after the
+rest of the function and the other inlined bodies. Every value the loop carried then had a
+linear-scan interval over all of that, calls included, so none could take a fragile
+register, and the allocator's loop depths (blocks h..s of a back edge s -> h) counted the
+whole range as the inner loop. Now the search takes first the successor in fewer loops
+(`loopDepths`: for each edge u -> v with v <= u, v and the blocks that reach u without
+passing v), so the exit comes after the loop's blocks, which follow their header with
+nothing between. It is still a reverse postorder, which the dominator computations need.
+montReduce's inner loop: 90 instructions a turn where there were 106; Crypto at scale 4
+with a fixed seed, 1.80G instructions where there were 1.85G.
+
 ## Repeated element reads
 
 `a[i]` read twice in one block, with nothing between that could change an array (only
@@ -200,19 +215,20 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   immediate, or from its slot, so the three integer registers of code on a baseline frame
   go to values.
 
-- **Seven integer registers on a baseline frame.** Code on a baseline frame had three
-  (rbx, r14, r15). rsi, rdi, rdx and r10 join them as fragile registers (`Pool.fragile`):
-  only a value whose interval holds nothing but instructions that keep them
-  (`x64_regalloc.keepsFragile`) takes one. Those are the gentle ones (integer arithmetic,
-  compares, constants, boxes and unboxes of numbers, jumps and branches), which never touch
-  them; a `check.array` and a trusted element read, which leave instead of calling; and a
-  trusted element store and a poll, whose slow paths keep the four registers in the scratch
-  slots over their call (`keepFragile`). rax, rcx (an exit's reason), r8, r9 and r11 stay
-  the lowering's own: a variable shift keeps rcx in r11, and a trusted store's heap test
-  takes r8. The exit dump holds the seven (`jit_exit_state.DUMP_INTEGERS`). Crypto's `am3`
-  then carries its counters in registers: at scale 20 the optimizer takes about 745 ms
-  where it took 850, though the instruction count hardly moves (moves between registers
-  cost next to nothing, a value's trip through a frame slot does).
+- **Eight integer registers on a baseline frame.** Code on a baseline frame had three
+  (rbx, r14, r15). rsi, rdi, rdx, r10 and rcx join them as fragile registers
+  (`Pool.fragile`): only a value whose interval holds nothing but instructions that keep
+  them (`x64_regalloc.keepsFragile`) takes one. Those are the gentle ones (integer
+  arithmetic, compares, constants, boxes and unboxes of numbers, jumps and branches), which
+  never touch them, and an inlined body's `inline.frame`, which emits nothing; a
+  `check.array` and a trusted element read, which leave instead of calling; and a trusted
+  element store and a poll, whose slow paths keep the five registers in the scratch slots
+  over their call (`keepFragile`). rax, r8, r9 and r11 stay the lowering's own: an exit
+  takes how it left in r8 (it was rcx), a variable shift keeps rcx in r11, and a trusted
+  store's heap test takes r8. The exit dump holds the eight (`jit_exit_state.DUMP_INTEGERS`).
+  Crypto's `am3` then carries its counters in registers: at scale 20 the optimizer took
+  about 745 ms where it took 850, though the instruction count hardly moved (moves between
+  registers cost next to nothing, a value's trip through a frame slot does).
 
 - **`mul.i32` tests for -0 out of line.** The product is taken from the second operand's
   register or slot (`imul eax, [slot]`); a zero product jumps to a piece after the blocks
