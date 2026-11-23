@@ -174,6 +174,7 @@ const STEP_GET_KEY_SLOW: u8 = 7
 const STEP_PUT_KEY_SLOW: u8 = 8
 const STEP_GET_LENGTH_SLOW: u8 = 9
 const STEP_ELEM_SLOW: u8 = 10
+const STEP_TRUTHY_SLOW: u8 = 11
 
 pub struct Emitter {
   pub a: Assembler,
@@ -359,8 +360,12 @@ fn immediateOperand(function: &Function, inst: Inst) -> bool {
 fn r11Kept(function: &Function, inst: Inst) -> bool {
   let op = inst.op
   if op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
-    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
-    || op == Op.BitNot || op == Op.Neg || op == Op.NotBool || op == Op.Removed { return true }
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Imul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.BitNot || op == Op.Neg || op == Op.NotBool
+    || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64
+    || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64
+    || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.ExactI32
+    || op == Op.Removed { return true }
   if op == Op.Shl || op == Op.Sar || op == Op.Shr {
     let def = function.value(inst.b).def
     return def != NONE && function.inst(def).op == Op.ConstI32
@@ -1099,6 +1104,8 @@ impl Emitter {
       return ()
     }
     if op == Op.BoxF64 {
+      // The trusted store right after it boxes into the element itself (storedBox).
+      if self.storedBox(&function, self.cursor) { return () }
       let place9 = self.at(inst.a) run getBits(&mut self.a, Reg.Rax, place9)
       run self.boxDoubleInto(Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
       return ()
@@ -1315,18 +1322,22 @@ impl Emitter {
       run self.a.alu(Alu.Cmp, Width.W64, Reg.Rax, Reg.R10)
       run self.a.jcc(Cond.Above, done)
       run self.a.movImm32(Reg.R9, 1)
-      run self.a.jmp(done)
-      self.a.bind(notDouble)
-      let symbol = layout.tagOf(-8)
-      let heap = run self.a.label()
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(symbol))
-      run self.a.jcc(Cond.NotEqual, heap)
-      run self.a.movImm32(Reg.R9, 1)
-      run self.a.jmp(done)
-      self.a.bind(heap)
-      run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
-      run self.callHelper(helpers.TRUTHY)
-      run self.a.mov(Width.W32, Reg.R9, Reg.Rax)
+      if self.on {
+        run self.stepSlows.append(StepSlow { entry: notDouble, auxLabel: notDouble, back: done, inst: inst, step: 0, shape: 0, out: NONE, extra: 0, kind: STEP_TRUTHY_SLOW })
+      } else {
+        run self.a.jmp(done)
+        self.a.bind(notDouble)
+        let symbol = layout.tagOf(-8)
+        let heap = run self.a.label()
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(symbol))
+        run self.a.jcc(Cond.NotEqual, heap)
+        run self.a.movImm32(Reg.R9, 1)
+        run self.a.jmp(done)
+        self.a.bind(heap)
+        run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+        run self.callHelper(helpers.TRUTHY)
+        run self.a.mov(Width.W32, Reg.R9, Reg.Rax)
+      }
       self.a.bind(done)
       let out = self.at(inst.result) run putI32(&mut self.a, out, Reg.R9)
       return ()
@@ -1716,6 +1727,62 @@ impl Emitter {
             self.skipAt = self.cursor + 1
             run self.a.jmp(self.skipLabel)
             self.a.bind(general)
+          } else if (borrowed || function.value(inst.result).own == Own.Owned) && self.fusedUnboxF64(&function, inst) {
+            // The next instruction unboxes this element as F64 and nothing else reads it:
+            // a Float64 loads directly into the XMM place (or slot), an Int converts via
+            // cvtsi2sd, and anything else goes to its slot for the unbox's exit.
+            let unbox = function.inst(self.cursor + 1)
+            let layout = self.settings.layout
+            let outOfLine = inst.trusted && self.settings.stress == 0
+            let notFloat = run self.a.label()
+            let general = run self.a.label()
+            let cold = run self.a.label()
+            let out = self.at(unbox.result)
+            let byteTag = layout.tagWidth == 1 && layout.float64() < 256 && layout.int() < 256
+            if byteTag {
+              run self.a.cmp8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.float64()))
+            } else {
+              run self.loadTag(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)))
+              run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+            }
+            run self.a.jcc(Cond.NotEqual, notFloat)
+            if out.kind == XMM {
+              run self.a.loadDouble(out.xmm, Mem.at(Reg.R11, 8))
+            } else {
+              run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 8))
+              run putBits(&mut self.a, out, Reg.Rax)
+            }
+            if outOfLine {
+              run self.a.jmp(done)
+            } else {
+              self.skipLabel = run self.a.label()
+              self.skipAt = self.cursor + 1
+              run self.a.jmp(self.skipLabel)
+            }
+            self.a.bind(notFloat)
+            if byteTag {
+              run self.a.cmp8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.int()))
+            } else {
+              run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+            }
+            if outOfLine { run self.a.jcc(Cond.NotEqual, cold) } else { run self.a.jcc(Cond.NotEqual, general) }
+            run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, 8))
+            if out.kind == XMM {
+              run self.a.intToDouble(Width.W32, out.xmm, Reg.Rax)
+            } else {
+              run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax)
+              run putF64(&mut self.a, out, Xmm.Xmm0)
+            }
+            if outOfLine {
+              self.omitAt = self.cursor + 1
+              run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(unbox.exit)
+              self.a.bind(general)
+              self.a.bind(done)
+              return ()
+            }
+            self.a.bind(cold)
+            run self.a.jmp(self.skipLabel)
+            self.a.bind(general)
           }
           run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
           run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
@@ -2055,7 +2122,9 @@ impl Emitter {
       else { run self.a.movImm64(Reg.Rdx, u64.bitOr(u32.toU64(inst.pc), helpers.PUT_FIELD_RELEASE_LAST)) }
       run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a))
       run self.a.lea(Width.W64, Reg.R8, slotOf(inst.b))
+      if self.on { run self.keepXmm() }
       run self.callHelper(helpers.PUT_FIELD)
+      if self.on { run self.restoreXmm() }
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
       run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
       self.a.bind(done)
@@ -2669,12 +2738,12 @@ impl Emitter {
   }
   /// Whether `read` (a get.elem) is followed in its block by the unbox of its result, the
   /// only reader of that result but for the unbox's own exit.
-  /// Whether instruction `at` is a box.i32 or box.bool whose one reader is the trusted
-  /// put.elem right after it, as its value: the store writes the tag and the number into
-  /// the element, and boxes into the value's slot only on the way to its helper.
+  /// Whether instruction `at` is a box.i32, box.bool, or box.f64 whose one reader is the
+  /// trusted put.elem right after it, as its value: the store writes the tag and the number
+  /// into the element, and boxes into the value's slot only on the way to its helper.
   fn storedBox(self: &Self, function: &Function, at: u32) -> bool {
     let box = function.inst(at)
-    if (box.op != Op.BoxI32 && box.op != Op.BoxBool) || box.result == NONE { return false }
+    if (box.op != Op.BoxI32 && box.op != Op.BoxBool && box.op != Op.BoxF64) || box.result == NONE { return false }
     let block = function.blocks.get(u32.toUsize(box.block))
     if at + 1 >= block.firstInst + block.instCount { return false }
     let store = function.inst(at + 1)
@@ -2691,6 +2760,29 @@ impl Emitter {
     while s < function.slotCount(exit) {
       let slot = function.slot(exit, s)
       if slot.mode != SlotMode.Virtual && slot.value == read.result { readers = readers + 1 }
+      s = s + 1
+    }
+    return self.uses.get(u32.toUsize(read.result)) == readers
+  }
+  fn fusedUnboxF64(self: &Self, function: &Function, read: Inst) -> bool {
+    let block = function.blocks.get(u32.toUsize(read.block))
+    if self.cursor + 1 >= block.firstInst + block.instCount { return false }
+    let unbox = function.inst(self.cursor + 1)
+    if unbox.op != Op.UnboxF64 || unbox.a != read.result || unbox.result == NONE || unbox.exit == NONE { return false }
+    if self.storage(read.result) != read.result { return false }
+    let exit = function.exit(unbox.exit)
+    let mut readers: u32 = 1
+    let mut s: u32 = 0
+    while s < function.slotCount(exit) {
+      let slot = function.slot(exit, s)
+      if slot.mode == SlotMode.Virtual {
+        let vo = function.virtualObjs.get(u32.toUsize(slot.value))
+        let mut fk: u32 = 0
+        while fk < vo.slotCount {
+          if vo.fields[u32.toUsize(fk)] == read.result { readers = readers + 1 }
+          fk = fk + 1
+        }
+      } else if slot.value == read.result { readers = readers + 1 }
       s = s + 1
     }
     return self.uses.get(u32.toUsize(read.result)) == readers
@@ -3374,7 +3466,9 @@ impl Emitter {
     if out.kind == OUT_RELEASE {
       run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1)
       run self.a.lea(Width.W64, Reg.Rsi, Mem.at(out.base, out.at))
+      if self.on { run self.keepXmm() }
       run self.callHelper(helpers.RELEASE)
+      if self.on { run self.restoreXmm() }
       run self.a.jmp(out.back)
       return ()
     }
@@ -3394,7 +3488,9 @@ impl Emitter {
       run self.a.store(Width.W64, Mem.at(Reg.R11, out.at + 8), Reg.R9)
       if (out.flags & PUT_MOVED) == 0 { run self.retainBits(Reg.Rax, Reg.R9) }
       run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rsp, self.scratch))
+      if self.on { run self.keepXmm() }
       run self.callHelper(helpers.RELEASE)
+      if self.on { run self.restoreXmm() }
       run self.a.jmp(out.back)
       return ()
     }
@@ -4574,18 +4670,22 @@ impl Emitter {
         // A loop of an inlined body: the poll runs on the body's record, as a call the body
         // makes does (callInBody), at the loop's target.
         let last = run self.bodyRecords(&function, state, function.exitFrame(state, state.frames - 1).pc)
+        run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
+        run self.keepXmm()
         run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_POLL))
         run self.a.movImm32(Reg.R8, 0)
         run self.a.movImm32(Reg.R9, 0)
-        run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
         run self.engineCall()
+        run self.restoreXmm()
         run self.bodyRecordsOff(last)
       } else {
         run self.a.storeImm(Width.W64, p.sf(p.f.currentPc), signed(poll.pc))
+        run self.keepXmm()
         run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_POLL))
         run self.a.movImm32(Reg.R8, 0)
         run self.a.movImm32(Reg.R9, 0)
         run self.engineCall()
+        run self.restoreXmm()
       }
       run self.restoreFragile()
       // Nonzero: it threw. Then the interpreter takes the frame when the poll turned
@@ -4680,13 +4780,26 @@ impl Emitter {
     if fused {
       box = self.cursor - 1
       let made = function.inst(box)
-      let mut tag = layout.int()
-      if made.op == Op.BoxBool { tag = layout.boolean() }
-      run self.a.storeImm(Width.W64, Mem.at(Reg.R11, 0), u64.wrappingToI32(layout.tagWord(tag)))
-      // A number's register holds it zero-extended, as the payload word wants it.
-      let number = self.at(made.a)
-      if number.kind == GPR { run self.a.store(Width.W64, Mem.at(Reg.R11, 8), number.gpr) }
-      else { run getI32(&mut self.a, Reg.Rax, number) run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rax) }
+      if made.op == Op.BoxF64 {
+        let tagWord = layout.tagWord(layout.float64())
+        if tagWord <= 0x7fffffff {
+          run self.a.storeImm(Width.W64, Mem.at(Reg.R11, 0), u64.wrappingToI32(tagWord))
+        } else {
+          run self.a.movImm64(Reg.R8, tagWord)
+          run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.R8)
+        }
+        let number = self.at(made.a)
+        if number.kind == XMM { run self.a.storeDouble(Mem.at(Reg.R11, 8), number.xmm) }
+        else { run getBits(&mut self.a, Reg.Rax, number) run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rax) }
+      } else {
+        let mut tag = layout.int()
+        if made.op == Op.BoxBool { tag = layout.boolean() }
+        run self.a.storeImm(Width.W64, Mem.at(Reg.R11, 0), u64.wrappingToI32(layout.tagWord(tag)))
+        // A number's register holds it zero-extended, as the payload word wants it.
+        let number = self.at(made.a)
+        if number.kind == GPR { run self.a.store(Width.W64, Mem.at(Reg.R11, 8), number.gpr) }
+        else { run getI32(&mut self.a, Reg.Rax, number) run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rax) }
+      }
     } else {
       run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
       // An immediate (a boxed number, undefined, a boolean) is never on the heap.
@@ -4757,18 +4870,31 @@ impl Emitter {
         run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
         run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
         run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        if function.value(inst.result).own != Own.Borrowed {
+          let skip = run self.a.label()
+          run self.heapTestWith(Reg.Rax, Reg.R8, skip)
+          run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1)
+          self.a.bind(skip)
+        }
         run self.a.jmp(self.exitLabels.get(u32.toUsize(aux)))
       } else {
         if aux != NONE {
           let made = function.inst(aux)
-          let number = self.at(made.a) run getI32(&mut self.a, Reg.Rax, number)
-          run self.boxInto(made.op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.b * SLOT_BYTES)
+          if made.op == Op.BoxF64 {
+            let number = self.at(made.a) run getBits(&mut self.a, Reg.Rax, number)
+            run self.boxDoubleInto(Reg.Rax, Reg.Rsp, inst.b * SLOT_BYTES)
+          } else {
+            let number = self.at(made.a) run getI32(&mut self.a, Reg.Rax, number)
+            run self.boxInto(made.op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.b * SLOT_BYTES)
+          }
         }
         run self.keepFragile()
         let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
         run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
+        if self.on { run self.keepXmm() }
         run self.callHelper(helpers.PUT_ELEM)
+        if self.on { run self.restoreXmm() }
         run self.restoreFragile()
         // In the count, on a fast Array, the helper stores; a refusal leaves all the same.
         run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
@@ -5641,7 +5767,9 @@ impl Emitter {
       if inst.op == Op.GetElem {
         let idx = self.at(inst.b) run getI32(&mut self.a, Reg.Rdx, idx)
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
+        run self.keepXmm()
         if borrowed { run self.callHelper(helpers.GET_ELEM_BORROWED) } else { run self.callHelper(helpers.GET_ELEM) }
+        run self.restoreXmm()
         run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
         if item.step != 0 && !borrowed {
           run self.a.jcc(Cond.NotEqual, item.back)
@@ -5654,7 +5782,9 @@ impl Emitter {
       } else {
         let idx = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, idx)
         run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
+        run self.keepXmm()
         run self.callHelper(helpers.PUT_ELEM)
+        run self.restoreXmm()
         run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
         run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
         run self.a.jmp(item.back)
@@ -5662,6 +5792,21 @@ impl Emitter {
       return ()
     }
     self.a.bind(item.entry)
+    if item.kind == STEP_TRUTHY_SLOW {
+      let layout = self.settings.layout
+      let symbol = layout.tagOf(-8)
+      let heap = run self.a.label()
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(symbol))
+      run self.a.jcc(Cond.NotEqual, heap)
+      run self.a.movImm32(Reg.R9, 1)
+      run self.a.jmp(item.back)
+      self.a.bind(heap)
+      run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+      run self.callHelper(helpers.TRUTHY)
+      run self.a.mov(Width.W32, Reg.R9, Reg.Rax)
+      run self.a.jmp(item.back)
+      return ()
+    }
     if item.kind == STEP_PUT_FIELD_SLOW {
       run self.ownFrame(Reg.Rsi)
       if inst.k == 0 { run self.a.movImm32(Reg.Rdx, inst.pc) }
@@ -5719,7 +5864,9 @@ impl Emitter {
       run self.a.movImm32(Reg.Rdx, site)
       run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a))
       run self.a.lea(Width.W64, Reg.R8, slotOf(inst.result))
+      run self.keepXmm()
       run self.callHelper(helpers.GET_FIELD)
+      run self.restoreXmm()
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       if item.step != 0 && !borrowed {
         run self.a.jcc(Cond.NotEqual, item.back)

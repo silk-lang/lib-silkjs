@@ -3,6 +3,7 @@
 //!
 //! The code names a helper by its index, never by address, so its bytes hold no
 //! process-local pointer (ahead-of-time compilation). One BaselineEnv serves a runtime.
+import silk.mem.layout { Layout }
 import silk.mem.pointer { Pointer }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -14,7 +15,7 @@ import silk.num.usize
 import silkjs.thin_list { ThinList }
 import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
 import silkjs.js_value { ValueBits }
-import silkjs.js_core_types { ObjectData, ObjectPayload, FunctionBytecode, RuntimeState, ShapeData, SlotBits, BuiltinFamily, NativeFunctionId }
+import silkjs.js_core_types { ObjectData, ObjectPayload, FunctionBytecode, RuntimeState, ShapeData, SlotBits, PropertySlot, BuiltinFamily, NativeFunctionId, NativeFunctionData, NativeCallProtocol }
 import silkjs.js_core_types as census
 import silkjs.js_class_data as classes
 import silkjs.js_gc as gc
@@ -93,6 +94,13 @@ pub const STORE_ELEMENT: u32 = 27
 /// object in out), 2 to skip SERVICE_NEW and fall through to SERVICE_CONSTRUCT, 0 to try
 /// SERVICE_NEW.
 pub const CONSTRUCT_FAST: u32 = 28
+/// get_private(env, cell) -> u32: OP_get_private_field of the object at cell and private
+/// symbol after it; replaces object with the retained value and drops both operands.
+pub const GET_PRIVATE: u32 = 29
+/// put_private(env, cell) -> u32: OP_put_private_field of the object at cell, value after
+/// it, and private symbol third; moves value into the own private data slot and drops the
+/// displaced value, symbol, and object.
+pub const PUT_PRIVATE: u32 = 30
 
 /// The layout baseline code reads: the offsets below are part of its ABI.
 pub struct BaselineEnv {
@@ -248,6 +256,10 @@ impl BaselineEnv {
     env.helpers[u32.toUsize(SCOPE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut engine.BaselineFrame, *mut ValueBits) -> (), *const ?*const u8>(Pointer.fromRef(&scope)))
     let constructFast: extern "C" fn(*mut BaselineEnv, *mut ValueBits, u32, *mut ValueBits) -> u32 = baselineConstructFast
     env.helpers[u32.toUsize(CONSTRUCT_FAST)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut ValueBits, u32, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&constructFast)))
+    let getPrivate: extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32 = baselineGetPrivate
+    env.helpers[u32.toUsize(GET_PRIVATE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&getPrivate)))
+    let putPrivate: extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32 = baselinePutPrivate
+    env.helpers[u32.toUsize(PUT_PRIVATE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&putPrivate)))
     return env
   }
 }
@@ -366,6 +378,230 @@ export "C" fn baselineAtomValue(env: *mut BaselineEnv, atom: u32, out: *mut Valu
 export "C" fn baselineTruth(env: *mut BaselineEnv, cell: *const ValueBits) -> u32 {
   if unsafe engine.truth(cell) { return 1 }
   return 0
+}
+
+@inlineAlways
+unsafe fn dropCount(value: ValueBits) -> () {
+  let cell = match value {
+    ValueBits.Object { reference } => reference
+    ValueBits.String { reference } => reference
+    ValueBits.Symbol { reference } => reference
+    ValueBits.Int { .. } => { return () }
+    ValueBits.Float64 { .. } => { return () }
+    ValueBits.Bool { .. } => { return () }
+    ValueBits.Undefined => { return () }
+    ValueBits.Null => { return () }
+    _ => { unsafe gc.releaseDeferred(value) return () }
+  }
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, cell)
+  if header.referenceCount > 1 { header.referenceCount = header.referenceCount - 1 return () }
+  drop header
+  unsafe gc.releaseDeferred(value)
+}
+
+export "C" fn baselineGetPrivate(env: *mut BaselineEnv, cell: *mut ValueBits) -> u32 {
+  let rt = unsafe runtimeOf(env)
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(cell)
+  let object = unsafe Pointer.read<ValueBits>(cell)
+  let name = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, 1))
+  let reference = match object { ValueBits.Object { reference } => reference _ => { return 0 } }
+  match name { ValueBits.Symbol { .. } => () _ => { return 0 } }
+  let anchor = ()
+  let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)).atoms.borrowedSymbolAtom(name)
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let index = match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { value } => value Option<usize>.None => { return 0 } }
+  let found = match data.slot(index).view(unsafe shapes.slotFlags(data.shape, index)) {
+    PropertySlot.Value { value } => value
+    _ => { return 0 }
+  }
+  drop data
+  if match found { ValueBits.Uninitialized => true _ => false } { return 0 }
+  let owned = unsafe found.retained()
+  unsafe Pointer.write<ValueBits>(cell, owned)
+  unsafe dropCount(name)
+  unsafe dropCount(object)
+  return 1
+}
+
+export "C" fn baselinePutPrivate(env: *mut BaselineEnv, cell: *mut ValueBits) -> u32 {
+  let rt = unsafe runtimeOf(env)
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(cell)
+  let object = unsafe Pointer.read<ValueBits>(cell)
+  let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, 1))
+  let name = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(cells, 2))
+  let reference = match object { ValueBits.Object { reference } => reference _ => { return 0 } }
+  match name { ValueBits.Symbol { .. } => () _ => { return 0 } }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  if state.debugger.restricted { return 0 }
+  let atom = state.atoms.borrowedSymbolAtom(name)
+  drop state
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let index = match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { value: found } => found Option<usize>.None => { return 0 } }
+  let previous = match data.slot(index).view(unsafe shapes.slotFlags(data.shape, index)) {
+    PropertySlot.Value { value: old } => old
+    _ => { return 0 }
+  }
+  drop data
+  let mut writeAnchor = ()
+  let mutable = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut writeAnchor, reference)
+  mutable.setSlot(index, SlotBits.value(value))
+  drop mutable
+  unsafe dropCount(previous)
+  unsafe dropCount(name)
+  unsafe dropCount(object)
+  return 1
+}
+
+/// Function.prototype.call's method number in BuiltinFamily.Function (js_function_invoke.CALL_METHOD).
+pub const CALL_METHOD: u32 = 2
+
+/// Byte offsets (from an ObjectData cell header) and discriminant bytes that identify a
+/// JS_CLASS_C_FUNCTION whose payload is ObjectPayload.NativeFunction with
+/// NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: CALL_METHOD } and
+/// magicBits == 0 (intrinsic Function.prototype.call across all realms).
+/// `payloadTagAt` is `u32.MAX` if probing could not uniquely identify every field.
+pub struct CallLayout {
+  pub cFunctionClass: u16,
+  pub payloadTagAt: u32,
+  pub nativePayloadTag: u8,
+  pub fnTagAt: u32,
+  pub builtinTag: u8,
+  pub familyAt: u32,
+  pub functionFamily: u8,
+  pub methodAt: u32,
+  pub magicAt: u32
+}
+impl Copy for CallLayout {}
+
+fn sampleCallPayload(id: NativeFunctionId, magicBits: u16) -> ObjectPayload {
+  return ObjectPayload.NativeFunction {
+    function: NativeFunctionData {
+      context: Pointer.null<HeapHeader>(),
+      function: id,
+      magicBits: magicBits,
+      length: 0,
+      protocol: NativeCallProtocol.Generic,
+      callKind: 0
+    }
+  }
+}
+
+fn callPayloadBytes(p: ObjectPayload, fill: u8) -> [u8; 64] {
+  let mut bytes: [u8; 64] = [fill; 64]
+  let dst = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ObjectPayload>(Pointer.fromMutRef<u8>(&mut bytes[0]))
+  unsafe Pointer.put<ObjectPayload>(dst, move p)
+  return bytes
+}
+
+fn invalidCallLayout() -> CallLayout {
+  return CallLayout {
+    cFunctionClass: u32.wrappingToU16(classes.JS_CLASS_C_FUNCTION),
+    payloadTagAt: u32.MAX,
+    nativePayloadTag: 0,
+    fnTagAt: u32.MAX,
+    builtinTag: 0,
+    familyAt: u32.MAX,
+    functionFamily: 0,
+    methodAt: u32.MAX,
+    magicAt: u32.MAX
+  }
+}
+
+/// Probes the exact byte offsets and discriminant bytes of ObjectPayload.NativeFunction
+/// and NativeFunctionId.Builtin { family: BuiltinFamily.Function, method } inside an
+/// ObjectData cell so STUB_CALL_METHOD / STUB_CALL_METHOD_KEEP can fast-path
+/// `Function.prototype.call` retargeting without a C round-trip.
+pub fn functionCallLayout() -> CallLayout {
+  let payloadSize = Layout.of<ObjectPayload>().bytes
+  if payloadSize > 64 || payloadSize < 4 { return invalidCallLayout() }
+  let mut cell: [u64; 64] = [0; 64]
+  let header = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut HeapHeader>(Pointer.fromMutRef<u64>(&mut cell[0]))
+  let base = Pointer.address<HeapHeader>(header)
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, header)
+  let payloadOff = Pointer.address<ObjectPayload>(Pointer.fromRef<ObjectPayload>(&data.payload)) - base
+  let f0_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: 0 }, 0), 0)
+  let f0_f = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: 0 }, 0), 255)
+  let f1_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: 0x01020304 }, 0), 0)
+  let f2_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: 0x11223344 }, 0), 0)
+  let fm1 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: 0 }, 0x0506), 0)
+  let fm2 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Function, method: 0 }, 0x1516), 0)
+  let j0_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.Json, method: 0 }, 0), 0)
+  let s0_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Builtin { family: BuiltinFamily.String, method: 0 }, 0), 0)
+  let h0_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Host { id: 0 }, 0), 0)
+  let h0_f = callPayloadBytes(sampleCallPayload(NativeFunctionId.Host { id: 0 }, 0), 255)
+  let h1_0 = callPayloadBytes(sampleCallPayload(NativeFunctionId.Host { id: 0x01020304 }, 0), 0)
+  let e0_0 = callPayloadBytes(ObjectPayload.Empty, 0)
+  let e0_f = callPayloadBytes(ObjectPayload.Empty, 255)
+  let b0_0 = callPayloadBytes(ObjectPayload.Boxed { value: ValueBits.Undefined }, 0)
+  let b0_f = callPayloadBytes(ObjectPayload.Boxed { value: ValueBits.Undefined }, 255)
+  let mut payloadTagAt = u32.MAX
+  let mut payloadTagCount: u32 = 0
+  let mut nativePayloadTag: u8 = 0
+  let mut fnTagAt = u32.MAX
+  let mut fnTagCount: u32 = 0
+  let mut builtinTag: u8 = 0
+  let mut famAt = u32.MAX
+  let mut famCount: u32 = 0
+  let mut functionFamily: u8 = 0
+  let mut methodAt = u32.MAX
+  let mut methodCount: u32 = 0
+  let mut magicAt = u32.MAX
+  let mut magicCount: u32 = 0
+  let mut b: usize = 0
+  while b < payloadSize {
+    if f0_0[b] == f0_f[b] && f0_0[b] == f1_0[b] {
+      if e0_0[b] == e0_f[b] && b0_0[b] == b0_f[b] && f0_0[b] == h0_0[b] && f0_0[b] == j0_0[b] && f0_0[b] == fm1[b]
+        && f0_0[b] != e0_0[b] && f0_0[b] != b0_0[b] && e0_0[b] != b0_0[b] {
+        payloadTagAt = usize.toU32(payloadOff + b)
+        nativePayloadTag = f0_0[b]
+        payloadTagCount = payloadTagCount + 1
+      }
+      if f0_0[b] == j0_0[b] && f0_0[b] == s0_0[b] && h0_0[b] == h0_f[b] && h0_0[b] == h1_0[b] && f0_0[b] != h0_0[b] {
+        fnTagAt = usize.toU32(payloadOff + b)
+        builtinTag = f0_0[b]
+        fnTagCount = fnTagCount + 1
+      }
+      if f0_0[b] != j0_0[b] && f0_0[b] != s0_0[b] && j0_0[b] != s0_0[b] {
+        famAt = usize.toU32(payloadOff + b)
+        functionFamily = f0_0[b]
+        famCount = famCount + 1
+      }
+    }
+    if b + 4 <= payloadSize
+      && f0_0[b] == 0 && f0_0[b + 1] == 0 && f0_0[b + 2] == 0 && f0_0[b + 3] == 0
+      && f0_f[b] == 0 && f0_f[b + 1] == 0 && f0_f[b + 2] == 0 && f0_f[b + 3] == 0
+      && f1_0[b] == 4 && f1_0[b + 1] == 3 && f1_0[b + 2] == 2 && f1_0[b + 3] == 1
+      && f2_0[b] == 0x44 && f2_0[b + 1] == 0x33 && f2_0[b + 2] == 0x22 && f2_0[b + 3] == 0x11 {
+      methodAt = usize.toU32(payloadOff + b)
+      methodCount = methodCount + 1
+    }
+    if b + 2 <= payloadSize
+      && f0_0[b] == 0 && f0_0[b + 1] == 0
+      && f0_f[b] == 0 && f0_f[b + 1] == 0
+      && fm1[b] == 6 && fm1[b + 1] == 5
+      && fm2[b] == 0x16 && fm2[b + 1] == 0x15 {
+      magicAt = usize.toU32(payloadOff + b)
+      magicCount = magicCount + 1
+    }
+    b = b + 1
+  }
+  if payloadTagCount != 1 || fnTagCount != 1 || famCount != 1 || methodCount != 1 || magicCount != 1 {
+    return invalidCallLayout()
+  }
+  return CallLayout {
+    cFunctionClass: u32.wrappingToU16(classes.JS_CLASS_C_FUNCTION),
+    payloadTagAt: payloadTagAt,
+    nativePayloadTag: nativePayloadTag,
+    fnTagAt: fnTagAt,
+    builtinTag: builtinTag,
+    familyAt: famAt,
+    functionFamily: functionFamily,
+    methodAt: methodAt,
+    magicAt: magicAt
+  }
 }
 
 const CONSTRUCT_GENERIC: u8 = 0

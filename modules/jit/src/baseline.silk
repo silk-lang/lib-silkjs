@@ -387,6 +387,8 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   if opcode == op.OP_put_field { if size != 13 { return departs(size) } return plain(13, 2, -2) }
   if opcode == op.OP_get_array_el { if size != 1 { return departs(size) } return plain(1, 2, -1) }
   if opcode == op.OP_put_array_el { if size != 1 { return departs(size) } return plain(1, 3, -3) }
+  if opcode == op.OP_get_private_field { if size != 1 { return departs(size) } return plain(1, 2, -1) }
+  if opcode == op.OP_put_private_field { if size != 1 { return departs(size) } return plain(1, 3, -3) }
   if opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 { if size != 15 { return departs(size) } return plain(15, 0, 0) }
   if opcode == op.OP_call_method {
     if size != 3 { return departs(size) }
@@ -1777,6 +1779,7 @@ impl Emitter {
       let released = run self.a.label()
       let known = run self.a.label()
       let retarget = run self.a.label()
+      let retargetDirect = run self.a.label()
       run self.a.store(Width.W64, p.sf(f.currentPc), Reg.Rax)
       if method { run self.tagIs(next.word(), p.object(), declined) }
       else {
@@ -1842,6 +1845,39 @@ impl Emitter {
       let mut request = engine.SERVICE_CALL
       if method { request = request | engine.CALL_METHOD }
       self.a.bind(native)
+      if method {
+        let callLayout = env.functionCallLayout()
+        if callLayout.payloadTagAt != u32.MAX {
+          // Fast-path `f.call(x, ...)` directly to `retargetDirect` without a C round-trip
+          // through `engineCall` -> `baselineCallNative` -> `CALL_RETARGET`: check argc != 0,
+          // callee is intrinsic Function.prototype.call, and receiver f at `top` is a
+          // compiled JS_CLASS_BYTECODE_FUNCTION.
+          let notCall = run self.a.label()
+          run self.a.test(Width.W32, Reg.Rdx, Reg.Rdx)
+          run self.a.jcc(Cond.Equal, notCall)
+          run self.a.cmp16MemImm(Mem.at(Reg.Rdi, signed(f.objectClass)), callLayout.cFunctionClass)
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.a.cmp8MemImm(Mem.at(Reg.Rdi, signed(callLayout.payloadTagAt)), callLayout.nativePayloadTag)
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.a.cmp8MemImm(Mem.at(Reg.Rdi, signed(callLayout.fnTagAt)), callLayout.builtinTag)
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.a.cmp8MemImm(Mem.at(Reg.Rdi, signed(callLayout.familyAt)), callLayout.functionFamily)
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.Rdi, signed(callLayout.methodAt)), signed(env.CALL_METHOD))
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.a.cmp16MemImm(Mem.at(Reg.Rdi, signed(callLayout.magicAt)), 0)
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.tagIs(top.word(), p.object(), notCall)
+          run self.a.load(Width.W64, Reg.Rdi, top.payload())
+          run self.a.cmp16MemImm(Mem.at(Reg.Rdi, signed(f.objectClass)), u32.wrappingToU16(f.bytecodeClass))
+          run self.a.jcc(Cond.NotEqual, notCall)
+          run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
+          run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
+          run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jcc(Cond.NotEqual, retargetDirect)
+          self.a.bind(notCall)
+        }
+      }
       run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(request | engine.CALL_NATIVE))
       run self.a.jmp(serviced)
       self.a.bind(generic)
@@ -1868,6 +1904,7 @@ impl Emitter {
         run self.a.load(Width.W64, Reg.Rdi, top.payload())
         run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
         run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
+        self.a.bind(retargetDirect)
         run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R13, signed(f.table)))
         run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.R14, 32))
         run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.R14, 16))
@@ -3333,6 +3370,22 @@ impl Emitter {
       // Array, and a Symbol-keyed own property; the rest is the engine's.
       let other = run self.bail(pc, depth, step)
       run self.site(STUB_PUT_ELEMENT, usize.toU32(pc), next)
+      run self.a.jcc(Cond.Equal, other)
+      return true
+    }
+    if opcode == op.OP_get_private_field {
+      let other = run self.bail(pc, depth, step)
+      run self.a.lea(Width.W64, Reg.Rsi, word(under))
+      run self.helper(env.GET_PRIVATE)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, other)
+      return true
+    }
+    if opcode == op.OP_put_private_field {
+      let other = run self.bail(pc, depth, step)
+      run self.a.lea(Width.W64, Reg.Rsi, word(p.operandAt(depth - 3)))
+      run self.helper(env.PUT_PRIVATE)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, other)
       return true
     }
