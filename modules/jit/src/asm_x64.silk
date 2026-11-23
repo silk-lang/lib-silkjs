@@ -175,6 +175,23 @@ pub struct Code {
   pub relocations: List<Relocation>,
 }
 
+/// A 32-bit PC-relative displacement in `Code.bytes` whose instruction and target lie on
+/// opposite sides of `SplitInfo.hotBytes`. `at` is the offset of the 4-byte field in the
+/// unsplit bytes, `disp` is its unsplit displacement, and `fromHot` is true when the
+/// instruction is in the hot part and targets the cold part.
+pub struct CrossReloc { pub at: usize, pub disp: i32, pub fromHot: bool }
+impl Copy for CrossReloc {}
+
+/// Hot/cold split metadata produced by `Assembler.finishPlacedSplit`. When unsplit,
+/// `hotBytes` is `usize.MAX` and `crossRelocs` is empty.
+pub struct SplitInfo { pub hotBytes: usize, pub crossRelocs: List<CrossReloc> }
+impl SplitInfo {
+  pub fn none() -> SplitInfo { return SplitInfo { hotBytes: usize.MAX, crossRelocs: List<CrossReloc>.make() } }
+}
+
+/// Finished machine code together with its hot/cold split metadata.
+pub struct SplitCode { pub code: Code, pub split: SplitInfo }
+
 /// The register that carries the integer or pointer argument number `index` (0 through 5) of a
 /// System V AMD64 C call: rdi, rsi, rdx, rcx, r8, r9. Any other `index` traps; later arguments
 /// travel on the stack.
@@ -203,13 +220,20 @@ pub struct Assembler { code: List<u8>, labels: List<usize>, fixups: List<Fixup>,
   /// `alias`: operands at rbp + aliasFrom up to 255 bytes on are encoded from rbx.
   aliased: bool, aliasFrom: i32,
   /// How many labels `bind` has positioned (`bound`).
-  binds: usize }
+  binds: usize,
+  /// Unshrunk offset of the hot/cold boundary (`markCold`), or `usize.MAX` when unsplit.
+  hotMark: usize }
 
 impl Assembler {
   /// An assembler with no code.
   pub fn make() -> Assembler {
     return Assembler { code: List<u8>.make(), labels: List<usize>.make(), fixups: List<Fixup>.make(),
-      relocations: List<Relocation>.make(), aliased: false, aliasFrom: 0, binds: 0 }
+      relocations: List<Relocation>.make(), aliased: false, aliasFrom: 0, binds: 0, hotMark: usize.MAX }
+  }
+  /// Marks the start of cold code. Label references crossing this boundary stay 32-bit and are
+  /// recorded in `SplitInfo.crossRelocs` by `finishPlacedSplit`.
+  pub fn markCold(self: &mut Self) -> () {
+    if self.hotMark == usize.MAX { self.hotMark = self.code.length() }
   }
   /// From here on, a memory operand rbp + d without an index, for d in from to from + 255,
   /// is encoded as rbx + (d - from - 128): one displacement byte in place of four. The
@@ -744,106 +768,151 @@ impl Assembler {
   /// up once the short references shrink.
   pub effect fn finishPlaced(self: Self, places: &mut List<u32>, stride: usize) -> Code ! UnboundLabelError {
     return match move self {
-      Assembler { code: bytes, labels, fixups: references, relocations: records, .. } => {
+      Assembler { code: bytes, labels, fixups: references, relocations: records, hotMark, .. } => {
         let mut code = move bytes
         let mut fixups = move references
         let mut relocations = move records
-        let mut index: usize = 0
-        while index < fixups.length() {
-          let label = fixups.get(index).label
-          if labels.get(label) == usize.MAX { fail UnboundLabelError { label: label } }
-          index = index + 1
-        }
-        index = 0
-        while index < fixups.length() {
-          let mut fixup = fixups.get(index)
-          fixup.target = rank(&fixups, labels.get(fixup.label))
-          fixups.set(index, fixup)
-          index = index + 1
-        }
-        // Grow the references that do not reach until none changes. A reference only grows,
-        // so this ends; it gives the same sizes as llvm-mc's relaxation.
-        let mut changed = true
-        while changed {
-          changed = false
-          let mut saved: usize = 0
-          index = 0
+        drop run relaxAndCompact(&mut code, &labels, &mut fixups, &mut relocations, &mut places, stride, hotMark)
+        return Code { bytes: move code, relocations: move relocations }
+      }
+    }
+  }
+  /// `finishPlaced`, also returning hot/cold split metadata (`SplitInfo`) for any `markCold()`
+  /// boundary set during assembly. Every label reference crossing the boundary stays 32-bit and
+  /// is recorded in `split.crossRelocs` for `Code.linkSplit`.
+  pub effect fn finishPlacedSplit(self: Self, places: &mut List<u32>, stride: usize) -> SplitCode ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+    return match move self {
+      Assembler { code: bytes, labels, fixups: references, relocations: records, hotMark, .. } => {
+        let mut code = move bytes
+        let mut fixups = move references
+        let mut relocations = move records
+        let hotBytes = run relaxAndCompact(&mut code, &labels, &mut fixups, &mut relocations, &mut places, stride, hotMark)
+        let mut crossRelocs = List<CrossReloc>.make()
+        if hotBytes != usize.MAX {
+          let mut index: usize = 0
           while index < fixups.length() {
-            let mut fixup = fixups.get(index)
-            fixup.before = saved
-            fixups.set(index, fixup)
-            saved = saved + saving(fixup)
-            index = index + 1
-          }
-          index = 0
-          while index < fixups.length() {
-            let mut fixup = fixups.get(index)
-            if fixup.short {
-              // The byte after the field: this reference is the last one in front of it.
-              let end = usize.wrappingToI64(fixup.offset + 4 - fixup.before - saving(fixup))
-              let target = usize.wrappingToI64(movedAt(&fixups, fixup.target, labels.get(fixup.label)))
-              if target - end < -128 || target - end > 127 {
-                fixup.short = false
-                fixups.set(index, fixup)
-                changed = true
+            let fixup = fixups.get(index)
+            if !fixup.short {
+              let field = fixup.offset - fixup.before
+              let movedTarget = movedAt(&fixups, fixup.target, labels.get(fixup.label))
+              let fixupInHot = field < hotBytes
+              let targetInHot = movedTarget < hotBytes
+              if fixupInHot != targetInHot {
+                let disp = i64.wrappingToI32(usize.wrappingToI64(movedTarget) - usize.wrappingToI64(field) - 4)
+                run crossRelocs.append(CrossReloc { at: field, disp: disp, fromHot: fixupInHot })
               }
             }
             index = index + 1
           }
         }
-        // Compact: each short reference's instruction becomes its opcode and an 8-bit field.
-        // Bytes only move left, so this works in place.
-        let mut from: usize = 0
-        let mut to: usize = 0
-        index = 0
-        while index < fixups.length() {
-          let fixup = fixups.get(index)
-          if fixup.short {
-            let start = fixup.offset - 1 - u8.toUsize(fixup.kind - 1)
-            while from < start { let byte = code.get(from) code.set(to, byte) from = from + 1 to = to + 1 }
-            let mut opcode: u8 = 0xeb
-            if fixup.kind == BRANCH { opcode = code.get(fixup.offset - 1) - 0x10 }
-            code.set(to, opcode)
-            code.set(to + 1, 0)
-            from = fixup.offset + 4
-            to = to + 2
-          }
-          index = index + 1
-        }
-        while from < code.length() { let byte = code.get(from) code.set(to, byte) from = from + 1 to = to + 1 }
-        code.truncate(to)
-        index = 0
-        while index < fixups.length() {
-          let fixup = fixups.get(index)
-          let target = usize.wrappingToI64(movedAt(&fixups, fixup.target, labels.get(fixup.label)))
-          if fixup.short {
-            // The field is the instruction's last byte; its start moved by the savings before it.
-            let field = fixup.offset - fixup.before - 1 - u8.toUsize(fixup.kind - 1) + 1
-            code.set(field, i64.wrappingToU8(target - usize.wrappingToI64(field) - 1))
-          } else {
-            // Both offsets are below 2^31: the displacement is relative to the end of its field.
-            let field = fixup.offset - fixup.before
-            patch32(&mut code, field, i64.wrappingToI32(target - usize.wrappingToI64(field) - 4))
-          }
-          index = index + 1
-        }
-        index = 0
-        while index < relocations.length() {
-          let mut record = relocations.get(index)
-          record.offset = moved(&fixups, record.offset)
-          relocations.set(index, record)
-          index = index + 1
-        }
-        index = 0
-        while index < places.length() {
-          let taken = u32.toUsize(places.get(index))
-          places.set(index, usize.toU32(moved(&fixups, taken)))
-          index = index + stride
-        }
-        return Code { bytes: move code, relocations: move relocations }
+        return SplitCode { code: Code { bytes: move code, relocations: move relocations }, split: SplitInfo { hotBytes: hotBytes, crossRelocs: move crossRelocs } }
       }
     }
   }
+}
+
+effect fn relaxAndCompact(code: &mut List<u8>, labels: &List<usize>, fixups: &mut List<Fixup>, relocations: &mut List<Relocation>, places: &mut List<u32>, stride: usize, hotMark: usize) -> usize ! UnboundLabelError {
+  let mut index: usize = 0
+  while index < fixups.length() {
+    let label = fixups.get(index).label
+    if labels.get(label) == usize.MAX { fail UnboundLabelError { label: label } }
+    index = index + 1
+  }
+  let hasMark = hotMark > 0 && hotMark < code.length()
+  index = 0
+  while index < fixups.length() {
+    let mut fixup = fixups.get(index)
+    let labelAt = labels.get(fixup.label)
+    fixup.target = rank(&fixups, labelAt)
+    // Any reference crossing hotMark must keep its 32-bit displacement so linkSplit can
+    // relocate it across the hot/cold gap.
+    if hasMark && ((fixup.offset < hotMark) != (labelAt < hotMark)) { fixup.short = false }
+    fixups.set(index, fixup)
+    index = index + 1
+  }
+  // Grow the references that do not reach until none changes. A reference only grows,
+  // so this ends; it gives the same sizes as llvm-mc's relaxation.
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut saved: usize = 0
+    index = 0
+    while index < fixups.length() {
+      let mut fixup = fixups.get(index)
+      fixup.before = saved
+      fixups.set(index, fixup)
+      saved = saved + saving(fixup)
+      index = index + 1
+    }
+    index = 0
+    while index < fixups.length() {
+      let mut fixup = fixups.get(index)
+      if fixup.short {
+        // The byte after the field: this reference is the last one in front of it.
+        let end = usize.wrappingToI64(fixup.offset + 4 - fixup.before - saving(fixup))
+        let target = usize.wrappingToI64(movedAt(&fixups, fixup.target, labels.get(fixup.label)))
+        if target - end < -128 || target - end > 127 {
+          fixup.short = false
+          fixups.set(index, fixup)
+          changed = true
+        }
+      }
+      index = index + 1
+    }
+  }
+  // Compact: each short reference's instruction becomes its opcode and an 8-bit field.
+  // Bytes only move left, so this works in place.
+  let mut from: usize = 0
+  let mut to: usize = 0
+  index = 0
+  while index < fixups.length() {
+    let fixup = fixups.get(index)
+    if fixup.short {
+      let start = fixup.offset - 1 - u8.toUsize(fixup.kind - 1)
+      while from < start { let byte = code.get(from) code.set(to, byte) from = from + 1 to = to + 1 }
+      let mut opcode: u8 = 0xeb
+      if fixup.kind == BRANCH { opcode = code.get(fixup.offset - 1) - 0x10 }
+      code.set(to, opcode)
+      code.set(to + 1, 0)
+      from = fixup.offset + 4
+      to = to + 2
+    }
+    index = index + 1
+  }
+  while from < code.length() { let byte = code.get(from) code.set(to, byte) from = from + 1 to = to + 1 }
+  code.truncate(to)
+  index = 0
+  while index < fixups.length() {
+    let fixup = fixups.get(index)
+    let target = usize.wrappingToI64(movedAt(&fixups, fixup.target, labels.get(fixup.label)))
+    if fixup.short {
+      // The field is the instruction's last byte; its start moved by the savings before it.
+      let field = fixup.offset - fixup.before - 1 - u8.toUsize(fixup.kind - 1) + 1
+      code.set(field, i64.wrappingToU8(target - usize.wrappingToI64(field) - 1))
+    } else {
+      // Both offsets are below 2^31: the displacement is relative to the end of its field.
+      let field = fixup.offset - fixup.before
+      patch32(&mut code, field, i64.wrappingToI32(target - usize.wrappingToI64(field) - 4))
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < relocations.length() {
+    let mut record = relocations.get(index)
+    record.offset = moved(&fixups, record.offset)
+    relocations.set(index, record)
+    index = index + 1
+  }
+  index = 0
+  while index < places.length() {
+    let taken = u32.toUsize(places.get(index))
+    places.set(index, usize.toU32(moved(&fixups, taken)))
+    index = index + stride
+  }
+  if !hasMark { return usize.MAX }
+  let hotBytes = moved(&fixups, hotMark)
+  if hotBytes == 0 || hotBytes >= code.length() { return usize.MAX }
+  return hotBytes
 }
 
 fn patch32(bytes: &mut List<u8>, offset: usize, value: i32) -> () {
@@ -881,6 +950,45 @@ impl Code {
         if distance < -2147483648 || distance > 2147483647 { fail LinkError { relocation: index, unknownSymbol: false } }
         patch32(&mut self.bytes, record.offset, i64.wrappingToI32(distance))
       }
+      index = index + 1
+    }
+  }
+  /// Links split code whose hot slice `[0..split.hotBytes)` will run at `hotAddr` and cold
+  /// slice `[split.hotBytes..]` will run at `coldAddr`. Patches both external `relocations`
+  /// and internal hot<->cold `split.crossRelocs` in `self.bytes`.
+  pub effect fn linkSplit(self: &mut Self, hotAddr: usize, coldAddr: usize, split: &SplitInfo, symbols: &[usize]) -> () ! LinkError {
+    if split.hotBytes == usize.MAX { run self.link(hotAddr, symbols) return () }
+    let hotBytes = split.hotBytes
+    let mut index: usize = 0
+    while index < self.relocations.length() {
+      let record = self.relocations.get(index)
+      let symbol = u32.toUsize(record.symbol)
+      if symbol >= symbols.length { fail LinkError { relocation: index, unknownSymbol: true } }
+      let target = i64.wrappingAdd(usize.wrappingToI64(symbols[symbol]), record.addend)
+      if record.kind == RelocationKind.Absolute64 {
+        let bits = i64.wrappingToU64(target)
+        let mut at: usize = 0
+        while at < 8 {
+          self.bytes.set(record.offset + at, u64.wrappingToU8(u64.shiftRight(bits, usize.toU64(at * 8))))
+          at = at + 1
+        }
+      } else {
+        let fieldAddr = if record.offset < hotBytes { hotAddr + record.offset } else { coldAddr + (record.offset - hotBytes) }
+        let field = usize.wrappingToI64(fieldAddr)
+        let distance = i64.wrappingSubtract(target, field)
+        if distance < -2147483648 || distance > 2147483647 { fail LinkError { relocation: index, unknownSymbol: false } }
+        patch32(&mut self.bytes, record.offset, i64.wrappingToI32(distance))
+      }
+      index = index + 1
+    }
+    let delta = i64.wrappingSubtract(usize.wrappingToI64(coldAddr), usize.wrappingToI64(hotAddr + hotBytes))
+    index = 0
+    while index < split.crossRelocs.length() {
+      let cr = split.crossRelocs.get(index)
+      let base = i32.toI64(cr.disp)
+      let patched = if cr.fromHot { i64.wrappingAdd(base, delta) } else { i64.wrappingSubtract(base, delta) }
+      if patched < -2147483648 || patched > 2147483647 { fail LinkError { relocation: self.relocations.length(), unknownSymbol: false } }
+      patch32(&mut self.bytes, cr.at, i64.wrappingToI32(patched))
       index = index + 1
     }
   }

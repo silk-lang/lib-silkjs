@@ -13,6 +13,7 @@ import silk.mem.pointer { Pointer }
 import silk.collections.slice { Slice }
 import silk.num.f64
 import silk.num.i32
+import silk.num.i64
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
@@ -35,8 +36,8 @@ import silkjs.js_feedback as feedback
 import silkjs.js_interrupt_host { HotHandler, C_HOT_FUNCTION }
 import silkjs.cli_io as io
 import silkjs.js_opcode_data as op
-import code_memory { CodeMemory, CodeBlock, MemoryError }
-import asm_x64 { Code, LinkError, UnboundLabelError }
+import code_memory { CodeMemory, CodeBlock, MemoryError, PACK_OPT_HOT, PACK_BASE_HOT, PACK_COLD }
+import asm_x64 { Code, SplitInfo, LinkError, UnboundLabelError }
 import x64_lower { Lowered, Refusal }
 import x64_lower as lower
 import jit_recompile { History }
@@ -570,7 +571,7 @@ unsafe effect fn baselineStubs(jit: &mut Jit, settings: &BaselineSettings) -> bo
     BaselineStubs { code: made, offsets } => {
       let mut sharedCode = move made
       let sharedBlock = match &mut jit.memory {
-        Option<CodeMemory>.Some { value } => run publish(&mut value, &mut sharedCode, none.asSlice())
+        Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_OPT_HOT, &mut sharedCode, none.asSlice())
         Option<CodeMemory>.None => { return false }
       }
       let base = Pointer.address<u8>(sharedBlock.entry())
@@ -597,11 +598,11 @@ unsafe effect fn baselineStubs(jit: &mut Jit, settings: &BaselineSettings) -> bo
     }
   }
   let entryBlock = match &mut jit.memory {
-    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut entryCode, none.asSlice())
+    Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_OPT_HOT, &mut entryCode, none.asSlice())
     Option<CodeMemory>.None => { return false }
   }
   let releaseBlock = match &mut jit.memory {
-    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut releaseCode, none.asSlice())
+    Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_OPT_HOT, &mut releaseCode, none.asSlice())
     Option<CodeMemory>.None => { return false }
   }
   let enter = entryBlock.entry()
@@ -664,7 +665,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       if !run unsafe baselineStubs(&mut jit, &settings) { jit.failed = jit.failed + 1 return () }
       let symbols = jit.baselineSymbols.asSlice()
       let block = match &mut jit.memory {
-        Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, symbols)
+        Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_BASE_HOT, &mut code, symbols)
         Option<CodeMemory>.None => { return () }
       }
       let entry = block.entry()
@@ -1205,8 +1206,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     inlinedSites = inlined.length()
   }
   let mut construct: u32 = 0
+  let mut split = SplitInfo.none()
   let mut code = match move result {
-    Lowered.Code { value, construct: at, .. } => { construct = at move value }
+    Lowered.Code { value, construct: at, split: splitInfo, .. } => { construct = at split = move splitInfo move value }
     Lowered.Refused { reason } => {
       jit.optimizeRefused = jit.optimizeRefused + 1
       if jit.options.dump { run sayRefusal(&reason) }
@@ -1214,15 +1216,41 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     }
   }
   if jit.options.dump { run dumpMachine(&code) }
-  let block = match &mut jit.memory {
-    Option<CodeMemory>.Some { value } => run publish(&mut value, &mut code, symbols.asSlice())
-    Option<CodeMemory>.None => { return () }
+  let isSplit = split.hotBytes != usize.MAX && split.hotBytes > 0 && split.hotBytes < code.bytes.length()
+  let mut entry = info.code
+  let mut coldEntry = info.code
+  if isSplit {
+    let blocks = match &mut jit.memory {
+      Option<CodeMemory>.Some { value } => run publishSplit(&mut value, &mut code, &split, symbols.asSlice())
+      Option<CodeMemory>.None => { return () }
+    }
+    match move blocks {
+      SplitBlocks { hot, cold } => {
+        entry = hot.entry()
+        coldEntry = cold.entry()
+        run jit.blocks.append(move hot)
+        run jit.blocks.append(move cold)
+      }
+    }
+  } else {
+    let block = match &mut jit.memory {
+      Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_OPT_HOT, &mut code, symbols.asSlice())
+      Option<CodeMemory>.None => { return () }
+    }
+    entry = block.entry()
+    coldEntry = entry
+    run jit.blocks.append(move block)
   }
-  let entry = block.entry()
-  run jit.blocks.append(move block)
-  // Constructs run the code too, through its own construct entry.
+  // Constructs run the code too, through its own construct entry (which lives in cold when split).
   let mut constructEntry = info.construct
-  if construct != 0 { constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(construct)) }
+  if construct != 0 {
+    let off = u32.toUsize(construct)
+    if isSplit && off >= split.hotBytes {
+      constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(coldEntry), off - split.hotBytes)
+    } else {
+      constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), off)
+    }
+  }
   unsafe engineBaseline.relink(rt, linked, entry, constructEntry)
   info.tier = TIER_OPTIMIZED
   if info.compiles < 255 { info.compiles = info.compiles + 1 }
@@ -1895,9 +1923,17 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
   let mut chainPc: usize = usize.MAX
   let mut this = usize.MAX
   if !Pointer.isNull<HeapHeader>(receiver) { this = thisLocal(bytes) }
+  // Straight-line stack tracking for `get_var; <args>; call/call0..3` direct function calls.
+  let trackVars = exact && !Pointer.isNull<HeapHeader>(owner)
+  let mut jumpTargets = List<bool>.make()
+  if trackVars { jumpTargets = run markJumpTargets(bytes) }
+  let mut varStack: [?*mut HeapHeader; 32] = [Pointer.null<HeapHeader>(); 32]
+  let mut varDepth: usize = 0
   while pc < bytes.length && cells.length() < MAX_CANDIDATES {
+    if trackVars && jumpTargets.get(pc) { varDepth = 0 }
     let opcode = bytes[pc]
-    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    let opInfo = op.opcodeInfo(opcode, true)
+    let size = u8.toUsize(opInfo.size)
     if size == 0 || pc + size > bytes.length { break }
     // The methods a site read for the shapes it saw (the engine records them when shapes
     // are recorded): several, or one among shapes whose method is not known, are tested in
@@ -2003,6 +2039,43 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
       if let Option<*mut HeapHeader>.Some { value: ctor } = Pointer.nonNullMut<HeapHeader>(chainObj) {
         run unsafe buildConstruct(rt, ctor, usize.toU32(chainPc), &mut constructDescs, &mut outConstructs)
       }
+    } else if trackVars && ((opcode == op.OP_call && size == 3) || (opcode >= op.OP_call0 && opcode <= op.OP_call3)) {
+      let argc = if opcode == op.OP_call { u8.toUsize(bytes[pc + 1]) | usize.shiftLeft(u8.toUsize(bytes[pc + 2]), 8) } else { u8.toUsize(opcode - op.OP_call0) }
+      if varDepth >= argc + 1 {
+        let calleeOpt = varStack[varDepth - argc - 1]
+        if let Option<*mut HeapHeader>.Some { value: calleeObj } = Pointer.nonNullMut<HeapHeader>(calleeOpt) {
+          let mut seenAtCall = false
+          let mut ti: usize = 0
+          while ti < targets.length() {
+            let existing = &targets.asSlice()[ti]
+            if existing.atCall && existing.pc == usize.toU32(pc) { seenAtCall = true break }
+            ti = ti + 1
+          }
+          if !seenAtCall {
+            if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.closureBytecode(ValueBits.Object { reference: calleeObj })) {
+              if Pointer.address<HeapHeader>(cell) != Pointer.address<HeapHeader>(bytecode) {
+                let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
+                let codeLen = (unsafe callee.code.asSlice()).length
+                if callee.scopeSlots == 0
+                  && Pointer.address<HeapHeader>(callee.realm) == Pointer.address<HeapHeader>(function.realm)
+                  && codeLen > 0 && codeLen <= CANDIDATE_BYTES {
+                  let mut input = run inputOf(&callee)
+                  input.doubleSites = run calleeDoubleSites(jit, &callee)
+                  input.siteShapes = run unsafe siteShapesOf(rt, cell)
+                  let id = u32.bitOr(usize.toU32(cells.length()), TARGET_EXACT)
+                  run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
+                  run closures.append(calleeOpt)
+                  run appendKnown(&mut holders, &KnownMethod.none())
+                  let mut childConstructs = List<ConstructTarget>.make()
+                  if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, calleeOpt, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+                  input.constructs = move childConstructs
+                  run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: unsafe ownedCells(calleeOpt), known: KnownShapes.none() })
+                }
+              }
+            }
+          }
+        }
+      }
     }
     if opcode == op.OP_get_var && size == 3 {
       chainObj = Pointer.null<HeapHeader>()
@@ -2011,22 +2084,105 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
       }
       chainEnd = pc + size
       chainPc = pc
-    } else if opcode == op.OP_push_this && size == 1 {
-      chainObj = receiver
-      chainEnd = pc + size
-      chainPc = usize.MAX
-    } else if this != usize.MAX && readLocal(bytes, pc, pc + size) == this {
-      chainObj = receiver
-      chainEnd = pc + size
-      chainPc = usize.MAX
-    } else if opcode == op.OP_get_field && size >= 5 && chainEnd == pc {
-      if let Option<*mut HeapHeader>.Some { value: from } = Pointer.nonNullMut<HeapHeader>(chainObj) {
-        let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
-        chainObj = unsafe ownObject(from, atom)
+      if trackVars {
+        if varDepth < 32 { varStack[varDepth] = chainObj varDepth = varDepth + 1 } else { varDepth = 0 }
+      }
+    } else {
+      if opcode == op.OP_push_this && size == 1 {
+        chainObj = receiver
         chainEnd = pc + size
-        chainPc = pc
+        chainPc = usize.MAX
+      } else if this != usize.MAX && readLocal(bytes, pc, pc + size) == this {
+        chainObj = receiver
+        chainEnd = pc + size
+        chainPc = usize.MAX
+      } else if opcode == op.OP_get_field && size >= 5 && chainEnd == pc {
+        if let Option<*mut HeapHeader>.Some { value: from } = Pointer.nonNullMut<HeapHeader>(chainObj) {
+          let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
+          chainObj = unsafe ownObject(from, atom)
+          chainEnd = pc + size
+          chainPc = pc
+        }
+      }
+      if trackVars {
+        if isControlOrShuffle(opcode, opInfo.format) {
+          varDepth = 0
+        } else {
+          let mut pops = u8.toUsize(opInfo.pops)
+          let mut unknownPop = false
+          if opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor || opcode == op.OP_array_from {
+            if size == 3 { pops = pops + (u8.toUsize(bytes[pc + 1]) | usize.shiftLeft(u8.toUsize(bytes[pc + 2]), 8)) }
+            else { unknownPop = true }
+          } else if opcode >= op.OP_call0 && opcode <= op.OP_call3 {
+            pops = 1 + u8.toUsize(opcode - op.OP_call0)
+          } else if opInfo.format == op.OP_FMT_npop || opInfo.format == op.OP_FMT_npopx || opInfo.format == op.OP_FMT_npop_u16 {
+            unknownPop = true
+          }
+          if unknownPop || pops > varDepth {
+            varDepth = 0
+          } else {
+            varDepth = varDepth - pops
+            let pushes = u8.toUsize(opInfo.pushes)
+            if varDepth + pushes > 32 {
+              varDepth = 0
+            } else {
+              let mut p: usize = 0
+              while p < pushes { varStack[varDepth] = Pointer.null<HeapHeader>() varDepth = varDepth + 1 p = p + 1 }
+            }
+          }
+        }
       }
     }
+    pc = pc + size
+  }
+  return move targets
+}
+
+fn isControlOrShuffle(opcode: u8, format: u8) -> bool {
+  if format == op.OP_FMT_label8 || format == op.OP_FMT_label16 || format == op.OP_FMT_label
+    || format == op.OP_FMT_atom_label_u8 || format == op.OP_FMT_atom_label_u16 || format == op.OP_FMT_label_u16 { return true }
+  if opcode >= op.OP_nip && opcode <= op.OP_rot5l { return true }
+  return opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_return_async
+    || opcode == op.OP_throw || opcode == op.OP_throw_error || opcode == op.OP_ret || opcode == op.OP_nip_catch
+    || opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8
+    || opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 || opcode == op.OP_if_not_nullish_keep8
+    || opcode == op.OP_tail_call || opcode == op.OP_tail_call_method
+}
+
+effect fn markJumpTargets(bytes: &[u8]) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut targets = List<bool>.make()
+  run targets.appendRepeated(false, bytes.length)
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    let mut target: i64 = -1
+    if (opcode == op.OP_if_false8 || opcode == op.OP_if_true8 || opcode == op.OP_goto8) && size == 2 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 1]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 1) + disp
+    } else if opcode == op.OP_goto16 && size == 3 {
+      let raw = u32.toI64(u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8))
+      let disp = if raw >= 32768 { raw - 65536 } else { raw }
+      target = usize.toI64(pc + 1) + disp
+    } else if (opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_goto || opcode == op.OP_catch || opcode == op.OP_gosub) && size == 5 {
+      let raw = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
+      target = usize.toI64(pc + 1) + i32.toI64(u32.wrappingToI32(raw))
+    } else if (opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8) && size == 3 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 2]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 2) + disp
+    } else if (opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8) && size == 4 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 2]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 2) + disp
+    } else if opcode == op.OP_if_not_nullish_keep8 && size == 5 {
+      let raw = usize.toI64(u8.toUsize(bytes[pc + 3]))
+      let disp = if raw >= 128 { raw - 256 } else { raw }
+      target = usize.toI64(pc + 3) + disp
+    }
+    if target >= 0 && i64.toUsize(target) < bytes.length { targets.set(i64.toUsize(target), true) }
     pc = pc + size
   }
   return move targets
@@ -2487,6 +2643,30 @@ effect fn publish(memory: &mut CodeMemory, code: &mut Code, symbols: &[usize]) -
   run code.link(writer.address(), symbols)
   run writer.append(code.bytes.asSlice())
   return run writer.finish()
+}
+struct SplitBlocks { hot: CodeBlock, cold: CodeBlock }
+/// Links code for the address it will run at in packed `lane`, and publishes it.
+effect fn publishIn(memory: &mut CodeMemory, lane: usize, code: &mut Code, symbols: &[usize]) -> CodeBlock ! MemoryError | LinkError {
+  let mut writer = run memory.allocatePackedIn(lane, code.bytes.length())
+  run code.link(writer.address(), symbols)
+  run writer.append(code.bytes.asSlice())
+  return run writer.finish()
+}
+/// Links split code across `PACK_OPT_HOT` and `PACK_COLD` within the same `CodeMemory`
+/// mapping, patching both external relocations and hot<->cold cross-region displacements,
+/// and publishes both halves.
+effect fn publishSplit(memory: &mut CodeMemory, code: &mut Code, split: &SplitInfo, symbols: &[usize]) -> SplitBlocks ! MemoryError | LinkError {
+  let hotLen = split.hotBytes
+  let coldLen = code.bytes.length() - hotLen
+  let mut hotWriter = run memory.allocatePackedIn(PACK_OPT_HOT, hotLen)
+  let mut coldWriter = run memory.allocatePackedIn(PACK_COLD, coldLen)
+  run code.linkSplit(hotWriter.address(), coldWriter.address(), split, symbols)
+  let bytes = code.bytes.asSlice()
+  run hotWriter.append(Slice.view<u8>(bytes, 0, hotLen))
+  run coldWriter.append(Slice.view<u8>(bytes, hotLen, coldLen))
+  let hot = run hotWriter.finish()
+  let cold = run coldWriter.finish()
+  return SplitBlocks { hot: move hot, cold: move cold }
 }
 effect fn sayRefusal(reason: &Refusal) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut line = List<u8>.make()

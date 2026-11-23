@@ -33,7 +33,7 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.usize
 import silk.core.option { Option }
-import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, Scale, Shift, Unary, UnboundLabelError, Width, Xmm }
+import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, Scale, Shift, SplitCode, SplitInfo, Unary, UnboundLabelError, Width, Xmm }
 import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS, UNBOX_EXACT }
 import ssa_verify { readsA, readsB }
 import ssa
@@ -91,8 +91,8 @@ fn isFloatClass(classId: u32) -> bool {
 /// Why a function was not lowered.
 pub struct Unsupported { pub why: &'static [u8] }
 /// Code: construct is the offset of frame mode's construct entry (x64_backend.construct), 0
-/// for code of no frame.
-pub union Lowering { Code { pub value: Code, pub construct: u32 }, Unsupported { pub reason: Unsupported } }
+/// for code of no frame; split carries the hot/cold boundary and cross-region relocations.
+pub union Lowering { Code { pub value: Code, pub construct: u32, pub split: SplitInfo }, Unsupported { pub reason: Unsupported } }
 
 /// Options of one lowering.
 pub struct Settings {
@@ -154,6 +154,17 @@ const OUT_PUT_LAST: u32 = 3
 /// The new value is in RAX and R9; the value's own count goes to the field.
 const PUT_HELD: u32 = 1
 const PUT_MOVED: u32 = 2
+
+/// A deferred slow path emitted after `markCold()` in frame mode: runs `stepOnFrame`
+/// (optionally preceded by `getterCall`, `setterCall`, `putFieldQuick`, or `helpers.PUT_FIELD`)
+/// and jumps back to `back`.
+struct StepSlow { entry: Label, back: Label, inst: Inst, step: u32, shape: u32, out: u32, kind: u8 }
+impl Copy for StepSlow {}
+const STEP_PLAIN: u8 = 0
+const STEP_GETTER: u8 = 1
+const STEP_SETTER: u8 = 2
+const STEP_SETTER_QUICK: u8 = 3
+const STEP_PUT_FIELD_SLOW: u8 = 4
 
 pub struct Emitter {
   pub a: Assembler,
@@ -249,6 +260,7 @@ pub struct Emitter {
   shapes: Shapes,
   polls: List<PollSlow>,
   outs: List<Out>,
+  stepSlows: List<StepSlow>,
   /// Frame mode: where the prologue goes when the native stack has no room.
   overflow: Label,
   /// Frame mode: the construct entry's offset before placing (frameTails), and where it
@@ -405,6 +417,7 @@ fn stepFor(function: &Function, inst: Inst, code: &[u8]) -> u32 {
   let opcode = code[u32.toUsize(inst.pc)]
   if inst.op == Op.Call && (inst.k & calls.GENERIC) != 0 && (opcode == opcodes.OP_object || opcode == opcodes.OP_define_field
     || opcode == opcodes.OP_set_proto || opcode == opcodes.OP_array_from || opcode == opcodes.OP_rest) { step = step | STEP_QUICK }
+  if (inst.op == Op.PutField || (inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_PUT_FIELD)) && opcode == opcodes.OP_put_field { step = step | STEP_QUICK }
   let before = function.exit(inst.exit).stackDepth
   let after = u32.wrappingToI32(before) + u32.wrappingToI32(u32.shiftRight(step, 16) & 255) - 128
   if before > 255 || after < 0 || after > 255 || inst.pc + (step & 65535) >= 16777216 { return 0 }
@@ -512,7 +525,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
     undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
-    on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
+    on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
     leaveAt: u32.wrappingToI32(leaveAt), leaveBytes: leaveBytes, callAt: callAt, bodyAt: callAt + bodyCells * SLOT_BYTES }
   run emitter.inlineClosures.appendRepeated(NONE, u32.toUsize(inlined))
@@ -589,6 +602,9 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     }
     b = b + 1
   }
+  // Everything after the hot blocks (undo/zero stubs, cold slow paths, frame tails, exit
+  // stubs and exit tables) belongs to the cold region in frame mode.
+  if on { emitter.a.markCold() }
   let mut u: usize = 0
   while u < emitter.undoInsts.length() {
     let inst = emitter.undoInsts.get(u)
@@ -611,6 +627,14 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     z = z + 1
   }
   run emitter.coldPieces(&function)
+  // Emit deferred step/PutField slow paths before `outs` so any `releaseAt` inside
+  // `getterCall`/`setterCall` has its `OUT_RELEASE` emitted by the loop below.
+  let mut ss: usize = 0
+  while ss < emitter.stepSlows.length() {
+    let item = emitter.stepSlows.get(ss)
+    run emitter.emitStepSlow(&function, item)
+    ss = ss + 1
+  }
   let mut o: usize = 0
   while o < emitter.outs.length() {
     let out = emitter.outs.get(o)
@@ -625,7 +649,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   run exits.emit(&mut emitter, &function)
   // The construct entry's offset, placed with the map's.
   if on { run offsets.append(emitter.constructAt) }
-  let code = run emitter.a.finishPlaced(&mut offsets, 1)
+  let finished = run emitter.a.finishPlacedSplit(&mut offsets, 1)
   let mut construct: u32 = 0
   if on { construct = offsets.get(offsets.length() - 1) drop offsets.pop() }
   if map {
@@ -636,7 +660,9 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     run line.append(10)
     io.stderr(line.asSlice())
   }
-  return Lowering.Code { value: move code, construct: construct }
+  return match move finished {
+    SplitCode { code, split } => Lowering.Code { value: move code, construct: construct, split: move split }
+  }
 }
 
 /// The ABI inputs, in argument order: arguments, state, counter, data, env, frame.
@@ -1462,10 +1488,10 @@ impl Emitter {
         // It left before: a function getter is called from here (getterCall); the
         // interpreter reads what is left (a primitive's property, a native getter), and its
         // value is on top of the stack afterwards.
-        run self.a.jcc(Cond.NotEqual, done)
-        if self.on && inst.frame == 0 { run self.getterCall(&function, inst, done) }
         let after = self.depthAfter(&function, inst, step)
-        run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
+        let kind = if self.on && inst.frame == 0 { STEP_GETTER } else { STEP_PLAIN }
+        let cold = run self.deferStep(inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result, done, kind)
+        run self.a.jcc(Cond.Equal, cold)
       } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
       self.a.bind(done)
       return ()
@@ -1676,9 +1702,9 @@ impl Emitter {
           // It left before (ELEM_STEPS): the interpreter reads what the helper declines,
           // and its value is on top of the stack afterwards.
           run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-          run self.a.jcc(Cond.NotEqual, done)
           let after = self.depthAfter(&function, inst, step)
-          run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
+          let cold = run self.deferStep(inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result, done, STEP_PLAIN)
+          run self.a.jcc(Cond.Equal, cold)
           self.a.bind(done)
           return ()
         }
@@ -1695,16 +1721,13 @@ impl Emitter {
         run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.LENGTH)))
         run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
         let step = self.stepAt()
-        let read = run self.a.label()
         if step != 0 {
           // It left before: the interpreter reads what the helper declines (a getter). Such a
           // read keeps its owned result (ssa_opt_borrow).
-          run self.a.jcc(Cond.NotEqual, read)
           let after = self.depthAfter(&function, inst, step)
-          run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
-          run self.a.jmp(done)
+          let cold = run self.deferStep(inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result, done, STEP_PLAIN)
+          run self.a.jcc(Cond.Equal, cold)
         } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
-        self.a.bind(read)
         if borrowed {
           run self.a.load(Width.W64, Reg.Rax, slotOf(inst.result))
           run self.heapTest(Reg.Rax, done)
@@ -1910,6 +1933,8 @@ impl Emitter {
         }
         self.a.bind(general)
       }
+      let step = self.stepAt()
+      let coldSlow = self.on && inst.frame == 0
       run self.fieldSlot(inst.a, inst.pc, slow)
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
       run self.heapTest(Reg.Rax, kept)
@@ -1926,7 +1951,17 @@ impl Emitter {
         run self.a.jmp(self.skipLabel)
       } else {
         run self.retainBits(Reg.Rax, Reg.R9)
-        run self.a.jmp(done)
+        if !coldSlow { run self.a.jmp(done) }
+      }
+      if coldSlow {
+        let mut shape: u32 = 0
+        if step != 0 {
+          let after = self.depthAfter(&function, inst, step)
+          shape = leaving.stepShape(0, 0, 0, after)
+        }
+        run self.stepSlows.append(StepSlow { entry: slow, back: done, inst: inst, step: step, shape: shape, out: NONE, kind: STEP_PUT_FIELD_SLOW })
+        self.a.bind(done)
+        return ()
       }
       self.a.bind(slow)
       // A live borrowed field may alias the displaced value. In that case the helper
@@ -1938,17 +1973,7 @@ impl Emitter {
       run self.a.lea(Width.W64, Reg.R8, slotOf(inst.b))
       run self.callHelper(helpers.PUT_FIELD)
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
-      let step = self.stepAt()
-      if step != 0 {
-        // An ordinary add that only needs a larger slot list (WRITE_NEEDS_ROOM) runs no code
-        // of the program's: the interpreter makes it on the frame, and the code goes on.
-        // Anything else the helper declines leaves.
-        run self.a.jcc(Cond.Equal, done)
-        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(objects.WRITE_NEEDS_ROOM))
-        run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
-        let after = self.depthAfter(&function, inst, step)
-        run self.stepOnFrame(&function, inst, step, leaving.stepShape(0, 0, 0, after), NONE)
-      } else { run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit))) }
+      run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
       self.a.bind(done)
       return ()
     }
@@ -4602,14 +4627,13 @@ impl Emitter {
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
       let step = self.stepAt()
       if step != 0 {
-        // What the helper declines: a function setter is called from here (setterCall);
-        // the interpreter stores the rest (a new property, a native setter).
-        let stored = run self.a.label()
-        run self.a.jcc(Cond.Equal, stored)
-        if inst.frame == 0 { run self.setterCall(&function, inst, stored) }
+        // What the helper declines: a function setter is called from here (setterCall), then
+        // SERVICE_QUICK handles allocating stores/shapes/Array.length, and the interpreter
+        // stores the rest (a native setter). All out of line in the cold section.
         let after = self.depthAfter(&function, inst, step)
-        run self.stepOnFrame(&function, inst, step, leaving.stepShape(0, 0, 0, after), NONE)
-        self.a.bind(stored)
+        let kind = if (step & STEP_QUICK) != 0 { STEP_SETTER_QUICK } else { STEP_SETTER }
+        let cold = run self.deferStep(inst, step, leaving.stepShape(0, 0, 0, after), NONE, done, kind)
+        run self.a.jcc(Cond.NotEqual, cold)
       } else { run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit))) }
       self.a.bind(done)
       run self.a.movImm64(Reg.Rax, layout.tagWord(layout.undefined()))
@@ -4652,8 +4676,8 @@ impl Emitter {
       let step = self.stepAt()
       if step != 0 {
         let after = self.depthAfter(&function, inst, step)
-        run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
-        run self.a.jmp(done)
+        let cold = run self.deferStep(inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result, done, STEP_PLAIN)
+        run self.a.jmp(cold)
       } else { run self.a.jmp(self.exitLabels.get(u32.toUsize(inst.exit))) }
       self.a.bind(joined)
       run self.a.load(Width.W64, Reg.Rax, p.rec(p.f.result))
@@ -4677,12 +4701,9 @@ impl Emitter {
       let done = run self.a.label()
       if step != 0 {
         // What coerces the interpreter compares: its Bool is where the operands were.
-        let answered = run self.a.label()
-        run self.a.jcc(Cond.NotEqual, answered)
         let after = self.depthAfter(&function, inst, step)
-        run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
-        run self.a.jmp(done)
-        self.a.bind(answered)
+        let cold = run self.deferStep(inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result, done, STEP_PLAIN)
+        run self.a.jcc(Cond.Equal, cold)
       } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
       self.a.bind(inPlace)
       if calls.notEqualOf(inst) { run self.a.aluImm(Alu.Xor, Width.W32, Reg.Rax, 1) }
@@ -4741,7 +4762,8 @@ impl Emitter {
         i = 0
         while i < count { run self.releaseCell(p.operandAt(base + i)) i = i + 1 }
       }
-      run self.stepOnFrame(&function, inst, step, leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after), out)
+      let cold = run self.deferStep(inst, step, leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after), out, stepped, STEP_PLAIN)
+      run self.a.jmp(cold)
       self.a.bind(stepped)
       if !first {
         run self.a.movImm64(Reg.Rax, layout.tagWord(layout.undefined()))
@@ -5011,9 +5033,9 @@ impl Emitter {
     let step = self.stepAt()
     if step != 0 {
       // It left before (ELEM_STEPS): the interpreter reads what the engine declines.
-      run self.a.jcc(Cond.NotEqual, done)
       let after = self.depthAfter(&function, inst, step)
-      run self.stepOnFrame(&function, inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result)
+      let cold = run self.deferStep(inst, step, leaving.stepShape(after - 1, 1, 0, after), inst.result, done, STEP_PLAIN)
+      run self.a.jcc(Cond.Equal, cold)
     } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
     self.a.bind(done)
   }
@@ -5098,9 +5120,9 @@ impl Emitter {
     if step != 0 {
       // A setter, a prototype's property, an add that needs a new shape: the interpreter
       // stores on the frame, and the code goes on.
-      run self.a.jcc(Cond.NotEqual, done)
       let after = self.depthAfter(&function, inst, step)
-      run self.stepOnFrame(&function, inst, step, leaving.stepShape(0, 0, 0, after), NONE)
+      let cold = run self.deferStep(inst, step, leaving.stepShape(0, 0, 0, after), NONE, done, STEP_PLAIN)
+      run self.a.jcc(Cond.Equal, cold)
     } else { run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit))) }
     self.a.bind(done)
   }
@@ -5202,6 +5224,82 @@ impl Emitter {
   /// The operands on the stack after the step `step` of inst's bytecode instruction.
   fn depthAfter(self: &Self, function: &Function, inst: Inst, step: u32) -> u32 {
     return i32.wrappingToU32(u32.wrappingToI32(function.exit(inst.exit).stackDepth) + u32.wrappingToI32(u32.shiftRight(step, 16) & 255) - 128)
+  }
+  /// Schedules a deferred slow path in the cold section (`stepSlows`).
+  effect fn deferStep(self: &mut Self, inst: Inst, step: u32, shape: u32, out: u32, back: Label, kind: u8) -> Label ! OutOfMemoryError ? &mut Allocator {
+    let entry = run self.a.label()
+    run self.stepSlows.append(StepSlow { entry: entry, back: back, inst: inst, step: step, shape: shape, out: out, kind: kind })
+    return entry
+  }
+  /// Tries `SERVICE_QUICK` for `OP_put_field` (allocating stores, new shapes, Array.length):
+  /// copies object (`inst.a`) and value (`inst.b`) into scratch slots with counts of their own;
+  /// on 0 both counts were consumed and control jumps to `stored`; on 2 both counts are
+  /// dropped (the slots still hold theirs) and control falls through to `stepOnFrame`.
+  effect fn putFieldQuick(self: &mut Self, inst: Inst, stored: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let scratch = self.scratch
+    run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
+    run self.a.load(Width.W64, Reg.Rdx, payloadOf(inst.a))
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, scratch), Reg.Rax)
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, scratch + 8), Reg.Rdx)
+    run self.retainBits(Reg.Rax, Reg.Rdx)
+    run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+    run self.a.load(Width.W64, Reg.Rdx, payloadOf(inst.b))
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, scratch + 16), Reg.Rax)
+    run self.a.store(Width.W64, Mem.at(Reg.Rsp, scratch + 24), Reg.Rdx)
+    run self.retainBits(Reg.Rax, Reg.Rdx)
+    run self.a.movImm32(Reg.Rcx, u32.bitOr(u64.wrappingToU32(frames.SERVICE_QUICK), u32.shiftLeft(inst.pc, 8)))
+    run self.a.lea(Width.W64, Reg.R8, Mem.at(Reg.Rsp, scratch + 32))
+    run self.a.movImm32(Reg.R9, 0)
+    run self.engineCall()
+    run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+    run self.a.jcc(Cond.Equal, stored)
+    let skipA = run self.a.label()
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, scratch))
+    run self.heapTest(Reg.Rax, skipA)
+    run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, scratch + 8))
+    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+    self.a.bind(skipA)
+    let skipB = run self.a.label()
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, scratch + 16))
+    run self.heapTest(Reg.Rax, skipB)
+    run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, scratch + 24))
+    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+    self.a.bind(skipB)
+  }
+  /// Emits one deferred cold slow path after `markCold()`.
+  effect fn emitStepSlow(self: &mut Self, function: &Function, item: StepSlow) -> () ! OutOfMemoryError ? &mut Allocator {
+    let inst = item.inst
+    self.frameOf = inst.frame
+    self.a.bind(item.entry)
+    if item.kind == STEP_PUT_FIELD_SLOW {
+      run self.ownFrame(Reg.Rsi)
+      if inst.k == 0 { run self.a.movImm32(Reg.Rdx, inst.pc) }
+      else { run self.a.movImm64(Reg.Rdx, u64.bitOr(u32.toU64(inst.pc), helpers.PUT_FIELD_RELEASE_LAST)) }
+      run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a))
+      run self.a.lea(Width.W64, Reg.R8, slotOf(inst.b))
+      run self.callHelper(helpers.PUT_FIELD)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+      if item.step != 0 {
+        run self.a.jcc(Cond.Equal, item.back)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(objects.WRITE_NEEDS_ROOM))
+        run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+        if (item.step & STEP_QUICK) != 0 { run self.putFieldQuick(inst, item.back) }
+        run self.stepOnFrame(&function, inst, item.step, item.shape, NONE)
+        run self.a.jmp(item.back)
+      } else {
+        run self.a.jcc(Cond.NotEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+        run self.a.jmp(item.back)
+      }
+      return ()
+    }
+    if item.kind == STEP_GETTER {
+      run self.getterCall(&function, inst, item.back)
+    } else if item.kind == STEP_SETTER || item.kind == STEP_SETTER_QUICK {
+      if inst.frame == 0 { run self.setterCall(&function, inst, item.back) }
+      if item.kind == STEP_SETTER_QUICK { run self.putFieldQuick(inst, item.back) }
+    }
+    run self.stepOnFrame(&function, inst, item.step, item.shape, item.out)
+    run self.a.jmp(item.back)
   }
   /// Frame mode: the interpreter runs the bytecode instruction of inst on the frame and the
   /// code goes on after it. The state of inst's exit goes into the frame's cells, each value

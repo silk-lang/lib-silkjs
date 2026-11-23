@@ -12,7 +12,7 @@ import silk.num.i32
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
-import ssa { Function, Edge, Inst, Slot, Type, Own, RootKind, Op, SlotMode, NONE, edgeCount, isNumberOp, numberOpHasExit, readsK, steppedRead }
+import ssa { Function, Edge, Inst, Slot, Type, Own, RootKind, Op, Cmp, SlotMode, NONE, edgeCount, isNumberOp, numberOpHasExit, readsK, steppedRead }
 import ssa_calls as calls
 import ssa_verify { readsA, readsB, dominators }
 
@@ -138,8 +138,146 @@ effect fn incomingEdges(f: &Function) -> Incoming ! OutOfMemoryError ? &mut Allo
 /// The instruction index of block `b`'s terminator, in a compacted function.
 fn terminatorIndex(f: &Function, b: u32) -> u32 { let block = f.blocks.get(u32.toUsize(b)) return block.firstInst + block.instCount - 1 }
 
-/// One round of local folds. Returns whether anything changed.
-effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+fn isNewObjectDef(f: &Function, v: u32) -> bool {
+  if v == NONE || u32.toUsize(v) >= f.values.length() { return false }
+  let def = f.value(v).def
+  return def != NONE && f.inst(def).op == Op.NewObject
+}
+
+fn isPlannedCallDef(f: &Function, v: u32) -> bool {
+  if v == NONE || u32.toUsize(v) >= f.values.length() { return false }
+  let def = f.value(v).def
+  return def != NONE && f.inst(def).op == Op.Call && (f.inst(def).k & calls.PLANNED) != 0
+}
+
+/// Values guaranteed to be a live JS Object: construct-join parameters whose two incoming
+/// edges pass `Op.NewObject` (fast path) and `Op.Call` with `calls.PLANNED` (slow path),
+/// plus transitive `Op.Retain` copies and block parameters whose every non-self incoming
+/// argument is such an object. (`Op.NewObject`'s result itself is excluded because it can
+/// be `Undefined` on the slow path.)
+effect fn knownConstructObjects(f: &Function) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut isObj = List<bool>.make()
+  if f.constructTargets.length() == 0 { return move isObj }
+  let count = f.values.length()
+  run isObj.appendRepeated(false, count)
+  let into = run incomingEdges(f)
+  let mut any = false
+  let mut b: u32 = 1
+  while b < f.blockCount() {
+    let s0 = into.first.get(u32.toUsize(b))
+    let s1 = into.first.get(u32.toUsize(b) + 1)
+    if s1 - s0 == 2 {
+      let block = f.blocks.get(u32.toUsize(b))
+      let e0 = f.edges.get(u32.toUsize(into.edges.get(u32.toUsize(s0))))
+      let e1 = f.edges.get(u32.toUsize(into.edges.get(u32.toUsize(s0 + 1))))
+      let mut g: u32 = 0
+      while g < block.paramCount && g < e0.argCount && g < e1.argCount {
+        let p = f.paramAt(block, g)
+        if f.value(p).ty == Type.Value {
+          let a0 = f.edgeArg(e0, g)
+          let a1 = f.edgeArg(e1, g)
+          if (isNewObjectDef(f, a0) && isPlannedCallDef(f, a1)) || (isPlannedCallDef(f, a0) && isNewObjectDef(f, a1)) {
+            isObj.set(u32.toUsize(p), true)
+            any = true
+          }
+        }
+        g = g + 1
+      }
+    }
+    b = b + 1
+  }
+  if !any { isObj.truncate(0) return move isObj }
+  let mut prop = true
+  while prop {
+    prop = false
+    let mut i: usize = 0
+    while i < f.insts.length() {
+      let inst = f.insts.get(i)
+      if inst.op == Op.Retain && inst.result != NONE && u32.toUsize(inst.a) < count && u32.toUsize(inst.result) < count {
+        if isObj.get(u32.toUsize(inst.a)) && !isObj.get(u32.toUsize(inst.result)) {
+          isObj.set(u32.toUsize(inst.result), true)
+          prop = true
+        }
+      }
+      i = i + 1
+    }
+    b = 1
+    while b < f.blockCount() {
+      let block = f.blocks.get(u32.toUsize(b))
+      let s0 = into.first.get(u32.toUsize(b))
+      let s1 = into.first.get(u32.toUsize(b) + 1)
+      if s0 < s1 {
+        let mut g: u32 = 0
+        while g < block.paramCount {
+          let p = f.paramAt(block, g)
+          if u32.toUsize(p) < count && f.value(p).ty == Type.Value && !isObj.get(u32.toUsize(p)) {
+            let mut allObj = true
+            let mut anyOther = false
+            let mut k = s0
+            while k < s1 {
+              let edge = f.edges.get(u32.toUsize(into.edges.get(u32.toUsize(k))))
+              if g >= edge.argCount { allObj = false break }
+              let a = f.edgeArg(edge, g)
+              if a != p {
+                anyOther = true
+                if u32.toUsize(a) >= count || !isObj.get(u32.toUsize(a)) { allObj = false break }
+              }
+              k = k + 1
+            }
+            if allObj && anyOther { isObj.set(u32.toUsize(p), true) prop = true }
+          }
+          g = g + 1
+        }
+      }
+      b = b + 1
+    }
+  }
+  return move isObj
+}
+
+/// Constant boolean value of `v` (1 true, 0 false, -1 unknown), through `Cmp` on `ConstI32`
+/// operands and `NotBool`.
+fn constBoolOf(f: &Function, forward: &Forward, v: u32) -> i32 {
+  let mut cur = forward.resolve(v)
+  let mut invert = false
+  let mut steps: u32 = 0
+  while steps < 8 {
+    if cur == NONE || u32.toUsize(cur) >= f.values.length() { return -1 }
+    let def = f.value(cur).def
+    if def == NONE { return -1 }
+    let inst = f.inst(def)
+    if inst.op == Op.NotBool {
+      invert = !invert
+      cur = forward.resolve(inst.a)
+      steps = steps + 1
+      continue
+    }
+    if inst.op == Op.Cmp {
+      let a = forward.resolve(inst.a)
+      let b = forward.resolve(inst.b)
+      if defOp(f, a) == Op.ConstI32 && defOp(f, b) == Op.ConstI32 {
+        let x = f.inst(f.value(a).def).k
+        let y = f.inst(f.value(b).def).k
+        let mut res = false
+        if inst.k == u8.toI32(Cmp.value(Cmp.Lt)) { res = x < y }
+        else if inst.k == u8.toI32(Cmp.value(Cmp.Le)) { res = x <= y }
+        else if inst.k == u8.toI32(Cmp.value(Cmp.Gt)) { res = x > y }
+        else if inst.k == u8.toI32(Cmp.value(Cmp.Ge)) { res = x >= y }
+        else if inst.k == u8.toI32(Cmp.value(Cmp.Eq)) { res = x == y }
+        else if inst.k == u8.toI32(Cmp.value(Cmp.Ne)) { res = x != y }
+        else { return -1 }
+        if invert { res = !res }
+        return if res { 1 } else { 0 }
+      }
+    }
+    return -1
+  }
+  return -1
+}
+
+/// One round of local folds. Returns whether anything changed; sets `needCompact` when
+/// instructions were inserted or a branch was folded to a jump.
+effect fn fold(f: &mut Function, needCompact: &mut bool) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut changed = false
   let mut forward = run Forward.make(&f.*)
   // One `arg n` per argument, at the entry.
@@ -165,6 +303,7 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
         let v = run f.insertBefore(at, Op.Arg, true, Type.Value, Own.Borrowed, NONE, NONE, inst.k)
         f.setOwnership(v, Own.Borrowed, RootKind.Argument, i32.wrappingToU32(inst.k))
         canonical.set(k, v)
+        needCompact.* = true
       }
       run forward.replace(inst.result, canonical.get(k))
       removeInst(&mut f, i)
@@ -173,8 +312,10 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
     i = i + 1
   }
   forward.apply(&mut f)
+  let isObj = run knownConstructObjects(&f.*)
+  let limit = f.insts.length()
   i = 0
-  while i < f.insts.length() {
+  while i < limit {
     let mut inst = f.insts.get(i)
     if readsA(inst.op) { inst.a = forward.resolve(inst.a) }
     if inst.op == Op.Unbox && defOp(&f.*, inst.a) == Op.BoxI32 {
@@ -195,6 +336,40 @@ effect fn fold(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
       run forward.replace(inst.result, inst.a) removeInst(&mut f, i) changed = true
     } else if inst.op == Op.Release && !isOwned(&f.*, inst.a) {
       removeInst(&mut f, i) changed = true
+    } else if (inst.op == Op.Truthy || inst.op == Op.TagIs) && u32.toUsize(inst.a) < isObj.length() && isObj.get(u32.toUsize(inst.a)) {
+      let zero = run f.insertBefore(usize.toU32(i), Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, 0)
+      let mut folded = inst
+      folded.op = Op.Cmp
+      folded.a = zero
+      folded.b = zero
+      folded.k = if inst.op == Op.Truthy { u8.toI32(Cmp.value(Cmp.Eq)) } else { u8.toI32(Cmp.value(Cmp.Ne)) }
+      f.insts.set(i, folded)
+      changed = true
+      needCompact.* = true
+    } else if inst.op == Op.NotBool {
+      let cb = constBoolOf(&f.*, &forward, inst.a)
+      if cb >= 0 {
+        let zero = run f.insertBefore(usize.toU32(i), Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, 0)
+        let mut folded = inst
+        folded.op = Op.Cmp
+        folded.a = zero
+        folded.b = zero
+        folded.k = if cb == 0 { u8.toI32(Cmp.value(Cmp.Eq)) } else { u8.toI32(Cmp.value(Cmp.Ne)) }
+        f.insts.set(i, folded)
+        changed = true
+        needCompact.* = true
+      }
+    } else if inst.op == Op.Branch {
+      let cb = constBoolOf(&f.*, &forward, inst.a)
+      if cb >= 0 {
+        let mut jmp = inst
+        jmp.op = Op.Jump
+        jmp.a = NONE
+        if cb == 0 { jmp.edge = inst.edge + 1 }
+        f.insts.set(i, jmp)
+        changed = true
+        needCompact.* = true
+      }
     }
     i = i + 1
   }
@@ -709,11 +884,12 @@ effect fn simplifyFrom(f: &mut Function, removed: bool) -> () ! OutOfMemoryError
   while going {
     going = false
     let before = f.insts.length()
-    if run fold(&mut f) {
+    let mut needCompact = false
+    if run fold(&mut f, &mut needCompact) {
       going = true
       dirty = true
-      // It inserted a canonical `arg`: block ranges are stale.
-      if f.insts.length() != before { run f.compact() dirty = false }
+      // It inserted instructions or folded a branch: block ranges and edges are stale.
+      if needCompact || f.insts.length() != before { run f.compact() dirty = false }
     }
     if run trivialParams(&mut f) { going = true }
     if run idleParams(&mut f) { going = true dirty = true }
