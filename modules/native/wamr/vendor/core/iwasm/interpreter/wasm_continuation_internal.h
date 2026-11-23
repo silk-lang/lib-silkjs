@@ -27,6 +27,10 @@ struct WASMInterpInvocation {
 };
 
 static os_thread_local_attribute WASMInterpInvocation *silk_invocations;
+/* Counts guest writes that can store a reference into a table, global or GC
+   object, so the host can skip re-walking reference graphs nothing changed. */
+static os_thread_local_attribute uint64 silk_ref_writes;
+#define SILK_NOTE_REF_WRITE() (silk_ref_writes++)
 static void silk_invocation_call_native(WASMExecEnv *, WASMFunctionInstance *,
                                         WASMInterpFrame *);
 static bool silk_invocation_gc_roots(void *heap);

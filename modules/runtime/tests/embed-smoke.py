@@ -52,6 +52,7 @@ def expected(wasm, files):
         'add 5',
         'wasm ' + wasm,
         'lib 42',
+        'meta true true',
         'libraries ' + ('object object function object object object object object function object strip true' if files else 'undefined undefined undefined undefined undefined undefined undefined undefined undefined undefined false false'),
         'dlopen ' + ('ERR_DLOPEN_FAILED' if files else 'ERR_DLOPEN_DISABLED'),
         'env EMBED_SMOKE,OPENSSL_CONF fixed /embed-smoke',

@@ -6,7 +6,6 @@
 import thin_list { ThinList, BoxList, ThinBox }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i32
-import silk.num.u16
 import silk.num.u32
 import silk.num.usize
 import silk.mem.pointer { Pointer }
@@ -25,7 +24,7 @@ import js_runtime as runtimeApi
 import js_compiler_emit { freeBytecodeAtoms }
 import js_compiler_types {
   FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, GlobalVar, BlockEnv, VariableDefinition,
-  CompilerError, CompilerErrorKind, MAX_LOCAL_VAR_COUNT, ARGUMENT_VAR_OFFSET,
+  CompilerError, CompilerErrorKind, MAX_LOCAL_VAR_COUNT, MAX_CLOSURE_VAR_COUNT, ARGUMENT_VAR_OFFSET,
   GLOBAL_VAR_OFFSET, ARG_SCOPE_INDEX, reserveThinArray, JumpSlot, LabelSlot
 }
 import js_debug_positions { SourcePositionCache, PcSourcePosition, encodePc2Line, encodeCallSitePc2Line, PendingLines,
@@ -226,6 +225,18 @@ pub fn findVarInChildScope(fd: &FunctionDef, name: u32, scope: i32) -> i32 {
 }
 pub fn findGlobalVar(fd: &FunctionDef, name: u32) -> i32 {
   let globals = fd.globalVars.asSlice()
+  // A bundle's module declares tens of thousands: scanning for each was quadratic.
+  if fd.globalNames.length() != 0 {
+    let names = fd.globalNames.asSlice()
+    let mask = names.length - 1
+    let mut at = varSlot(name, mask)
+    while names[at] != 0 {
+      let i = u32.toUsize(names[at] - 1)
+      if globals[i].name == name { return usize.toI32(i) }
+      at = (at + 1) & mask
+    }
+    return -1
+  }
   let mut i: usize = 0
   while i < globals.length { if globals[i].name == name { return usize.toI32(i) } i = i + 1 }
   return -1
@@ -341,9 +352,30 @@ pub effect fn addGlobalVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u3
   ! OutOfMemoryError ? &mut Allocator {
   run reserveThinArray(&mut fd.globalVars)
   let index = usize.toI32(fd.globalVars.length())
+  let first = findGlobalVar(&fd.*, name) < 0
   run fd.globalVars.append(GlobalVar { constantPoolIndex: -1, forceInit: false,
     isLexical: false, isConst: false, scopeLevel: fd.scopeLevel, name: table.duplicate(name) })
+  let count = fd.globalVars.length()
+  if count < VAR_INDEX_MIN { return index }
+  if fd.globalNames.length() == 0 || count * 2 > fd.globalNames.length() {
+    let mut size: usize = 64
+    while count * 2 > size { size = size * 2 }
+    fd.globalNames.clear() run fd.globalNames.appendRepeated(0, size)
+    let mut i: usize = 0
+    while i < count { indexGlobal(&mut fd, i) i = i + 1 }
+  } else if first { indexGlobal(&mut fd, count - 1) }
   return index
+}
+// Adds globalVars[index] to globalNames unless an earlier entry has its name.
+fn indexGlobal(fd: &mut FunctionDef, index: usize) {
+  let name = fd.globalVars.get(index).name
+  let mask = fd.globalNames.length() - 1
+  let mut at = varSlot(name, mask)
+  while fd.globalNames.get(at) != 0 {
+    if fd.globalVars.get(u32.toUsize(fd.globalNames.get(at) - 1)).name == name { return }
+    at = (at + 1) & mask
+  }
+  fd.globalNames.set(at, usize.toU32(index + 1))
 }
 pub effect fn defineVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u32, definition: VariableDefinition) -> i32
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
@@ -430,8 +462,8 @@ pub effect fn addVarThis(fd: &mut FunctionDef, table: &mut AtomTable) -> i32
 pub effect fn addClosureVar(fd: &mut FunctionDef, table: &mut AtomTable, kind: ClosureKind,
     index: i32, name: u32, isConst: bool, isLexical: bool, variableKind: VariableKind) -> i32
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
-  if fd.closureVars.length() >= MAX_LOCAL_VAR_COUNT {
-    let error = run CompilerError.make(&table.*, CompilerErrorKind.TooManyClosures, name) fail move error
+  if fd.closureVars.length() >= MAX_CLOSURE_VAR_COUNT {
+    let error = run CompilerError.closures(&table.*, &fd.*, fd.closureVars.length() + 1) fail move error
   }
   // Closure variables arrive one by one as free names resolve, often dozens per
   // function: grow 2x from 8 rather than 1.5x from 4.
@@ -446,7 +478,7 @@ pub effect fn addClosureVar(fd: &mut FunctionDef, table: &mut AtomTable, kind: C
     run fd.debuggerMetadata.closureScopes.append(ClosureScope { depth: 0, scope: -1 })
   }
   run fd.closureVars.append(ClosureVar { kind: kind, isLexical: isLexical, isConst: isConst,
-    variableKind: variableKind, variableIndex: i32.toU16(index), depth: CLOSURE_NO_DEPTH, name: table.duplicate(name) })
+    variableKind: variableKind, variableIndex: i32.toU32(index), depth: CLOSURE_NO_DEPTH, name: table.duplicate(name) })
   return result
 }
 // Brings the closure-var indexes up to date with closureVars once there are
@@ -469,7 +501,7 @@ pub effect fn syncClosureIndex(fd: &mut FunctionDef) ! OutOfMemoryError ? &mut A
     let mut at = varSlot(closure.name, mask)
     while fd.closureNames.get(at) != 0 { at = (at + 1) & mask }
     fd.closureNames.set(at, usize.toU32(i + 1))
-    at = varSlot(u16.toU32(closure.variableIndex), mask)
+    at = varSlot(closure.variableIndex, mask)
     while fd.closureSlots.get(at) != 0 { at = (at + 1) & mask }
     fd.closureSlots.set(at, usize.toU32(i + 1))
     i = i + 1
@@ -506,7 +538,7 @@ pub fn indexedClosureBySlot(fd: &FunctionDef, kind: ClosureKind, index: i32) -> 
   let mut found: i32 = -1
   while slots[at] != 0 {
     let i = u32.toUsize(slots[at] - 1)
-    if u16.toI32(vars[i].variableIndex) == index && vars[i].kind == kind && (found < 0 || usize.toI32(i) < found) { found = usize.toI32(i) }
+    if u32.toI32(vars[i].variableIndex) == index && vars[i].kind == kind && (found < 0 || usize.toI32(i) < found) { found = usize.toI32(i) }
     at = (at + 1) & mask
   }
   return found
@@ -534,7 +566,7 @@ pub effect fn getClosureVar(tree: &mut FunctionTree, id: FunctionId, ancestor: F
   let mut i: usize = 0
   while indexed == -2 && i < fd.closureVars.length() {
     let v = fd.closureVars.get(i)
-    if u16.toI32(v.variableIndex) == captureIndex && v.kind == captureKind { return usize.toI32(i) }
+    if u32.toI32(v.variableIndex) == captureIndex && v.kind == captureKind { return usize.toI32(i) }
     i = i + 1
   }
   let mut origin = ClosureScope { depth: 0, scope: -1 }

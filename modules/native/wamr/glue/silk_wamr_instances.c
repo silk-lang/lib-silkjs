@@ -230,6 +230,8 @@ SilkWasmHandle *silk_wasm_instantiate(SilkWasmHandle *module,
         if (!store->error_kind) store->error_kind = SILK_WASM_RUNTIME_ERROR;
         return NULL;
     }
+    /* Active element segments and global initializers stored references. */
+    ++store->edge_generation;
     for (uint32_t i = 0; i < instance->as.instance.function_count; ++i)
         if (!silk_wasm_instance_function(instance, i)) return NULL;
     for (uint32_t i = 0; i < instance->as.instance.tag_count; ++i)

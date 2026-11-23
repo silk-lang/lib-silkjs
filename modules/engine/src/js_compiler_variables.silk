@@ -25,7 +25,7 @@ import js_heap { HeapCell }
 import js_atoms { AtomTable }
 import js_atom_data as atoms
 import js_opcode_data as op
-import js_core_types { RuntimeState, ExportBinding, FunctionBytecode, ClosureVar, CLOSURE_NO_DEPTH, ClosureKind, VariableKind, JS_MODE_STRICT, linkedModule, FrameSlots }
+import js_core_types { RuntimeState, ExportBinding, FunctionBytecode, ClosureVar, CLOSURE_NO_DEPTH, ClosureKind, VariableKind, JS_MODE_STRICT, linkedModule, FrameSlots, SCOPE_OPERAND }
 import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, StubName, GlobalVar, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET, ARG_SCOPE_END }
 import js_compiler_state as state
 import js_compiler_emit as emit
@@ -212,7 +212,7 @@ effect fn snapshotClosure(fd: &mut FunctionDef, table: &mut AtomTable, kind: Clo
     index: i32, name: u32, constant: bool, lexical: bool, variableKind: VariableKind,
     origin: ClosureScope) -> () ! OutOfMemoryError ? &mut Allocator {
   if fd.debuggerMetadata.enabled { run fd.debuggerMetadata.closureScopes.append(origin) }
-  run fd.closureVars.append(ClosureVar { kind: kind, variableIndex: i32.toU16(index & 65535),
+  run fd.closureVars.append(ClosureVar { kind: kind, variableIndex: i32.toU32(index),
     name: table.duplicate(name), isConst: constant, isLexical: lexical, variableKind: variableKind, depth: CLOSURE_NO_DEPTH })
 }
 // A local still in its temporal dead zone in `tdz` (the paused frame's locals, for a debugger
@@ -268,11 +268,34 @@ pub effect fn addGlobalVariables(tree: &mut FunctionTree, cell: FunctionId) -> (
   }
   if needed {
     let mut kind = ClosureKind.GlobalDeclaration if fd.module.isSome() { kind = ClosureKind.ModuleDeclaration }
-    i = 0
-    while i < fd.globalVars.length() {
-      let v = fd.globalVars.get(i) let mut vk = VariableKind.Normal
-      if v.constantPoolIndex >= 0 && !v.isLexical { vk = VariableKind.GlobalFunctionDeclaration }
-      let _added = run state.addClosureVar(&mut fd, &mut rt.atoms, kind, usize.toI32(i), v.name, v.isConst, v.isLexical, vk) i = i + 1
+    // A module's bindings are all its closure vars, but its own var-ref and
+    // get_var operands reach only the first SCOPE_OPERAND. When they do not all
+    // fit (a big bundle), the ones its own code names come first, then the
+    // globals it names (resolve would append them last); the rest only its
+    // functions capture.
+    let limit = u16.toUsize(SCOPE_OPERAND)
+    let split = fd.module.isSome() && fd.closureVars.length() + fd.globalVars.length() > limit
+    let mut named = List<u32>.make() let mut mask: usize = 0
+    if split { mask = run ownNames(&fd.*, &mut named) }
+    let mut pass: usize = 0 if !split { pass = 1 }
+    while pass < 2 {
+      i = 0
+      while i < fd.globalVars.length() {
+        let v = fd.globalVars.get(i) let mut vk = VariableKind.Normal
+        if v.constantPoolIndex >= 0 && !v.isLexical { vk = VariableKind.GlobalFunctionDeclaration }
+        let own = v.constantPoolIndex >= 0 || v.forceInit || hasName(&named, mask, v.name)
+        if !split || own == (pass == 0) {
+          let _added = run state.addClosureVar(&mut fd, &mut rt.atoms, kind, usize.toI32(i), v.name, v.isConst, v.isLexical, vk)
+        }
+        i = i + 1
+      }
+      if pass == 0 && split {
+        run addNamedGlobals(&mut fd, &mut rt.atoms, &named, mask)
+        if fd.closureVars.length() > limit {
+          let error = run CompilerError.closures(&rt.atoms, &fd.*, fd.closureVars.length()) fail move error
+        }
+      }
+      pass = pass + 1
     }
   }
   if fd.module.isNone() { return () }
@@ -351,6 +374,8 @@ effect fn memoLookup(tree: &mut FunctionTree, cell: FunctionId, memo: &mut Bindi
     }
   }
   let binding = run lookup(&mut tree, cell, name, scope, code, &mut label)
+  // Var-ref and get_var operands at SCOPE_OPERAND and above name scope slots.
+  if binding.storage >= 2 && binding.index >= u16.toI32(SCOPE_OPERAND) { run tooManyClosures(&tree.*, cell, binding.index) }
   if label.* < 0 && memo.count < MEMO_SLOTS / 2 {
     if memo.keys.length() == 0 {
       run memo.keys.appendRepeated(0, MEMO_SLOTS)
@@ -502,6 +527,11 @@ effect fn optimizeReference(fd: &mut FunctionDef, input: &mut ByteBuffer, label:
   input.set(p, get + 1) input.patchU16(p + 1, i32.toU16(index)) p = p + 3
   while p < labelPosition + 2 { input.set(p, op.OP_nop) p = p + 1 }
   return result
+}
+@inlineNever
+effect fn tooManyClosures(tree: &FunctionTree, cell: FunctionId, index: i32) -> () ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut ra = () let owner = tree.get(cell) let rt = owner.runtimeState(&ra)
+  let error = run CompilerError.closures(&rt.atoms, &owner.*, i32.toUsize(index) + 1) fail move error
 }
 effect fn resolveScope(tree: &mut FunctionTree, cell: FunctionId, input: &mut ByteBuffer, memo: &mut BindingMemo, name: u32, scope: i32, code: u8, label: i32, next: i32,
   use: u8, child: i32) -> i32
@@ -752,7 +782,74 @@ effect fn hoisted(fd: &mut FunctionDef, table: &mut AtomTable) -> () ! OutOfMemo
     i = i + 1
   }
   fd.globalVars = ThinList<GlobalVar>.make()
+  fd.globalNames = ThinList<u32>.make()
   if next >= 0 { run emit.emitU8(&mut fd, op.OP_return_undef) run labelOut(&mut fd, next) }
+}
+/// The atoms fd's own scope opcodes name, as an open-addressed set in names
+/// (0 is empty, at most half full); returns its mask.
+effect fn ownNames(fd: &FunctionDef, names: &mut List<u32>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let code = fd.bytecode.asSlice()
+  let mut size: usize = 64
+  while size < fd.globalVars.length() * 2 { size = size * 2 }
+  while true {
+    names.clear() run names.reserveExact(size)
+    while names.length() < size { run names.append(0) }
+    let mask = size - 1 let mut used: usize = 0 let mut fits = true
+    let mut p: usize = 0
+    while p < code.length && fits {
+      let c = code[p]
+      if c == op.OP_scope_get_var_checkthis || c == op.OP_scope_get_var_undef || c == op.OP_scope_get_var
+        || c == op.OP_scope_put_var || c == op.OP_scope_delete_var || c == op.OP_scope_get_ref || c == op.OP_scope_put_var_init || c == op.OP_scope_make_ref {
+        let name = readU32(code, p + 1)
+        let mut slot = nameSlot(name, mask)
+        while names.get(slot) != 0 && names.get(slot) != name { slot = (slot + 1) & mask }
+        if names.get(slot) == 0 { if used * 2 >= size { fits = false } else { names.set(slot, name) used = used + 1 } }
+      }
+      p = p + u8.toUsize(op.opcodeInfo(c, false).size)
+    }
+    if fits { return mask }
+    size = size * 2
+  }
+  return 0
+}
+/// The names in named that fd declares nowhere, as Global closure vars: what
+/// resolving fd's own code would add for them.
+effect fn addNamedGlobals(fd: &mut FunctionDef, table: &mut AtomTable, named: &List<u32>, mask: usize) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut declared = List<u32>.make()
+  let mut size: usize = 64
+  while size < (fd.globalVars.length() + fd.closureVars.length() + fd.vars.length() + fd.args.length()) * 2 { size = size * 2 }
+  run declared.reserveExact(size)
+  while declared.length() < size { run declared.append(0) }
+  let dmask = size - 1
+  let mut i: usize = 0
+  while i < fd.globalVars.length() { insertName(&mut declared, dmask, fd.globalVars.get(i).name) i = i + 1 }
+  i = 0
+  while i < fd.closureVars.length() { insertName(&mut declared, dmask, fd.closureVars.get(i).name) i = i + 1 }
+  i = 0
+  while i < fd.vars.length() { insertName(&mut declared, dmask, fd.vars.get(i).name) i = i + 1 }
+  i = 0
+  while i < fd.args.length() { insertName(&mut declared, dmask, fd.args.get(i).name) i = i + 1 }
+  i = 0
+  while i <= mask {
+    let name = named.get(i)
+    if name != 0 && !pseudo(name) && !hasName(&declared, dmask, name) {
+      let _added = run state.addClosureVar(&mut fd, &mut table, ClosureKind.Global, 0, name, false, false, VariableKind.Normal)
+    }
+    i = i + 1
+  }
+}
+fn insertName(names: &mut List<u32>, mask: usize, name: u32) -> () {
+  if name == 0 { return () }
+  let mut slot = nameSlot(name, mask)
+  while names.get(slot) != 0 { if names.get(slot) == name { return () } slot = (slot + 1) & mask }
+  names.set(slot, name)
+}
+fn hasName(names: &List<u32>, mask: usize, name: u32) -> bool {
+  if names.length() == 0 { return false }
+  let mut slot = nameSlot(name, mask)
+  while names.get(slot) != 0 { if names.get(slot) == name { return true } slot = (slot + 1) & mask }
+  return false
 }
 /// The first probe slot for name in hoisted's name index (mask + 1 slots).
 fn nameSlot(name: u32, mask: usize) -> usize {
@@ -1122,13 +1219,13 @@ effect fn resolveStubName(tree: &mut FunctionTree, cell: FunctionId, shortcut: b
       // The first child's lookup captured the variable and made every closure
       // entry between it and the parent; only this child's own entry is new.
       if v.kind == ClosureKind.Local || v.kind == ClosureKind.Argument {
-        state.captureVar(&mut owner, u16.toI32(v.variableIndex), v.kind == ClosureKind.Argument)
+        state.captureVar(&mut owner, u32.toI32(v.variableIndex), v.kind == ClosureKind.Argument)
       }
       drop owner
       // A lazy body's use of a name is no known callee read (js_compiler_known).
-      if v.kind == ClosureKind.Local { known.noteLocal(&mut tree, outer, u16.toI32(v.variableIndex), known.USE_OTHER) }
-      else if v.kind == ClosureKind.Reference { known.noteClosure(&mut tree, outer, u16.toI32(v.variableIndex), known.USE_OTHER) }
-      let _index = run state.getClosureVar(&mut tree, cell, outer, v.kind, u16.toI32(v.variableIndex), name, v.isConst, v.isLexical, v.variableKind)
+      if v.kind == ClosureKind.Local { known.noteLocal(&mut tree, outer, u32.toI32(v.variableIndex), known.USE_OTHER) }
+      else if v.kind == ClosureKind.Reference { known.noteClosure(&mut tree, outer, u32.toI32(v.variableIndex), known.USE_OTHER) }
+      let _index = run state.getClosureVar(&mut tree, cell, outer, v.kind, u32.toI32(v.variableIndex), name, v.isConst, v.isLexical, v.variableKind)
       return
     }
     drop owner

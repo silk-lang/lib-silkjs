@@ -15,7 +15,10 @@ function file(name, content) {
   writeFileSync(path, content);
 }
 const cases = [];
-const add = (name, source, module = false) => cases.push({ name, args: [...(module ? ['--input-type=module'] : []), '-e', source] });
+// A scenario that starts the runtime again for each of its cases gets longer than
+// the default 15 s: six child runtimes took 12 s of it on a CI runner.
+const CHILD_PROCESS_TIMEOUT = 60000;
+const add = (name, source, module = false, timeout = undefined) => cases.push({ name, args: [...(module ? ['--input-type=module'] : []), '-e', source], timeout });
 add('buffer-views-boundaries', `const b=Buffer.from('hé💠');const s=b.subarray(1,3);s[0]=42;const n=Buffer.alloc(16);n.writeBigInt64BE(-9223372036854775808n);n.writeDoubleLE(-0,8);console.log(JSON.stringify([[...b],n.toString('hex'),Object.is(n.readDoubleLE(8),-0),Buffer.from('ab-_','base64url').toString('hex')]));`);
 add('decoder-partial-input', `const {StringDecoder}=require('string_decoder');const d=new StringDecoder('utf8');console.log(JSON.stringify([d.write(Buffer.from([240,159])),d.write(Buffer.from([146,160])),d.end(Buffer.from([226,130]))]));`);
 add('emitter-reentrancy', `const E=require('events');const e=new E(),out=[];function b(){out.push('b')}e.on('x',()=>{out.push('a');e.removeListener('x',b)});e.once('x',()=>out.push('once'));e.on('x',b);e.emit('x');e.emit('x');console.log(JSON.stringify([out,e.listenerCount('x')]));`);
@@ -115,8 +118,8 @@ cases.push({ name: 'esm-builtin-live-update', args: [join(directory, 'builtin-sy
 file('syntax-only.cjs', '#!/usr/bin/env node\nconsole.log("must-not-execute");require("./missing.cjs");return;\n');
 file('syntax-only.mjs', 'import "./missing.mjs";console.log("must-not-execute");await Promise.resolve();export const value=42;\n');
 file('syntax-invalid.cjs', 'const value = ;\n');
-add('cli-syntax-only-boundaries', `const {spawnSync}=require('node:child_process');const cases=[[['--check','syntax-only.cjs']], [['--check','syntax-only.mjs']], [['--check','syntax-invalid.cjs']], [['--check','--input-type=module'],'import "./missing.mjs";console.log("must-not-execute")'],[['--check','--eval=console.log("must-not-execute")']], [['--input-type=module','syntax-only.cjs']]];console.log(JSON.stringify(cases.map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`);
-add('cli-automatic-module-input', `const {spawnSync}=require('node:child_process');const source='await Promise.resolve();console.log(typeof require,42)';console.log(JSON.stringify([[['--eval='+source]], [[],source], [['--input-type=commonjs','--eval='+source]]].map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`);
+add('cli-syntax-only-boundaries', `const {spawnSync}=require('node:child_process');const cases=[[['--check','syntax-only.cjs']], [['--check','syntax-only.mjs']], [['--check','syntax-invalid.cjs']], [['--check','--input-type=module'],'import "./missing.mjs";console.log("must-not-execute")'],[['--check','--eval=console.log("must-not-execute")']], [['--input-type=module','syntax-only.cjs']]];console.log(JSON.stringify(cases.map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`, false, CHILD_PROCESS_TIMEOUT);
+add('cli-automatic-module-input', `const {spawnSync}=require('node:child_process');const source='await Promise.resolve();console.log(typeof require,42)';console.log(JSON.stringify([[['--eval='+source]], [[],source], [['--input-type=commonjs','--eval='+source]]].map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`, false, CHILD_PROCESS_TIMEOUT);
 // One long function whose call sites are asked for in mixed order, twice in a row
 // and going backwards, through the stack string and through call sites.
 file('stack-sites.cjs', `'use strict';

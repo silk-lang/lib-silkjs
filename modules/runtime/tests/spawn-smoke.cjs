@@ -149,6 +149,16 @@ const scenarios = {
     result.afterExit = { sent: done.kill('SIGTERM') };
     return result;
   },
+  // A program whose loop ends while unreferenced children run leaves them running, and its
+  // teardown takes their exit watches off the loop: with a stdin pipe (as a desktop app's server)
+  // and without.
+  async endWithChildren() {
+    const script = "const { spawn } = require('node:child_process');" +
+      "spawn('/bin/sh', ['-c', 'sleep 2'], { stdio: ['pipe', 'ignore', 'ignore'] }).unref();" +
+      "spawn('/bin/sh', ['-c', 'sleep 2'], { stdio: 'ignore' }).unref();" +
+      "process.exitCode = 3;";
+    return { exited: await run(process.execPath, ['-e', script], pipes) };
+  },
   // A detached child leads a new session; an attached one shares the parent's.
   async sessions() {
     const python = ['/usr/bin/python3', '/usr/local/bin/python3', '/opt/homebrew/bin/python3'].find(p => fs.existsSync(p));
@@ -220,6 +230,7 @@ function expect(name, r) {
     for (const signal of ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGUSR2']) check(r[signal].sent === true && r[signal].signal === signal && r[signal].code === null && r[signal].killed === true, `${signal}: ${JSON.stringify(r[signal])}`);
     check(r.afterExit.sent === false, `kill after exit: ${JSON.stringify(r.afterExit)}`);
   }
+  if (name === 'endWithChildren') exited(r.exited, 3, 'end with running children');
   if (name === 'sessions' && !r.skipped) {
     check(r.detached.stdout === 'True True\n', `detached: ${JSON.stringify(r.detached)}`);
     check(r.attached.stdout === 'False False\n', `attached: ${JSON.stringify(r.attached)}`);

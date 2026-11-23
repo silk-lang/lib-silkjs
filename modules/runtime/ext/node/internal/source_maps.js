@@ -214,8 +214,11 @@ function dereference(record) {
 // when the native script is destroyed; generated eval can remain realm-owned,
 // as in Node. scriptId indexes a real native identity, not a synthesized name.
 function registerSource(filename, source, metadata = emptyOptions) {
-  validateString(source, 'source');
   validateObject(metadata, 'metadata');
+  // A big script comes without its text: decoding it makes a string as large as the
+  // script, twice that when a character is wide, so it waits until a map is recorded.
+  const lazy = source === undefined && metadata.generated !== true;
+  if (!lazy) validateString(source, 'source');
   const coverage = process.env.NODE_V8_COVERAGE;
   if (!support.enabled && !coverage) return undefined;
   const generated = metadata.generated === true;
@@ -232,6 +235,10 @@ function registerSource(filename, source, metadata = emptyOptions) {
   if (!url || (!support.nodeModules && nodeModules.test(url))) return undefined;
   // Node 24 records generatedCode in its support object but does not gate its
   // generated-source cache with it; enabled controls capture for both kinds.
+  if (lazy) {
+    source = (metadata.owner ?? metadata).source;
+    validateString(source, 'source');
+  }
   const lengths = [];
   let start = 0;
   for (let i = 0; i < source.length; i++) {

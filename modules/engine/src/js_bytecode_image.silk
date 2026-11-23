@@ -35,6 +35,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
+import silk.core.option { Option }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.mem.pointer { Pointer }
@@ -42,7 +43,7 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import js_heap { CellRef }
+import js_heap { CellRef, HeapCell }
 import js_value { ValueBits }
 import js_owned_value { Value }
 import js_realm { Realm }
@@ -50,7 +51,8 @@ import js_engine { Engine }
 import js_engine_host { EngineServices }
 import js_exceptions { JsException }
 import js_coercion_host { CoercionHooks }
-import js_core_types { ModuleDef, NativeErrorKind }
+import js_core_types { ModuleDef, NativeErrorKind, RuntimeState, FunctionBytecode, FunctionDebugInfo }
+import js_compiler_finish as finish
 import js_string_types { StringLengthError }
 import runtime_memory { AllocationObserver }
 import byte_buffer { readU64 }
@@ -147,13 +149,62 @@ effect fn assemble(payload: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocat
 /// runtime is destroyed; they are an image this embedder's build wrote.
 pub unsafe effect fn load<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
   data: *const u8, length: usize) -> Value ! JsException ? &mut Allocator {
+  return run unsafe loadNamed(&mut engine, realm, data, length, b"")
+}
+/// Gives a decoded script or module the file name `name`: its functions' (the ones
+/// still in the image's bytes take it when a call reads them) and, for a module,
+/// the name its imports resolve from.
+unsafe effect fn rename<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>, value: ValueBits, name: &[u8])
+  -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, realm.runtime())
+  let atom = run state.atoms.internUtf8(name)
+  let code = match value {
+    ValueBits.Module { reference } => {
+      let mut moduleAnchor = ()
+      let module = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut moduleAnchor, reference)
+      let previous = Intrinsic.replace(module.name, state.atoms.duplicate(atom))
+      let function = module.functionObject.view() drop module
+      state.atoms.release(previous)
+      function
+    }
+    _ => value
+  }
+  if let ValueBits.FunctionBytecode { reference } = code {
+    let mut codeAnchor = ()
+    let top = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, reference)
+    if let Option<FunctionDebugInfo>.Some { value: debug } = &mut top.debug {
+      let previous = Intrinsic.replace(debug.filename, state.atoms.duplicate(atom))
+      state.atoms.release(previous)
+    }
+    drop top
+    unsafe finish.spreadHostDebug(&mut state, reference, finish.HostDebug { filename: atom, nodeVm: false, nodeSourceURL: false,
+      lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0 })
+  }
+  state.atoms.release(atom)
+}
+/// load, for an image whose script runs under another name than it was written
+/// with: an app's bundle is named by where the app is installed, which the build
+/// that wrote its image did not know. An empty name keeps the image's own.
+///
+/// Safety: as for load.
+pub unsafe effect fn loadNamed<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  data: *const u8, length: usize, name: &[u8]) -> Value ! JsException ? &mut Allocator {
   let held = ()
   if length == 0 || !loadable(unsafe Pointer.borrowMany<(), u8>(&held, unsafe Pointer.assumeMany<u8>(data), length)) {
     return run CoercionHooks.throwError(&mut engine, realm, NativeErrorKind.Type, b"not a bytecode image of this engine build")
   }
   let payload = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(data), HEADER)
   let value = run reader.readObjectTrusted(&mut engine, realm, payload, length - HEADER,
-    reader.BYTECODE | reader.LAZY | reader.DEFER)
+    reader.BYTECODE | reader.LAZY | reader.DEFER | reader.LEND_TEXT)
+  if name.length != 0 {
+    let renamed = run Effect.result(unsafe rename(&mut engine, realm, value, name))
+    if let Result<(), OutOfMemoryError | StringLengthError>.Failure { error } = move renamed {
+      if let ValueBits.Module { reference } = value { unsafe gc.detachModule(&mut engine, realm.runtime(), reference) }
+      unsafe gc.release(&mut engine, realm.runtime(), value)
+      return unsafe Value.adoptBits(run errors.materialize<ValueBits, Engine<'m, S>>(&mut engine, realm, move error))
+    }
+  }
   if let ValueBits.Module { reference } = value {
     // A decoded module comes back unresolved, as a bundled one does.
     let resolved = run Effect.result(loader.resolveModule(&mut engine, realm, unsafe CellRef<ModuleDef>.of(reference)))

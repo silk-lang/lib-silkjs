@@ -422,23 +422,11 @@ function inputBytes(input) {
 }
 function isAscii(input) {
   const b = inputBytes(input);
-  for (let i = 0; i < b.length; i++) if (b[i] > 127) return false;
-  return true;
+  return bufferCodec(14, b, 0, b.length);
 }
 function isUtf8(input) {
   const b = inputBytes(input);
-  for (let i = 0; i < b.length;) {
-    const a = b[i++];
-    if (a < 128) continue;
-    const needed = a >= 0xc2 && a <= 0xdf ? 1 : a >= 0xe0 && a <= 0xef ? 2 : a >= 0xf0 && a <= 0xf4 ? 3 : 0;
-    if (!needed || i + needed > b.length) return false;
-    for (let j = 0; j < needed; j++) {
-      const c = b[i++];
-      if (c < 0x80 || c > 0xbf || (j === 0 && ((a === 0xe0 && c < 0xa0) || (a === 0xed && c > 0x9f) ||
-          (a === 0xf0 && c < 0x90) || (a === 0xf4 && c > 0x8f)))) return false;
-    }
-  }
-  return true;
+  return bufferCodec(13, b, 0, b.length);
 }
 
 // btoa returns -1 for a code unit above 0xff; atob returns -2 for an invalid

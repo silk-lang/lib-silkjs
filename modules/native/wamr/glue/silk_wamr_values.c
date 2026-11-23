@@ -534,6 +534,7 @@ bool silk_wasm_sync_edges(SilkWasmHandle *owner,
     EdgeProjection projection = { 0 };
     projection.edges.store = owner->store;
     projection.owner = owner;
+    if (owner->kind != UINT32_MAX) ++owner->store->edge_generation;
     owner->store->reference_visit_failed = false;
     visit(owner, project_handle, project_reference, &projection);
     bool ok = !projection.failed && !owner->store->reference_visit_failed;
@@ -545,6 +546,12 @@ bool silk_wasm_sync_edges(SilkWasmHandle *owner,
 bool silk_wasm_sync_store_edges(SilkWasmStore *store)
 {
     if (store->syncing_edges) return true;
+    /* Owner graphs change only through guest reference stores, which the
+     * interpreter counts, or through handles coming and going. */
+    uint64_t generation = store->edge_generation, writes = wasm_interp_ref_writes();
+    if (store->edges_synced && store->synced_generation == generation
+        && store->synced_ref_writes == writes)
+        return true;
     store->syncing_edges = true;
     store->reference_visit_failed = false;
     EdgeProjection *first = NULL;
@@ -573,6 +580,9 @@ bool silk_wasm_sync_store_edges(SilkWasmStore *store)
         first = next;
     }
     store->syncing_edges = false;
+    store->edges_synced = ok;
+    store->synced_generation = generation;
+    store->synced_ref_writes = writes;
     return ok;
 }
 

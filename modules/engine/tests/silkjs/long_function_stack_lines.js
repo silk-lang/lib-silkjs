@@ -19,3 +19,10 @@ for (let i = 0; i < 3; i++) {
   assertEq(typeof inner(first[i]), "string", "error " + i + " of the called function is on line 3002");
   assertEq(inner(second[i]), inner(first[i]), "error " + i + " has the same frame on the second call");
 }
+// A long span whose positions go back in the source (a loop's update runs after its
+// body) encodes its table on the first capture instead of rescanning for each.
+const looped = (0, eval)(pad + "for (var k = 0; k < 2; k++) { p += k; }\nnew Error('y').stack");
+const straight = (0, eval)(pad + "p++;\nnew Error('y').stack");
+const top = (stack) => stack.split("\n").find((line) => /:3002:\d+/.test(line));
+assertEq(typeof top(looped), "string", "the looped span's first capture names line 3002");
+assertEq(top(looped), top(straight), "the looped span's first capture has the scanned span's column");

@@ -146,6 +146,12 @@ try {
   const esm = await import(pathToFileURL(esmFilename).href);
   assert.ok(findSourceMap(esmFilename) instanceof SourceMap);
   assert.deepEqual(findSourceMap(esmFilename).lineLengths, esmSource.split('\n').map(line => line.length));
+  // A big module's source is decoded only when read (script_metadata.lazySource).
+  const bigFilename = path.join(directory, 'big.mjs');
+  const bigSource = 'export const text = "\u2603", read = () => text;\n' + 'void 0;\n'.repeat(12000) + '//# sourceMappingURL=' + inline;
+  fs.writeFileSync(bigFilename, bigSource);
+  assert.equal((await import(pathToFileURL(bigFilename).href)).read(), '\u2603');
+  assert.deepEqual(findSourceMap(bigFilename).lineLengths, bigSource.split('\n').map(line => line.length));
   assert.equal(esm.capture({ sourceMap: true }).scriptName, originalURL);
   assert.equal(esm.capture({ sourceMap: false }).scriptName, pathToFileURL(esmFilename).href);
   assert.deepEqual(esm.metadata, { url: pathToFileURL(esmFilename).href, filename: esmFilename });

@@ -2326,6 +2326,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 }
 
                 tbl_inst->elems[elem_idx] = elem_val;
+                SILK_NOTE_REF_WRITE();
                 HANDLE_OP_END();
             }
 
@@ -2602,6 +2603,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                         if (wasm_is_type_reftype(field_type)) {
                             field_value.gc_obj = POP_REF();
+                            SILK_NOTE_REF_WRITE();
                         }
                         else if (field_type == VALUE_TYPE_I32
                                  || field_type == VALUE_TYPE_F32
@@ -2845,6 +2847,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             (WASMArrayType *)module->module->types[type_index];
                         if (wasm_is_type_reftype(array_type->elem_type)) {
                             array_elem.gc_obj = POP_REF();
+                            SILK_NOTE_REF_WRITE();
                         }
                         else if (array_type->elem_type == VALUE_TYPE_I32
                                  || array_type->elem_type == VALUE_TYPE_F32
@@ -2899,6 +2902,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         len = POP_I32();
                         if (wasm_is_type_reftype(array_type->elem_type)) {
                             fill_value.gc_obj = POP_REF();
+                            SILK_NOTE_REF_WRITE();
                         }
                         else if (array_type->elem_type == VALUE_TYPE_I32
                                  || array_type->elem_type == VALUE_TYPE_F32
@@ -2964,6 +2968,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                             wasm_array_obj_copy(dst_obj, dst_offset, src_obj,
                                                 src_offset, len);
+                            SILK_NOTE_REF_WRITE();
                         }
 
                         (void)src_type_index;
@@ -4104,8 +4109,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #else
                 if (!wasm_is_type_reftype(global->type))
                     *(int32 *)global_addr = POP_I32();
-                else
+                else {
                     PUT_REF_TO_ADDR((uint32 *)global_addr, POP_REF());
+                    SILK_NOTE_REF_WRITE();
+                }
 #endif
                 /* clang-format on */
                 HANDLE_OP_END();
@@ -5682,6 +5689,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_REF_TYPES != 0 || WASM_ENABLE_GC != 0
                     case WASM_OP_TABLE_INIT:
                     {
+                        SILK_NOTE_REF_WRITE();
                         uint32 tbl_idx;
                         tbl_elem_idx_t elem_idx, d;
                         uint32 n, s;
@@ -5780,6 +5788,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     }
                     case WASM_OP_TABLE_COPY:
                     {
+                        SILK_NOTE_REF_WRITE();
                         uint32 src_tbl_idx, dst_tbl_idx;
                         tbl_elem_idx_t n, s, d;
                         WASMTableInstance *src_tbl_inst, *dst_tbl_inst;
@@ -5838,6 +5847,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     }
                     case WASM_OP_TABLE_GROW:
                     {
+                        SILK_NOTE_REF_WRITE();
                         WASMTableInstance *tbl_inst;
                         uint32 tbl_idx, orig_tbl_sz;
                         tbl_elem_idx_t n;
@@ -5891,6 +5901,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     }
                     case WASM_OP_TABLE_FILL:
                     {
+                        SILK_NOTE_REF_WRITE();
                         uint32 tbl_idx;
                         tbl_elem_idx_t n, elem_idx;
                         WASMTableInstance *tbl_inst;

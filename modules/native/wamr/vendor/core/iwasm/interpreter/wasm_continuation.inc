@@ -249,6 +249,66 @@ silk_invocation_run(WASMInterpInvocation *inv)
     return inv->status;
 }
 
+/* Every JS to Wasm call is an invocation with its own exec env. Creating one
+   zeroes its whole operand stack, and freeing it returns the stack to the
+   system, which dominated short calls. Freed envs are kept per thread and
+   reused with only their header reset: the interpreter writes every stack
+   cell before reading it, as stock WAMR's reused module exec env relies on. */
+#define SILK_EXEC_ENV_CACHE 4
+static os_thread_local_attribute WASMExecEnv *silk_exec_env_cache[SILK_EXEC_ENV_CACHE];
+static os_thread_local_attribute uint32 silk_exec_env_cached;
+
+static WASMExecEnv *
+silk_exec_env_take(WASMModuleInstanceCommon *module, uint32 stack_size)
+{
+    WASMExecEnv *env;
+    uint32 i;
+    for (i = silk_exec_env_cached; i > 0; i--) {
+        env = silk_exec_env_cache[i - 1];
+        if (env->wasm_stack_size != stack_size)
+            continue;
+        silk_exec_env_cache[i - 1] = silk_exec_env_cache[--silk_exec_env_cached];
+        memset(env, 0, offsetof(WASMExecEnv, wasm_stack_u.bottom));
+        env->module_inst = module;
+        env->wasm_stack_size = stack_size;
+        env->wasm_stack.bottom = env->wasm_stack_u.bottom;
+        env->wasm_stack.top_boundary = env->wasm_stack.bottom + stack_size;
+        env->wasm_stack.top = env->wasm_stack.bottom;
+#if WASM_ENABLE_INSTRUCTION_METERING != 0
+        env->instructions_to_execute = -1;
+#endif
+        return env;
+    }
+    return wasm_exec_env_create_internal(module, stack_size);
+}
+
+static void
+silk_exec_env_give(WASMExecEnv *env)
+{
+#if WASM_ENABLE_AOT == 0 && WASM_ENABLE_THREAD_MGR == 0 \
+    && !defined(OS_ENABLE_HW_BOUND_CHECK)
+    if (silk_exec_env_cached < SILK_EXEC_ENV_CACHE) {
+        silk_exec_env_cache[silk_exec_env_cached++] = env;
+        return;
+    }
+#endif
+    wasm_exec_env_destroy_internal(env);
+}
+
+uint64
+wasm_interp_ref_writes(void)
+{
+    return silk_ref_writes;
+}
+
+void
+wasm_interp_invocation_release_cache(void)
+{
+    while (silk_exec_env_cached > 0)
+        wasm_exec_env_destroy_internal(
+            silk_exec_env_cache[--silk_exec_env_cached]);
+}
+
 WASMInterpInvocation *
 wasm_interp_invocation_create(WASMModuleInstance *module,
                               WASMFunctionInstance *function,
@@ -265,8 +325,7 @@ wasm_interp_invocation_create(WASMModuleInstance *module,
         return NULL;
     memset(inv, 0, sizeof(*inv)
                    + function->ret_cell_num * sizeof(uint32));
-    env = wasm_exec_env_create_internal((WASMModuleInstanceCommon *)module,
-                                        stack_size);
+    env = silk_exec_env_take((WASMModuleInstanceCommon *)module, stack_size);
     if (!env) {
         wasm_runtime_free(inv);
         return NULL;
@@ -519,7 +578,7 @@ wasm_interp_invocation_free(WASMInterpInvocation *inv)
     inv->status = WASM_INVOCATION_CANCELLED;
     silk_invocation_release_frames(inv);
     inv->env->silk_invocation = NULL;
-    wasm_exec_env_destroy_internal(inv->env);
+    silk_exec_env_give(inv->env);
     wasm_silk_instance_release(inv->module);
     if (inv->trap_frames)
         wasm_runtime_free(inv->trap_frames);

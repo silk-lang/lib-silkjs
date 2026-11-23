@@ -68,6 +68,11 @@ bool wasm_interp_invocation_frame(const WASMInterpInvocation *invocation,
                                   WASMInterpInvocationFrame *frame);
 /* Invalid on a RUNNING invocation. SUSPENDED invocations are cancelled. */
 void wasm_interp_invocation_free(WASMInterpInvocation *invocation);
+/* Frees this thread's cached exec envs; call before the runtime is destroyed. */
+void wasm_interp_invocation_release_cache(void);
+/* This thread's count of guest reference stores (table, global, struct and
+   array writes of references); unchanged means no such store ran. */
+uint64 wasm_interp_ref_writes(void);
 
 /* JS boundary guard: the adapter restores the previous value after a
  * synchronous host call. A false guard requires the adapter to return a real

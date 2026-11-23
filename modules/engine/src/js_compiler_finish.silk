@@ -14,6 +14,7 @@ import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.core.ownership { Copy }
 import silk.collections.slice { Slice }
+import silk.collections.list { List }
 import silk.num.u32
 import silk.num.u16
 import silk.num.i32
@@ -380,6 +381,44 @@ pub unsafe fn spreadHostDebug(rt: &mut RuntimeState, node: *mut HeapHeader, host
     i = i + 1
   }
 }
+/// Gives node's function constants (and theirs) node's host values (configureHostCallbacks:
+/// the module that owns the code, its import() callback, its script metadata) where they
+/// have none: the functions a lazy reparse or a deferred read brought after the host
+/// configured the tree, which import.meta and import() in them go by.
+pub unsafe effect fn spreadHostEdges(node: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let top = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+  if top.host.isNone() { return () }
+  let count = top.constants.length() drop top
+  let mut i: usize = 0
+  while i < count {
+    let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+    let child = parent.constants.get(i) drop parent
+    if let ValueBits.FunctionBytecode { reference } = child {
+      let childAnchor = ()
+      let existing = unsafe HeapCell.payload<FunctionBytecode, ()>(&childAnchor, reference)
+      let bare = existing.host.isNone() drop existing
+      if bare {
+        // Allocated before the references are taken, so a failure leaves nothing to release.
+        let mut fresh = run ThinBox<HostEdges>.make(HostEdges.empty())
+        let owner = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+        let from = owner.host.get()
+        let edges = fresh.getMut()
+        let callback = Intrinsic.replace(edges.callback, from.callback.dup()).intoBits()
+        let module = Intrinsic.replace(edges.owner, from.owner.dup()).intoBits()
+        let metadata = Intrinsic.replace(edges.scriptMetadata, from.scriptMetadata.dup()).intoBits()
+        drop callback drop module drop metadata
+        drop edges drop from drop owner
+        let mut codeAnchor = ()
+        let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, reference)
+        code.host = move fresh
+        drop code
+        run unsafe spreadHostEdges(reference)
+      }
+    }
+    i = i + 1
+  }
+}
 /// Stub code: never run, since no call reaches a frame before finishing it.
 pub const STUB_STACK: u16 = 0xffff
 /// A stub's FunctionBytecode.frameCells: more cells than any call-frame region
@@ -688,6 +727,61 @@ pub unsafe fn deferredStub(node: *mut HeapHeader) -> bool {
 pub unsafe fn lazyStub(node: *mut HeapHeader) -> bool {
   let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
   return b.pending.isSome() && b.pending.get().lazy.isSome()
+}
+
+/// Whether node is a stub of defer that waits for finish: it keeps its whole definition
+/// (a FunctionDef and its unresolved code) until a first call.
+unsafe fn waitingStub(node: *mut HeapHeader) -> bool {
+  let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+  if b.pending.isNone() { return false }
+  let pending = b.pending.get()
+  return pending.lazy.isNone() && pending.deferred.isNone()
+}
+
+/// Appends to out every stub of defer in runtime whose first call has not come, each with
+/// a reference of its own: what finishWaiting takes. A function a program never calls keeps
+/// its definition for good otherwise, some 1.5 KB and its unresolved code against the few
+/// hundred bytes of its finished form; a large bundle has tens of thousands. A host calls
+/// this when its application is idle, outside a collection and outside any compile.
+pub unsafe effect fn waitingStubs(runtime: *mut HeapHeader, out: &mut List<*mut HeapHeader>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let mut walk = unsafe js_gc.walkCells(runtime)
+  while true {
+    let cursor = unsafe js_gc.nextCell(&mut walk)
+    if Pointer.isNull<HeapHeader>(cursor) { break }
+    let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cursor)
+    let head = unsafe Pointer.borrow<(), HeapHeader>(&anchor, node)
+    let wanted = head.kind == HeapKind.FunctionBytecode && head.referenceCount > 0
+    drop head
+    if !wanted || !unsafe waitingStub(node) { continue }
+    run out.append(node)
+    unsafe HeapCell.retain(node)
+  }
+}
+
+/// Finishes up to count of the stubs waitingStubs listed, from the end of stubs, giving
+/// back the list's reference to each, and returns how many it took. One a call finished
+/// in the meantime costs nothing; one that fails to finish stays a stub, as after a
+/// failed first call. The same conditions as waitingStubs.
+pub unsafe effect fn finishWaiting<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, stubs: &mut List<*mut HeapHeader>, count: usize) -> usize ? &mut Allocator {
+  let mut taken: usize = 0
+  while taken < count {
+    let node = match stubs.pop() { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+    taken = taken + 1
+    let finished = run Effect.result(unsafe finish(&mut hooks, node))
+    drop finished
+    unsafe js_gc.releaseHeader(&mut hooks, runtime, node)
+  }
+  return taken
+}
+
+/// Gives back the references of the stubs still listed, unfinished: what a host does with
+/// a list it will not finish, before the runtime goes.
+pub unsafe fn forgetWaiting<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, stubs: &mut List<*mut HeapHeader>) -> () {
+  while true {
+    let node = match stubs.pop() { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+    unsafe js_gc.releaseHeader(&mut hooks, runtime, node)
+  }
 }
 
 /// createFunction for finishLazy: compiles cell, never deferred, into the stub

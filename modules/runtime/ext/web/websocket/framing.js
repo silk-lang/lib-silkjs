@@ -1,6 +1,7 @@
 'use strict';
 
 const { Buffer } = require('buffer');
+const { bufferCodec } = require('internal/host');
 const randomBytes = (...args) => require('crypto').randomBytes(...args);
 // Bound both compressed wire messages and expanded messages before allocation.
 const MAX_MESSAGE = 64 * 1024 * 1024;
@@ -12,30 +13,10 @@ function failure(message, closeCode = 1002) {
 function validCloseCode(code) {
   return code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006 || code >= 3000 && code <= 4999;
 }
+// RFC 3629 over the complete reassembled message: no overlong sequences,
+// surrogates, stray continuations or values beyond U+10FFFF.
 function decodeText(bytes) {
-  // RFC 3629: no overlong sequences, surrogates, stray continuations or values
-  // beyond U+10FFFF. Validation spans the complete reassembled message.
-  for (let i = 0; i < bytes.length;) {
-    const first = bytes[i++];
-    if (first < 0x80) continue;
-    let remaining, low = 0x80, high = 0xbf;
-    if (first >= 0xc2 && first <= 0xdf) remaining = 1;
-    else if (first >= 0xe0 && first <= 0xef) {
-      remaining = 2;
-      if (first === 0xe0) low = 0xa0;
-      if (first === 0xed) high = 0x9f;
-    } else if (first >= 0xf0 && first <= 0xf4) {
-      remaining = 3;
-      if (first === 0xf0) low = 0x90;
-      if (first === 0xf4) high = 0x8f;
-    } else throw failure('Invalid UTF-8 in WebSocket message', 1007);
-    if (i + remaining > bytes.length || bytes[i] < low || bytes[i] > high) throw failure('Invalid UTF-8 in WebSocket message', 1007);
-    i++;
-    while (--remaining) {
-      if (bytes[i] < 0x80 || bytes[i] > 0xbf) throw failure('Invalid UTF-8 in WebSocket message', 1007);
-      i++;
-    }
-  }
+  if (!bufferCodec(13, bytes, 0, bytes.length)) throw failure('Invalid UTF-8 in WebSocket message', 1007);
   return bytes.toString('utf8');
 }
 function frame(opcode, payload) {
@@ -52,7 +33,8 @@ function frame(opcode, payload) {
   const mask = randomBytes(4);
   output.set(mask, 2 + extra);
   const start = 6 + extra;
-  for (let i = 0; i < size; i++) output[start + i] = payload[i] ^ mask[i & 3];
+  output.set(payload, start);
+  bufferCodec(15, output, start, start + size, mask.readUInt32BE(0));
   return output;
 }
 class Receiver {
