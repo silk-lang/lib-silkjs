@@ -207,6 +207,14 @@ pub struct Emitter {
   zeroLabels: List<Label>,
   zeroBacks: List<Label>,
   zeroInsts: List<Inst>,
+  /// Slow paths placed after the blocks (coldPieces): where each starts and goes back to,
+  /// the instruction, and COLD_READ's unbox exit or COLD_STORE's box (NONE for none).
+  coldLabels: List<Label>,
+  coldBacks: List<Label>,
+  coldInsts: List<Inst>,
+  coldAux: List<u32>,
+  /// An instruction another one lowered already (a trusted read's unbox), or NONE.
+  omitAt: u32,
   /// Where the inlined callees' CompiledFrames start, from rsp: INLINE_FRAME_WORDS words each.
   inlineFrames: i32,
   /// The closure value each inlined callee's `inline.frame` names, by frame number less one.
@@ -469,7 +477,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
@@ -541,7 +549,8 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     while i < block.instCount {
       emitter.cursor = block.firstInst + i
       if emitter.settings.map { run offsets.append(usize.toU32(emitter.a.offset())) }
-      run emitter.instruction(&function, function.inst(block.firstInst + i))
+      if emitter.omitAt == block.firstInst + i { emitter.omitAt = NONE }
+      else { run emitter.instruction(&function, function.inst(block.firstInst + i)) }
       if emitter.skipAt == block.firstInst + i { emitter.a.bind(emitter.skipLabel) emitter.skipAt = NONE }
       i = i + 1
     }
@@ -568,6 +577,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     run emitter.a.jmp(emitter.zeroBacks.get(z))
     z = z + 1
   }
+  run emitter.coldPieces(&function)
   let mut o: usize = 0
   while o < emitter.outs.length() {
     let out = emitter.outs.get(o)
@@ -1488,6 +1498,10 @@ impl Emitter {
       }
       // A trusted store whose value is the box right before it, made here (storedBox).
       let fused = op == Op.PutElem && self.cursor > 0 && self.storedBox(&function, self.cursor - 1)
+      if op == Op.PutElem && inst.trusted {
+        run self.trustedStore(&function, inst, fused, done)
+        return ()
+      }
       if op == Op.GetElem || op == Op.PutElem {
         let slow = run self.a.label()
         let typed = run self.a.label()
@@ -1521,10 +1535,23 @@ impl Emitter {
             let layout = self.settings.layout
             run self.loadTag(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)))
             run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
-            run self.a.jcc(Cond.NotEqual, general)
+            // A trusted read needs no path past this one: anything but an Int goes out of
+            // line to its slot and to the plain unbox's exit, which refuses it, and the
+            // unbox itself is not lowered (omitAt). Stress keeps the unbox's guard.
+            let outOfLine = inst.trusted && unbox.k == 0 && self.settings.stress == 0
+            let cold = run self.a.label()
+            if outOfLine { run self.a.jcc(Cond.NotEqual, cold) } else { run self.a.jcc(Cond.NotEqual, general) }
             let out = self.at(unbox.result)
             if out.kind == GPR { run self.a.load(Width.W32, out.gpr, Mem.at(Reg.R11, 8)) }
             else { run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, 8)) run self.a.store(Width.W64, slotOf(unbox.result), Reg.Rax) }
+            if outOfLine {
+              self.omitAt = self.cursor + 1
+              run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(unbox.exit)
+              self.a.bind(general)
+              self.a.bind(done)
+              return ()
+            }
+            self.a.bind(cold)
             self.skipLabel = run self.a.label()
             self.skipAt = self.cursor + 1
             run self.a.jmp(self.skipLabel)
@@ -1545,31 +1572,19 @@ impl Emitter {
           let oldPlain = run self.a.label()
           let newPlain = run self.a.label()
           run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-          // r8, not r10: values live in r10 through a trusted store (keepsFragile).
-          run self.heapTestWith(Reg.Rax, Reg.R8, oldPlain)
+          run self.heapTest(Reg.Rax, oldPlain)
           run self.a.jmp(slow)
           self.a.bind(oldPlain)
-          if fused {
-            // The box of the number before it, written into the element.
-            let box = function.inst(self.cursor - 1)
-            let layout = self.settings.layout
-            let mut tag = layout.int()
-            if box.op == Op.BoxBool { tag = layout.boolean() }
-            run self.a.storeImm(Width.W64, Mem.at(Reg.R11, 0), u64.wrappingToI32(layout.tagWord(tag)))
-            let number = self.at(box.a) run getI32(&mut self.a, Reg.Rax, number)
-            run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rax)
-          } else {
-            run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
-            // An immediate (a boxed number, undefined, a boolean) is never on the heap.
-            if function.value(inst.b).own != Own.Imm {
-              run self.heapTestWith(Reg.Rax, Reg.R8, newPlain)
-              run self.a.jmp(slow)
-            }
-            self.a.bind(newPlain)
-            run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
-            run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
-            run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
+          run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+          // An immediate (a boxed number, undefined, a boolean) is never on the heap.
+          if function.value(inst.b).own != Own.Imm {
+            run self.heapTest(Reg.Rax, newPlain)
+            run self.a.jmp(slow)
           }
+          self.a.bind(newPlain)
+          run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+          run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+          run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
         }
         run self.a.jmp(done)
         self.a.bind(typed)
@@ -1578,27 +1593,6 @@ impl Emitter {
       }
       // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
       // get_length(env, object, out) -> 1 when done.
-      if fused {
-        // The helper takes the value from its slot.
-        let box = function.inst(self.cursor - 1)
-        let number = self.at(box.a) run getI32(&mut self.a, Reg.Rax, number)
-        run self.boxInto(box.op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.b * SLOT_BYTES)
-      }
-      if op == Op.PutElem && inst.trusted {
-        // Values in the fragile registers live through a trusted store (x64_regalloc
-        // keepsFragile): kept over the call, and the index read before rsi is written.
-        run self.keepFragile()
-        let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
-        run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
-        run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
-        run self.callHelper(helpers.PUT_ELEM)
-        run self.restoreFragile()
-        // In the count, on a fast Array, the helper stores; a refusal leaves all the same.
-        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-        run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
-        self.a.bind(done)
-        return ()
-      }
       run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
       if op == Op.GetElem {
         let index = self.at(inst.b) run getI32(&mut self.a, Reg.Rdx, index)
@@ -4138,6 +4132,89 @@ impl Emitter {
       run self.a.jmp(poll.back)
       i = i + 1
     }
+  }
+  /// A put.elem a check.array proved (Inst.trusted): the index against the count, then the
+  /// value into the element when neither it nor the one there is counted; a counted one
+  /// goes out of line to the helper (coldPieces), which keeps the fragile registers over
+  /// its call. `fused`: the value is the box right before (storedBox), made here.
+  effect fn trustedStore(self: &mut Self, function: &Function, inst: Inst, fused: bool, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let layout = self.settings.layout
+    let miss = self.exitLabels.get(u32.toUsize(inst.exit))
+    run self.trustedSlot(inst.a, i32.wrappingToU32(inst.k), miss)
+    let cold = run self.a.label()
+    run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+    // r8, not r10: values live in r10 through a trusted store (keepsFragile).
+    run self.heapJump(Reg.Rax, Reg.R8, cold)
+    let mut box = NONE
+    if fused {
+      box = self.cursor - 1
+      let made = function.inst(box)
+      let mut tag = layout.int()
+      if made.op == Op.BoxBool { tag = layout.boolean() }
+      run self.a.storeImm(Width.W64, Mem.at(Reg.R11, 0), u64.wrappingToI32(layout.tagWord(tag)))
+      let number = self.at(made.a) run getI32(&mut self.a, Reg.Rax, number)
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rax)
+    } else {
+      run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+      // An immediate (a boxed number, undefined, a boolean) is never on the heap.
+      if function.value(inst.b).own != Own.Imm { run self.heapJump(Reg.Rax, Reg.R8, cold) }
+      run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+      run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
+    }
+    self.a.bind(done)
+    run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(box)
+  }
+  /// The slow paths placed after the blocks. A trusted read fused with its unbox
+  /// (coldAux: the unbox's exit) copies an element that is no Int to its slot and leaves
+  /// at the unbox's exit. A trusted store (coldAux: its box, or NONE) boxes its value into
+  /// its slot if it made it, and has the helper store it, with the fragile registers kept
+  /// over the call and the index read before rsi is written.
+  effect fn coldPieces(self: &mut Self, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut c: usize = 0
+    while c < self.coldInsts.length() {
+      let inst = self.coldInsts.get(c)
+      let aux = self.coldAux.get(c)
+      self.a.bind(self.coldLabels.get(c))
+      if inst.op == Op.GetElem {
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        run self.a.jmp(self.exitLabels.get(u32.toUsize(aux)))
+      } else {
+        if aux != NONE {
+          let made = function.inst(aux)
+          let number = self.at(made.a) run getI32(&mut self.a, Reg.Rax, number)
+          run self.boxInto(made.op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.b * SLOT_BYTES)
+        }
+        run self.keepFragile()
+        let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
+        run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+        run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
+        run self.callHelper(helpers.PUT_ELEM)
+        run self.restoreFragile()
+        // In the count, on a fast Array, the helper stores; a refusal leaves all the same.
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+        run self.a.jmp(self.coldBacks.get(c))
+      }
+      c = c + 1
+    }
+  }
+  /// To `heap` when tagWord's value is counted (the opposite of heapTest), with `scratch`
+  /// for the layouts that need a register.
+  effect fn heapJump(self: &mut Self, tagWord: Reg, scratch: Reg, heap: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let plain = run self.a.label()
+    let layout = self.settings.layout
+    if layout.tagOffset == 0 && layout.tagWidth == 1 && layout.heapLowest == 0 {
+      run self.a.cmp8Imm(tagWord, u32.wrappingToU8(layout.heapHighest))
+      run self.a.jcc(Cond.BelowOrEqual, heap)
+      return ()
+    }
+    run self.heapTestWith(tagWord, scratch, plain)
+    run self.a.jmp(heap)
+    self.a.bind(plain)
   }
   /// Before a call a trusted element store or a poll makes on its slow path (x64_regalloc
   /// keepsFragile): the fragile pool registers the code uses (rsi, rdi, rdx, r10) go to the

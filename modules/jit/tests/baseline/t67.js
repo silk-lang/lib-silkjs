@@ -70,6 +70,13 @@ out.push(reads(getter, 10));
 Array.prototype[12] = 5;
 out.push(reads(ints(10, 7), 14));
 delete Array.prototype[12];
+// An element that is no Int (a double, a string, an object) in a loop made for Ints, and an
+// object stored over a number.
+var odd = ints(40, 9); odd[5] = 2.5; odd[17] = 'q'; odd[30] = { v: 1 };
+out.push(mix(odd, ints(40, 1), 40), reads(odd, 40));
+var held = ints(40, 3);
+for (var r = 0; r < 50; r++) { held[r % 40] = { r: r }; out.length < 40 && r % 25 == 0 && out.push(mix(ints(40, r), ints(40, r + 1), 40)); }
+out.push(held[7].r);
 // The loops on arrays again.
 total = 0;
 for (var r = 0; r < 200; r++) {

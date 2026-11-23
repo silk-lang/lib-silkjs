@@ -220,6 +220,12 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   nonzero product runs `imul`, `jo`, `test` and a branch not taken. Operands known never
   to be negative (a constant that is not, an `and` with one, `>>>` by a nonzero constant)
   need no test at all.
+- **Trusted accesses keep their slow paths out of line.** A trusted read fused with its
+  unbox branches to a piece after the blocks when the element is no Int (it copies the
+  element to its slot and leaves at the unbox's exit) and the unbox itself is not lowered
+  (`omitAt`); a trusted store branches there when the old or the new value is counted (the
+  helper, with the fragile registers kept). The loop then runs straight through both, with
+  no jump over code it does not run (`coldPieces`).
 - **A store of an immediate skips its heap test.** `put.elem` of a value that is
   `Own.Imm` (a boxed number, undefined, a boolean) does not test whether the new value is
   counted.
