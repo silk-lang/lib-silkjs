@@ -22,7 +22,8 @@ import silkjs.js_compiled as compiled
 import silkjs.js_compiled_inline as inline
 import silkjs.js_compiled_inline { KnownMethod, WatchedRecord }
 import ssa_translate { CallTarget, SiteShape, RecordSlot }
-import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, SiteShapes }
+import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, SiteShapes, ObjectData, JS_PROP_TMASK }
+import silkjs.js_shapes as shapes
 import silkjs.js_runtime as runtime
 import silkjs.js_backtrace as backtrace
 import silkjs.js_feedback as feedback
@@ -842,24 +843,88 @@ effect fn missedSites(jit: &Jit, function: &FunctionBytecode, sites: &mut List<u
   let bytes = unsafe function.code.asSlice()
   let mut i: usize = 0
   while i < baseline_env.MISSES {
-    let site = jit.baselineEnv.asSlice()[0].misses[i]
-    if site >= first && site < first + length && (elementOpcode(bytes[site - first]) || fieldOpcode(bytes[site - first]) || addOpcode(bytes[site - first])) {
-      let pc = usize.toU32(site - first)
-      let mut known = false
-      let mut n: usize = 0
-      while n < sites.length() { if sites.get(n) == pc { known = true } n = n + 1 }
-      if !known {
-        run sites.append(pc)
-        // An add named twice is the engine's join (ssa_translate.concatenates).
-        if addOpcode(bytes[site - first]) { run sites.append(pc) }
+    let raw = jit.baselineEnv.asSlice()[0].misses[i]
+    let concat = (raw & baseline_env.MISS_CONCAT) != 0
+    let site = raw & usize.bitNot(baseline_env.MISS_CONCAT)
+    if site >= first && site < first + length {
+      let opcode = bytes[site - first]
+      if elementOpcode(opcode) || fieldOpcode(opcode) || numericOpcode(opcode) {
+        let pc = usize.toU32(site - first)
+        let mut known: u32 = 0
+        let mut n: usize = 0
+        while n < sites.length() { if sites.get(n) == pc { known = known + 1 } n = n + 1 }
+        if known == 0 {
+          run sites.append(pc)
+          // An add named twice is the engine's join (ssa_translate.concatenates).
+          if concat && addOpcode(opcode) { run sites.append(pc) }
+        } else if known == 1 && concat && addOpcode(opcode) {
+          run sites.append(pc)
+        }
       }
     }
     i = i + 1
   }
 }
+/// The numeric sites of an inline candidate (callee) that baseline code or earlier compiles
+/// saw with non-Int numbers, so the inlined body widens them to doubles from the start.
+effect fn calleeDoubleSites(jit: &Jit, callee: &FunctionBytecode) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut sites = List<u32>.make()
+  let length = callee.code.length()
+  if length == 0 { return move sites }
+  let bytes = unsafe callee.code.asSlice()
+  if jit.baselineEnv.length() != 0 {
+    let first = Pointer.address<u8>(unsafe callee.code.start()) + 1
+    let mut i: usize = 0
+    while i < baseline_env.MISSES {
+      let raw = jit.baselineEnv.asSlice()[0].misses[i]
+      let concat = (raw & baseline_env.MISS_CONCAT) != 0
+      let site = raw & usize.bitNot(baseline_env.MISS_CONCAT)
+      if !concat && site >= first && site < first + length && numericOpcode(bytes[site - first]) {
+        let pc = usize.toU32(site - first)
+        let mut known = false
+        let mut n: usize = 0
+        while n < sites.length() { if sites.get(n) == pc { known = true } n = n + 1 }
+        if !known { run sites.append(pc) }
+      }
+      i = i + 1
+    }
+  }
+  if callee.baseline != 0 {
+    let index = engineBaseline.linkedIndex(callee.baseline)
+    let mut l: usize = 0
+    while l < jit.leftAt.length() {
+      let left = jit.leftAt.get(l)
+      if u64.toUsize(u64.shiftRight(left, 32)) == index {
+        let pc = u64.wrappingToU32(left)
+        let at = u32.toUsize(pc)
+        if at < bytes.length && numericOpcode(bytes[at]) {
+          let mut known = false
+          let mut n: usize = 0
+          while n < sites.length() { if sites.get(n) == pc { known = true } n = n + 1 }
+          if !known { run sites.append(pc) }
+        }
+      }
+      l = l + 1
+    }
+  }
+  return move sites
+}
 /// Whether opcode is an add that baseline code notes where it joined a string.
 fn addOpcode(opcode: u8) -> bool {
   return opcode == op.OP_add || opcode == op.OP_add_loc || opcode == op.OP_add_loc_loc8 || opcode == op.OP_add_top_loc8 || opcode == op.OP_add_top_arg8
+}
+/// Whether opcode is an arithmetic, comparison or unary op that baseline code notes when it
+/// handles a non-Int number (BaselineEnv.misses).
+fn numericOpcode(opcode: u8) -> bool {
+  return addOpcode(opcode)
+    || opcode == op.OP_sub || opcode == op.OP_sub_loc_loc8 || opcode == op.OP_sub_top_loc8 || opcode == op.OP_sub_top_arg8
+    || opcode == op.OP_mul || opcode == op.OP_mul_loc_loc8 || opcode == op.OP_mul_top_loc8 || opcode == op.OP_mul_top_arg8
+    || opcode == op.OP_div || opcode == op.OP_mod
+    || opcode == op.OP_lt || opcode == op.OP_lte || opcode == op.OP_gt || opcode == op.OP_gte
+    || opcode == op.OP_and || opcode == op.OP_or || opcode == op.OP_xor
+    || opcode == op.OP_shl || opcode == op.OP_sar || opcode == op.OP_shr
+    || opcode == op.OP_neg || opcode == op.OP_plus
+    || opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8
 }
 /// Whether opcode is a named property read or store, whose site baseline code notes where
 /// it met an accessor (BaselineEnv.misses).
@@ -1781,6 +1846,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           continue
         }
         let mut input = run inputOf(&callee)
+        input.doubleSites = run calleeDoubleSites(jit, &callee)
         input.siteShapes = run unsafe siteShapesOf(rt, cell)
         let id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
@@ -1792,9 +1858,10 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
     }
   }
   let mut pc: usize = 0
-  // Where the instruction before pc starts (usize.MAX at the first), and the local that
-  // holds `this` for good when the code has one (thisLocal).
-  let mut previous: usize = usize.MAX
+  // The object produced by a contiguous `get_var` / `push_this` / `thisLocal` followed by
+  // zero or more `get_field` hops (e.g. `Flog.RayTracer.Vector.prototype`), ending at `chainEnd`.
+  let mut chainObj = Pointer.null<HeapHeader>()
+  let mut chainEnd: usize = usize.MAX
   let mut this = usize.MAX
   if !Pointer.isNull<HeapHeader>(receiver) { this = thisLocal(bytes) }
   while pc < bytes.length && cells.length() < MAX_CANDIDATES {
@@ -1825,6 +1892,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           continue
         }
         let mut input = run inputOf(&callee)
+        input.doubleSites = run calleeDoubleSites(jit, &callee)
         input.siteShapes = run unsafe siteShapesOf(rt, cell)
         let mut id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
@@ -1852,18 +1920,13 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
       let mut object = objects[0]
       let mut single = several[0]
       if known == 0 { single = unsafe inline.methodTarget(rt, bytecode, usize.toU32(pc), &mut object) }
-      // A function's own method, read off the object a variable of this code holds
-      // (`Strength.stronger(a, b)`), or off `this` when this code's `this` is known to be
-      // such an object: the closure there now, which the call tests its callee against.
-      // holder is that object: the target's `this`.
+      // A function's own method, read off the object a variable or property chain of this
+      // code holds (`Strength.stronger(a, b)`, `Flog.RayTracer.Vector.prototype.subtract`),
+      // or off `this` when this code's `this` is known to be such an object: the closure
+      // there now, which the call tests its callee against. holder is that object.
       let mut holder = Pointer.null<HeapHeader>()
-      if known == 0 && Pointer.isNull<HeapHeader>(single) && previous != usize.MAX {
-        if previous + 3 == pc && bytes[previous] == op.OP_get_var {
-          if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
-            holder = unsafe engineBaseline.variableObject(reader, u8.toU32(bytes[previous + 1]) | u32.shiftLeft(u8.toU32(bytes[previous + 2]), 8))
-          }
-        } else if previous + 1 == pc && bytes[previous] == op.OP_push_this { holder = receiver }
-        else if this != usize.MAX && readLocal(bytes, previous, pc) == this { holder = receiver }
+      if known == 0 && Pointer.isNull<HeapHeader>(single) && chainEnd == pc {
+        holder = chainObj
         if let Option<*mut HeapHeader>.Some { value: from } = Pointer.nonNullMut<HeapHeader>(holder) {
           let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
           object = unsafe engineBaseline.ownMethod(from, atom, bytecode)
@@ -1876,6 +1939,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
         if (unsafe callee.code.asSlice()).length <= CANDIDATE_BYTES {
           let mut input = run inputOf(&callee)
+          input.doubleSites = run calleeDoubleSites(jit, &callee)
           input.siteShapes = run unsafe siteShapesOf(rt, cell)
           let mut id = usize.toU32(cells.length())
           run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
@@ -1901,10 +1965,41 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         run say(b"jit: no inline target: ", text)
       }
     }
-    previous = pc
+    if opcode == op.OP_get_var && size == 3 {
+      chainObj = Pointer.null<HeapHeader>()
+      if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
+        chainObj = unsafe engineBaseline.variableObject(reader, u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8))
+      }
+      chainEnd = pc + size
+    } else if opcode == op.OP_push_this && size == 1 {
+      chainObj = receiver
+      chainEnd = pc + size
+    } else if this != usize.MAX && readLocal(bytes, pc, pc + size) == this {
+      chainObj = receiver
+      chainEnd = pc + size
+    } else if opcode == op.OP_get_field && size >= 5 && chainEnd == pc {
+      if let Option<*mut HeapHeader>.Some { value: from } = Pointer.nonNullMut<HeapHeader>(chainObj) {
+        let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
+        chainObj = unsafe ownObject(from, atom)
+        chainEnd = pc + size
+      }
+    }
     pc = pc + size
   }
   return move targets
+}
+
+/// The own data-property object `atom` of `object`, or null for anything else.
+unsafe fn ownObject(object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.isExotic() { return Pointer.null<HeapHeader>() }
+  let slot = match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { value } => value Option<usize>.None => { return Pointer.null<HeapHeader>() } }
+  if slot >= data.slotCount() || (u8.toU32(unsafe shapes.slotFlags(data.shape, slot)) & JS_PROP_TMASK) != 0 { return Pointer.null<HeapHeader>() }
+  return match (unsafe data.slotUnchecked(slot)).valueBits() {
+    ValueBits.Object { reference } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
+    _ => Pointer.null<HeapHeader>()
+  }
 }
 
 /// The watched objects of one candidate, KNOWN_SYMBOLS of them, into holders.

@@ -7,10 +7,13 @@
 //! colliding: J (objects) 0-31, H (calls) 32-63, I (loops) 64-95, K (numbers) 96-127.
 import silk.mem.pointer { Pointer }
 import silk.core.ownership { Copy }
+import silk.num.f64
+import silk.num.i32
 import silk.num.u32
 import silk.num.u64
-import silkjs.js_heap { HeapHeader }
+import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { ObjectData, ObjectPayload, BuiltinFamily, NativeFunctionId }
 import silkjs.js_gc as gc
 import silkjs.js_compiled { CompiledFrame }
 import silkjs.js_compiled_objects as objects
@@ -97,6 +100,12 @@ pub const CALL_POP: u32 = 33
 /// callee, receiver and count arguments; 1 with the result in out when the callee is a Math
 /// function of Numbers (js_compiled_math.mathCall), else 0 and the call is made.
 pub const MATH: u32 = 98
+/// math_frame(env, calleeCell: *const ValueBits, count: u32, out: *mut ValueBits) -> u32:
+/// frame-mode layout where callee is at [0] and arguments follow at [1..1+count]; handles
+/// js_compiled_math.mathCall as well as 2-arg Math.min and Math.max on Numbers.
+pub const MATH_FRAME: u32 = 99
+/// mod_f64(env, aBits: u64, bBits: u64) -> u64: IEEE fmod (f64.remainder) of two doubles.
+pub const MOD_F64: u32 = 100
 // ---- compile cost and code quality: 120-127 (from K's range) ----
 /// exit_state(env, state, frame, record, dump) -> u32: writes the interpreter state an exit
 /// record describes and returns the exit status (jit_exit_state).
@@ -177,6 +186,10 @@ impl CompiledEnv {
     env.helpers[u32.toUsize(GET_ELEM_BORROWED)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const ValueBits, i32, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&getElemBorrowed)))
     let exitState: extern "C" fn(*mut u8, *mut u64, *mut u8, *mut u32, *mut u64) -> u32 = jitExitState
     env.helpers[u32.toUsize(EXIT_STATE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut u8, *mut u64, *mut u8, *mut u32, *mut u64) -> u32, *const ?*const u8>(Pointer.fromRef(&exitState)))
+    let mathFrame: extern "C" fn(*mut CompiledEnv, *const ValueBits, u32, *mut ValueBits) -> u32 = jitMathFrame
+    env.helpers[u32.toUsize(MATH_FRAME)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const ValueBits, u32, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&mathFrame)))
+    let modF64: extern "C" fn(*mut CompiledEnv, u64, u64) -> u64 = jitModF64
+    env.helpers[u32.toUsize(MOD_F64)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, u64, u64) -> u64, *const ?*const u8>(Pointer.fromRef(&modF64)))
     return env
   }
 }
@@ -194,6 +207,60 @@ export "C" fn jitArrayPop(env: *mut CompiledEnv, object: *const ValueBits, out: 
 export "C" fn jitMath(env: *mut CompiledEnv, area: *const ValueBits, count: u32, out: *mut ValueBits) -> u32 {
   if unsafe mathematics.mathCall(area, count, out) { return 1 }
   return 0
+}
+
+fn numberBitsOf(value: ValueBits, out: &mut f64) -> bool {
+  match value {
+    ValueBits.Int { value: x } => { out.* = i32.toF64(x) return true }
+    ValueBits.Float64 { value: x } => { out.* = x return true }
+    _ => { return false }
+  }
+}
+
+export "C" fn jitMathFrame(env: *mut CompiledEnv, calleeCell: *const ValueBits, count: u32, out: *mut ValueBits) -> u32 {
+  if count != 1 && count != 2 { return 0 }
+  let many = unsafe Pointer.assumeMany<ValueBits>(calleeCell)
+  let callee = unsafe Pointer.read<ValueBits>(calleeCell)
+  let arg0 = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(many, 1))
+  let mut arg1 = ValueBits.Undefined
+  if count == 2 { arg1 = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(many, 2)) }
+  let area: [ValueBits; 4] = [callee, ValueBits.Undefined, arg0, arg1]
+  if unsafe mathematics.mathCall(Pointer.fromRef<ValueBits>(&area[0]), count, out) { return 1 }
+  if count != 2 { return 0 }
+  let object = match callee { ValueBits.Object { reference } => reference _ => { return 0 } }
+  let anchor = ()
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let mut method: u32 = u32.MAX
+  match &p.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      match native.function {
+        NativeFunctionId.Builtin { family, method: m } => {
+          if family == BuiltinFamily.Math && (m == 0 || m == 1) { method = m }
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  drop p
+  if method == u32.MAX { return 0 }
+  let mut x: f64 = 0.0 let mut y: f64 = 0.0
+  if !numberBitsOf(arg0, &mut x) || !numberBitsOf(arg1, &mut y) { return 0 }
+  let mut res: f64 = 0.0
+  if x != x || y != y { res = x + y }
+  else if method == 0 {
+    // Math.min(x, y): -0 < +0.
+    if x < y || (x == y && (f64.toBits(x) & 0x8000000000000000) != 0) { res = x } else { res = y }
+  } else {
+    // Math.max(x, y): +0 > -0.
+    if x > y || (x == y && (f64.toBits(x) & 0x8000000000000000) == 0) { res = x } else { res = y }
+  }
+  unsafe Pointer.write<ValueBits>(out, ValueBits.number(res))
+  return 1
+}
+
+export "C" fn jitModF64(env: *mut CompiledEnv, aBits: u64, bBits: u64) -> u64 {
+  return f64.toBits(f64.remainder(f64.fromBits(aBits), f64.fromBits(bBits)))
 }
 
 export "C" fn jitCallPop(env: *mut CompiledEnv, activation: *mut u8) -> () {

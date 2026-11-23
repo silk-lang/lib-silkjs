@@ -847,14 +847,30 @@ impl Emitter {
 
   /// Notes the instruction at pc in BaselineEnv.misses (baseline_env.missIndex of its
   /// operand's address), for the optimizer to compile its general case from the start.
-  /// Clobbers rax and r10.
-  effect fn noteSite(self: &mut Self, pc: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  /// When concat is true, sets MISS_CONCAT (an add that joined a string); otherwise records
+  /// a numeric/general site without overwriting an existing MISS_CONCAT note for the same
+  /// instruction. Clobbers rax, r10 and r11.
+  effect fn noteSite(self: &mut Self, pc: usize, concat: bool) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.operandInto(Reg.Rax, pc)
     run self.a.mov(Width.W64, Reg.R10, Reg.Rax)
     run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, usize.wrappingToU8(env.MISS_SHIFT))
     run self.a.alu(Alu.Xor, Width.W64, Reg.R10, Reg.Rax)
     run self.a.aluImm(Alu.And, Width.W32, Reg.R10, u32.wrappingToI32(usize.toU32(env.MISSES - 1)))
-    run self.a.store(Width.W64, Mem.indexed(Reg.R12, Reg.R10, Scale.Eight, env.MISSES_OFFSET), Reg.Rax)
+    if concat {
+      run self.a.movImm64(Reg.R11, usize.toU64(env.MISS_CONCAT))
+      run self.a.alu(Alu.Or, Width.W64, Reg.Rax, Reg.R11)
+      run self.a.store(Width.W64, Mem.indexed(Reg.R12, Reg.R10, Scale.Eight, env.MISSES_OFFSET), Reg.Rax)
+    } else {
+      let done = run self.a.label()
+      run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.indexed(Reg.R12, Reg.R10, Scale.Eight, env.MISSES_OFFSET))
+      run self.a.jcc(Cond.Equal, done)
+      run self.a.movImm64(Reg.R11, usize.toU64(env.MISS_CONCAT))
+      run self.a.alu(Alu.Or, Width.W64, Reg.R11, Reg.Rax)
+      run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R11, Mem.indexed(Reg.R12, Reg.R10, Scale.Eight, env.MISSES_OFFSET))
+      run self.a.jcc(Cond.Equal, done)
+      run self.a.store(Width.W64, Mem.indexed(Reg.R12, Reg.R10, Scale.Eight, env.MISSES_OFFSET), Reg.Rax)
+      self.a.bind(done)
+    }
   }
   /// The running function's bytecode object into reg.
   effect fn bytecodeInto(self: &mut Self, reg: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -1394,6 +1410,7 @@ impl Emitter {
           run self.a.zeroExtend8(Reg.Rax, Reg.Rax)
           run self.boxed(item.c, p.boolean(), Reg.Rax)
         }
+        if p.tier { run self.noteSite(u32.toUsize(item.pc), false) }
         run self.a.jmp(item.back)
         if mixed {
           self.a.bind(leftInt)
@@ -1427,15 +1444,18 @@ impl Emitter {
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       if opcode != op.OP_add {
         run self.a.jcc(Cond.Equal, item.other)
+        if p.tier { run self.noteSite(u32.toUsize(item.pc), false) }
         run self.a.jmp(item.back)
         return ()
       }
-      run self.a.jcc(Cond.NotEqual, item.back)
+      run self.a.jcc(Cond.Equal, text)
+      if p.tier { run self.noteSite(u32.toUsize(item.pc), false) }
+      run self.a.jmp(item.back)
       self.a.bind(text)
       // A string and a string or number: the engine joins them (SERVICE_CONCAT). The text
       // replaces the left value, in the out cell; a right operand on the stack is consumed.
       // The site is noted for the optimizer, which then joins there from the start.
-      run self.noteSite(u32.toUsize(item.pc))
+      run self.noteSite(u32.toUsize(item.pc), true)
       let threw = run self.exit(u32.toUsize(item.pc), u32.wrappingToI32(item.depth), true)
       run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(item.pc))
       if item.c != item.a {
@@ -1479,6 +1499,7 @@ impl Emitter {
       run self.helper(item.k)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, item.other)
+      if p.tier && item.k == env.UNARY { run self.noteSite(u32.toUsize(item.pc), false) }
       run self.a.jmp(item.back)
       return ()
     }
@@ -1872,22 +1893,42 @@ impl Emitter {
       return ()
     }
     if index == STUB_CONSTRUCT {
-      // Six words below the return address, so rsp is as a stub's own; a call from here
-      // takes one more. [0]: the receiver; [16]: r14 and the count, then a result to drop.
+      // Eight words below the return address, so rsp is as a stub's own; a call from here
+      // takes one more. [0]: the receiver; [16]: forwarded target; [32]: r14 and count;
+      // [48]: a result to drop.
       let receiver = Cell { base: Reg.Rsp, at: 0 }
-      let dropped = Cell { base: Reg.Rsp, at: 16 }
+      let forwarded = Cell { base: Reg.Rsp, at: 16 }
+      let dropped = Cell { base: Reg.Rsp, at: 48 }
       let direct = run self.a.label()
+      let directFast = run self.a.label()
+      let forwardFast = run self.a.label()
       let made = run self.a.label()
+      let fastMade = run self.a.label()
+      let serviceConstruct = run self.a.label()
       let threw = run self.a.label()
       let left = run self.a.label()
       let plain = run self.a.label()
       run self.a.store(Width.W64, p.sf(f.currentPc), Reg.Rax)
-      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 48)
-      run self.a.store(Width.W64, Mem.at(Reg.Rsp, 16), Reg.R14)
-      run self.a.store(Width.W64, Mem.at(Reg.Rsp, 24), Reg.Rdx)
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 64)
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, 32), Reg.R14)
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, 40), Reg.Rdx)
+      // Planned spare-cell fast path: 1 succeeded into [rsp+0], 2 declined non-generic
+      // (skip SERVICE_NEW), 3 receiver in [rsp+0] and forwarded target in [rsp+16],
+      // 4 receiver in [rsp+0] for direct generic constructor call, 0 try SERVICE_NEW.
+      run self.a.mov(Width.W64, Reg.Rsi, Reg.R14)
+      run self.a.lea(Width.W64, Reg.Rcx, Mem.at(Reg.Rsp, 0))
+      run self.helper(env.CONSTRUCT_FAST)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+      run self.a.jcc(Cond.Equal, fastMade)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 3)
+      run self.a.jcc(Cond.Equal, forwardFast)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 4)
+      run self.a.jcc(Cond.Equal, directFast)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 2)
+      run self.a.jcc(Cond.Equal, serviceConstruct)
       run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_NEW))
-      run self.a.mov(Width.W64, Reg.R8, Reg.R14)
-      run self.a.mov(Width.W32, Reg.R9, Reg.Rdx)
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.Rsp, 32))
+      run self.a.load(Width.W32, Reg.R9, Mem.at(Reg.Rsp, 40))
       run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
       run self.engineCall()
       run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
@@ -1898,10 +1939,11 @@ impl Emitter {
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
       run self.a.jcc(Cond.Equal, threw)
       // Declined: the engine constructs.
+      self.a.bind(serviceConstruct)
       run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1)
       run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_CONSTRUCT))
-      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.Rsp, 16))
-      run self.a.load(Width.W32, Reg.R9, Mem.at(Reg.Rsp, 24))
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.Rsp, 32))
+      run self.a.load(Width.W32, Reg.R9, Mem.at(Reg.Rsp, 40))
       run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
       run self.engineCall()
       run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
@@ -1910,14 +1952,47 @@ impl Emitter {
       self.a.bind(made)
       run self.a.load(Width.W64, Reg.Rax, p.rec(f.result))
       run self.a.load(Width.W64, Reg.Rdx, p.rec(f.result + 8))
+      run self.a.jmp(left)
+      self.a.bind(fastMade)
+      run self.a.load(Width.W64, Reg.Rax, receiver.word())
+      run self.a.load(Width.W64, Reg.Rdx, receiver.payload())
       self.a.bind(left)
-      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 48)
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 64)
       run self.a.alu(Alu.Xor, Width.W32, Reg.Rcx, Reg.Rcx)
       run self.a.ret()
       self.a.bind(threw)
-      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 48)
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 64)
       run self.a.movImm32(Reg.Rcx, 2)
       run self.a.ret()
+      // Forwarded wrapper (`this.initialize.apply(this, arguments)`): call the compiled
+      // target as a normal method on receiver, drop its return value, and return receiver.
+      self.a.bind(forwardFast)
+      let forwardThrew = run self.a.label()
+      run self.a.load(Width.W64, Reg.Rcx, receiver.word())
+      run self.a.load(Width.W64, Reg.R8, receiver.payload())
+      run self.a.load(Width.W64, Reg.Rdi, forwarded.payload())
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
+      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
+      run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R13, signed(f.table)))
+      run self.a.load(Width.W64, Reg.R14, Mem.at(Reg.Rsp, 32))
+      run self.a.load(Width.W32, Reg.Rdx, Mem.at(Reg.Rsp, 40))
+      run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.R14, 32))
+      if p.count { run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.DIRECT_CALLS_OFFSET), 1) }
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.a.callMem(Mem.indexed(Reg.R10, Reg.Rax, Scale.Eight, -8))
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
+      run self.a.store(Width.W64, dropped.word(), Reg.Rax)
+      run self.a.store(Width.W64, dropped.payload(), Reg.Rdx)
+      run self.releaseAt(forwarded)
+      run self.a.cmp8MemImm(dropped.word(), i32.wrappingToU8(p.exception()))
+      run self.a.jcc(Cond.Equal, forwardThrew)
+      run self.releaseAt(dropped)
+      run self.a.load(Width.W64, Reg.Rax, receiver.word())
+      run self.a.load(Width.W64, Reg.Rdx, receiver.payload())
+      run self.a.jmp(left)
+      self.a.bind(forwardThrew)
+      run self.releaseAt(receiver)
+      run self.a.jmp(threw)
       // The function's code on the receiver, as a method call enters it, at its construct
       // entry (the table's word after its code's).
       self.a.bind(direct)
@@ -1925,8 +2000,14 @@ impl Emitter {
       run self.a.load(Width.W64, Reg.R8, p.rec(f.result + 8))
       run self.a.store(Width.W64, receiver.word(), Reg.Rcx)
       run self.a.store(Width.W64, receiver.payload(), Reg.R8)
-      run self.a.load(Width.W64, Reg.R14, Mem.at(Reg.Rsp, 16))
-      run self.a.load(Width.W32, Reg.Rdx, Mem.at(Reg.Rsp, 24))
+      let directCall = run self.a.label()
+      run self.a.jmp(directCall)
+      self.a.bind(directFast)
+      run self.a.load(Width.W64, Reg.Rcx, receiver.word())
+      run self.a.load(Width.W64, Reg.R8, receiver.payload())
+      self.a.bind(directCall)
+      run self.a.load(Width.W64, Reg.R14, Mem.at(Reg.Rsp, 32))
+      run self.a.load(Width.W32, Reg.Rdx, Mem.at(Reg.Rsp, 40))
       run self.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.R14, 8))
       run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, signed(f.closureBytecode)))
       run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.bytecodeBaseline)))
@@ -3575,6 +3656,7 @@ impl Emitter {
       run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 1)
       if opcode == op.OP_strict_neq_imm8 { run self.a.aluImm(Alu.Xor, Width.W32, Reg.Rax, 1) }
       run self.boxed(top, p.boolean(), Reg.Rax)
+      if p.tier { run self.noteSite(pc, false) }
       run self.a.jmp(done)
       self.a.bind(notNumber)
       run self.releaseCell(top)
