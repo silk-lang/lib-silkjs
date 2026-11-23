@@ -164,7 +164,7 @@ impl Options {
 /// stale counts the times in a row it was given back without having learned one; waits
 /// the times its first optimization was put off for method calls not yet run (unseenCalls),
 /// and unseen how many there were when it was last put off.
-struct BaselineInfo { entry: usize, code: *const u8, construct: *const u8, moved: u32, finish: u32, stepEnded: u32, tier: u8, compiles: u8, exits: u32, learned: bool, stale: u8, waits: u8, unseen: u32 }
+struct BaselineInfo { entry: usize, code: *const u8, construct: *const u8, moved: usize, finish: usize, stepEnded: usize, tier: u8, compiles: u8, exits: u32, learned: bool, stale: u8, waits: u8, unseen: u32 }
 impl Copy for BaselineInfo {}
 /// Optimized code that left at guards this often, and at more than one entry in EXIT_RATE
 /// (a loop's turns do not count: code that leaves on each is slow whatever its entries),
@@ -649,7 +649,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
   let wait = if jit.options.optimize { tierUpWait(jit.options.optimizeEntries, bytes) } else { jit.options.optimizeEntries }
   drop function
   match move outcome {
-    BaselineOutcome { code: made, why, uncovered, stepped, map, construct, resume } => {
+    BaselineOutcome { code: made, split, why, uncovered, stepped, map, construct, resume } => {
       let mut code = match move made {
         Option<Code>.Some { value } => move value
         Option<Code>.None => {
@@ -670,24 +670,63 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       }
       if !run unsafe baselineStubs(&mut jit, &settings) { jit.failed = jit.failed + 1 return () }
       let symbols = jit.baselineSymbols.asSlice()
-      let block = match &mut jit.memory {
-        Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_BASE_HOT, &mut code, symbols)
-        Option<CodeMemory>.None => { return () }
+      let isSplit = split.hotBytes != usize.MAX && split.hotBytes > 0 && split.hotBytes < code.bytes.length()
+      let mut entry: ?*const u8 = Pointer.null<u8>()
+      let mut coldEntry: ?*const u8 = Pointer.null<u8>()
+      if isSplit {
+        let blocks = match &mut jit.memory {
+          Option<CodeMemory>.Some { value } => run publishSplitIn(&mut value, PACK_BASE_HOT, &mut code, &split, symbols)
+          Option<CodeMemory>.None => { return () }
+        }
+        match move blocks {
+          SplitBlocks { hot, cold } => {
+            entry = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(hot.entry())
+            coldEntry = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(cold.entry())
+            run jit.blocks.append(move hot)
+            run jit.blocks.append(move cold)
+          }
+        }
+      } else {
+        let block = match &mut jit.memory {
+          Option<CodeMemory>.Some { value } => run publishIn(&mut value, PACK_BASE_HOT, &mut code, symbols)
+          Option<CodeMemory>.None => { return () }
+        }
+        entry = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(block.entry())
+        coldEntry = entry
+        run jit.blocks.append(move block)
       }
-      let entry = block.entry()
-      run jit.blocks.append(move block)
-      let constructEntry = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(construct))
+      let hotPtr = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(entry)
+      let coldPtr = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(coldEntry)
+      let hotAddr = Pointer.address<u8>(hotPtr)
+      let coldAddr = Pointer.address<u8>(coldPtr)
+      let constructOff = u32.toUsize(construct)
+      let constructEntry = if isSplit && constructOff >= split.hotBytes {
+        unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(coldPtr), constructOff - split.hotBytes)
+      } else {
+        unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(hotPtr), constructOff)
+      }
       let mut resumeEntry: ?*const u8 = Pointer.null<u8>()
-      if resume != 0 { resumeEntry = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(entry), u32.toUsize(resume))) }
-      unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), entry, constructEntry, resumeEntry)
+      if resume != 0 {
+        let resumeOff = u32.toUsize(resume)
+        let rp = if isSplit && resumeOff >= split.hotBytes {
+          unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(coldPtr), resumeOff - split.hotBytes)
+        } else {
+          unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(hotPtr), resumeOff)
+        }
+        resumeEntry = unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(rp)
+      }
+      unsafe engineBaseline.link(rt, bytecode, u64.wrappingToU32(jit.baselineCompiled), hotPtr, constructEntry, resumeEntry)
       // Where the tails optimized code leaves through are; the shared prologue counts the
       // entries until the function is reported for it.
-      let mut info = BaselineInfo { entry: Pointer.address<u8>(entry), code: entry, construct: constructEntry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0, learned: false, stale: 0, waits: 0, unseen: 0 }
+      let mut info = BaselineInfo { entry: hotAddr, code: hotPtr, construct: constructEntry, moved: 0, finish: 0, stepEnded: 0, tier: TIER_NONE, compiles: 0, exits: 0, learned: false, stale: 0, waits: 0, unseen: 0 }
       let mut mark: usize = 0
       while mark + 2 < map.length() {
-        if map.get(mark + 2) == baseline.MARK_MOVED { info.moved = map.get(mark) }
-        if map.get(mark + 2) == baseline.MARK_FINISH { info.finish = map.get(mark) }
-        if map.get(mark + 2) == baseline.MARK_STEP_ENDED { info.stepEnded = map.get(mark) }
+        let off = u32.toUsize(map.get(mark))
+        let addr = if isSplit && off >= split.hotBytes { coldAddr + (off - split.hotBytes) } else { hotAddr + off }
+        let what = map.get(mark + 2)
+        if what == baseline.MARK_MOVED { info.moved = addr }
+        if what == baseline.MARK_FINISH { info.finish = addr }
+        if what == baseline.MARK_STEP_ENDED { info.stepEnded = addr }
         mark = mark + 3
       }
       run jit.baselineInfo.append(info)
@@ -696,7 +735,7 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
       jit.baselineBytes = jit.baselineBytes + usize.toU64(code.bytes.length())
       jit.baselineUncovered = jit.baselineUncovered + usize.toU64(uncovered.length())
       if jit.options.dump {
-        run dumpPlaced(b"jit: baseline code at ", Pointer.address<u8>(entry), &code)
+        run dumpPlaced(b"jit: baseline code at ", hotAddr, &code)
         let mut line = List<u8>.make()
         run line.appendSlice(b"jit: baseline uncovered:")
         let mut k: usize = 0
@@ -1005,7 +1044,8 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
   // optimization waits, up to UNSEEN_WAITS times, while baseline code runs them. A wait
   // that ran none of them is the last: they are on paths the function does not take (a
   // server's per-request function waited some ten thousand entries for them).
-  let unseen = if info.compiles == 0 && info.waits < UNSEEN_WAITS { unsafe unseenCalls(rt, bytecode) } else { 0 }
+  let defaultLoopFree = jit.options.optimizeEntries == OPTIMIZE_ENTRIES && !hasBackEdge(unsafe function.code.asSlice())
+  let unseen = if info.compiles == 0 && info.waits < UNSEEN_WAITS && !defaultLoopFree { unsafe unseenCalls(rt, bytecode) } else { 0 }
   if unseen != 0 && (info.waits == 0 || unseen < info.unseen) {
     info.waits = info.waits + 1
     info.unseen = unseen
@@ -1034,9 +1074,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     Option<BaselineSettings>.None => { return () }
   }
   let shape = unsafe engineBaseline.shape(bytecode)
-  if shape.scoped || shape.known {
+  if shape.scoped {
     jit.optimizeRefused = jit.optimizeRefused + 1
-    run sayOptimizer(jit.options.dump, b"a scope of its own, or a known local function")
+    run sayOptimizer(jit.options.dump, b"a scope of its own")
     return ()
   }
   let mut cost = Cost.make()
@@ -1133,10 +1173,10 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
   // target the address of its cell, of the first byte of its code and of its closure.
   let mut symbols = List<usize>.make()
   run symbols.appendSlice(jit.baselineSymbols.asSlice())
-  run symbols.append(info.entry + u32.toUsize(info.moved))
-  run symbols.append(info.entry + u32.toUsize(info.finish))
+  run symbols.append(info.moved)
+  run symbols.append(info.finish)
   run symbols.append(info.entry)
-  run symbols.append(info.entry + u32.toUsize(info.stepEnded))
+  run symbols.append(info.stepEnded)
   run symbols.append(Pointer.address<u8>(info.construct))
   let mut inlinedSites: usize = 0
   if let Lowered.Code { inlined, .. } = &result {
@@ -2233,7 +2273,7 @@ fn hasBackEdge(bytes: &[u8]) -> bool {
 }
 
 fn tierUpWait(optimizeEntries: u32, bytes: &[u8]) -> u32 {
-  if optimizeEntries != OPTIMIZE_ENTRIES || bytes.length <= 160 { return optimizeEntries }
+  if optimizeEntries != OPTIMIZE_ENTRIES || bytes.length <= 140 { return optimizeEntries }
   if hasBackEdge(bytes) { return optimizeEntries }
   let mut callCount: u32 = 0
   let mut pc: usize = 0
@@ -2247,8 +2287,9 @@ fn tierUpWait(optimizeEntries: u32, bytes: &[u8]) -> u32 {
     }
     pc = pc + size
   }
-  if bytes.length > 320 && callCount >= 4 { return optimizeEntries * 6 }
-  if callCount >= 4 || bytes.length > 240 { return optimizeEntries * 4 }
+  // Large loop-free server glue expands 3-5x in the optimizer without loop payoff and
+  // would otherwise compile mid-workload; keep it in compact hot/cold-split baseline.
+  if bytes.length > 200 || callCount >= 4 { return PARKED }
   return optimizeEntries
 }
 
@@ -2730,13 +2771,13 @@ effect fn publishIn(memory: &mut CodeMemory, lane: usize, code: &mut Code, symbo
   run writer.append(code.bytes.asSlice())
   return run writer.finish()
 }
-/// Links split code across `PACK_OPT_HOT` and `PACK_COLD` within the same `CodeMemory`
-/// mapping, patching both external relocations and hot<->cold cross-region displacements,
-/// and publishes both halves.
-effect fn publishSplit(memory: &mut CodeMemory, code: &mut Code, split: &SplitInfo, symbols: &[usize]) -> SplitBlocks ! MemoryError | LinkError {
+/// Links split code across `hotLane` (`PACK_OPT_HOT` or `PACK_BASE_HOT`) and `PACK_COLD`
+/// within the same `CodeMemory` mapping, patching both external relocations and hot<->cold
+/// cross-region displacements, and publishes both halves.
+effect fn publishSplitIn(memory: &mut CodeMemory, hotLane: usize, code: &mut Code, split: &SplitInfo, symbols: &[usize]) -> SplitBlocks ! MemoryError | LinkError {
   let hotLen = split.hotBytes
   let coldLen = code.bytes.length() - hotLen
-  let mut hotWriter = run memory.allocatePackedIn(PACK_OPT_HOT, hotLen)
+  let mut hotWriter = run memory.allocatePackedIn(hotLane, hotLen)
   let mut coldWriter = run memory.allocatePackedIn(PACK_COLD, coldLen)
   run code.linkSplit(hotWriter.address(), coldWriter.address(), split, symbols)
   let bytes = code.bytes.asSlice()
@@ -2745,6 +2786,9 @@ effect fn publishSplit(memory: &mut CodeMemory, code: &mut Code, split: &SplitIn
   let hot = run hotWriter.finish()
   let cold = run coldWriter.finish()
   return SplitBlocks { hot: move hot, cold: move cold }
+}
+effect fn publishSplit(memory: &mut CodeMemory, code: &mut Code, split: &SplitInfo, symbols: &[usize]) -> SplitBlocks ! MemoryError | LinkError {
+  return run publishSplitIn(&mut memory, PACK_OPT_HOT, &mut code, split, symbols)
 }
 effect fn sayRefusal(reason: &Refusal) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut line = List<u8>.make()
