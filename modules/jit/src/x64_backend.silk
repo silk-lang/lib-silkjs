@@ -215,6 +215,11 @@ pub struct Emitter {
   coldAux: List<u32>,
   /// An instruction another one lowered already (a trusted read's unbox), or NONE.
   omitAt: u32,
+  /// The last trusted element read (its instruction, the object's storage and the index):
+  /// R11 holds that element's address after it, until something touches R11 (reusesElement).
+  elementAt: u32,
+  elementObject: u32,
+  elementIndex: u32,
   /// Where the inlined callees' CompiledFrames start, from rsp: INLINE_FRAME_WORDS words each.
   inlineFrames: i32,
   /// The closure value each inlined callee's `inline.frame` names, by frame number less one.
@@ -304,6 +309,20 @@ fn immediateOperand(function: &Function, inst: Inst) -> bool {
   if op == Op.Mul {
     let def = function.value(inst.b).def
     return def != NONE && function.inst(def).op == Op.ConstI32 && function.inst(def).k > 0
+  }
+  return false
+}
+/// Whether lowering inst leaves R11 as it is, and stores to no Array: arithmetic,
+/// compares, constants, boxes and unboxes of numbers, and shifts by a constant (a shift by
+/// a register keeps rcx in R11).
+fn r11Kept(function: &Function, inst: Inst) -> bool {
+  let op = inst.op
+  if op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.BitNot || op == Op.Neg || op == Op.NotBool || op == Op.Removed { return true }
+  if op == Op.Shl || op == Op.Sar || op == Op.Shr {
+    let def = function.value(inst.b).def
+    return def != NONE && function.inst(def).op == Op.ConstI32
   }
   return false
 }
@@ -477,7 +496,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
@@ -1519,6 +1538,7 @@ impl Emitter {
           // Past the count the interpreter takes over: no helper runs (ssa_opt_hoist).
           let miss = self.exitLabels.get(u32.toUsize(inst.exit))
           run self.trustedSlot(inst.a, index, miss)
+          self.elementAt = self.cursor self.elementObject = self.storage(inst.a) self.elementIndex = index
         } else if only != 0 {
           let fast = run self.a.label()
           run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, only, done, fast)
@@ -4140,7 +4160,9 @@ impl Emitter {
   effect fn trustedStore(self: &mut Self, function: &Function, inst: Inst, fused: bool, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let miss = self.exitLabels.get(u32.toUsize(inst.exit))
-    run self.trustedSlot(inst.a, i32.wrappingToU32(inst.k), miss)
+    // The element a trusted read of the same index found just before is the one (R11).
+    if !self.reusesElement(function, inst) { run self.trustedSlot(inst.a, i32.wrappingToU32(inst.k), miss) }
+    self.elementAt = NONE
     let cold = run self.a.label()
     run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
     // r8, not r10: values live in r10 through a trusted store (keepsFragile).
@@ -4164,6 +4186,18 @@ impl Emitter {
     }
     self.a.bind(done)
     run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(box)
+  }
+  /// Whether R11 still holds the address of the element the trusted store `inst` stores
+  /// to: the last trusted read (elementAt) was of the same object and the same index, in
+  /// the same block, and nothing between touches R11 or the Array (r11Kept). The Array's
+  /// elements stay where they are: nothing between stores to it or calls.
+  fn reusesElement(self: &Self, function: &Function, inst: Inst) -> bool {
+    if self.elementAt == NONE || self.elementAt >= self.cursor { return false }
+    if self.storage(inst.a) != self.elementObject || i32.wrappingToU32(inst.k) != self.elementIndex { return false }
+    if function.inst(self.elementAt).block != inst.block { return false }
+    let mut c = self.elementAt + 1
+    while c < self.cursor { if !r11Kept(function, function.inst(c)) { return false } c = c + 1 }
+    return true
   }
   /// The slow paths placed after the blocks. A trusted read fused with its unbox
   /// (coldAux: the unbox's exit) copies an element that is no Int to its slot and leaves

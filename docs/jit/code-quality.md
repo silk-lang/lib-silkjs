@@ -226,6 +226,12 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   (`omitAt`); a trusted store branches there when the old or the new value is counted (the
   helper, with the fragile registers kept). The loop then runs straight through both, with
   no jump over code it does not run (`coldPieces`).
+- **A trusted store reuses the element a read of it found.** `a[j] = f(a[j])`: the store
+  of a trusted Array element whose object and index are those of the trusted read before
+  it in the same block, with nothing between that touches R11 (arithmetic, compares,
+  constants, number boxes and unboxes, shifts by a constant: `r11Kept`), takes the element's
+  address from R11 instead of loading the object, testing the count and indexing again
+  (`reusesElement`). Seven instructions of each turn of Crypto's `am3` loop.
 - **A store of an immediate skips its heap test.** `put.elem` of a value that is
   `Own.Imm` (a boxed number, undefined, a boolean) does not test whether the new value is
   counted.
