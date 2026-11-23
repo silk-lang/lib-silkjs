@@ -158,6 +158,19 @@ Crypto's `am3`: 143 instructions an iteration where there were 164; Crypto at sc
 3.26G instructions where there were 3.48G. At scale 20 the optimizer takes 1,019 ms (V8:
 325), where before this and the fragile registers it took 1,256.
 
+## Inlined loops
+
+Code inlined from a callee with a loop (Crypto's `am3` in `montReduce` and `bnpSquareTo`)
+gets what a function's own loop gets. The edge liveness that passes undefined for a dead
+local uses the body's own liveness and block pcs (`Translator.leaderPc` holds a body's
+leaders and latches too), so the body's temporaries no longer go around its loop boxed and
+released; and the array checks move in front of an inlined loop as well (an inlined body
+records no element kinds and has none of the caller's sites). With parameter writes in
+inlined bodies (inlining.md), `am3` is inlined: its calls no longer go through the baseline
+call stubs (about 230 instructions a call) and its prologue. Crypto at scale 4 with a fixed
+seed: 2.01G instructions where there were 2.44G; at scale 20, about 680 ms where there
+were 810 (medians of 15 runs; node 322).
+
 ## Repeated element reads
 
 `a[i]` read twice in one block, with nothing between that could change an array (only

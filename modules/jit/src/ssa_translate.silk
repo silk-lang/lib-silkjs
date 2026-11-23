@@ -157,6 +157,7 @@ fn inlinable(opcode: u8) -> bool {
     || opcode == op.OP_get_var || opcode == op.OP_get_var_undef || opcode == op.OP_put_var
     || opcode == op.OP_get_array_el || opcode == op.OP_get_array_el2 || opcode == op.OP_get_array_el3
     || opcode == op.OP_put_array_el || opcode == op.OP_get_length
+    || opcode == op.OP_put_arg || opcode == op.OP_set_arg || opcode == op.OP_step_arg8
     || opcode == op.OP_get_loc_length8 || opcode == op.OP_get_arg_length8 || opcode == op.OP_get_loc_el8
     || opcode == op.OP_get_arg_el8 || opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8
     || (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method
@@ -860,6 +861,10 @@ struct Translator {
   ownedCells: u64,
   /// A guard came after an effect: the attempt fails.
   broken: bool,
+  /// A body of the attempt wrote one of its parameters (the caller's operand in held): every
+  /// exit after leaves with the bodies' frames, whose call operands carry the new value;
+  /// an exit that ran the call again would run it on that value.
+  paramWrites: bool,
   /// Why inlineTarget found none.
   missed: &'static [u8],
   /// On-stack replacement: argument n's number, guarded once at entry, or NONE (or empty).
@@ -1119,7 +1124,7 @@ impl Translator {
     // A call's exit is also where it leaves when it threw: the body's frame takes that.
     // So does a body with a loop around: what ran in an earlier turn is not in front of
     // the instruction.
-    let mut effects = self.f.insts.get(u32.toUsize(inst)).op == Op.Call || self.bodyLoops != 0
+    let mut effects = self.f.insts.get(u32.toUsize(inst)).op == Op.Call || self.bodyLoops != 0 || self.paramWrites
     while before < u32.toUsize(inst) { if !withoutEffect(self.f.insts.get(before).op) { effects = true } before = before + 1 }
     if effects && !self.leaves { self.broken = true }
     drop run self.f.exitFor(inst, self.rootPc, usize.toU32(self.rootDepth))
@@ -1317,7 +1322,9 @@ impl Translator {
     // Boxes first: they are instructions of the current block.
     let mut args = run self.heldBoxed(pc)
     let mut at = NONE
-    if self.depth == 0 && u32.toUsize(target) < self.leaderPc.length() { at = self.leaderPc.get(u32.toUsize(target)) }
+    // A block's pc is in the code being translated (an inlined body's own, there), whose
+    // liveness self.liveness is.
+    if u32.toUsize(target) < self.leaderPc.length() { at = self.leaderPc.get(u32.toUsize(target)) }
     let mut i: usize = 0
     while i < self.locals.length() {
       let v = self.locals.get(i)
@@ -1358,7 +1365,7 @@ impl Translator {
       i = 0
       while i < self.stack.length() { let p = run self.f.addParam(latch, Type.Value, Own.Owned) self.stack.set(i, p) i = i + 1 }
     }
-    if self.depth == 0 { run self.setLeader(latch, usize.toU32(targetPc)) }
+    run self.setLeader(latch, usize.toU32(targetPc))
     drop run self.f.emit(latch, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, pc)
     let last = self.f.lastInst() run self.exitHere(last, usize.toU32(targetPc))
     let edge = run self.edgeTo(target, pc)
@@ -1458,6 +1465,28 @@ impl Translator {
   effect fn store(self: &mut Self, index: usize, v: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let old = self.locals.get(index)
     self.locals.set(index, v)
+    run self.release(old, pc)
+  }
+  /// In an inlined body, the slot index (past the locals) that stands for parameter n, the
+  /// caller's operand in held; refused for a parameter the call passed no argument for,
+  /// which has no operand to carry it.
+  effect fn heldParameter(self: &mut Self, n: usize, pc: u32, opcode: u8) -> usize ! Refusal {
+    if n >= self.argCount { fail refuse(pc, opcode, b"a write of a parameter the call passed no argument for") }
+    return self.locals.length() + n
+  }
+  /// Local `index`, or past the locals an inlined body's parameter (heldParameter).
+  fn slotGet(self: &Self, index: usize) -> u32 {
+    if index < self.locals.length() { return self.locals.get(index) }
+    return self.held.get(self.argsBase + index - self.locals.length())
+  }
+  /// `store` for slotGet's slots: a parameter of an inlined body is the caller's operand,
+  /// which the call then consumes as it is (paramWrites).
+  effect fn slotStore(self: &mut Self, index: usize, v: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if index < self.locals.length() { run self.store(index, v, pc) return () }
+    let at = self.argsBase + index - self.locals.length()
+    let old = self.held.get(at)
+    self.held.set(at, v)
+    self.paramWrites = true
     run self.release(old, pc)
   }
 
@@ -1862,16 +1891,19 @@ impl Translator {
     else if opcode >= op.OP_put_loc0 && opcode <= op.OP_put_loc3 { index = u8.toUsize(opcode - op.OP_put_loc0) }
     else if opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3 { index = u8.toUsize(opcode - op.OP_get_arg0) }
     else if opcode == op.OP_step_arg8 {
-      // step_loc8 on the parameter's slot (argSlots is set: the scan saw this instruction).
-      if self.depth != 0 { fail refuse(at, opcode, b"a parameter write inside an inlined body") }
+      // step_loc8 on the parameter's slot (argSlots is set: the scan saw this instruction),
+      // or in an inlined body on the caller's operand that is the argument (heldParameter).
       let n = u8.toU32(byteAt(input, pc + 1))
-      if n >= self.argSlots { fail refuse(at, opcode, b"argument index out of range") }
-      index = u32.toUsize(self.f.localCount + n)
+      if self.depth != 0 { index = run self.heldParameter(u32.toUsize(n), at, opcode) }
+      else {
+        if n >= self.argSlots { fail refuse(at, opcode, b"argument index out of range") }
+        index = u32.toUsize(self.f.localCount + n)
+      }
     }
     let isArgument = opcode == op.OP_get_arg || (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3)
     if index != usize.MAX {
       if isArgument { if index >= self.argumentLimit() { fail refuse(at, opcode, b"argument index out of range") } }
-      else if index >= self.locals.length() { fail refuse(at, opcode, b"local index out of range") }
+      else if index >= self.locals.length() && !(opcode == op.OP_step_arg8 && self.depth != 0) { fail refuse(at, opcode, b"local index out of range") }
     }
     if isArgument && self.argSlots != 0 && self.depth == 0 {
       let slotIndex = u32.toUsize(self.f.localCount) + index
@@ -1884,14 +1916,18 @@ impl Translator {
       run self.push(r) return true
     }
     if opcode == op.OP_put_arg || opcode == op.OP_set_arg {
-      // A parameter slot (argSlots is set: the scan saw this instruction).
-      if self.depth != 0 { fail refuse(at, opcode, b"a parameter write inside an inlined body") }
+      // A parameter slot (argSlots is set: the scan saw this instruction), or in an inlined
+      // body the caller's operand that is the argument (heldParameter).
       let n = u16.toUsize(u16At(input, pc + 1))
-      if n >= u32.toUsize(self.argSlots) { fail refuse(at, opcode, b"argument index out of range") }
+      let mut slotIndex = usize.MAX
+      if self.depth != 0 { slotIndex = run self.heldParameter(n, at, opcode) }
+      else {
+        if n >= u32.toUsize(self.argSlots) { fail refuse(at, opcode, b"argument index out of range") }
+        slotIndex = u32.toUsize(self.f.localCount) + n
+      }
       let mut v = NONE
       if opcode == op.OP_put_arg { v = self.pop() } else { let kept = self.top(1) v = run self.share(kept, at) }
-      let slotIndex = u32.toUsize(self.f.localCount) + n
-      run self.store(slotIndex, v, at)
+      run self.slotStore(slotIndex, v, at)
       return true
     }
     if opcode == op.OP_get_loc || opcode == op.OP_get_loc8 || (opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc3) {
@@ -1965,7 +2001,7 @@ impl Translator {
     }
     if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc || opcode == op.OP_step_loc8 || opcode == op.OP_step_arg8 {
       let stepping = opcode == op.OP_step_loc8 || opcode == op.OP_step_arg8
-      let v = self.locals.get(index)
+      let v = self.slotGet(index)
       if self.numberSite(at, v, v) {
         let mut k: f64 = 1.0
         let mut mode: u8 = 1
@@ -1975,7 +2011,7 @@ impl Translator {
         if x == NONE { fail refuse(at, opcode, b"a boolean operand of arithmetic") }
         let c = run self.doubleConstant(k, at)
         let r = run self.f.emit(self.current, Op.AddF64, true, Type.F64, Own.Unboxed, x, c, 0, at)
-        run self.store(index, r, at)
+        run self.slotStore(index, r, at)
         if stepping { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
         return true
       }
@@ -1987,7 +2023,7 @@ impl Translator {
       if stepping { mode = byteAt(input, pc + 2) if (mode & 2) != 0 { operation = Op.Sub } }
       else if opcode == op.OP_dec_loc { operation = Op.Sub }
       let r = run self.arith(operation, x, one, at)
-      run self.store(index, r, at)
+      run self.slotStore(index, r, at)
       // step_loc8 pushes the old value (mode bit 0 clear) or the new one.
       if stepping { if (mode & 1) != 0 { run self.push(r) } else { run self.push(x) } }
       return true
@@ -2684,12 +2720,14 @@ impl Translator {
     let savedLocals = run copyList(&self.locals)
     let savedStack = run copyList(&self.stack)
     let savedHeld = run copyList(&self.held)
+    let savedWrites = self.paramWrites
     if outer == 0 {
       self.held.clear()
       self.rootPc = pc
       self.rootDepth = self.stack.length()
       self.rootInst = self.f.insts.length()
       self.broken = false
+      self.paramWrites = false
     }
     // The guard and the frame run for the caller: its exit is the caller's.
     let k = usize.toI32(self.f.inlineTargets.length())
@@ -2762,6 +2800,7 @@ impl Translator {
       self.locals = move savedLocals
       self.stack = move savedStack
       self.held = move savedHeld
+      self.paramWrites = savedWrites
       run self.f.inlineMisses.append(InlineMiss { pc: pc, depth: self.depth, opcode: stopped, why: why })
       return false
     }
@@ -2819,6 +2858,7 @@ impl Translator {
         if shapeOf.leader.get(pc) && shapeOf.start.get(pc) {
           let b = run self.f.block()
           self.blockAt.set(pc, b)
+          run self.setLeader(b, usize.toU32(pc))
           let count = self.held.length() + u32.toUsize(callee.localCount) + i32.toUsize(shapeOf.depth.get(pc))
           let mut i: usize = 0
           while i < count { drop run self.f.addParam(b, Type.Value, Own.Owned) i = i + 1 }
@@ -3207,7 +3247,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, paramWrites: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
   t.f.arrayShape = input.arrayShape
   if t.lazySlot != usize.MAX { t.lazyAlias = lazyArgumentsCopy(input, t.lazySlot) }
@@ -3454,7 +3494,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     returns: run copyList(&shapeOf.returns),
     tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make() }, addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
-    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
+    argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownedCells: 0, broken: false, paramWrites: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
   let entry = run t.f.block()
   let mut pc: usize = 0

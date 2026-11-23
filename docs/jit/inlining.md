@@ -69,6 +69,12 @@ undefined). The differences from translating a function's own code:
 - `get_arg n` is the caller's operand `n` (retained when it holds a count, as the
   interpreter's `get_arg` does), or undefined past the arguments passed; the fused forms that
   read an argument cell read that operand;
+- `put_arg`, `set_arg` and `step_arg8` write the caller's operand that is the argument (in
+  held, releasing what it held), so later reads, loops and the call's own release after the
+  body see the new value. A parameter the call passed no argument for has no operand: the
+  attempt fails. After such a write every exit of the attempt leaves with the bodies' frames
+  (`Translator.paramWrites`), whose call operands carry the new value, as an exit that ran
+  the call again would run it on that value; off a baseline frame the attempt fails then;
 - `push_this` is the receiver operand, guarded to be an object as in a function's own code;
 - `return` ends the body with its value; the callee's locals and leftover operands are
   released first;
@@ -131,9 +137,8 @@ another function.
 
 ## 4. What is not done yet
 
-- Callees with loops.
-- A guard after an effect: an exit that names two frames, so the interpreter resumes inside
-  the callee.
+- Callees with loops, and a guard after an effect, off a baseline frame: on one an exit
+  names the bodies' frames (`ssa.Exit.frames`) and the engine resumes inside the callee.
 - Natives and constructors as targets.
 - A site with more than one target falls back to a deoptimization and an ordinary call on
   recompilation, instead of a second guarded body or a call on the miss path.
