@@ -11,6 +11,8 @@ import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.mem.pointer { Pointer }
 import silk.collections.slice { Slice }
+import silk.num.f64
+import silk.num.i32
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
@@ -21,8 +23,11 @@ import silkjs.js_value { ValueBits }
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_inline as inline
 import silkjs.js_compiled_inline { KnownMethod, WatchedRecord }
-import ssa_translate { CallTarget, SiteShape, RecordSlot }
-import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, SiteShapes, ObjectData, JS_PROP_TMASK }
+import ssa_translate { CallTarget, ConstructTarget, SiteShape, RecordSlot, CONSTRUCT_PLAN_STORES, CONSTRUCT_PLAN_RECIPE, RCONST_UNDEF, RCONST_NULL, RCONST_FALSE, RCONST_TRUE, RCONST_INT, RCONST_F64, RECIPE_CONST }
+import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, BuiltinFamily, SiteShapes, ObjectData, ObjectPayload, RuntimeState, ShapeData, JS_PROP_TMASK, JS_PROP_WRITABLE }
+import silkjs.js_class_data as classes
+import silkjs.js_atom_data as atomData
+import silkjs.js_constructor_ops as constructors
 import silkjs.js_shapes as shapes
 import silkjs.js_runtime as runtime
 import silkjs.js_backtrace as backtrace
@@ -39,7 +44,7 @@ import jit_recompile as recompile
 import ssa_input { inputOf }
 import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, Refusal as TranslateRefusal }
 import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_FLAGS, KNOWN_SYMBOLS, SITE_ARRAY }
-import jit_helpers { CompiledEnv }
+import jit_helpers { CompiledEnv, ConstructDesc }
 import jit_cost { Cost, now }
 import baseline
 import baseline { Settings as BaselineSettings, Outcome as BaselineOutcome, Stubs as BaselineStubs }
@@ -278,12 +283,16 @@ pub struct Jit {
   /// The records optimized code reads slots of as constants (inline.cellRecord), each
   /// watched from the compile that first found it in a target's variable cells.
   records: List<WatchedRecord>,
+  /// Inlined construct descriptors (`Op.NewObject`), fixed-capacity so linked pointers never move.
+  constructDescs: List<ConstructDesc>,
   /// Functions given back to their baseline code for leaving too often.
   pub optimizeBacked: u64,
   pub optimized: u64,
   pub optimizeRefused: u64,
   pub optimizedBytes: u64
 }
+/// Maximum distinct inlined construct descriptors per runtime (storage never reallocates).
+const CONSTRUCT_DESC_CAPACITY: usize = 512
 impl Jit {
   pub effect fn make(options: Options) -> Self ! OutOfMemoryError ? &mut Allocator {
     let entries = run List<CompiledEntry>.makeWithCapacity(CAPACITY)
@@ -297,6 +306,7 @@ impl Jit {
     let baselineTable = run List<?*const u8>.makeWithCapacity(CAPACITY * engineBaseline.TABLE_WORDS)
     let mut baselineEnv = run List<BaselineEnv>.makeWithCapacity(1)
     drop baselineEnv.appendWithinCapacity(BaselineEnv.make())
+    let constructDescs = run List<ConstructDesc>.makeWithCapacity(CONSTRUCT_DESC_CAPACITY)
     return Self { options: move options, memory: Option<CodeMemory>.none(), entries: move entries, activations: move activations, kept: move kept, siteShapes: move siteShapes, inlinedSites: 0, env: move env, blocks: List<CodeBlock>.make(),
       stressCounter: 0, handler: HotHandler { function: hotAddress(), data: Pointer.null<u8>() }, runtime: Pointer.null<HeapHeader>(),
       reported: 0, compiledFunctions: 0, refused: 0, failed: 0, codeBytes: 0, lastEntry: 0, compileNanoseconds: 0, runs: 0, deopts: 0, polls: 0, unlinked: 0,
@@ -304,7 +314,7 @@ impl Jit {
       osrLists: List<List<OsrEntry>>.make(), books: List<LoopBook>.make(), osrCompiled: 0, osrRefused: 0, osrOnly: 0, osrRuns: 0, osrDeopts: 0, cost: Cost.make(), overBudget: 0, waited: 0, profiled: 0, learned: 0, foreseen: 0, genericSites: 0,
       baselineTable: move baselineTable, baselineEnv: move baselineEnv, baselineSettings: Option<BaselineSettings>.none(), baselineReady: false, baselineSymbols: List<usize>.make(),
       baselineCompiled: 0, baselineRefused: 0, baselineBytes: 0, baselineUncovered: 0,
-      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), leftSeen: List<u32>.make(), leftHow: List<u8>.make(), arrayNatives: List<usize>.make(), records: List<WatchedRecord>.make(), optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
+      baselineInfo: List<BaselineInfo>.make(), leftAt: List<u64>.make(), leftSeen: List<u32>.make(), leftHow: List<u8>.make(), arrayNatives: List<usize>.make(), records: List<WatchedRecord>.make(), constructDescs: move constructDescs, optimizeBacked: 0, optimized: 0, optimizeRefused: 0, optimizedBytes: 0 }
   }
   /// The runtime setup callback (QjsOptions.runtimeSetup) and its data word for self.
   pub fn setupAddress() -> *const u8 {
@@ -1031,15 +1041,19 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
   let mut closures = List<?*mut HeapHeader>.make()
   let mut targets = List<CallTarget>.make()
   let mut holders = List<?*mut HeapHeader>.make()
+  let mut localDescs = List<ConstructDesc>.make()
+  let mut rootConstructs = List<ConstructTarget>.make()
   if jit.options.inlining {
     // First the watches (they change versions the sites' shapes are read with), over the
     // same walk; then the candidates.
     let mut firstCells = List<?*mut HeapHeader>.make()
     let mut firstClosures = List<?*mut HeapHeader>.make()
     let mut firstHolders = List<?*mut HeapHeader>.make()
-    let _watched = run unsafe candidates(&jit, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>())
+    let mut dummyDescs = List<ConstructDesc>.make()
+    let mut dummyConstructs = List<ConstructTarget>.make()
+    let _watched = run unsafe candidates(&jit, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs)
     run unsafe watchRecords(&mut jit, rt, &firstClosures)
-    targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>())
+    targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>(), &mut localDescs, &mut rootConstructs)
   }
   // Where its earlier code left at guards.
   let mut sites = List<u32>.make()
@@ -1100,7 +1114,7 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     while n < sites.length() { if n > earlier { run line.append(32) } run decimal(&mut line, u32.toU64(sites.get(n))) n = n + 1 }
     run say(b"jit: noted: ", line.asSlice())
   }
-  let lowered = run Effect.result(unsafe lower.lowerOnFrame(&function, &sites, move targets, &elements, move read, FramePlan.of(settings.frame, &shape), arrayAtoms[0], arrayAtoms[1], u64.wrappingToU32(arrayShape), move records, &mut cost))
+  let lowered = run Effect.result(unsafe lower.lowerOnFrame(&function, &sites, move targets, &elements, move read, FramePlan.of(settings.frame, &shape), arrayAtoms[0], arrayAtoms[1], u64.wrappingToU32(arrayShape), move records, move rootConstructs, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost optimized", &cost) }
   drop function
@@ -1175,6 +1189,17 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
         if cell == 0 { jit.optimizeRefused = jit.optimizeRefused + 1 return () }
         run symbols.append(cell)
         a = a + 1
+      }
+    }
+    // Inlined construct descriptors (x64_backend.constructSymbol): deduplicated in
+    // jit.constructDescs, with all referenced objects kept alive for the runtime.
+    if let Lowered.Code { constructs, .. } = &result {
+      let mut ci: usize = 0
+      while ci < constructs.length() {
+        let descAddr = unsafe commitConstructDesc(&mut jit, rt, localDescs.get(u32.toUsize(constructs.get(ci))))
+        if descAddr == 0 { jit.optimizeRefused = jit.optimizeRefused + 1 return () }
+        run symbols.append(descAddr)
+        ci = ci + 1
       }
     }
     inlinedSites = inlined.length()
@@ -1421,7 +1446,9 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let mut closures = List<?*mut HeapHeader>.make()
   let mut targets = List<CallTarget>.make()
   let mut holders = List<?*mut HeapHeader>.make()
-  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()) }
+  let mut dummyDescs = List<ConstructDesc>.make()
+  let mut dummyConstructs = List<ConstructTarget>.make()
+  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs) }
   let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &plan.elements, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
@@ -1821,7 +1848,7 @@ unsafe fn ownedCells(closure: ?*mut HeapHeader) -> u64 {
 /// (null else): the variables it reads are its, and a method read off one is a target too;
 /// receiver is the object its `this` is when that is known (an own method read off a
 /// variable, inlined there), and a method read off `this` is a target too.
-unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, receiver: ?*mut HeapHeader) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, receiver: ?*mut HeapHeader, constructDescs: &mut List<ConstructDesc>, outConstructs: &mut List<ConstructTarget>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
   let mut targets = List<CallTarget>.make()
   let rt = match Pointer.nonNullMut<HeapHeader>(jit.runtime) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return move targets } }
   let anchor = ()
@@ -1852,7 +1879,9 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(Pointer.null<HeapHeader>())
         run appendKnown(&mut holders, &KnownMethod.none())
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()) }
+        let mut childConstructs = List<ConstructTarget>.make()
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+        input.constructs = move childConstructs
         run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
       }
     }
@@ -1860,8 +1889,10 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
   let mut pc: usize = 0
   // The object produced by a contiguous `get_var` / `push_this` / `thisLocal` followed by
   // zero or more `get_field` hops (e.g. `Flog.RayTracer.Vector.prototype`), ending at `chainEnd`.
+  // `chainPc` is the pc of the final `get_var` or `get_field` in the chain (or usize.MAX).
   let mut chainObj = Pointer.null<HeapHeader>()
   let mut chainEnd: usize = usize.MAX
+  let mut chainPc: usize = usize.MAX
   let mut this = usize.MAX
   if !Pointer.isNull<HeapHeader>(receiver) { this = thisLocal(bytes) }
   while pc < bytes.length && cells.length() < MAX_CANDIDATES {
@@ -1911,7 +1942,9 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           run decimal(&mut line, if Pointer.isNull<HeapHeader>(object) { 0 } else { 1 }) run line.append(32) run decimal(&mut line, usize.toU64(found.count))
           run say(b"jit: chained target: ", line.asSlice())
         }
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, Pointer.null<HeapHeader>()) }
+        let mut childConstructs = List<ConstructTarget>.make()
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+        input.constructs = move childConstructs
         run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), known: knownShapes(&found) })
       }
     } else if opcode == op.OP_get_field2 {
@@ -1951,7 +1984,9 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           run appendKnown(&mut holders, &found)
           if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
           if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
-          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, holder) }
+          let mut childConstructs = List<ConstructTarget>.make()
+          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, holder, &mut constructDescs, &mut childConstructs) }
+          input.constructs = move childConstructs
           run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), known: knownShapes(&found) })
         } else if jit.options.dump && depth == 0 && !watch { run say(b"jit: no inline target: ", b"the method is too long") }
       } else if jit.options.dump && depth == 0 && !watch {
@@ -1964,6 +1999,10 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         else if why == 6 { text = b"another realm's function" }
         run say(b"jit: no inline target: ", text)
       }
+    } else if opcode == op.OP_dup && size == 1 && !watch && exact && chainEnd == pc && chainPc != usize.MAX {
+      if let Option<*mut HeapHeader>.Some { value: ctor } = Pointer.nonNullMut<HeapHeader>(chainObj) {
+        run unsafe buildConstruct(rt, ctor, usize.toU32(chainPc), &mut constructDescs, &mut outConstructs)
+      }
     }
     if opcode == op.OP_get_var && size == 3 {
       chainObj = Pointer.null<HeapHeader>()
@@ -1971,22 +2010,416 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         chainObj = unsafe engineBaseline.variableObject(reader, u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8))
       }
       chainEnd = pc + size
+      chainPc = pc
     } else if opcode == op.OP_push_this && size == 1 {
       chainObj = receiver
       chainEnd = pc + size
+      chainPc = usize.MAX
     } else if this != usize.MAX && readLocal(bytes, pc, pc + size) == this {
       chainObj = receiver
       chainEnd = pc + size
+      chainPc = usize.MAX
     } else if opcode == op.OP_get_field && size >= 5 && chainEnd == pc {
       if let Option<*mut HeapHeader>.Some { value: from } = Pointer.nonNullMut<HeapHeader>(chainObj) {
         let atom = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) | u32.shiftLeft(u8.toU32(bytes[pc + 3]), 16) | u32.shiftLeft(u8.toU32(bytes[pc + 4]), 24)
         chainObj = unsafe ownObject(from, atom)
         chainEnd = pc + size
+        chainPc = pc
       }
     }
     pc = pc + size
   }
   return move targets
+}
+
+const CTOR_FORM_STORES: u8 = 1
+const CTOR_FORM_FORWARD: u8 = 2
+const CTOR_FORM_EVAL: u8 = 3
+const CTOR_STORE_SIZE: usize = 15
+const CTOR_APPLY_METHOD: u32 = 3
+
+/// The own data-property slot index of `atom` on non-exotic `object`, or usize.MAX.
+unsafe fn ownDataSlot(object: *mut HeapHeader, atom: u32) -> usize {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.isExotic() { return usize.MAX }
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: slot } => {
+      if slot < data.slotCount() && (u8.toU32(unsafe shapes.slotFlags(data.shape, slot)) & JS_PROP_TMASK) == 0 { slot }
+      else { usize.MAX }
+    }
+    Option<usize>.None => usize.MAX
+  }
+}
+
+unsafe fn isApplyBuiltin(object: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != classes.JS_CLASS_C_FUNCTION { return false }
+  return match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => if native.magicBits != 0 { false } else { match native.function {
+      NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.Function && method == CTOR_APPLY_METHOD
+      _ => false
+    } }
+    _ => false
+  }
+}
+
+unsafe fn recipeCacheWay(state: &RuntimeState, code: usize) -> usize {
+  let first = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(code / 16), 0x9e3779b97f4a7c15), 58)) & 62
+  let second = first + 1
+  if state.constructCache[first].code == code { return first }
+  if state.constructCache[second].code == code { return second }
+  return first
+}
+
+/// Inspects a constructor object found by a `get_var`/`get_field` chain right before `OP_dup`
+/// and, when it has a valid planned shape and store/recipe plan (CONSTRUCT_STORES,
+/// CONSTRUCT_EVAL, CONSTRUCT_FORWARD + CONSTRUCT_EVAL, or CONSTRUCT_FORWARD + CONSTRUCT_STORES),
+/// appends a `ConstructDesc` and `ConstructTarget` for `readPc`.
+unsafe effect fn buildConstruct(rt: *mut HeapHeader, ctor: *mut HeapHeader, readPc: u32, descs: &mut List<ConstructDesc>, targets: &mut List<ConstructTarget>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let ctorData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, ctor)
+  if ctorData.classId() != classes.JS_CLASS_BYTECODE_FUNCTION || ctorData.isExotic() || !ctorData.isConstructor() { return () }
+  let bytecode = match &ctorData.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return () } }
+  let ctorVersion = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, ctorData.shape)).version
+  let ctorSlots = ctorData.slotCount()
+  drop ctorData
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let form = code.constructForm
+  let derived = code.isDerivedClassConstructor
+  let realm = code.realm
+  drop code
+  if derived || form == 0 { return () }
+  let ctorAddr = Pointer.address<HeapHeader>(ctor)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let set = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(ctorAddr / 16), 0x9e3779b97f4a7c15), 60))
+  let first = set * 4
+  let mut recvSlot = usize.MAX
+  let mut way: usize = 0
+  while way < 4 {
+    if state.receiverFunctions[first + way] == ctorAddr { recvSlot = first + way break }
+    way = way + 1
+  }
+  if recvSlot == usize.MAX { drop state return () }
+  let entry = state.receiverCache[recvSlot]
+  let epoch = state.shapeEpoch
+  drop state
+  if entry.version != ctorVersion { return () }
+  let empty = match Pointer.nonNullMut<HeapHeader>(entry.empty) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return () }
+  }
+  let protoSlot = entry.index
+  if protoSlot >= ctorSlots { return () }
+  let emptyProto = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, empty)).prototype
+  let proto = match Pointer.nonNullMut<HeapHeader>(emptyProto) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return () }
+  }
+  let ctorData2 = unsafe HeapCell.payload<ObjectData, ()>(&anchor, ctor)
+  let protoMatches = match (unsafe ctorData2.slotUnchecked(protoSlot)).valueBits() {
+    ValueBits.Object { reference } => Pointer.address<HeapHeader>(reference) == Pointer.address<HeapHeader>(proto)
+    _ => false
+  }
+  drop ctorData2
+  if !protoMatches { return () }
+  let forward = form == CTOR_FORM_FORWARD
+  let mut targetOpt = Pointer.null<HeapHeader>()
+  let mut fnProtoOpt = Pointer.null<HeapHeader>()
+  let mut applyOpt = Pointer.null<HeapHeader>()
+  let mut holderSlot: usize = 0
+  let mut applySlot: usize = 0
+  let mut targetVersion: u64 = 0
+  let mut fnProtoVersion: u64 = 0
+  let mut targetBytecode = bytecode
+  let mut targetForm = form
+  if forward {
+    let fwdAtom = unsafe constructors.forwardedAtom(ValueBits.Object { reference: ctor })
+    if fwdAtom == 0 { return () }
+    holderSlot = unsafe ownDataSlot(proto, fwdAtom)
+    if holderSlot == usize.MAX { return () }
+    let protoData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, proto)
+    let targetObj = match (unsafe protoData.slotUnchecked(holderSlot)).valueBits() {
+      ValueBits.Object { reference } => reference
+      _ => { drop protoData return () }
+    }
+    drop protoData
+    let targetData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, targetObj)
+    if targetData.classId() != classes.JS_CLASS_BYTECODE_FUNCTION || targetData.isExotic() { drop targetData return () }
+    targetBytecode = match &targetData.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { drop targetData return () } }
+    if let Option<usize>.Some { .. } = unsafe shapes.lookup(targetData.shape, atomData.JS_ATOM_apply) { drop targetData return () }
+    let tShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, targetData.shape)
+    targetVersion = tShape.version
+    let fnProtoVal = tShape.prototype
+    drop tShape drop targetData
+    let fnProto = match Pointer.nonNullMut<HeapHeader>(fnProtoVal) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return () }
+    }
+    let fnProtoData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, fnProto)
+    if fnProtoData.isExotic() || !fnProtoData.isPrototype() { drop fnProtoData return () }
+    fnProtoVersion = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, fnProtoData.shape)).version
+    drop fnProtoData
+    applySlot = unsafe ownDataSlot(fnProto, atomData.JS_ATOM_apply)
+    if applySlot == usize.MAX { return () }
+    let fnProtoData2 = unsafe HeapCell.payload<ObjectData, ()>(&anchor, fnProto)
+    let applyObj = match (unsafe fnProtoData2.slotUnchecked(applySlot)).valueBits() {
+      ValueBits.Object { reference } => reference
+      _ => { drop fnProtoData2 return () }
+    }
+    drop fnProtoData2
+    if !unsafe isApplyBuiltin(applyObj) { return () }
+    let tCode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, targetBytecode)
+    if tCode.isDerivedClassConstructor { drop tCode return () }
+    targetForm = tCode.constructForm
+    drop tCode
+    targetOpt = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(targetObj)
+    fnProtoOpt = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(fnProto)
+    applyOpt = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(applyObj)
+  }
+  let mut finalOpt = Pointer.null<HeapHeader>()
+  let mut stores: usize = 0
+  let mut planKind: u8 = 0
+  let mut fromEmpty: u8 = 0
+  let mut checkInterrupt: u8 = 1
+  let mut nodeCount: u8 = 0
+  let mut sources: [u8; 8] = [0; 8]
+  let mut roots: [u8; 8] = [0; 8]
+  let mut nodes: [u32; 32] = [0; 32]
+  let mut constKinds: [u8; 16] = [0; 16]
+  let mut constBits: [u64; 16] = [0; 16]
+  let mut addAtoms: [u32; 8] = [0; 8]
+  let mut storedAtoms: [u32; 8] = [0; 8]
+  if !forward && targetForm == CTOR_FORM_STORES {
+    stores = u8.toUsize(entry.stores)
+    if stores == 0 || stores > 8 || entry.bytecode != Pointer.address<HeapHeader>(targetBytecode) { return () }
+    let final = match Pointer.nonNullMut<HeapHeader>(entry.final) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return () }
+    }
+    let fShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+    if fShape.properties.length() != stores { drop fShape return () }
+    let mut i: usize = 0
+    while i < stores {
+      storedAtoms[i] = fShape.properties.get(i).atom
+      sources[i] = entry.sources[i] & 0x3F
+      i = i + 1
+    }
+    drop fShape
+    finalOpt = entry.final
+    planKind = CONSTRUCT_PLAN_STORES
+    fromEmpty = 0
+    checkInterrupt = 0
+  } else if forward && targetForm == CTOR_FORM_STORES {
+    let tCode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, targetBytecode)
+    let codeBytes = unsafe tCode.code.asSlice()
+    let len = codeBytes.length
+    if len < 3 + CTOR_STORE_SIZE || len > 3 + CTOR_STORE_SIZE * 8 || (len - 3) % CTOR_STORE_SIZE != 0 { drop tCode return () }
+    if codeBytes[0] != op.OP_push_this || codeBytes[1] != op.OP_put_loc0 || codeBytes[len - 1] != op.OP_return_undef { drop tCode return () }
+    stores = (len - 3) / CTOR_STORE_SIZE
+    let mut cur = empty
+    let mut i: usize = 0
+    while i < stores {
+      let at = 2 + i * CTOR_STORE_SIZE
+      let argOp = codeBytes[at + 1]
+      if codeBytes[at] != op.OP_get_loc0 || argOp < op.OP_get_arg0 || argOp > op.OP_get_arg3 || codeBytes[at + 2] != op.OP_put_field { drop tCode return () }
+      let atom = u8.toU32(codeBytes[at + 3]) | u32.shiftLeft(u8.toU32(codeBytes[at + 4]), 8)
+        | u32.shiftLeft(u8.toU32(codeBytes[at + 5]), 16) | u32.shiftLeft(u8.toU32(codeBytes[at + 6]), 24)
+      let next = match Pointer.nonNullMut<HeapHeader>(unsafe shapes.verifiedAdd(rt, cur, atom)) {
+        Option<*mut HeapHeader>.Some { value } => value
+        Option<*mut HeapHeader>.None => { drop tCode return () }
+      }
+      if (unsafe Pointer.borrow<(), HeapHeader>(&anchor, next)).referenceCount <= 0 { drop tCode return () }
+      addAtoms[i] = atom
+      storedAtoms[i] = atom
+      sources[i] = argOp - op.OP_get_arg0
+      cur = next
+      i = i + 1
+    }
+    drop tCode
+    finalOpt = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cur)
+    planKind = CONSTRUCT_PLAN_STORES
+    fromEmpty = 1
+    checkInterrupt = 1
+  } else if targetForm == CTOR_FORM_EVAL {
+    stores = u8.toUsize(entry.stores)
+    if stores == 0 || stores > 8 || entry.bytecode != Pointer.address<HeapHeader>(targetBytecode) { return () }
+    let final = match Pointer.nonNullMut<HeapHeader>(entry.final) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return () }
+    }
+    let tCode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, targetBytecode)
+    if tCode.code.length() == 0 { drop tCode return () }
+    let codeAddr = Pointer.address<u8>(unsafe tCode.code.pointerAt(0))
+    drop tCode
+    let st = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    let rEntry = &st.constructCache[unsafe recipeCacheWay(&st.*, codeAddr)]
+    if rEntry.code != codeAddr || u8.toUsize(rEntry.recipe.stores) != stores || rEntry.base != Pointer.address<HeapHeader>(empty)
+      || rEntry.recipe.fieldsReference != 255 || rEntry.recipe.nodeCount < 2 || rEntry.recipe.nodeCount > 32 {
+      drop rEntry drop st return ()
+    }
+    let rFinal = match Pointer.nonNullMut<HeapHeader>(rEntry.final) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { drop rEntry drop st return () }
+    }
+    if Pointer.address<HeapHeader>(rFinal) != Pointer.address<HeapHeader>(final) { drop rEntry drop st return () }
+    nodeCount = rEntry.recipe.nodeCount
+    nodes = rEntry.recipe.nodes
+    let mut i: usize = 0
+    while i < stores {
+      roots[i] = rEntry.recipe.roots[i]
+      storedAtoms[i] = rEntry.recipe.atoms[i]
+      i = i + 1
+    }
+    i = 2
+    while i < u8.toUsize(nodeCount) {
+      let word = nodes[i]
+      if (word & 255) == RECIPE_CONST {
+        let ci = u32.toUsize(u32.shiftRight(word, 8) & 255) & 15
+        match rEntry.recipe.constants[ci] {
+          ValueBits.Undefined => { constKinds[ci] = RCONST_UNDEF constBits[ci] = 0 }
+          ValueBits.Null => { constKinds[ci] = RCONST_NULL constBits[ci] = 0 }
+          ValueBits.Bool { value: b } => { constKinds[ci] = if b { RCONST_TRUE } else { RCONST_FALSE } constBits[ci] = 0 }
+          ValueBits.Int { value: n } => { constKinds[ci] = RCONST_INT constBits[ci] = u32.toU64(i32.wrappingToU32(n)) }
+          ValueBits.Float64 { value: x } => { constKinds[ci] = RCONST_F64 constBits[ci] = f64.toBits(x) }
+          _ => { drop rEntry drop st return () }
+        }
+      }
+      i = i + 1
+    }
+    drop rEntry drop st
+    finalOpt = entry.final
+    planKind = CONSTRUCT_PLAN_RECIPE
+    fromEmpty = 0
+    checkInterrupt = 1
+  } else {
+    return ()
+  }
+  let final = match Pointer.nonNullMut<HeapHeader>(finalOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return () }
+  }
+  let fShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  if fShape.properties.length() != stores || fShape.version >= 2147483648 { drop fShape return () }
+  let shapeVersion = u64.wrappingToU32(fShape.version)
+  drop fShape
+  let mut tail = unsafe shapes.planInline(empty, stores)
+  if fromEmpty != 0 || (tail != 0 && tail < stores) { tail = shapes.INLINE_SLOTS }
+  if (tail != shapes.INLINE_SLOTS && tail != shapes.PAIR_SLOTS) || stores > tail { return () }
+  // Live-verify prototype chain: non-exotic, isPrototype(), and no inherited property for
+  // any stored atom (so adding all `stores` fields invokes no setters or read-only slots).
+  let mut protoObjs: [?*mut HeapHeader; 4] = [Pointer.null<HeapHeader>(); 4]
+  let mut protoVersions: [u64; 4] = [0; 4]
+  let mut protoCount: usize = 0
+  let mut curOpt = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(proto)
+  while true {
+    let link = match Pointer.nonNullMut<HeapHeader>(curOpt) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { break }
+    }
+    if protoCount >= 4 { return () }
+    let ld = unsafe HeapCell.payload<ObjectData, ()>(&anchor, link)
+    if ld.isExotic() || !ld.isPrototype() { drop ld return () }
+    let lShape = ld.shape
+    drop ld
+    let mut j: usize = 0
+    while j < stores {
+      if let Option<usize>.Some { value: slot } = unsafe shapes.lookup(lShape, storedAtoms[j]) {
+        let flags = u8.toU32(unsafe shapes.slotFlags(lShape, slot))
+        if (flags & JS_PROP_TMASK) != 0 || (flags & JS_PROP_WRITABLE) == 0 { return () }
+      }
+      j = j + 1
+    }
+    let ls = unsafe HeapCell.payload<ShapeData, ()>(&anchor, lShape)
+    protoObjs[protoCount] = curOpt
+    protoVersions[protoCount] = ls.version
+    curOpt = ls.prototype
+    drop ls
+    protoCount = protoCount + 1
+  }
+  let id = usize.toU32(descs.length())
+  run descs.append(ConstructDesc {
+    ctor: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(ctor),
+    proto: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(proto),
+    target: targetOpt,
+    fnProto: fnProtoOpt,
+    applyFn: applyOpt,
+    realm: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(realm),
+    ctorVersion: ctorVersion,
+    targetVersion: targetVersion,
+    fnProtoVersion: fnProtoVersion,
+    shapeEpoch: epoch,
+    finalShape: Pointer.address<HeapHeader>(final),
+    emptyShape: Pointer.address<HeapHeader>(empty),
+    protoSlot: protoSlot,
+    holderSlot: holderSlot,
+    applySlot: applySlot,
+    receiverSlot: recvSlot,
+    stores: stores,
+    tail: tail,
+    protoObjs: protoObjs,
+    protoVersions: protoVersions,
+    addAtoms: addAtoms,
+    protoCount: usize.toU8(protoCount),
+    forward: if forward { 1 } else { 0 },
+    fromEmpty: fromEmpty,
+    checkInterrupt: checkInterrupt
+  })
+  run targets.append(ConstructTarget {
+    pc: readPc,
+    id: id,
+    shapeVersion: shapeVersion,
+    kind: planKind,
+    stores: usize.toU8(stores),
+    nodeCount: nodeCount,
+    sources: sources,
+    roots: roots,
+    nodes: nodes,
+    constKinds: constKinds,
+    constBits: constBits
+  })
+}
+
+fn sameConstructDesc(a: &ConstructDesc, b: &ConstructDesc) -> bool {
+  return Pointer.address<HeapHeader>(a.ctor) == Pointer.address<HeapHeader>(b.ctor)
+    && Pointer.address<HeapHeader>(a.proto) == Pointer.address<HeapHeader>(b.proto)
+    && Pointer.address<HeapHeader>(a.target) == Pointer.address<HeapHeader>(b.target)
+    && Pointer.address<HeapHeader>(a.fnProto) == Pointer.address<HeapHeader>(b.fnProto)
+    && Pointer.address<HeapHeader>(a.applyFn) == Pointer.address<HeapHeader>(b.applyFn)
+    && a.ctorVersion == b.ctorVersion && a.targetVersion == b.targetVersion && a.fnProtoVersion == b.fnProtoVersion
+    && a.finalShape == b.finalShape && a.emptyShape == b.emptyShape
+    && a.stores == b.stores && a.tail == b.tail
+    && a.forward == b.forward && a.fromEmpty == b.fromEmpty && a.checkInterrupt == b.checkInterrupt
+    && a.receiverSlot == b.receiverSlot && a.protoCount == b.protoCount
+}
+
+/// Deduplicates `desc` into `jit.constructDescs`, keeping every referenced heap object alive
+/// for the runtime, and returns the stable address of the descriptor (or 0 on failure).
+unsafe fn commitConstructDesc(jit: &mut Jit, rt: *mut HeapHeader, desc: ConstructDesc) -> usize {
+  let mut i: usize = 0
+  while i < jit.constructDescs.length() {
+    if sameConstructDesc(&jit.constructDescs.asSlice()[i], &desc) {
+      return Pointer.address<ConstructDesc>(Pointer.fromMutRef<ConstructDesc>(&mut jit.constructDescs.asMutSlice()[i]))
+    }
+    i = i + 1
+  }
+  if jit.constructDescs.length() >= CONSTRUCT_DESC_CAPACITY { return 0 }
+  if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.ctor) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
+  if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.proto) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
+  if desc.forward != 0 {
+    if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.target) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
+    if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.fnProto) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
+    if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.applyFn) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
+  }
+  let mut p: usize = 0
+  while p < u8.toUsize(desc.protoCount) {
+    if let Option<*mut HeapHeader>.Some { value: o } = Pointer.nonNullMut<HeapHeader>(desc.protoObjs[p]) { if !(unsafe inline.keepClosure(rt, o)) { return 0 } }
+    p = p + 1
+  }
+  let slot = jit.constructDescs.length()
+  if !jit.constructDescs.appendWithinCapacity(desc) { return 0 }
+  return Pointer.address<ConstructDesc>(Pointer.fromMutRef<ConstructDesc>(&mut jit.constructDescs.asMutSlice()[slot]))
 }
 
 /// The own data-property object `atom` of `object`, or null for anything else.

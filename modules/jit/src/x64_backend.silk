@@ -487,7 +487,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
       getters = true
       if bodyCells < 3 { bodyCells = 3 }
     }
-    if (inst.op == Op.Call || inst.op == Op.Poll) && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
+    if (inst.op == Op.Call || inst.op == Op.Poll || inst.op == Op.NewObject) && inst.exit != NONE && function.exit(inst.exit).frames != 0 {
       if inst.op == Op.Call && calls.countOf(inst) + 2 > bodyCells { bodyCells = calls.countOf(inst) + 2 }
       if function.exit(inst.exit).frames > bodyDepth { bodyDepth = function.exit(inst.exit).frames }
     }
@@ -667,6 +667,7 @@ fn supported(function: &Function, on: bool, stress: u32, steps: &List<u32>) -> O
     if on && inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_CALL && (inst.k & calls.LAZY_ARGUMENTS) != 0 { return Option<&'static [u8]>.some(b"a lazy arguments call on a baseline frame") }
     if inst.op == Op.PutKey && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a keyed store off the function's own baseline frame") }
     if inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_ADD && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a concatenation off the function's own baseline frame") }
+    if !on && (inst.op == Op.NewObject || inst.op == Op.InitSlot) { return Option<&'static [u8]>.some(b"inlined construct off a baseline frame") }
     i = i + 1
   }
   return Option<&'static [u8]>.none()
@@ -1951,6 +1952,64 @@ impl Emitter {
       self.a.bind(done)
       return ()
     }
+    if op == Op.NewObject {
+      run self.stressGuard(inst.exit)
+      let layout = self.settings.layout
+      let miss = self.exitLabels.get(u32.toUsize(inst.exit))
+      let retry = run self.a.label()
+      let pollSlow = run self.a.label()
+      let done = run self.a.label()
+      let sym = self.constructSymbol(&function, i32.wrappingToU32(inst.k))
+      run self.unlessTag(inst.a, layout.object(), miss)
+      run self.payloadInto(Reg.R8, inst.a)
+      run self.a.movSymbol(Reg.Rsi, sym)
+      run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.Rsi, 0))
+      run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.R10)
+      run self.a.jcc(Cond.NotEqual, miss)
+      if inst.b != inst.a {
+        run self.unlessTag(inst.b, layout.object(), miss)
+        run self.payloadInto(Reg.R8, inst.b)
+        run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.R10)
+        run self.a.jcc(Cond.NotEqual, miss)
+      }
+      self.a.bind(retry)
+      run self.a.movSymbol(Reg.Rsi, sym)
+      run self.a.lea(Width.W64, Reg.Rdx, slotOf(inst.result))
+      run self.callHelper(helpers.NEW_OBJECT)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+      run self.a.jcc(Cond.Equal, done)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 2)
+      run self.a.jcc(Cond.NotEqual, miss)
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rsp, self.realmAt))
+      run self.a.jmp(pollSlow)
+      self.a.bind(done)
+      run self.polls.append(PollSlow { slow: pollSlow, back: retry, exit: inst.exit, pc: function.exit(inst.exit).pc })
+      return ()
+    }
+    if op == Op.InitSlot {
+      run self.payloadInto(Reg.R11, inst.a)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, u32.wrappingToI32(self.fields.objectSlots)))
+      let off = i32.wrappingToU32(inst.k) * 16
+      let info = function.value(given.b)
+      if info.ty == Type.I32 || info.ty == Type.Bool {
+        match self.constants.get(u32.toUsize(inst.b)) {
+          Option<i32>.Some { value } => { run self.a.movImm32(Reg.Rax, i32.wrappingToU32(value)) }
+          Option<i32>.None => { let p = self.at(inst.b) run getI32(&mut self.a, Reg.Rax, p) }
+        }
+        run self.boxInto(info.ty == Type.Bool, Reg.Rax, Reg.R11, off)
+      } else if info.ty == Type.F64 {
+        let p = self.at(inst.b)
+        run getBits(&mut self.a, Reg.Rax, p)
+        run self.boxDoubleInto(Reg.Rax, Reg.R11, off)
+      } else {
+        run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+        run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+        run self.a.store(Width.W64, word(Reg.R11, off), Reg.Rax)
+        run self.a.store(Width.W64, word(Reg.R11, off + 8), Reg.R9)
+        if info.own != Own.Imm { run self.retainBits(Reg.Rax, Reg.R9) }
+      }
+      return ()
+    }
     if op == Op.CallArg && self.on {
       // Borrowed into the operand cell the interpreter would have it in; an i32 or bool is
       // boxed there.
@@ -2523,6 +2582,9 @@ impl Emitter {
   /// The relocation symbol of string cell n of the code's linked atoms (Function.linkedAtoms),
   /// after the array natives'.
   fn atomSymbol(self: &Self, function: &Function, n: u32) -> u32 { return self.arraySymbol(function, 2) + n }
+  /// The relocation symbol of construct descriptor k (Function.constructTargets), after the
+  /// linked atoms'.
+  fn constructSymbol(self: &Self, function: &Function, k: u32) -> u32 { return self.atomSymbol(function, usize.toU32(self.atoms.length())) + k }
   /// The relocation symbol of the realm's Array.prototype push (which 0) or pop (1), a
   /// native function object, or of nothing when the realm has none.
   fn arraySymbol(self: &Self, function: &Function, which: u32) -> u32 {
@@ -4106,7 +4168,7 @@ impl Emitter {
     }
     self.a.bind(self.prologued)
     // The realm, for the polls and for an inlined callee's CompiledFrame.
-    let mut needed = function.inlineTargets.length() != 0
+    let mut needed = function.inlineTargets.length() != 0 || function.constructTargets.length() != 0
     let mut i: usize = 0
     while i < function.insts.length() { if function.insts.get(i).op == Op.Poll { needed = true } i = i + 1 }
     if needed {

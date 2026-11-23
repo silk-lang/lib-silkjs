@@ -80,7 +80,41 @@ pub struct FunctionInput {
   /// The slots of watched records (js_compiled_inline.cellRecord) the code may read as
   /// constants, for the function and every body inlined into it.
   pub records: List<RecordSlot>,
+  /// Planned constructor sites (`new C(...)`) the embedder resolved to a fixed shape and
+  /// store/recipe plan (frame mode only).
+  pub constructs: List<ConstructTarget>,
 }
+
+pub const CONSTRUCT_PLAN_STORES: u8 = 1
+pub const CONSTRUCT_PLAN_RECIPE: u8 = 2
+pub const RCONST_UNDEF: u8 = 0
+pub const RCONST_NULL: u8 = 1
+pub const RCONST_FALSE: u8 = 2
+pub const RCONST_TRUE: u8 = 3
+pub const RCONST_INT: u8 = 4
+pub const RCONST_F64: u8 = 5
+pub const RECIPE_CONST: u32 = 0
+pub const RECIPE_ARG: u32 = 1
+pub const RECIPE_RECEIVER: u32 = 2
+pub const RECIPE_NOT: u32 = 3
+pub const RECIPE_SELECT: u32 = 4
+
+/// Planned constructor target for `new C(...)` where the constructor function was read at `pc`
+/// (`get_field` or `get_var`). Plain serializable data (no heap pointers).
+pub struct ConstructTarget {
+  pub pc: u32,
+  pub id: u32,
+  pub shapeVersion: u32,
+  pub kind: u8,
+  pub stores: u8,
+  pub nodeCount: u8,
+  pub sources: [u8; 8],
+  pub roots: [u8; 8],
+  pub nodes: [u32; 32],
+  pub constKinds: [u8; 16],
+  pub constBits: [u64; 16],
+}
+impl Copy for ConstructTarget {}
 /// Slot `slot` of a watched record whose shape's version is `version` (`before`: what it
 /// was before the watch, as inline keys filled earlier hold it) holds a constant of `kind`
 /// (js_compiled_inline.RECORD_INT and the others) and `value`.
@@ -2475,6 +2509,7 @@ impl Translator {
     else if construct { let given = self.top(count + 1) receiver = run self.boxed(given, at) }
     else { receiver = run self.imm(Imm.Undefined, at) }
     if !construct && run self.inlined(input, function, receiver, method, count, at) { return true }
+    if construct && run self.inlineConstruct(input, function, receiver, count, at) { return true }
     // A body's own call: code that can leave the body part way through makes it (its exit
     // names the body's frame, ssa.Exit.frames).
     if self.depth != 0 && (!self.leaves || self.lazyApply(method, count)) { fail refuse(at, opcode, b"a call inside an inlined body") }
@@ -2488,6 +2523,207 @@ impl Translator {
       else if atom != 0 && atom == self.arrayPop && count == 0 { native = calls.NATIVE_POP }
     }
     run self.plainCall(function, receiver, method, construct, count, at, native)
+    return true
+  }
+  /// The pc of the `get.field` or `get.var` of this frame that produced constructor `function`,
+  /// looking through `Retain` copies and single-source block parameters, or NONE.
+  fn ctorReadOf(self: &Self, function: u32) -> u32 {
+    let mut v = function
+    let mut steps: u32 = 0
+    while steps < 8 {
+      let mut budget: u32 = 256
+      v = self.sourceOf(v, 16, &mut budget)
+      let info = self.f.value(v)
+      if info.def == NONE { return NONE }
+      let inst = self.f.inst(info.def)
+      if inst.op == Op.Retain { v = inst.a steps = steps + 1 continue }
+      if (inst.op == Op.GetField || inst.op == Op.GetVar) && inst.frame == self.f.frame { return inst.pc }
+      return NONE
+    }
+    return NONE
+  }
+  /// Static truthiness of SSA value `v`: 0 (always falsy), 1 (always truthy), -1 (unknown).
+  fn constTruth(self: &Self, v: u32) -> i32 {
+    let info = self.f.value(v)
+    if info.def == NONE { return -1 }
+    let inst = self.f.inst(info.def)
+    if inst.op == Op.ConstI32 { return if inst.k == 0 { 0 } else { 1 } }
+    if inst.op == Op.ConstF64 && inst.k >= 0 && i32.toUsize(inst.k) < self.f.numbers.length() {
+      let x = f64.fromBits(self.f.numbers.get(i32.toUsize(inst.k)))
+      return if x == x && x != 0.0 { 1 } else { 0 }
+    }
+    if inst.op == Op.Imm {
+      if inst.k == u8.toI32(Imm.value(Imm.True)) { return 1 }
+      if inst.k == u8.toI32(Imm.value(Imm.False)) || inst.k == u8.toI32(Imm.value(Imm.Undefined)) || inst.k == u8.toI32(Imm.value(Imm.Null)) { return 0 }
+    }
+    return -1
+  }
+  /// Inlines a planned `new C(...)` site as `Op.NewObject` (the sole exit, at `at`) followed
+  /// by `Op.InitSlot` instructions (with zero exits). Returns true when handled.
+  effect fn inlineConstruct(self: &mut Self, input: &FunctionInput, function: u32, receiver: u32, count: usize, at: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if !self.leaves || input.constructs.length() == 0 { return false }
+    if self.depth == 0 {
+      let mut s: usize = 0
+      while s < self.doubleSites.length() { if self.doubleSites.get(s) == at { return false } s = s + 1 }
+    }
+    let readPc = self.ctorReadOf(function)
+    if readPc == NONE { return false }
+    let mut found = usize.MAX
+    let mut idx: usize = 0
+    while idx < input.constructs.length() {
+      if input.constructs.get(idx).pc == readPc { found = idx break }
+      idx = idx + 1
+    }
+    if found == usize.MAX { return false }
+    let t = input.constructs.get(found)
+    let stores = u8.toUsize(t.stores)
+    if stores == 0 || stores > 8 { return false }
+    run self.f.constructTargets.append(t.id)
+    run self.f.constructShapes.append(t.shapeVersion)
+    let siteIdx = usize.toI32(self.f.constructTargets.length() - 1)
+    let obj = run self.f.emit(self.current, Op.NewObject, true, Type.Value, Own.Owned, function, receiver, siteIdx, at)
+    let last = self.f.lastInst()
+    run self.exitHere(last, at)
+    let mut temps = List<u32>.make()
+    if t.kind == CONSTRUCT_PLAN_STORES {
+      let mut s: usize = 0
+      while s < stores {
+        let src = u8.toUsize(t.sources[s])
+        let val = if src < count { self.top(count - src) } else { run self.imm(Imm.Undefined, at) }
+        drop run self.f.emit(self.current, Op.InitSlot, false, Type.I32, Own.Unboxed, obj, val, usize.toI32(s), at)
+        s = s + 1
+      }
+    } else if t.kind == CONSTRUCT_PLAN_RECIPE {
+      let nodeCount = u8.toUsize(t.nodeCount)
+      let mut usedInner: [bool; 32] = [false; 32]
+      let mut i: usize = 2
+      while i < nodeCount && i < 32 {
+        let word = t.nodes[i]
+        let kind = word & 255
+        let a = u32.toUsize(u32.shiftRight(word, 8) & 255) & 31
+        if kind == RECIPE_NOT { usedInner[a] = true }
+        else if kind >= RECIPE_SELECT {
+          let b = u32.toUsize(u32.shiftRight(word, 16) & 255) & 31
+          let c = u32.toUsize(u32.shiftRight(word, 24)) & 31
+          usedInner[a] = true usedInner[b] = true usedInner[c] = true
+        }
+        i = i + 1
+      }
+      let mut nodeVals: [u32; 32] = [NONE; 32]
+      nodeVals[0] = obj
+      nodeVals[1] = run self.imm(Imm.Undefined, at)
+      i = 2
+      while i < nodeCount && i < 32 {
+        let word = t.nodes[i]
+        let kind = word & 255
+        let a = u32.toUsize(u32.shiftRight(word, 8) & 255)
+        if kind == RECIPE_ARG {
+          nodeVals[i] = if a < count { self.top(count - a) } else { nodeVals[1] }
+        } else if kind == RECIPE_CONST {
+          let ck = t.constKinds[a & 15]
+          let cb = t.constBits[a & 15]
+          if ck == RCONST_UNDEF { nodeVals[i] = nodeVals[1] }
+          else if ck == RCONST_NULL { nodeVals[i] = run self.imm(Imm.Null, at) }
+          else if ck == RCONST_FALSE { nodeVals[i] = run self.constBool(false, at) }
+          else if ck == RCONST_TRUE { nodeVals[i] = run self.constBool(true, at) }
+          else if ck == RCONST_INT { nodeVals[i] = run self.constant(u32.wrappingToI32(u64.wrappingToU32(cb)), at) }
+          else { nodeVals[i] = run self.doubleConstant(f64.fromBits(cb), at) }
+        } else if kind == RECIPE_RECEIVER {
+          nodeVals[i] = obj
+        } else if kind == RECIPE_NOT {
+          let ct = self.constTruth(nodeVals[a & 31])
+          if ct >= 0 { nodeVals[i] = run self.constBool(ct == 0, at) }
+          else {
+            let cond = run self.condition(nodeVals[a & 31], at)
+            nodeVals[i] = run self.f.emit(self.current, Op.NotBool, true, Type.Bool, Own.Unboxed, cond, NONE, 0, at)
+          }
+        } else if usedInner[i] {
+          // Non-root RECIPE_SELECT: fold constant condition or merge arms into joinB.
+          let tVal = nodeVals[u32.toUsize(u32.shiftRight(word, 16) & 255) & 31]
+          let fVal = nodeVals[u32.toUsize(u32.shiftRight(word, 24)) & 31]
+          let ct = self.constTruth(nodeVals[a & 31])
+          if ct == 1 { nodeVals[i] = tVal }
+          else if ct == 0 { nodeVals[i] = fVal }
+          else {
+            let cond = run self.condition(nodeVals[a & 31], at)
+            let thenB = run self.f.block()
+            let elseB = run self.f.block()
+            let joinB = run self.f.block()
+            let sameUnboxed = self.f.value(tVal).ty == self.f.value(fVal).ty && self.f.value(tVal).ty != Type.Value
+            let joinTy = if sameUnboxed { self.f.value(tVal).ty } else { Type.Value }
+            let joinOwn = if sameUnboxed { Own.Unboxed } else { Own.Owned }
+            let merged = run self.f.addParam(joinB, joinTy, joinOwn)
+            let e1 = run self.f.newEdge(thenB)
+            drop run self.f.newEdge(elseB)
+            run self.f.terminate(self.current, Op.Branch, cond, e1, at)
+            self.current = thenB
+            let mut tArg = tVal
+            if !sameUnboxed {
+              tArg = run self.boxed(tArg, at)
+              if self.f.value(tArg).own != Own.Imm { tArg = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, tArg, NONE, 0, at) }
+            }
+            let jt = run self.f.newEdge(joinB)
+            run self.f.edgeArgument(tArg)
+            run self.f.terminate(thenB, Op.Jump, NONE, jt, at)
+            self.current = elseB
+            let mut fArg = fVal
+            if !sameUnboxed {
+              fArg = run self.boxed(fArg, at)
+              if self.f.value(fArg).own != Own.Imm { fArg = run self.f.emit(self.current, Op.Retain, true, Type.Value, Own.Owned, fArg, NONE, 0, at) }
+            }
+            let je = run self.f.newEdge(joinB)
+            run self.f.edgeArgument(fArg)
+            run self.f.terminate(elseB, Op.Jump, NONE, je, at)
+            self.current = joinB
+            nodeVals[i] = merged
+            if !sameUnboxed { run temps.append(merged) }
+          }
+        }
+        i = i + 1
+      }
+      let mut s: usize = 0
+      while s < stores {
+        let r = u8.toUsize(t.roots[s]) & 31
+        if r < nodeCount && (t.nodes[r] & 255) >= RECIPE_SELECT && nodeVals[r] == NONE {
+          let word = t.nodes[r]
+          let condNode = u32.toUsize(u32.shiftRight(word, 8) & 255) & 31
+          let tNode = u32.toUsize(u32.shiftRight(word, 16) & 255) & 31
+          let fNode = u32.toUsize(u32.shiftRight(word, 24)) & 31
+          let ct = self.constTruth(nodeVals[condNode])
+          if ct == 1 {
+            drop run self.f.emit(self.current, Op.InitSlot, false, Type.I32, Own.Unboxed, obj, nodeVals[tNode], usize.toI32(s), at)
+          } else if ct == 0 {
+            drop run self.f.emit(self.current, Op.InitSlot, false, Type.I32, Own.Unboxed, obj, nodeVals[fNode], usize.toI32(s), at)
+          } else {
+            let cond = run self.condition(nodeVals[condNode], at)
+            let thenB = run self.f.block()
+            let elseB = run self.f.block()
+            let joinB = run self.f.block()
+            let e1 = run self.f.newEdge(thenB)
+            drop run self.f.newEdge(elseB)
+            run self.f.terminate(self.current, Op.Branch, cond, e1, at)
+            self.current = thenB
+            drop run self.f.emit(thenB, Op.InitSlot, false, Type.I32, Own.Unboxed, obj, nodeVals[tNode], usize.toI32(s), at)
+            let jt = run self.f.newEdge(joinB)
+            run self.f.terminate(thenB, Op.Jump, NONE, jt, at)
+            self.current = elseB
+            drop run self.f.emit(elseB, Op.InitSlot, false, Type.I32, Own.Unboxed, obj, nodeVals[fNode], usize.toI32(s), at)
+            let je = run self.f.newEdge(joinB)
+            run self.f.terminate(elseB, Op.Jump, NONE, je, at)
+            self.current = joinB
+          }
+        } else {
+          drop run self.f.emit(self.current, Op.InitSlot, false, Type.I32, Own.Unboxed, obj, nodeVals[r], usize.toI32(s), at)
+        }
+        s = s + 1
+      }
+    }
+    let mut tm: usize = 0
+    while tm < temps.length() { run self.release(temps.get(tm), at) tm = tm + 1 }
+    let depth = count + 2
+    let mut p: usize = 0
+    while p < depth { let v = self.pop() run self.release(v, at) p = p + 1 }
+    run self.push(obj)
     return true
   }
   /// The call at `pc` of `function` with the `count` operands on the stack as arguments (and
