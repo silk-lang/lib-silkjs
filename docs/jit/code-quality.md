@@ -252,6 +252,12 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   or store of element `i` in the same block has no overflow test: `i` is below an
   Array's count, far below 2^31 (`cannotOverflow`). And a compare that reads the value the
   operation before it just stored from RAX takes it from RAX (`raxHolds`).
+- **Byte compares in memory, flags reused.** A trusted read's tag test and a trusted
+  store's test of the old value compare the tag byte in memory (`cmp byte [r11], k`); a
+  fused store writes the number's register as the payload word (it is zero-extended). A
+  compare with 0 of the value the add, sub or bitwise operation just before computed, with
+  no code between, takes that operation's flags (`flagsAfter`, `flagsHold`): without an
+  overflow they are a compare's for the signed conditions and equality.
 - **A store of an immediate skips its heap test.** `put.elem` of a value that is
   `Own.Imm` (a boxed number, undefined, a boolean) does not test whether the new value is
   counted.
