@@ -232,6 +232,10 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   constants, number boxes and unboxes, shifts by a constant: `r11Kept`), takes the element's
   address from R11 instead of loading the object, testing the count and indexing again
   (`reusesElement`). Seven instructions of each turn of Crypto's `am3` loop.
+- **An index a trusted access bounded does not overflow.** `i + 1` after a trusted read
+  or store of element `i` in the same block has no overflow test: `i` is below an
+  Array's count, far below 2^31 (`cannotOverflow`). And a compare that reads the value the
+  operation before it just stored from RAX takes it from RAX (`raxHolds`).
 - **A store of an immediate skips its heap test.** `put.elem` of a value that is
   `Own.Imm` (a boxed number, undefined, a boolean) does not test whether the new value is
   counted.

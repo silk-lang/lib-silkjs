@@ -220,6 +220,15 @@ pub struct Emitter {
   elementAt: u32,
   elementObject: u32,
   elementIndex: u32,
+  /// Indexes a trusted access of this block bounded (below an Array's count, so at most
+  /// 2^31 - 2): adding 1 to one cannot overflow. Cleared at each block.
+  bounded: List<u32>,
+  boundedBlock: u32,
+  /// The value the last operation left in RAX as it stored it to its slot, and the code
+  /// offset just after: RAX still holds it while nothing more was emitted (raxHolds).
+  raxValue: u32,
+  raxOffset: usize,
+  raxBlock: u32,
   /// Where the inlined callees' CompiledFrames start, from rsp: INLINE_FRAME_WORDS words each.
   inlineFrames: i32,
   /// The closure value each inlined callee's `inline.frame` names, by frame number less one.
@@ -496,7 +505,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
@@ -886,6 +895,7 @@ impl Emitter {
       let turnedConstant = self.constants.get(u32.toUsize(turned.b)).isSome()
       if into.kind == GPR && self.key(turned.a) == self.key(turned.result) && (turnedConstant || self.key(turned.b) != self.key(turned.result)) {
         run self.operate(alu, into.gpr, turned.b)
+        if self.cannotOverflow(&function, inst) { return () }
         let undo = run self.a.label()
         run self.a.jcc(Cond.Overflow, undo)
         run self.undoLabels.append(undo)
@@ -897,13 +907,14 @@ impl Emitter {
         // overflow leaves with both operands where they were.
         let place3 = self.at(turned.a) run getI32(&mut self.a, into.gpr, place3)
         run self.operate(alu, into.gpr, turned.b)
-        run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
+        if !self.cannotOverflow(&function, inst) { run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit))) }
         return ()
       }
       let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
       run self.operate(alu, Reg.Rax, inst.b)
-      run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
+      if !self.cannotOverflow(&function, inst) { run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit))) }
       let place102 = self.at(inst.result) run putI32(&mut self.a, place102, Reg.Rax)
+      if place102.kind != GPR { self.raxValue = inst.result self.raxOffset = self.a.offset() self.raxBlock = inst.block }
       return ()
     }
     if op == Op.Mul && inst.b != NONE && positiveConstant(self.constants.get(u32.toUsize(inst.b))) > 0 {
@@ -944,7 +955,7 @@ impl Emitter {
       // A compare whose only reader is the branch right after it is that branch's flags.
       if self.fusedCompare(&function, inst) { return () }
       run self.a.movImm32(Reg.R9, 0)
-      run self.compare(inst)
+      run self.compare(&function, inst)
       run self.a.setcc(condition(inst.k), Reg.R9)
       let place104 = self.at(inst.result) run putI32(&mut self.a, place104, Reg.R9)
       return ()
@@ -1045,7 +1056,7 @@ impl Emitter {
       let def = self.defs.get(u32.toUsize(inst.a))
       if def != NONE && self.fusedCompare(&function, function.inst(def)) {
         let compared = function.inst(def)
-        run self.compare(compared)
+        run self.compare(&function, compared)
         taken = condition(compared.k) untaken = condition(opposite(compared.k))
       } else if def != NONE && self.fusedEquals(&function, function.inst(def)) {
         run self.equalsFlags(&function, function.inst(def))
@@ -1539,6 +1550,7 @@ impl Emitter {
           let miss = self.exitLabels.get(u32.toUsize(inst.exit))
           run self.trustedSlot(inst.a, index, miss)
           self.elementAt = self.cursor self.elementObject = self.storage(inst.a) self.elementIndex = index
+          run self.bound(&function, index)
         } else if only != 0 {
           let fast = run self.a.label()
           run self.typedElement(op == Op.PutElem, inst.a, index, inst.b, inst.result, only, done, fast)
@@ -2723,10 +2735,10 @@ impl Emitter {
     self.a.bind(other)
   }
   /// The flags of compare's operands (it stores nothing).
-  effect fn compare(self: &mut Self, compare: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn compare(self: &mut Self, function: &Function, compare: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
     let left = self.at(compare.a)
     let mut dst = Reg.Rax
-    if left.kind == GPR { dst = left.gpr } else { run getI32(&mut self.a, Reg.Rax, left) }
+    if left.kind == GPR { dst = left.gpr } else if !self.raxHolds(function, compare.a) { run getI32(&mut self.a, Reg.Rax, left) }
     run self.operate(Alu.Cmp, dst, compare.b)
   }
   /// dst = dst op b, with b an immediate when it is a constant.
@@ -4163,6 +4175,7 @@ impl Emitter {
     // The element a trusted read of the same index found just before is the one (R11).
     if !self.reusesElement(function, inst) { run self.trustedSlot(inst.a, i32.wrappingToU32(inst.k), miss) }
     self.elementAt = NONE
+    run self.bound(function, i32.wrappingToU32(inst.k))
     let cold = run self.a.label()
     run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
     // r8, not r10: values live in r10 through a trusted store (keepsFragile).
@@ -4186,6 +4199,29 @@ impl Emitter {
     }
     self.a.bind(done)
     run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(box)
+  }
+  /// Notes that `index` passed a trusted access's count test in the block being lowered.
+  effect fn bound(self: &mut Self, function: &Function, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let block = function.inst(self.cursor).block
+    if block != self.boundedBlock { self.bounded.clear() self.boundedBlock = block }
+    run self.bounded.append(index)
+  }
+  /// Whether `add.i32 x, 1` cannot overflow: x is an index a trusted access earlier in the
+  /// block bounded (bound), below a count of elements, which is far below 2^31.
+  fn cannotOverflow(self: &Self, function: &Function, inst: Inst) -> bool {
+    if inst.op != Op.Add || inst.b == NONE || function.inst(self.cursor).block != self.boundedBlock { return false }
+    match self.constants.get(u32.toUsize(inst.b)) {
+      Option<i32>.Some { value } => { if value != 1 { return false } }
+      Option<i32>.None => { return false }
+    }
+    let mut i: usize = 0
+    while i < self.bounded.length() { if self.bounded.get(i) == inst.a { return true } i = i + 1 }
+    return false
+  }
+  /// Whether RAX holds v: the last operation of this block stored it from RAX to its slot
+  /// and nothing was emitted after (raxValue), so no other way reaches here.
+  fn raxHolds(self: &Self, function: &Function, v: u32) -> bool {
+    return v == self.raxValue && self.a.offset() == self.raxOffset && function.inst(self.cursor).block == self.raxBlock
   }
   /// Whether R11 still holds the address of the element the trusted store `inst` stores
   /// to: the last trusted read (elementAt) was of the same object and the same index, in
