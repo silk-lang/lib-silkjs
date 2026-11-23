@@ -238,6 +238,9 @@ argument-web rule, simplify again.
   `unbox.bool (box.bool c)` to `c`, a retain or release of an `imm` value removed;
 - trivial parameters: a block parameter whose incoming arguments are all one value (or itself)
   is replaced by that value;
+- idle parameters: a block parameter nothing reads but its releases, when no edge passes it an
+  owned value, goes with its releases and its edge arguments (a loop's exit block that took
+  every local, as boxes and borrows, where the code after reads one);
 - exit slots: a slot holding `box.i32 x` or `box.bool c` becomes an `int`/`bool` slot of `x`/`c`,
   so the box is no longer needed for the exit;
 - dead code: pure instructions (constants, `arg`, `imm`, boxes, comparisons) with no use go;

@@ -151,6 +151,9 @@ keeps all of them in the loop. `tests/baseline/t67.js` runs such loops on arrays
 arrays, strings, `arguments`, frozen, holey and getter-holding arrays, past the end and
 with stores that append.
 
+A borrowed copy of the Array (`this_array` read from a local the loop's front block
+copied) is checked as what it copies: one `check.array` per object.
+
 Crypto's `am3`: 143 instructions an iteration where there were 164; Crypto at scale 4,
 3.26G instructions where there were 3.48G. At scale 20 the optimizer takes 1,019 ms (V8:
 325), where before this and the fragile registers it took 1,256.
@@ -195,6 +198,15 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   rdi over the slow paths of element accesses and polls (so longer values could take them
   too) measured worse, 167, and is not done.
 
+- **`mul.i32` tests for -0 out of line.** The product is taken from the second operand's
+  register or slot (`imul eax, [slot]`); a zero product jumps to a piece after the blocks
+  that ors the operands, still in their places, and leaves when that is negative, so a
+  nonzero product runs `imul`, `jo`, `test` and a branch not taken. Operands known never
+  to be negative (a constant that is not, an `and` with one, `>>>` by a nonzero constant)
+  need no test at all.
+- **A store of an immediate skips its heap test.** `put.elem` of a value that is
+  `Own.Imm` (a boxed number, undefined, a boolean) does not test whether the new value is
+  counted.
 - **`add.i32` and `sub.i32` in place.** When the result takes the first operand's register
   the operation runs there, two instructions where there were four. The exit state reads
   the operand, so the overflow jump goes to a short piece after the blocks that undoes the

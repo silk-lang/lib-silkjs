@@ -203,6 +203,10 @@ pub struct Emitter {
   /// reads the operand.
   undoLabels: List<Label>,
   undoInsts: List<Inst>,
+  /// mul.i32's tests for -0, out of line: where a zero product goes, where it comes back.
+  zeroLabels: List<Label>,
+  zeroBacks: List<Label>,
+  zeroInsts: List<Inst>,
   /// Where the inlined callees' CompiledFrames start, from rsp: INLINE_FRAME_WORDS words each.
   inlineFrames: i32,
   /// The closure value each inlined callee's `inline.frame` names, by frame number less one.
@@ -294,6 +298,24 @@ fn immediateOperand(function: &Function, inst: Inst) -> bool {
     return def != NONE && function.inst(def).op == Op.ConstI32 && function.inst(def).k > 0
   }
   return false
+}
+/// Whether the i32 v is never negative: a constant that is not, an `and` with one, or a
+/// logical shift right by a nonzero constant.
+fn nonNegative(function: &Function, v: u32) -> bool {
+  let def = function.value(v).def
+  if def == NONE { return false }
+  let inst = function.inst(def)
+  if inst.op == Op.ConstI32 { return inst.k >= 0 }
+  if inst.op == Op.BitAnd { return nonNegativeConstant(function, inst.a) || nonNegativeConstant(function, inst.b) }
+  if inst.op == Op.Shr {
+    let shift = function.value(inst.b).def
+    return shift != NONE && function.inst(shift).op == Op.ConstI32 && (function.inst(shift).k & 31) != 0
+  }
+  return false
+}
+fn nonNegativeConstant(function: &Function, v: u32) -> bool {
+  let def = function.value(v).def
+  return def != NONE && function.inst(def).op == Op.ConstI32 && function.inst(def).k >= 0
 }
 /// The constant when it is positive, else 0.
 fn positiveConstant(constant: Option<i32>) -> i32 {
@@ -445,7 +467,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(),
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), outs: List<Out>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(),
@@ -533,6 +555,16 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     run emitter.operate(back, place.gpr, inst.b)
     run emitter.a.jmp(emitter.exitLabels.get(u32.toUsize(inst.exit)))
     u = u + 1
+  }
+  let mut z: usize = 0
+  while z < emitter.zeroInsts.length() {
+    let inst = emitter.zeroInsts.get(z)
+    emitter.a.bind(emitter.zeroLabels.get(z))
+    let place = emitter.at(inst.a) run getI32(&mut emitter.a, Reg.R9, place)
+    run emitter.operate(Alu.Or, Reg.R9, inst.b)
+    run emitter.a.jcc(Cond.Sign, emitter.exitLabels.get(u32.toUsize(inst.exit)))
+    run emitter.a.jmp(emitter.zeroBacks.get(z))
+    z = z + 1
   }
   let mut o: usize = 0
   while o < emitter.outs.length() {
@@ -839,20 +871,20 @@ impl Emitter {
     }
     if op == Op.Mul {
       let place5 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place5)
-      let place6 = self.at(inst.b) run getI32(&mut self.a, Reg.R8, place6)
       run self.stressGuard(inst.exit)
-      // -0: a zero product with a negative operand, which (a | b) < 0 detects.
-      run self.a.mov(Width.W32, Reg.R9, Reg.Rax)
-      run self.a.alu(Alu.Or, Width.W32, Reg.R9, Reg.R8)
-      run self.a.imul(Width.W32, Reg.Rax, Reg.R8)
+      let place6 = self.at(inst.b)
+      if place6.kind == GPR { run self.a.imul(Width.W32, Reg.Rax, place6.gpr) } else { run self.a.imulLoad(Width.W32, Reg.Rax, place6.mem) }
       run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
-      let fine = run self.a.label()
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.NotEqual, fine)
-      run self.a.test(Width.W32, Reg.R9, Reg.R9)
-      run self.a.jcc(Cond.Sign, self.exitLabels.get(u32.toUsize(inst.exit)))
-      self.a.bind(fine)
-      run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
+      if !(nonNegative(&function, inst.a) && nonNegative(&function, inst.b)) {
+        // A zero product is -0 when an operand is negative: that test is out of line
+        // (zeroInsts), where both operands are still in their places.
+        let zero = run self.a.label()
+        let back = run self.a.label()
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.Equal, zero)
+        self.a.bind(back)
+        run self.zeroLabels.append(zero) run self.zeroBacks.append(back) run self.zeroInsts.append(inst)
+      }
       let place103 = self.at(inst.result) run putI32(&mut self.a, place103, Reg.Rax)
       return ()
     }
@@ -1492,8 +1524,11 @@ impl Emitter {
           run self.a.jmp(slow)
           self.a.bind(oldPlain)
           run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
-          run self.heapTest(Reg.Rax, newPlain)
-          run self.a.jmp(slow)
+          // An immediate (a boxed number, undefined, a boolean) is never on the heap.
+          if function.value(inst.b).own != Own.Imm {
+            run self.heapTest(Reg.Rax, newPlain)
+            run self.a.jmp(slow)
+          }
           self.a.bind(newPlain)
           run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
           run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
