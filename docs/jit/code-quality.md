@@ -187,16 +187,19 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   immediate, or from its slot, so the three integer registers of code on a baseline frame
   go to values.
 
-- **Two more registers on a baseline frame.** Code on a baseline frame had three integer
-  registers (rbx, r14, r15). rsi and rdi join them as fragile registers (`Pool.fragile`):
-  only a value whose interval holds nothing but gentle instructions (integer arithmetic,
-  compares, constants, boxes and unboxes of numbers, jumps and branches, none of which
-  touch rsi or rdi or call out) takes one. The temporaries of a loop's arithmetic go there,
-  the callee-saved three to the values that live across element accesses and polls. On
-  Crypto's `am3` loop: 164 instructions an iteration where there were 168 (Crypto in all:
-  3.47G instructions at scale 4, from 3.57G). Keeping rsi and
-  rdi over the slow paths of element accesses and polls (so longer values could take them
-  too) measured worse, 167, and is not done.
+- **Seven integer registers on a baseline frame.** Code on a baseline frame had three
+  (rbx, r14, r15). rsi, rdi, rdx and r10 join them as fragile registers (`Pool.fragile`):
+  only a value whose interval holds nothing but instructions that keep them
+  (`x64_regalloc.keepsFragile`) takes one. Those are the gentle ones (integer arithmetic,
+  compares, constants, boxes and unboxes of numbers, jumps and branches), which never touch
+  them; a `check.array` and a trusted element read, which leave instead of calling; and a
+  trusted element store and a poll, whose slow paths keep the four registers in the scratch
+  slots over their call (`keepFragile`). rax, rcx (an exit's reason), r8, r9 and r11 stay
+  the lowering's own: a variable shift keeps rcx in r11, and a trusted store's heap test
+  takes r8. The exit dump holds the seven (`jit_exit_state.DUMP_INTEGERS`). Crypto's `am3`
+  then carries its counters in registers: at scale 20 the optimizer takes about 745 ms
+  where it took 850, though the instruction count hardly moves (moves between registers
+  cost next to nothing, a value's trip through a frame slot does).
 
 - **`mul.i32` tests for -0 out of line.** The product is taken from the second operand's
   register or slot (`imul eax, [slot]`); a zero product jumps to a piece after the blocks

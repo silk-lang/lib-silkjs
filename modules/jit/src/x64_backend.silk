@@ -405,7 +405,9 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   // own CompiledFrame, built where a helper needs one (ownFrame), takes the inputs' place,
   // the realm's word follows the inlined callees' frames, and all of it is below the
   // baseline frame, which the shared prologue fills.
-  let inputs = (values + 1) * SLOT_BYTES
+  // Two scratch slots: the edge moves' one, and room to keep the four fragile registers
+  // over a slow path's call (keepFragile).
+  let inputs = (values + 2) * SLOT_BYTES
   let inlined = usize.toU32(function.inlineTargets.length())
   let mut own = INPUT_COUNT * 8
   if on { own = INLINE_FRAME_WORDS * 8 }
@@ -833,6 +835,8 @@ impl Emitter {
       return ()
     }
     if op == Op.BoxI32 || op == Op.BoxBool {
+      // The trusted store right after it boxes into the element itself (storedBox).
+      if self.storedBox(&function, self.cursor) { return () }
       let place1 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place1)
       run self.boxInto(op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
       return ()
@@ -844,12 +848,27 @@ impl Emitter {
       // In place when the result takes the first operand's register and the second operand
       // is elsewhere: the exit reads the operand, so an overflow undoes the operation first.
       let into = self.at(inst.result)
-      if into.kind == GPR && self.key(inst.a) == self.key(inst.result) && (self.constants.get(u32.toUsize(inst.b)).isSome() || self.key(inst.b) != self.key(inst.result)) {
-        run self.operate(alu, into.gpr, inst.b)
+      let constantB = self.constants.get(u32.toUsize(inst.b)).isSome()
+      // An add whose result takes the second operand's register runs there the same way,
+      // with its operands the other way round.
+      let mut turned = inst
+      if op == Op.Add && into.kind == GPR && !constantB && self.key(inst.b) == self.key(inst.result) && self.key(inst.a) != self.key(inst.result)
+        && self.constants.get(u32.toUsize(inst.a)).isNone() { turned.a = inst.b turned.b = inst.a }
+      let turnedConstant = self.constants.get(u32.toUsize(turned.b)).isSome()
+      if into.kind == GPR && self.key(turned.a) == self.key(turned.result) && (turnedConstant || self.key(turned.b) != self.key(turned.result)) {
+        run self.operate(alu, into.gpr, turned.b)
         let undo = run self.a.label()
         run self.a.jcc(Cond.Overflow, undo)
         run self.undoLabels.append(undo)
-        run self.undoInsts.append(inst)
+        run self.undoInsts.append(turned)
+        return ()
+      }
+      if into.kind == GPR && (turnedConstant || self.key(turned.b) != self.key(turned.result)) {
+        // The result's register holds neither operand: the operation runs there, and an
+        // overflow leaves with both operands where they were.
+        let place3 = self.at(turned.a) run getI32(&mut self.a, into.gpr, place3)
+        run self.operate(alu, into.gpr, turned.b)
+        run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
         return ()
       }
       let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
@@ -870,22 +889,26 @@ impl Emitter {
       return ()
     }
     if op == Op.Mul {
-      let place5 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place5)
+      // In the result's register when that holds neither operand (the exits read both).
+      let out = self.at(inst.result)
+      let mut work = Reg.Rax
+      if out.kind == GPR && self.key(inst.a) != self.key(inst.result) && self.key(inst.b) != self.key(inst.result) { work = out.gpr }
+      let place5 = self.at(inst.a) run getI32(&mut self.a, work, place5)
       run self.stressGuard(inst.exit)
       let place6 = self.at(inst.b)
-      if place6.kind == GPR { run self.a.imul(Width.W32, Reg.Rax, place6.gpr) } else { run self.a.imulLoad(Width.W32, Reg.Rax, place6.mem) }
+      if place6.kind == GPR { run self.a.imul(Width.W32, work, place6.gpr) } else { run self.a.imulLoad(Width.W32, work, place6.mem) }
       run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
       if !(nonNegative(&function, inst.a) && nonNegative(&function, inst.b)) {
         // A zero product is -0 when an operand is negative: that test is out of line
         // (zeroInsts), where both operands are still in their places.
         let zero = run self.a.label()
         let back = run self.a.label()
-        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.test(Width.W32, work, work)
         run self.a.jcc(Cond.Equal, zero)
         self.a.bind(back)
         run self.zeroLabels.append(zero) run self.zeroBacks.append(back) run self.zeroInsts.append(inst)
       }
-      let place103 = self.at(inst.result) run putI32(&mut self.a, place103, Reg.Rax)
+      run putI32(&mut self.a, out, work)
       return ()
     }
     if op == Op.Cmp {
@@ -1463,6 +1486,8 @@ impl Emitter {
         self.a.bind(done)
         return ()
       }
+      // A trusted store whose value is the box right before it, made here (storedBox).
+      let fused = op == Op.PutElem && self.cursor > 0 && self.storedBox(&function, self.cursor - 1)
       if op == Op.GetElem || op == Op.PutElem {
         let slow = run self.a.label()
         let typed = run self.a.label()
@@ -1520,19 +1545,31 @@ impl Emitter {
           let oldPlain = run self.a.label()
           let newPlain = run self.a.label()
           run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-          run self.heapTest(Reg.Rax, oldPlain)
+          // r8, not r10: values live in r10 through a trusted store (keepsFragile).
+          run self.heapTestWith(Reg.Rax, Reg.R8, oldPlain)
           run self.a.jmp(slow)
           self.a.bind(oldPlain)
-          run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
-          // An immediate (a boxed number, undefined, a boolean) is never on the heap.
-          if function.value(inst.b).own != Own.Imm {
-            run self.heapTest(Reg.Rax, newPlain)
-            run self.a.jmp(slow)
+          if fused {
+            // The box of the number before it, written into the element.
+            let box = function.inst(self.cursor - 1)
+            let layout = self.settings.layout
+            let mut tag = layout.int()
+            if box.op == Op.BoxBool { tag = layout.boolean() }
+            run self.a.storeImm(Width.W64, Mem.at(Reg.R11, 0), u64.wrappingToI32(layout.tagWord(tag)))
+            let number = self.at(box.a) run getI32(&mut self.a, Reg.Rax, number)
+            run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.Rax)
+          } else {
+            run self.a.load(Width.W64, Reg.Rax, slotOf(inst.b))
+            // An immediate (a boxed number, undefined, a boolean) is never on the heap.
+            if function.value(inst.b).own != Own.Imm {
+              run self.heapTestWith(Reg.Rax, Reg.R8, newPlain)
+              run self.a.jmp(slow)
+            }
+            self.a.bind(newPlain)
+            run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
+            run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
+            run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
           }
-          self.a.bind(newPlain)
-          run self.a.load(Width.W64, Reg.R9, payloadOf(inst.b))
-          run self.a.store(Width.W64, Mem.at(Reg.R11, 0), Reg.Rax)
-          run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
         }
         run self.a.jmp(done)
         self.a.bind(typed)
@@ -1541,6 +1578,27 @@ impl Emitter {
       }
       // get_elem(env, object, index, out) / put_elem(env, object, index, value) /
       // get_length(env, object, out) -> 1 when done.
+      if fused {
+        // The helper takes the value from its slot.
+        let box = function.inst(self.cursor - 1)
+        let number = self.at(box.a) run getI32(&mut self.a, Reg.Rax, number)
+        run self.boxInto(box.op == Op.BoxBool, Reg.Rax, Reg.Rsp, inst.b * SLOT_BYTES)
+      }
+      if op == Op.PutElem && inst.trusted {
+        // Values in the fragile registers live through a trusted store (x64_regalloc
+        // keepsFragile): kept over the call, and the index read before rsi is written.
+        run self.keepFragile()
+        let index = self.at(i32.wrappingToU32(inst.k)) run getI32(&mut self.a, Reg.Rdx, index)
+        run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
+        run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.b))
+        run self.callHelper(helpers.PUT_ELEM)
+        run self.restoreFragile()
+        // In the count, on a fast Array, the helper stores; a refusal leaves all the same.
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+        self.a.bind(done)
+        return ()
+      }
       run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
       if op == Op.GetElem {
         let index = self.at(inst.b) run getI32(&mut self.a, Reg.Rdx, index)
@@ -2210,6 +2268,17 @@ impl Emitter {
   }
   /// Whether `read` (a get.elem) is followed in its block by the unbox of its result, the
   /// only reader of that result but for the unbox's own exit.
+  /// Whether instruction `at` is a box.i32 or box.bool whose one reader is the trusted
+  /// put.elem right after it, as its value: the store writes the tag and the number into
+  /// the element, and boxes into the value's slot only on the way to its helper.
+  fn storedBox(self: &Self, function: &Function, at: u32) -> bool {
+    let box = function.inst(at)
+    if (box.op != Op.BoxI32 && box.op != Op.BoxBool) || box.result == NONE { return false }
+    let block = function.blocks.get(u32.toUsize(box.block))
+    if at + 1 >= block.firstInst + block.instCount { return false }
+    let store = function.inst(at + 1)
+    return store.op == Op.PutElem && store.trusted && store.b == box.result && self.uses.get(u32.toUsize(box.result)) == 1
+  }
   fn fusedUnbox(self: &Self, function: &Function, read: Inst) -> bool {
     let block = function.blocks.get(u32.toUsize(read.block))
     if self.cursor + 1 >= block.firstInst + block.instCount { return false }
@@ -2651,24 +2720,29 @@ impl Emitter {
   /// or a count of its own (JavaScript takes it modulo 32).
   effect fn withImmediate(self: &mut Self, inst: Inst, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
     let op = inst.op
-    let place = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place)
-    if op == Op.BitAnd { run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, value) }
-    else if op == Op.BitOr { run self.a.aluImm(Alu.Or, Width.W32, Reg.Rax, value) }
-    else if op == Op.BitXor { run self.a.aluImm(Alu.Xor, Width.W32, Reg.Rax, value) }
+    // In the result's register when it has one: the operand there, if any, dies here, and
+    // the one exit (`>>> 0`) changes nothing before it leaves.
+    let out = self.at(inst.result)
+    let mut work = Reg.Rax
+    if out.kind == GPR { work = out.gpr }
+    let place = self.at(inst.a) run getI32(&mut self.a, work, place)
+    if op == Op.BitAnd { run self.a.aluImm(Alu.And, Width.W32, work, value) }
+    else if op == Op.BitOr { run self.a.aluImm(Alu.Or, Width.W32, work, value) }
+    else if op == Op.BitXor { run self.a.aluImm(Alu.Xor, Width.W32, work, value) }
     else {
       let count = i32.wrappingToU8(value & 31)
       let mut shift = Shift.Shl
       if op == Op.Sar { shift = Shift.Sar } else if op == Op.Shr { shift = Shift.Shr }
-      if count != 0 { run self.a.shiftImm(shift, Width.W32, Reg.Rax, count) }
+      if count != 0 { run self.a.shiftImm(shift, Width.W32, work, count) }
       else if op == Op.Shr {
         // `x >>> 0` of a negative x is past the int32 maximum: a double in the interpreter.
         // A nonzero count leaves the sign bit clear.
         run self.stressGuard(inst.exit)
-        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.test(Width.W32, work, work)
         run self.a.jcc(Cond.Sign, self.exitLabels.get(u32.toUsize(inst.exit)))
       }
     }
-    let out = self.at(inst.result) run putI32(&mut self.a, out, Reg.Rax)
+    run putI32(&mut self.a, out, work)
   }
   effect fn operate(self: &mut Self, alu: Alu, dst: Reg, b: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     match self.constants.get(u32.toUsize(b)) {
@@ -3427,6 +3501,10 @@ impl Emitter {
   /// Jumps to notHeap unless the ValueBits whose first word is in tagWord is a heap
   /// reference. Clobbers R10.
   pub effect fn heapTest(self: &mut Self, tagWord: Reg, notHeap: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.heapTestWith(tagWord, Reg.R10, notHeap)
+  }
+  /// heapTest with `scratch` for the layouts that need a register (it clobbers that).
+  pub effect fn heapTestWith(self: &mut Self, tagWord: Reg, scratch: Reg, notHeap: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     if layout.tagOffset == 0 && layout.tagWidth == 1 && layout.heapLowest == 0 {
       // The heap variants' tags start at 0: one byte compare tells.
@@ -3434,12 +3512,12 @@ impl Emitter {
       run self.a.jcc(Cond.Above, notHeap)
       return ()
     }
-    run self.a.mov(Width.W64, Reg.R10, tagWord)
-    if layout.tagOffset != 0 { run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, u32.wrappingToU8(layout.tagOffset * 8)) }
-    if layout.tagWidth == 1 { run self.a.aluImm(Alu.And, Width.W32, Reg.R10, 255) }
-    else if layout.tagWidth == 2 { run self.a.aluImm(Alu.And, Width.W32, Reg.R10, 65535) }
-    run self.a.aluImm(Alu.Sub, Width.W32, Reg.R10, u32.wrappingToI32(layout.heapLowest))
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, u32.wrappingToI32(layout.heapHighest - layout.heapLowest))
+    run self.a.mov(Width.W64, scratch, tagWord)
+    if layout.tagOffset != 0 { run self.a.shiftImm(Shift.Shr, Width.W64, scratch, u32.wrappingToU8(layout.tagOffset * 8)) }
+    if layout.tagWidth == 1 { run self.a.aluImm(Alu.And, Width.W32, scratch, 255) }
+    else if layout.tagWidth == 2 { run self.a.aluImm(Alu.And, Width.W32, scratch, 65535) }
+    run self.a.aluImm(Alu.Sub, Width.W32, scratch, u32.wrappingToI32(layout.heapLowest))
+    run self.a.aluImm(Alu.Cmp, Width.W32, scratch, u32.wrappingToI32(layout.heapHighest - layout.heapLowest))
     run self.a.jcc(Cond.Above, notHeap)
   }
   /// The frame slot of ABI input k.
@@ -4028,6 +4106,7 @@ impl Emitter {
       let poll = self.polls.get(i)
       self.a.bind(poll.slow)
       run self.a.storeImm(Width.W32, Mem.at(Reg.Rax, signed(p.f.interruptCounter)), signed(p.f.interruptPeriod))
+      run self.keepFragile()
       let state = function.exit(poll.exit)
       if state.frames != 0 {
         // A loop of an inlined body: the poll runs on the body's record, as a call the body
@@ -4046,6 +4125,7 @@ impl Emitter {
         run self.a.movImm32(Reg.R9, 0)
         run self.engineCall()
       }
+      run self.restoreFragile()
       // Nonzero: it threw. Then the interpreter takes the frame when the poll turned
       // instruction observation on.
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
@@ -4057,6 +4137,31 @@ impl Emitter {
       run self.a.jcc(Cond.NotEqual, self.exitWith.get(u32.toUsize(poll.exit)))
       run self.a.jmp(poll.back)
       i = i + 1
+    }
+  }
+  /// Before a call a trusted element store or a poll makes on its slow path (x64_regalloc
+  /// keepsFragile): the fragile pool registers the code uses (rsi, rdi, rdx, r10) go to the
+  /// scratch slots, which only the moves at a block's end use otherwise. After it: back.
+  effect fn keepFragile(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = self.scratch
+    let mut r: usize = 0
+    while r < gprCount() {
+      if u32.bitAnd(u32.shiftRight(self.places.pool.fragile, usize.toU32(r)), 1) != 0 && self.saves(r) {
+        run self.a.store(Width.W64, Mem.at(Reg.Rsp, at), self.places.pool.registers[r])
+        at = at + 8
+      }
+      r = r + 1
+    }
+  }
+  effect fn restoreFragile(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = self.scratch
+    let mut r: usize = 0
+    while r < gprCount() {
+      if u32.bitAnd(u32.shiftRight(self.places.pool.fragile, usize.toU32(r)), 1) != 0 && self.saves(r) {
+        run self.a.load(Width.W64, self.places.pool.registers[r], Mem.at(Reg.Rsp, at))
+        at = at + 8
+      }
+      r = r + 1
     }
   }
   /// The engine's service on this frame (baseline.engineCall): request in ecx, r8 and r9.
