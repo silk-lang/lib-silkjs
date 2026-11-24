@@ -52,6 +52,8 @@ pub struct Settings {
   pub layout: ValueLayout,
   pub frame: BaselineLayout,
   pub fields: FieldLayout,
+  /// Byte offset of BytecodeClosure.homeObject from a closure ObjectData cell header, or u32.MAX.
+  pub closureHome: u32,
   /// The code counts its direct calls in the environment (--jit-stats).
   pub count: bool,
   /// The shared prologue counts each function's entries down (FunctionBytecode.hotness, from
@@ -78,7 +80,7 @@ pub fn probe(count: bool, tier: bool) -> Option<Settings> {
   // would be (js_baseline.FRAME_STOP).
   let record = (frame.frameBytes + 15) / 16 * 16
   if frame.state + 16 < record || frame.state + 8 > record { return Option<Settings>.none() }
-  return Option<Settings>.some(Settings { layout: layout, frame: frame, fields: objects.fieldLayout(), count: count, tier: tier })
+  return Option<Settings>.some(Settings { layout: layout, frame: frame, fields: objects.fieldLayout(), closureHome: env.closureHomeOffset(), count: count, tier: tier })
 }
 
 /// What compile made of a function.
@@ -219,26 +221,18 @@ pub const STUB_CONSTRUCT: u32 = 33
 /// define_field: the value in the cell under r14 moves into the cached own slot of the
 /// plain object in the cell under that; declines on miss.
 pub const STUB_DEFINE_FIELD: u32 = 34
-/// get_var, get_var_ref and get_var_ref_check into r14's cell; eax is the variable index.
-/// STUB_GET_VAR_KNOWN is a known local function's. Declines an uninitialized binding.
-pub const STUB_GET_VAR: u32 = 35
-pub const STUB_GET_VAR_KNOWN: u32 = 36
 /// SERVICE_QUICK of the instruction at eax, with r14 the cell above its operands. Returns
 /// the service's answer in eax (0 when the engine did it; zero flag is clear when nonzero).
-pub const STUB_QUICK: u32 = 37
-/// get_length (STUB_LENGTH_TOP, consuming r14's cell) and get_loc_length8 / get_arg_length8
-/// (STUB_LENGTH_CELL, reading the cell at rdx into r14's). Declines what needs user code.
-pub const STUB_LENGTH_TOP: u32 = 38
-pub const STUB_LENGTH_CELL: u32 = 39
+pub const STUB_QUICK: u32 = 35
 /// `new` for baseline code: runs STUB_CONSTRUCT on the function at r14, new.target after it
 /// and edx arguments, then (when it did not throw) drops all edx + 2 cells and writes the
 /// result into r14's cell. Zero flag is clear when it threw.
-pub const STUB_CONSTRUCT_OWN: u32 = 40
+pub const STUB_CONSTRUCT_OWN: u32 = 36
 /// A field store of cells (put_loc_field_loc8 / put_loc_field_arg8) that a function setter
 /// takes: target cell at rdx, source cell at rcx, r14 at three free operand cells, eax the
 /// instruction's offset. Ends as STUB_CALL does.
-pub const STUB_SETTER_CELLS: u32 = 41
-pub const STUB_COUNT: u32 = 42
+pub const STUB_SETTER_CELLS: u32 = 37
+pub const STUB_COUNT: u32 = 38
 
 // ---- Bytecode steps -------------------------------------------------------------------
 
@@ -450,7 +444,7 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   if opcode == op.OP_rest { if size != 3 { return departs(size) } return plain(3, 0, 1) }
   if opcode == op.OP_special_object && size == 2 {
     let kind = bytes[pc + 1]
-    if kind == engine.LAZY_ARGUMENTS || kind == 2 || kind == 3 { return plain(2, 0, 1) }
+    if kind == engine.LAZY_ARGUMENTS || kind == 2 || kind == 3 || kind == 4 { return plain(2, 0, 1) }
   }
   if opcode == op.OP_array_from && size == 3 {
     let argc = u32.wrappingToI32(u16At(bytes, pc + 1))
@@ -510,6 +504,7 @@ struct Plan {
   layout: ValueLayout,
   f: BaselineLayout,
   fields: FieldLayout,
+  closureHome: u32,
   /// The BaselineFrame record and the first cell (the argument area), from rbp; the bytes
   /// of the frame below rbp.
   record: i32,
@@ -552,7 +547,7 @@ pub fn extent(frame: &BaselineLayout, shape: &Shape) -> Extent {
 impl Plan {
   fn of(settings: &Settings, shape: &Shape) -> Plan {
     let at = extent(&settings.frame, &shape)
-    return Plan { layout: settings.layout, f: settings.frame, fields: settings.fields,
+    return Plan { layout: settings.layout, f: settings.frame, fields: settings.fields, closureHome: settings.closureHome,
       record: at.record, cells: at.cells, below: at.below,
       arguments: shape.arguments, locals: shape.locals, stack: shape.stack,
       constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants, count: settings.count, tier: settings.tier, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - at.below, lazy: false, strict: (shape.mode & 1) != 0 }
@@ -605,6 +600,7 @@ const S_BACK_EDGE: u8 = 5
 /// After a call stub that did not finish (callAt): the call threw, or other.
 const S_CALLED: u8 = 6
 const S_VARIABLE: u8 = 8
+const S_ATTACHED: u8 = 9
 /// S_HELPER whose second cell is an argument (b its offset in the argument area).
 const S_HELPER_ARGUMENT: u8 = 10
 /// arithmetic(a, b, opcode k): the result is in a at back; other when the helper declines.
@@ -621,6 +617,7 @@ const S_RELEASE_AT: u8 = 15
 /// SERVICE_QUICK for the instruction at pc with a the cell above its operands: back when
 /// the engine did it, other when it declined.
 const S_QUICK: u8 = 16
+const S_LENGTH: u8 = 18
 const S_TRUNCATE: u8 = 19
 /// A field read that a getter answers: the getter of the field at pc of the object in cell a
 /// (an argument's offset when flag) is called on it, with the object in the frame cell c
@@ -640,6 +637,8 @@ const S_QUICK_THROW: u8 = 25
 /// target local at a, source at b (an argument offset when flag), three free operand cells
 /// starting at c; result dropped at back, other when no function setter takes the store.
 const S_SETTER_CELLS: u8 = 26
+/// add_imm of a Float64 or overflowing Int in cell a with signed immediate b; notes pc.
+const S_ADD_IMM: u8 = 27
 /// S_HELPER.b when the helper takes no second cell.
 const NO_CELL: i32 = 1
 /// Code kept out of the straight path: a last release, a cache miss, a poll, a generic call.
@@ -1506,6 +1505,15 @@ impl Emitter {
       run self.helper(env.ARITHMETIC)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       if opcode != op.OP_add {
+        if opcode == op.OP_mod && p.tier {
+          let declined = run self.a.label()
+          run self.a.jcc(Cond.Equal, declined)
+          run self.a.jmp(item.back)
+          self.a.bind(declined)
+          run self.noteSite(u32.toUsize(item.pc), false)
+          run self.a.jmp(item.other)
+          return ()
+        }
         run self.a.jcc(Cond.Equal, item.other)
         if p.tier {
           run self.tagIs(word(item.c), p.float(), item.back)
@@ -1615,11 +1623,53 @@ impl Emitter {
       run self.a.jmp(item.back)
       return ()
     }
+    if item.kind == S_ATTACHED {
+      // The variable cell in rax lives in a frame: r11 = its local's cell (an argument is
+      // the engine's, at other).
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rax, signed(f.refFrame)))
+      run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.Rax, signed(f.refSlot)))
+      run self.a.mov(Width.W64, Reg.R10, Reg.R9)
+      run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, 48)
+      run self.a.testImm(Width.W32, Reg.R10, 1)
+      run self.a.jcc(Cond.NotEqual, item.other)
+      run self.a.mov(Width.W32, Reg.R9, Reg.R9)
+      run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, signed(f.localsData)))
+      run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
+      run self.a.jmp(item.back)
+      return ()
+    }
+    if item.kind == S_LENGTH {
+      // The length of the value in cell b (an argument's offset when flag) into cell a;
+      // other: the helper declines. A flat string's is read here, and the string dropped
+      // when the length takes its cell; a rope's and an object's are the helper's.
+      let rope = run self.a.label()
+      let mut source = framed(item.b)
+      if item.flag { run self.argumentBase() source = Cell { base: Reg.Rcx, at: item.b } }
+      run self.a.cmp8MemImm(source.word(), i32.wrappingToU8(p.tag(-7)))
+      run self.a.jcc(Cond.NotEqual, rope)
+      run self.a.load(Width.W64, Reg.R11, source.payload())
+      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.stringLength)))
+      run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 0x7fffffff)
+      if !item.flag && item.a == item.b { run self.releaseCell(item.a) }
+      run self.boxed(item.a, p.int(), Reg.Rax)
+      run self.a.jmp(item.back)
+      self.a.bind(rope)
+      if item.flag { run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rcx, item.b)) }
+      else { run self.a.lea(Width.W64, Reg.Rsi, word(item.b)) }
+      run self.a.lea(Width.W64, Reg.Rdx, word(item.a))
+      run self.helper(env.LENGTH)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, item.other)
+      run self.a.jmp(item.back)
+      return ()
+    }
     if item.kind == S_TRUNCATE {
       // The Float64 in cell a becomes the Int it truncates to (ToInt32 of a double in the
       // Int range), in eax too; other: any other value, or a double out of range
       // (cvttsd2si's 0x80000000, which -2^31 itself gives as well).
       run self.tagIs(word(item.a), p.float(), item.other)
+      if p.tier { run self.noteSite(u32.toUsize(item.pc), false) }
       run self.a.loadDouble(Xmm.Xmm0, payload(item.a))
       run self.a.doubleToInt(Width.W32, Reg.Rax, Xmm.Xmm0)
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, -0x80000000)
@@ -1658,6 +1708,27 @@ impl Emitter {
       if item.flag { differs = 1 }
       run self.a.storeImm(Width.W64, payload(item.a), differs)
       run self.a.jmp(item.back)
+      return ()
+    }
+    if item.kind == S_ADD_IMM {
+      // add_imm of a Float64 or overflowing Int in cell a with signed immediate b.
+      let intOverflow = run self.a.label()
+      let compute = run self.a.label()
+      run self.tagIs(word(item.a), p.float(), intOverflow)
+      run self.a.loadDouble(Xmm.Xmm0, payload(item.a))
+      self.a.bind(compute)
+      run self.a.movImm32(Reg.Rax, i32.wrappingToU32(item.b))
+      run self.a.intToDouble(Width.W32, Xmm.Xmm1, Reg.Rax)
+      run self.a.scalar(ScalarOp.Add, Xmm.Xmm0, Xmm.Xmm1)
+      run self.a.storeImm(Width.W64, word(item.a), p.float())
+      run self.a.storeDouble(payload(item.a), Xmm.Xmm0)
+      if p.tier { run self.noteSite(u32.toUsize(item.pc), false) }
+      run self.a.jmp(item.back)
+      self.a.bind(intOverflow)
+      run self.tagIs(word(item.a), p.int(), item.other)
+      run self.a.load(Width.W32, Reg.Rax, payload(item.a))
+      run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax)
+      run self.a.jmp(compute)
       return ()
     }
   }
@@ -2607,68 +2678,6 @@ impl Emitter {
       run self.unlink()
       return ()
     }
-    if index == STUB_GET_VAR || index == STUB_GET_VAR_KNOWN {
-      let known = index == STUB_GET_VAR_KNOWN
-      let miss = run self.a.label()
-      let found = run self.a.label()
-      let attached = run self.a.label()
-      let unset = run self.a.label()
-      // Keep index in ecx in case the fast path falls back to env.GET_VAR.
-      run self.a.mov(Width.W32, Reg.Rcx, Reg.Rax)
-      if f.refTag != u32.MAX {
-        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 4096)
-        run self.a.jcc(Cond.Above, miss)
-        run self.a.load(Width.W64, Reg.R8, p.sf(f.currentFunction + 8))
-        if known { run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.knownRefs))) }
-        else { run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.closureVarRefs))) }
-        run self.a.load(Width.W64, Reg.R8, Mem.indexed(Reg.R8, Reg.Rax, Scale.Eight, signed(f.boxHeader)))
-        run self.a.test(Width.W64, Reg.R8, Reg.R8)
-        run self.a.jcc(Cond.Equal, miss)
-        run self.a.loadZero8(Reg.R10, Mem.at(Reg.R8, signed(f.refTag)))
-        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, signed(f.refDetached))
-        run self.a.jcc(Cond.NotEqual, attached)
-        run self.a.lea(Width.W64, Reg.R11, Mem.at(Reg.R8, signed(f.refValue)))
-        self.a.bind(found)
-        // A binding still in its dead zone throws: the interpreter's.
-        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-        run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
-        run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.tag(4)))
-        run self.a.jcc(Cond.Equal, unset)
-        run self.a.store(Width.W64, next.word(), Reg.Rax)
-        run self.a.store(Width.W64, next.payload(), Reg.Rdx)
-        run self.retain(Reg.Rax, Reg.Rdx)
-        run self.stubDone()
-        self.a.bind(attached)
-        // The variable cell in r8 lives in a frame: r11 = its local's cell (an argument is
-        // the engine's, at miss).
-        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R8, signed(f.refFrame)))
-        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, signed(f.refSlot)))
-        run self.a.mov(Width.W64, Reg.R10, Reg.R9)
-        run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, 48)
-        run self.a.testImm(Width.W32, Reg.R10, 1)
-        run self.a.jcc(Cond.NotEqual, miss)
-        run self.a.mov(Width.W32, Reg.R9, Reg.R9)
-        run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
-        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, signed(f.localsData)))
-        run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
-        run self.a.jmp(found)
-        self.a.bind(unset)
-        run self.stubDeclined()
-      } else {
-        self.a.bind(found)
-        self.a.bind(attached)
-        self.a.bind(unset)
-      }
-      self.a.bind(miss)
-      // get_var(env, function, index [| KNOWN_VARIABLE], out) -> 0: the interpreter runs it.
-      run self.a.load(Width.W64, Reg.Rsi, p.sf(f.currentFunction + 8))
-      run self.a.mov(Width.W32, Reg.Rdx, Reg.Rcx)
-      if known { run self.a.aluImm(Alu.Or, Width.W32, Reg.Rdx, u32.wrappingToI32(engine.KNOWN_VARIABLE)) }
-      run self.a.mov(Width.W64, Reg.Rcx, Reg.R14)
-      run self.helper(env.GET_VAR)
-      run self.stubAnswered()
-      return ()
-    }
     if index == STUB_QUICK {
       run self.a.mov(Width.W32, Reg.Rcx, Reg.Rax)
       run self.a.shiftImm(Shift.Shl, Width.W32, Reg.Rcx, 8)
@@ -2678,43 +2687,6 @@ impl Emitter {
       run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
       run self.engineCall()
       run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
-      run self.stubAnswered()
-      return ()
-    }
-    if index == STUB_LENGTH_TOP || index == STUB_LENGTH_CELL {
-      let consumed = index == STUB_LENGTH_TOP
-      let mut source = next
-      if !consumed { source = Cell { base: Reg.Rdx, at: 0 } }
-      let notObject = run self.a.label()
-      let general = run self.a.label()
-      // An Array's length is its first own property, a plain number.
-      run self.tagIs(source.word(), p.object(), notObject)
-      run self.a.load(Width.W64, Reg.Rsi, source.payload())
-      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
-      run self.a.jcc(Cond.NotEqual, general)
-      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-      run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.R11, 8))
-      run self.a.store(Width.W64, next.word(), Reg.Rax)
-      run self.a.store(Width.W64, next.payload(), Reg.Rcx)
-      if consumed { run self.releaseObject(Reg.Rsi) }
-      run self.stubDone()
-      // A flat string's length is in its header; ropes and other objects go to env.LENGTH.
-      self.a.bind(notObject)
-      run self.a.cmp8MemImm(source.word(), i32.wrappingToU8(p.tag(-7)))
-      run self.a.jcc(Cond.NotEqual, general)
-      run self.a.load(Width.W64, Reg.R11, source.payload())
-      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.stringLength)))
-      run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 0x7fffffff)
-      if consumed { run self.releaseAt(next) }
-      run self.a.storeImm(Width.W64, next.word(), p.int())
-      run self.a.store(Width.W64, next.payload(), Reg.Rax)
-      run self.stubDone()
-      self.a.bind(general)
-      if consumed { run self.a.mov(Width.W64, Reg.Rsi, Reg.R14) }
-      else { run self.a.mov(Width.W64, Reg.Rsi, Reg.Rdx) }
-      run self.a.mov(Width.W64, Reg.Rdx, Reg.R14)
-      run self.helper(env.LENGTH)
       run self.stubAnswered()
       return ()
     }
@@ -3399,6 +3371,20 @@ impl Emitter {
         self.a.bind(done)
         return true
       }
+      if !p.known && kind == 4 && p.closureHome != u32.MAX {
+        // Home object of a method/constructor closure (or undefined if none), retained.
+        let done = run self.a.label()
+        run self.a.storeImm(Width.W64, word(next), p.undefined())
+        run self.a.load(Width.W64, Reg.Rdx, p.sf(f.currentFunction + 8))
+        run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rdx, signed(p.closureHome)))
+        run self.a.test(Width.W64, Reg.Rdx, Reg.Rdx)
+        run self.a.jcc(Cond.Equal, done)
+        run self.a.storeImm(Width.W64, word(next), p.object())
+        run self.a.store(Width.W64, payload(next), Reg.Rdx)
+        run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+        self.a.bind(done)
+        return true
+      }
       return false
     }
     if opcode == op.OP_define_field {
@@ -3433,11 +3419,22 @@ impl Emitter {
       return true
     }
     if opcode == op.OP_get_length {
-      // An Array's length, a flat string's, or the helper's (STUB_LENGTH_TOP).
+      // An Array's length is its first own property, a plain number (js_vm_property_ops
+      // lengthOperand); a string's and another object's out of line (S_LENGTH).
       let other = run self.bail(pc, depth, step)
-      run self.a.lea(Width.W64, Reg.R14, word(top))
-      run self.a.callSymbol(STUB_LENGTH_TOP)
-      run self.a.jcc(Cond.Equal, other)
+      let done = run self.a.label()
+      let text = run self.slow(S_LENGTH, done, other, top, top, 0, pc, depth, Reg.Rax, false)
+      run self.tagIs(word(top), p.object(), text)
+      run self.a.load(Width.W64, Reg.Rsi, payload(top))
+      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
+      run self.a.jcc(Cond.NotEqual, text)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
+      run self.a.store(Width.W64, word(top), Reg.Rax)
+      run self.a.store(Width.W64, payload(top), Reg.Rdx)
+      run self.releaseObject(Reg.Rsi)
+      self.a.bind(done)
       return true
     }
     if opcode == op.OP_push_atom_value || opcode == op.OP_push_empty_string {
@@ -3632,14 +3629,36 @@ impl Emitter {
       return true
     }
     if opcode == op.OP_get_var || opcode == op.OP_get_var_ref || opcode == op.OP_get_var_ref_check {
-      // The closure's variable cell: one that owns its value, or one still in its frame.
+      // A detached cell in the closure's list, or one attached to a frame's local (S_ATTACHED);
+      // an unpopulated slot or an attached argument through the helper (S_VARIABLE).
       // (get_var_ref of a cell that holds no value yet is the interpreter's too.)
       let index = u16At(bytes, pc + 1)
       let other = run self.bail(pc, depth, step)
-      let mut which = STUB_GET_VAR
-      if p.known { which = STUB_GET_VAR_KNOWN }
-      run self.site(which, index, next)
-      run self.a.jcc(Cond.Equal, other)
+      let done = run self.a.label()
+      let found = run self.a.label()
+      let miss = run self.slow(S_VARIABLE, done, other, next, 0, index, pc, depth, Reg.Rax, false)
+      if f.refTag == u32.MAX || index > 4096 { run self.a.jmp(miss) self.a.bind(done) return true }
+      let attached = run self.slow(S_ATTACHED, found, miss, 0, 0, 0, pc, depth, Reg.Rax, false)
+      run self.a.load(Width.W64, Reg.Rax, p.sf(f.currentFunction + 8))
+      if p.known { run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.knownRefs))) }
+      else { run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.closureVarRefs))) }
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.boxHeader + index * 8)))
+      run self.a.test(Width.W64, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, miss)
+      run self.a.loadZero8(Reg.R10, Mem.at(Reg.Rax, signed(f.refTag)))
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, signed(f.refDetached))
+      run self.a.jcc(Cond.NotEqual, attached)
+      run self.a.lea(Width.W64, Reg.R11, Mem.at(Reg.Rax, signed(f.refValue)))
+      self.a.bind(found)
+      // A binding still in its dead zone throws: the interpreter's.
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
+      run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.tag(4)))
+      run self.a.jcc(Cond.Equal, miss)
+      run self.a.store(Width.W64, word(next), Reg.Rax)
+      run self.a.store(Width.W64, payload(next), Reg.Rdx)
+      run self.retain(Reg.Rax, Reg.Rdx)
+      self.a.bind(done)
       return true
     }
     if opcode == op.OP_put_var {
@@ -3876,18 +3895,23 @@ impl Emitter {
       self.a.bind(done)
       return true
     }
-    if opcode == op.OP_shl_imm || opcode == op.OP_or_imm {
+    if opcode == op.OP_shl_imm || opcode == op.OP_sar_imm || opcode == op.OP_and_imm || opcode == op.OP_or_imm {
       let other = run self.bail(pc, depth, step)
-      // x | 0 of a double in the Int range truncates it.
+      // A double in the Int range truncates to i32 (ToInt32) out of line (S_TRUNCATE).
       let loaded = run self.a.label()
       let truncate = run self.slow(S_TRUNCATE, loaded, other, top, 0, 0, pc, depth, Reg.Rax, false)
       run self.tagIs(word(top), p.int(), truncate)
       run self.a.load(Width.W32, Reg.Rax, payload(top))
       self.a.bind(loaded)
       if opcode == op.OP_or_imm { run self.a.aluImm(Alu.Or, Width.W32, Reg.Rax, i16At(bytes, pc + 1)) }
+      else if opcode == op.OP_and_imm { run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, i16At(bytes, pc + 1)) }
       else {
         let count = i32.wrappingToU32(i16At(bytes, pc + 1)) & 31
-        if count != 0 { run self.a.shiftImm(Shift.Shl, Width.W32, Reg.Rax, u32.wrappingToU8(count)) }
+        if count != 0 {
+          let mut shift = Shift.Shl
+          if opcode == op.OP_sar_imm { shift = Shift.Sar }
+          run self.a.shiftImm(shift, Width.W32, Reg.Rax, u32.wrappingToU8(count))
+        }
       }
       run self.a.store(Width.W64, payload(top), Reg.Rax)
       return true
@@ -4077,32 +4101,50 @@ impl Emitter {
     }
     if opcode == op.OP_get_loc_length8 || opcode == op.OP_get_arg_length8 {
       let index = u8.toU32(bytes[pc + 1])
+      let mut cell = framed(0)
       if opcode == op.OP_get_loc_length8 {
         if index >= p.locals { return false }
-        run self.a.lea(Width.W64, Reg.Rdx, word(p.localAt(index)))
+        cell = framed(p.localAt(index))
       } else {
         if index >= p.arguments { return false }
-        run self.a.load(Width.W64, Reg.Rdx, p.sf(f.argumentsData))
-        if index != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rdx, signed(index * 16)) }
+        run self.argumentBase()
+        cell = Cell { base: Reg.Rcx, at: signed(index * 16) }
       }
       let other = run self.bail(pc, depth, step)
-      run self.a.lea(Width.W64, Reg.R14, word(next))
-      run self.a.callSymbol(STUB_LENGTH_CELL)
-      run self.a.jcc(Cond.Equal, other)
+      let done = run self.a.label()
+      let text = run self.slow(S_LENGTH, done, other, next, cell.at, 0, pc, depth, Reg.Rax, opcode == op.OP_get_arg_length8)
+      run self.tagIs(cell.word(), p.object(), text)
+      run self.a.load(Width.W64, Reg.Rsi, cell.payload())
+      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
+      run self.a.jcc(Cond.NotEqual, text)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
+      run self.a.store(Width.W64, word(next), Reg.Rax)
+      run self.a.store(Width.W64, payload(next), Reg.Rdx)
+      self.a.bind(done)
       return true
     }
-    if opcode == op.OP_inc || opcode == op.OP_dec || opcode == op.OP_add_imm || opcode == op.OP_and_imm || opcode == op.OP_sar_imm {
+    if opcode == op.OP_add_imm {
+      let k = i16At(bytes, pc + 1)
+      let other = run self.bail(pc, depth, step)
+      let done = run self.a.label()
+      let slow = run self.slow(S_ADD_IMM, done, other, top, k, 0, pc, depth, Reg.Rax, false)
+      run self.tagIs(word(top), p.int(), slow)
+      run self.a.load(Width.W32, Reg.Rax, payload(top))
+      run self.a.aluImm(Alu.Add, Width.W32, Reg.Rax, k)
+      run self.a.jcc(Cond.Overflow, slow)
+      run self.a.store(Width.W64, payload(top), Reg.Rax)
+      self.a.bind(done)
+      return true
+    }
+    if opcode == op.OP_inc || opcode == op.OP_dec {
       let other = run self.bail(pc, depth, step)
       run self.tagIs(word(top), p.int(), other)
       run self.a.load(Width.W32, Reg.Rax, payload(top))
-      if opcode == op.OP_inc { run self.a.aluImm(Alu.Add, Width.W32, Reg.Rax, 1) run self.a.jcc(Cond.Overflow, other) }
-      else if opcode == op.OP_dec { run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rax, 1) run self.a.jcc(Cond.Overflow, other) }
-      else if opcode == op.OP_add_imm { run self.a.aluImm(Alu.Add, Width.W32, Reg.Rax, i16At(bytes, pc + 1)) run self.a.jcc(Cond.Overflow, other) }
-      else if opcode == op.OP_and_imm { run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, i16At(bytes, pc + 1)) }
-      else {
-        let count = i32.wrappingToU32(i16At(bytes, pc + 1)) & 31
-        if count != 0 { run self.a.shiftImm(Shift.Sar, Width.W32, Reg.Rax, u32.wrappingToU8(count)) }
-      }
+      if opcode == op.OP_inc { run self.a.aluImm(Alu.Add, Width.W32, Reg.Rax, 1) }
+      else { run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rax, 1) }
+      run self.a.jcc(Cond.Overflow, other)
       run self.a.store(Width.W64, payload(top), Reg.Rax)
       return true
     }

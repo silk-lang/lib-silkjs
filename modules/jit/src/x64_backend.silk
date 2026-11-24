@@ -47,6 +47,7 @@ import silkjs.js_core_types { SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK 
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_objects { FieldLayout }
 import silkjs.js_compiled_objects as objects
+import silkjs.js_atom_data as atomData
 import silkjs.js_class_data as classes
 import silkjs.js_feedback as feedback
 import ssa_liveness as liveness
@@ -253,6 +254,9 @@ pub struct Emitter {
   elementAt: u32,
   elementObject: u32,
   elementIndex: u32,
+  /// Frame mode: last trusted fast-array value whose elements pointer is live in R9 and
+  /// elementCount in EAX (NONE when invalid). Reset at every block and non-whitelisted inst.
+  cachedArr: u32,
   /// Indexes a trusted access of this block bounded (below an Array's count, so at most
   /// 2^31 - 2): adding 1 to one cannot overflow. Cleared at each block.
   bounded: List<u32>,
@@ -440,12 +444,18 @@ pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FrameP
 /// In a step entry (Emitter.steps): the engine may make the instruction without the
 /// interpreter (js_baseline.SERVICE_QUICK), on its operand cells alone.
 const STEP_QUICK: u32 = 0x80000000
+const STEP_GET_PRIVATE: u32 = 0x40000000
+const STEP_PUT_PRIVATE: u32 = 0x20000000
 fn stepFor(function: &Function, inst: Inst, code: &[u8]) -> u32 {
   let mut step = stubs.stepAlone(code, u32.toUsize(inst.pc))
   if step == 0 { return 0 }
   let opcode = code[u32.toUsize(inst.pc)]
-  if inst.op == Op.Call && (inst.k & calls.GENERIC) != 0 && (opcode == opcodes.OP_object || opcode == opcodes.OP_define_field
-    || opcode == opcodes.OP_set_proto || opcode == opcodes.OP_array_from || opcode == opcodes.OP_rest) { step = step | STEP_QUICK }
+  if inst.op == Op.Call && (inst.k & calls.GENERIC) != 0 {
+    if opcode == opcodes.OP_object || opcode == opcodes.OP_define_field || opcode == opcodes.OP_set_proto
+      || opcode == opcodes.OP_array_from || opcode == opcodes.OP_rest { step = step | STEP_QUICK }
+    else if opcode == opcodes.OP_get_private_field { step = step | STEP_GET_PRIVATE }
+    else if opcode == opcodes.OP_put_private_field { step = step | STEP_PUT_PRIVATE }
+  }
   if (inst.op == Op.PutField || (inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_PUT_FIELD)) && opcode == opcodes.OP_put_field { step = step | STEP_QUICK }
   let before = function.exit(inst.exit).stackDepth
   let after = u32.wrappingToI32(before) + u32.wrappingToI32(u32.shiftRight(step, 16) & 255) - 128
@@ -558,7 +568,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(), construct: helpers.constructLayout(), math: helpers.mathLayout(), usedXmm: usedXmm,
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cachedArr: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), checkConstructSlows: List<CheckConstructSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(), aliased: List<bool>.make(),
@@ -627,6 +637,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   while b < function.blockCount() {
     let block = function.blocks.get(u32.toUsize(b))
     emitter.current = b
+    emitter.cachedArr = NONE
     emitter.a.bind(emitter.blockLabels.get(u32.toUsize(b)))
     let mut i: u32 = 0
     while i < block.instCount {
@@ -634,7 +645,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
       if emitter.settings.map { run offsets.append(usize.toU32(emitter.a.offset())) }
       if emitter.omitAt == block.firstInst + i { emitter.omitAt = NONE }
       else { run emitter.instruction(&function, function.inst(block.firstInst + i)) }
-      if emitter.skipAt == block.firstInst + i { emitter.a.bind(emitter.skipLabel) emitter.skipAt = NONE }
+      if emitter.skipAt == block.firstInst + i { emitter.a.bind(emitter.skipLabel) emitter.skipAt = NONE emitter.cachedArr = NONE }
       i = i + 1
     }
     b = b + 1
@@ -741,9 +752,24 @@ impl Emitter {
   pub fn saves(self: &Self, index: usize) -> bool { return u32.bitAnd(u32.shiftRight(self.places.savedMask, usize.toU32(index)), 1) != 0 }
   /// Where value v lives.
   fn at(self: &Self, v: u32) -> Place { return self.places.place(v, slotOf(v)) }
+  /// Whether lowering `given` in frame mode may safely consume or preserve the cached
+  /// trusted fast-array `(cachedArr, r9 = elements, eax = elementCount)` without clobbering
+  /// `rax`/`r9` or mutating array length/storage. Instructions with conditional `rax`/`r9`
+  /// paths (Add/Sub Rax fallback, non-fused GetElem, trustedStore) invalidate `cachedArr`
+  /// on those paths themselves.
+  fn preservesArrCache(self: &Self, function: &Function, given: Inst) -> bool {
+    let op = given.op
+    if op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.SqrtF64
+      || op == Op.ConstI32 || op == Op.Add || op == Op.Sub || op == Op.InlineFrame || op == Op.Removed { return true }
+    if op == Op.GetElem && given.trusted && given.k == 0 { return true }
+    if op == Op.PutElem && given.trusted { return true }
+    if op == Op.BoxF64 || op == Op.BoxI32 || op == Op.BoxBool { return self.storedBox(function, self.cursor) }
+    return false
+  }
   effect fn instruction(self: &mut Self, function: &Function, given: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
     let op = given.op
     self.frameOf = given.frame
+    if !self.on || !self.preservesArrCache(&function, given) { self.cachedArr = NONE }
     // Operands are read where their bits are (stored). A return asks whose count it hands
     // over, which is the copy's own: resultInto and valueInto find the bits themselves.
     let mut inst = given
@@ -903,10 +929,74 @@ impl Emitter {
     if op == Op.TypeofAtom {
       run self.stressGuard(inst.exit)
       if self.on {
+        let layout = self.settings.layout
+        let fields = self.fields
         let slow = run self.a.label()
         let done = run self.a.label()
+        let isUndef = run self.a.label()
+        let isBool = run self.a.label()
+        let isNum = run self.a.label()
+        let isStr = run self.a.label()
+        let isSym = run self.a.label()
+        let isFn = run self.a.label()
+        let isObj = run self.a.label()
+        let objTag = run self.a.label()
+        run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES + layout.tagOffset)))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined()))
+        run self.a.jcc(Cond.Equal, isUndef)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+        run self.a.jcc(Cond.Equal, objTag)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.tagOf(-7)))
+        run self.a.jcc(Cond.Equal, isStr)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+        run self.a.jcc(Cond.Equal, isNum)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+        run self.a.jcc(Cond.Equal, isNum)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.boolean()))
+        run self.a.jcc(Cond.Equal, isBool)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null()))
+        run self.a.jcc(Cond.Equal, isObj)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.tagOf(-6)))
+        run self.a.jcc(Cond.Equal, isStr)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.tagOf(-8)))
+        run self.a.jcc(Cond.Equal, isSym)
         run self.a.jmp(slow)
+        self.a.bind(objTag)
+        run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+        run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.falsy))
+        run self.a.jcc(Cond.NotEqual, slow)
+        run self.a.loadZero16(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.objectClass)))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(classes.JS_CLASS_BYTECODE_FUNCTION))
+        run self.a.jcc(Cond.Equal, isFn)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(classes.JS_CLASS_C_FUNCTION))
+        run self.a.jcc(Cond.Equal, isFn)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(classes.JS_CLASS_OBJECT))
+        run self.a.jcc(Cond.Equal, isObj)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(classes.JS_CLASS_ARRAY))
+        run self.a.jcc(Cond.Equal, isObj)
+        run self.a.jmp(slow)
+        self.a.bind(isUndef)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_undefined)
+        run self.a.jmp(done)
+        self.a.bind(isBool)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_boolean)
+        run self.a.jmp(done)
+        self.a.bind(isNum)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_number)
+        run self.a.jmp(done)
+        self.a.bind(isStr)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_string)
+        run self.a.jmp(done)
+        self.a.bind(isSym)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_symbol)
+        run self.a.jmp(done)
+        self.a.bind(isFn)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_function)
+        run self.a.jmp(done)
+        self.a.bind(isObj)
+        run self.a.movImm32(Reg.Rax, atomData.JS_ATOM_object)
         self.a.bind(done)
+        let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
         run self.stepSlows.append(StepSlow { entry: slow, auxLabel: slow, back: done, inst: inst, step: 0, shape: 0, out: NONE, extra: 0, kind: STEP_HELPER_SLOW })
         return ()
       }
@@ -945,7 +1035,7 @@ impl Emitter {
       if self.on {
         let answered = run self.a.label()
         let slow = run self.a.label()
-        run self.equalsFast(inst.a, inst.b, slow, answered, false, answered)
+        run self.equalsFast(inst.a, inst.b, inst.k != 0, slow, answered, false, answered)
         self.a.bind(answered)
         let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
         run self.stepSlows.append(StepSlow { entry: slow, auxLabel: answered, back: answered, inst: inst, step: 0, shape: 0, out: NONE, extra: i32.wrappingToU32(inst.k), kind: STEP_EQUALS_SLOW })
@@ -1021,6 +1111,7 @@ impl Emitter {
         self.flagsAfter(inst)
         return ()
       }
+      self.cachedArr = NONE
       let place2 = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place2)
       run self.operate(alu, Reg.Rax, inst.b)
       if !self.cannotOverflow(&function, inst) { run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit))) }
@@ -1328,11 +1419,17 @@ impl Emitter {
       return ()
     }
     if op == Op.Truthy {
-      // ToBoolean from the tag: Bool and Int by payload, Float64 unless +-0 or NaN, Null and
-      // Undefined false, Symbol true; anything else through the truthy helper. No exit.
+      // ToBoolean from the tag: Bool, Int, Object (non-falsy), FlatString (len != 0),
+      // Null/Undefined (false), Float64 (unless +-0 or NaN) inline; Symbol/Rope/BigInt/falsy
+      // object through STEP_TRUTHY_SLOW / TRUTHY helper. No exit.
       let layout = self.settings.layout
+      let fields = self.fields
       let done = run self.a.label()
-      let notInt = run self.a.label() let notBool = run self.a.label() let notDouble = run self.a.label()
+      let notBool = run self.a.label()
+      let notInt = run self.a.label()
+      let notObj = run self.a.label()
+      let notStr = run self.a.label()
+      let slow = run self.a.label()
       run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(inst.a * SLOT_BYTES + layout.tagOffset)))
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.boolean()))
       run self.a.jcc(Cond.NotEqual, notBool)
@@ -1351,9 +1448,27 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, done)
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined()))
       run self.a.jcc(Cond.Equal, done)
+      // Object: truthy unless marked falsy (htmlDda).
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+      run self.a.jcc(Cond.NotEqual, notObj)
+      run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+      run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.falsy))
+      run self.a.jcc(Cond.NotEqual, slow)
+      run self.a.movImm32(Reg.R9, 1)
+      run self.a.jmp(done)
+      // FlatString (-7, never Rope -6): truthy iff low 31 bits of length word != 0.
+      self.a.bind(notObj)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.tagOf(-7)))
+      run self.a.jcc(Cond.NotEqual, notStr)
+      run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(self.plan.f.stringLength)))
+      run self.a.testImm(Width.W32, Reg.Rax, 0x7fffffff)
+      run self.a.setcc(Cond.NotEqual, Reg.R9)
+      run self.a.jmp(done)
+      // Float64: bits << 1 drops the sign: 0 is +-0, above 0xFFE0000000000000 is NaN.
+      self.a.bind(notStr)
       run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
-      run self.a.jcc(Cond.NotEqual, notDouble)
-      // bits << 1 drops the sign: 0 is +-0, above 0xFFE0000000000000 is NaN.
+      run self.a.jcc(Cond.NotEqual, slow)
       run self.a.load(Width.W64, Reg.Rax, payloadOf(inst.a))
       run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rax, 1)
       run self.a.jcc(Cond.Equal, done)
@@ -1362,10 +1477,10 @@ impl Emitter {
       run self.a.jcc(Cond.Above, done)
       run self.a.movImm32(Reg.R9, 1)
       if self.on {
-        run self.stepSlows.append(StepSlow { entry: notDouble, auxLabel: notDouble, back: done, inst: inst, step: 0, shape: 0, out: NONE, extra: 0, kind: STEP_TRUTHY_SLOW })
+        run self.stepSlows.append(StepSlow { entry: slow, auxLabel: slow, back: done, inst: inst, step: 0, shape: 0, out: NONE, extra: 0, kind: STEP_TRUTHY_SLOW })
       } else {
         run self.a.jmp(done)
-        self.a.bind(notDouble)
+        self.a.bind(slow)
         let symbol = layout.tagOf(-8)
         let heap = run self.a.label()
         run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(symbol))
@@ -1453,12 +1568,11 @@ impl Emitter {
         let at = u64.wrappingToI32(u64.bitAnd(key, 65535)) * 16
         if inst.result != NONE && (borrowed || function.value(inst.result).own == Own.Owned) && (inst.k & FIELD_STEPS) == 0 && self.settings.stress == 0 && self.fusedUnboxF64(&function, inst) {
           // The next instruction unboxes this field as F64 and nothing else reads it:
-          // a Float64 loads directly from the object's slot into the XMM place (or slot),
-          // an Int converts via cvtsi2sd, and anything else goes out of line to store the
-          // field and exit at the unbox's exit.
+          // a Float64 loads directly from the object's slot into the XMM place (or slot);
+          // non-Float64 goes out of line to coldPieces (converting Int via cvtsi2sd or
+          // storing the field and exiting at the unbox's exit).
           let unbox = function.inst(self.cursor + 1)
           let layout = self.settings.layout
-          let notFloat = run self.a.label()
           let cold = run self.a.label()
           let out = self.at(unbox.result)
           let byteTag = layout.tagWidth == 1 && layout.float64() < 256 && layout.int() < 256
@@ -1468,27 +1582,12 @@ impl Emitter {
             run self.loadTag(Reg.R8, Mem.at(Reg.R11, at + u32.wrappingToI32(layout.tagOffset)))
             run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
           }
-          run self.a.jcc(Cond.NotEqual, notFloat)
+          run self.a.jcc(Cond.NotEqual, cold)
           if out.kind == XMM {
             run self.a.loadDouble(out.xmm, Mem.at(Reg.R11, at + 8))
           } else {
             run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, at + 8))
             run putBits(&mut self.a, out, Reg.Rax)
-          }
-          run self.a.jmp(done)
-          self.a.bind(notFloat)
-          if byteTag {
-            run self.a.cmp8MemImm(Mem.at(Reg.R11, at + u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.int()))
-          } else {
-            run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
-          }
-          run self.a.jcc(Cond.NotEqual, cold)
-          run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, at + 8))
-          if out.kind == XMM {
-            run self.a.intToDouble(Width.W32, out.xmm, Reg.Rax)
-          } else {
-            run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax)
-            run putF64(&mut self.a, out, Xmm.Xmm0)
           }
           self.omitAt = self.cursor + 1
           run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(unbox.exit)
@@ -1797,7 +1896,7 @@ impl Emitter {
             if outOfLine { run self.a.jcc(Cond.NotEqual, cold) } else { run self.a.jcc(Cond.NotEqual, general) }
             let out = self.at(unbox.result)
             if out.kind == GPR { run self.a.load(Width.W32, out.gpr, Mem.at(Reg.R11, 8)) }
-            else { run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, 8)) run self.a.store(Width.W64, slotOf(unbox.result), Reg.Rax) }
+            else { run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R11, 8)) run self.a.store(Width.W64, slotOf(unbox.result), Reg.R8) }
             if outOfLine {
               self.omitAt = self.cursor + 1
               run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(unbox.exit)
@@ -1805,6 +1904,7 @@ impl Emitter {
               self.a.bind(done)
               return ()
             }
+            self.cachedArr = NONE
             self.a.bind(cold)
             self.skipLabel = run self.a.label()
             self.skipAt = self.cursor + 1
@@ -1813,15 +1913,36 @@ impl Emitter {
           } else if (borrowed || function.value(inst.result).own == Own.Owned) && self.fusedUnboxF64(&function, inst) {
             // The next instruction unboxes this element as F64 and nothing else reads it:
             // a Float64 loads directly into the XMM place (or slot), an Int converts via
-            // cvtsi2sd, and anything else goes to its slot for the unbox's exit.
+            // cvtsi2sd (out of line in coldPieces when outOfLine), and anything else goes
+            // to its slot for the unbox's exit.
             let unbox = function.inst(self.cursor + 1)
             let layout = self.settings.layout
             let outOfLine = inst.trusted && self.settings.stress == 0
-            let notFloat = run self.a.label()
-            let general = run self.a.label()
-            let cold = run self.a.label()
             let out = self.at(unbox.result)
             let byteTag = layout.tagWidth == 1 && layout.float64() < 256 && layout.int() < 256
+            if outOfLine {
+              let cold = run self.a.label()
+              if byteTag {
+                run self.a.cmp8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.float64()))
+              } else {
+                run self.loadTag(Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)))
+                run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+              }
+              run self.a.jcc(Cond.NotEqual, cold)
+              if out.kind == XMM {
+                run self.a.loadDouble(out.xmm, Mem.at(Reg.R11, 8))
+              } else {
+                run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R11, 8))
+                run putBits(&mut self.a, out, Reg.R8)
+              }
+              self.omitAt = self.cursor + 1
+              run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(unbox.exit)
+              self.a.bind(done)
+              return ()
+            }
+            self.cachedArr = NONE
+            let notFloat = run self.a.label()
+            let general = run self.a.label()
             if byteTag {
               run self.a.cmp8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.float64()))
             } else {
@@ -1835,20 +1956,16 @@ impl Emitter {
               run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 8))
               run putBits(&mut self.a, out, Reg.Rax)
             }
-            if outOfLine {
-              run self.a.jmp(done)
-            } else {
-              self.skipLabel = run self.a.label()
-              self.skipAt = self.cursor + 1
-              run self.a.jmp(self.skipLabel)
-            }
+            self.skipLabel = run self.a.label()
+            self.skipAt = self.cursor + 1
+            run self.a.jmp(self.skipLabel)
             self.a.bind(notFloat)
             if byteTag {
               run self.a.cmp8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.int()))
             } else {
               run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
             }
-            if outOfLine { run self.a.jcc(Cond.NotEqual, cold) } else { run self.a.jcc(Cond.NotEqual, general) }
+            run self.a.jcc(Cond.NotEqual, general)
             run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, 8))
             if out.kind == XMM {
               run self.a.intToDouble(Width.W32, out.xmm, Reg.Rax)
@@ -1856,17 +1973,10 @@ impl Emitter {
               run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax)
               run putF64(&mut self.a, out, Xmm.Xmm0)
             }
-            if outOfLine {
-              self.omitAt = self.cursor + 1
-              run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(unbox.exit)
-              self.a.bind(general)
-              self.a.bind(done)
-              return ()
-            }
-            self.a.bind(cold)
             run self.a.jmp(self.skipLabel)
             self.a.bind(general)
           }
+          self.cachedArr = NONE
           run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
           run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, 8))
           run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
@@ -1989,7 +2099,7 @@ impl Emitter {
       let mut site = u32.bitOr(u32.bitOr(k & 0xffff, u32.shiftLeft(u32.shiftRight(k, 16) & 1, 31)), u32.shiftLeft(u32.shiftRight(k, 17) & 1, 30))
       // A borrowed result (ssa_opt_borrow) takes no count: bit 29.
       if op == Op.GetScope && function.value(inst.result).own == Own.Borrowed { site = u32.bitOr(site, 0x20000000) }
-      if self.on {
+      if self.on && op == Op.GetScope {
         let slow = run self.a.label()
         let done = run self.a.label()
         let mut closure = NONE
@@ -3035,8 +3145,8 @@ impl Emitter {
     let branch = function.inst(last)
     return branch.op == Op.Branch && branch.a == test.result && function.inst(last - 1).result == test.result
   }
-  /// The `equals` test (fusedEquals) as flags: Equal when it holds. Two int32s or two
-  /// objects compare their payloads inline; anything else runs in STEP_EQUALS_SLOW.
+  /// The `equals` test (fusedEquals) as flags: Equal when it holds. Fast cases run inline;
+  /// anything else runs in STEP_EQUALS_SLOW.
   effect fn equalsFlags(self: &mut Self, function: &Function, given: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut inst = given
     inst.a = self.storage(inst.a)
@@ -3044,7 +3154,7 @@ impl Emitter {
     run self.stressGuard(inst.exit)
     let slow = run self.a.label()
     let decided = run self.a.label()
-    run self.equalsFast(inst.a, inst.b, slow, decided, true, decided)
+    run self.equalsFast(inst.a, inst.b, inst.k != 0, slow, decided, true, decided)
     self.a.bind(decided)
     let extra = u32.bitOr(i32.wrappingToU32(inst.k), 2)
     run self.stepSlows.append(StepSlow { entry: slow, auxLabel: decided, back: decided, inst: inst, step: 0, shape: 0, out: NONE, extra: extra, kind: STEP_EQUALS_SLOW })
@@ -3805,10 +3915,27 @@ impl Emitter {
     run self.elementOf(place, miss)
   }
   /// elementSlot for an access whose object a `check.array` proved a fast Array (Inst.trusted):
-  /// the count test alone.
+  /// the count test alone. In frame mode, caches `(cachedArr, r9 = elements, eax = count)`
+  /// across consecutive trusted accesses on the same array.
   effect fn trustedSlot(self: &mut Self, value: u32, index: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.a.load(Width.W64, Reg.R11, payloadOf(value))
     let place = self.at(index)
+    if self.on {
+      let arr = self.storage(value)
+      let fields = self.fields
+      if self.cachedArr != arr {
+        run self.a.load(Width.W64, Reg.R9, payloadOf(arr))
+        run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R9, u32.wrappingToI32(fields.elementCount)))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R9, u32.wrappingToI32(fields.elements)))
+        self.cachedArr = arr
+      }
+      run getI32(&mut self.a, Reg.R8, place)
+      run self.a.alu(Alu.Cmp, Width.W32, Reg.R8, Reg.Rax)
+      run self.a.jcc(Cond.AboveOrEqual, miss)
+      run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R8, 4)
+      run self.a.lea(Width.W64, Reg.R11, Mem.indexed(Reg.R9, Reg.R8, Scale.One, 0))
+      return ()
+    }
+    run self.a.load(Width.W64, Reg.R11, payloadOf(value))
     run self.elementOf(place, miss)
   }
   /// To `miss` unless value is a fast Array, whose object is then in R11. Clobbers R8.
@@ -4927,6 +5054,7 @@ impl Emitter {
       run self.a.store(Width.W64, Mem.at(Reg.R11, 8), Reg.R9)
     }
     self.a.bind(done)
+    self.cachedArr = NONE
     run self.coldLabels.append(cold) run self.coldBacks.append(done) run self.coldInsts.append(inst) run self.coldAux.append(box)
   }
   /// Notes that `index` passed a trusted access's count test in the block being lowered.
@@ -4973,8 +5101,9 @@ impl Emitter {
     return true
   }
   /// The slow paths placed after the blocks. A trusted read fused with its unbox
-  /// (coldAux: the unbox's exit) copies an element that is no Int to its slot and leaves
-  /// at the unbox's exit. A trusted store (coldAux: its box, or NONE) boxes its value into
+  /// (coldAux: the unbox's exit) converts an Int to F64 (for UnboxF64) and returns to
+  /// `coldBacks`, or copies a non-matching element/field to its slot and leaves at the
+  /// unbox's exit. A trusted store (coldAux: its box, or NONE) boxes its value into
   /// its slot if it made it, and has the helper store it, with the fragile registers kept
   /// over the call and the index read before rsi is written.
   effect fn coldPieces(self: &mut Self, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -4984,10 +5113,35 @@ impl Emitter {
       let aux = self.coldAux.get(c)
       self.a.bind(self.coldLabels.get(c))
       if inst.op == Op.GetElem || inst.op == Op.GetField {
+        let defAt = self.defs.get(u32.toUsize(inst.result))
+        let unbox = function.inst(defAt + 1)
         let mut at: i32 = 0
         if inst.op == Op.GetField {
-          let key = self.shapes.key(self.defs.get(u32.toUsize(inst.result)))
+          let key = self.shapes.key(defAt)
           at = u64.wrappingToI32(u64.bitAnd(key, 65535)) * 16
+        }
+        if unbox.op == Op.UnboxF64 {
+          // Non-Float64 tag on a fused F64 read: convert Int -> F64 in R8 (preserving RAX/R9
+          // for the trusted fast-array cache) and jump back to `done`.
+          let layout = self.settings.layout
+          let notInt = run self.a.label()
+          let byteTag = layout.tagWidth == 1 && layout.float64() < 256 && layout.int() < 256
+          if byteTag {
+            run self.a.cmp8MemImm(Mem.at(Reg.R11, at + u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.int()))
+          } else {
+            run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+          }
+          run self.a.jcc(Cond.NotEqual, notInt)
+          let out = self.at(unbox.result)
+          run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R11, at + 8))
+          if out.kind == XMM {
+            run self.a.intToDouble(Width.W32, out.xmm, Reg.R8)
+          } else {
+            run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.R8)
+            run putF64(&mut self.a, out, Xmm.Xmm0)
+          }
+          run self.a.jmp(self.coldBacks.get(c))
+          self.a.bind(notInt)
         }
         run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, at))
         run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R11, at + 8))
@@ -5125,20 +5279,30 @@ impl Emitter {
     if info.own == Own.Imm || info.own == Own.Owned { return () }
     run self.retainBits(Reg.Rax, Reg.Rdx)
   }
-  /// Frame mode: hot fast path for `a == b` / `a === b`. Compares two int32s or two objects
-  /// inline; everything else jumps to `slow` (STEP_EQUALS_SLOW in PACK_COLD) with tag(a) in
-  /// RAX and tag(b) in R8. When `fused`, reaches `decided` with ZF=1 iff equal; otherwise
-  /// reaches `answered` with EAX = 0 or 1.
-  effect fn equalsFast(self: &mut Self, a: u32, b: u32, slow: Label, answered: Label, fused: bool, decided: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  /// Frame mode: hot fast path for `a == b` / `a === b`. Handles same-tag int32, object,
+  /// flat-string pointer equality, bool, null, and undefined inline, plus strict different-tag
+  /// mismatches (excluding float64/rope/bigint) and loose null/undefined comparisons inline;
+  /// anything else jumps to `slow` (STEP_EQUALS_SLOW in PACK_COLD) with tag(a) in RAX and
+  /// tag(b) in R8. When `fused`, reaches `decided` with ZF=1 iff equal; otherwise reaches
+  /// `answered` with EAX = 0 or 1.
+  effect fn equalsFast(self: &mut Self, a: u32, b: u32, strict: bool, slow: Label, answered: Label, fused: bool, decided: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
-    let tryObj = run self.a.label()
+    let fields = self.fields
+    let diffTag = run self.a.label()
+    let notInt = run self.a.label()
+    let notObj = run self.a.label()
+    let notStr = run self.a.label()
+    let notBool = run self.a.label()
+    let isNeq = run self.a.label()
+    let mut eqTarget = decided
+    if !fused { eqTarget = run self.a.label() }
     run self.loadTag(Reg.Rax, Mem.at(Reg.Rsp, u32.wrappingToI32(a * SLOT_BYTES + layout.tagOffset)))
     run self.loadTag(Reg.R8, Mem.at(Reg.Rsp, u32.wrappingToI32(b * SLOT_BYTES + layout.tagOffset)))
-    // Two int32s first, the most common: their payloads, with no branch on the answer.
+    run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.R8)
+    run self.a.jcc(Cond.NotEqual, diffTag)
+    // Same tag: Int -> 32-bit payload cmp.
     run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.int()))
-    run self.a.jcc(Cond.NotEqual, tryObj)
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
-    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.jcc(Cond.NotEqual, notInt)
     run self.a.load(Width.W32, Reg.R11, payloadOf(a))
     if fused {
       run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R11, payloadOf(b))
@@ -5149,18 +5313,105 @@ impl Emitter {
       run self.a.setcc(Cond.Equal, Reg.Rax)
       run self.a.jmp(answered)
     }
-    self.a.bind(tryObj)
+    // Same tag: Object -> 64-bit pointer cmp.
+    self.a.bind(notInt)
     run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.object()))
-    run self.a.jcc(Cond.NotEqual, slow)
-    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
-    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.jcc(Cond.NotEqual, notObj)
     run self.a.load(Width.W64, Reg.R11, payloadOf(a))
     if fused {
       run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R11, payloadOf(b))
+      run self.a.jmp(decided)
     } else {
       run self.a.movImm32(Reg.Rax, 0)
       run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R11, payloadOf(b))
       run self.a.setcc(Cond.Equal, Reg.Rax)
+      run self.a.jmp(answered)
+    }
+    // Same tag: FlatString (-7) -> 64-bit pointer equality fast path; distinct pointers go slow.
+    self.a.bind(notObj)
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.tagOf(-7)))
+    run self.a.jcc(Cond.NotEqual, notStr)
+    run self.a.load(Width.W64, Reg.R11, payloadOf(a))
+    run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R11, payloadOf(b))
+    run self.a.jcc(Cond.NotEqual, slow)
+    run self.a.jmp(eqTarget)
+    // Same tag: Bool -> low-byte payload cmp.
+    self.a.bind(notStr)
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.boolean()))
+    run self.a.jcc(Cond.NotEqual, notBool)
+    run self.a.loadZero8(Reg.R11, payloadOf(a))
+    run self.a.loadZero8(Reg.R9, payloadOf(b))
+    if fused {
+      run self.a.alu(Alu.Cmp, Width.W32, Reg.R11, Reg.R9)
+      run self.a.jmp(decided)
+    } else {
+      run self.a.movImm32(Reg.Rax, 0)
+      run self.a.alu(Alu.Cmp, Width.W32, Reg.R11, Reg.R9)
+      run self.a.setcc(Cond.Equal, Reg.Rax)
+      run self.a.jmp(answered)
+    }
+    // Same tag: Null or Undefined -> equal; Float64/Rope/BigInt/Symbol -> slow.
+    self.a.bind(notBool)
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.null()))
+    run self.a.jcc(Cond.Equal, eqTarget)
+    run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.undefined()))
+    run self.a.jcc(Cond.Equal, eqTarget)
+    run self.a.jmp(slow)
+    // Different tags (RAX != R8).
+    self.a.bind(diffTag)
+    if strict {
+      // Under ===, only (Int, Float64), (String, Rope), or (BigInt, ShortBigInt) can match.
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.float64()))
+      run self.a.jcc(Cond.Equal, slow)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+      run self.a.jcc(Cond.Equal, slow)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.tagOf(-6)))
+      run self.a.jcc(Cond.Equal, slow)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.tagOf(-6)))
+      run self.a.jcc(Cond.Equal, slow)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.tagOf(-9)))
+      run self.a.jcc(Cond.Equal, slow)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.tagOf(-9)))
+      run self.a.jcc(Cond.Equal, slow)
+    } else {
+      // Under ==, settle all comparisons involving null or undefined inline (except htmlDda objects).
+      let aNullish = run self.a.label()
+      let bNullish = run self.a.label()
+      let checkObj = run self.a.label()
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.null()))
+      run self.a.jcc(Cond.Equal, aNullish)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.undefined()))
+      run self.a.jcc(Cond.Equal, aNullish)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null()))
+      run self.a.jcc(Cond.Equal, bNullish)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined()))
+      run self.a.jcc(Cond.NotEqual, slow)
+      self.a.bind(bNullish)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.object()))
+      run self.a.jcc(Cond.NotEqual, isNeq)
+      run self.a.load(Width.W64, Reg.R11, payloadOf(a))
+      run self.a.jmp(checkObj)
+      self.a.bind(aNullish)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null()))
+      run self.a.jcc(Cond.Equal, eqTarget)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined()))
+      run self.a.jcc(Cond.Equal, eqTarget)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+      run self.a.jcc(Cond.NotEqual, isNeq)
+      run self.a.load(Width.W64, Reg.R11, payloadOf(b))
+      self.a.bind(checkObj)
+      run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.falsy))
+      run self.a.jcc(Cond.NotEqual, slow)
+    }
+    self.a.bind(isNeq)
+    if fused {
+      // Clear ZF (bit 0 set -> nonzero result) so `decided` observes NotEqual.
+      run self.a.aluImm(Alu.Or, Width.W32, Reg.Rax, 1)
+    } else {
+      run self.a.movImm32(Reg.Rax, 0)
+      run self.a.jmp(answered)
+      self.a.bind(eqTarget)
+      run self.a.movImm32(Reg.Rax, 1)
     }
   }
   /// The `call` the `call.arg` being lowered belongs to: the next one in its block.
@@ -5244,7 +5495,7 @@ impl Emitter {
       let inPlace = run self.a.label()
       let slow = run self.a.label()
       let done = run self.a.label()
-      run self.equalsFast(inst.a, inst.b, slow, inPlace, false, inPlace)
+      run self.equalsFast(inst.a, inst.b, false, slow, inPlace, false, inPlace)
       self.a.bind(inPlace)
       if calls.notEqualOf(inst) { run self.a.aluImm(Alu.Xor, Width.W32, Reg.Rax, 1) }
       run self.a.movImm64(Reg.R9, layout.tagWord(layout.boolean()))
@@ -5309,6 +5560,69 @@ impl Emitter {
         self.a.bind(stepped)
         return ()
       }
+      if (step & STEP_GET_PRIVATE) != 0 && count == 2 && first && after == base + 1 && calls.keptCells(inst.k) == 0 && self.operandsOf(&function, count) {
+        // OP_get_private_field fast path via baseline_env.GET_PRIVATE: consumes the two
+        // operand counts and writes the owned field value into cell[base] on 1; leaves
+        // everything untouched on 0 so STEP_GENERIC_DECLINED releases and steps on frame.
+        let declined = run self.a.label()
+        let p = self.plan
+        let mut i: u32 = 0
+        while i < count {
+          let arg = function.inst(self.cursor - count + i)
+          let at = i32.wrappingToU32(p.operandAt(base + i))
+          run self.valueInto(&function, arg.a, SlotMode.Imm, Reg.Rbp, at)
+          run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rbp, p.operandAt(base + i)))
+          run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, p.operandAt(base + i) + 8))
+          run self.retainBits(Reg.Rax, Reg.Rdx)
+          i = i + 1
+        }
+        run self.a.mov(Width.W64, Reg.Rdi, Reg.R12)
+        run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rbp, p.operandAt(base)))
+        run self.keepXmm()
+        run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.GET_PRIVATE)))
+        run self.restoreXmm()
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.Equal, declined)
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rbp, p.operandAt(base)))
+        run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, p.operandAt(base) + 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rdx)
+        let shape = leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after)
+        run self.stepSlows.append(StepSlow { entry: declined, auxLabel: declined, back: stepped, inst: inst, step: step, shape: shape, out: out, extra: base, kind: STEP_GENERIC_DECLINED })
+        self.a.bind(stepped)
+        return ()
+      }
+      if (step & STEP_PUT_PRIVATE) != 0 && count == 3 && !first && after == base && calls.keptCells(inst.k) == 0 && self.operandsOf(&function, count) {
+        // OP_put_private_field fast path via baseline_env.PUT_PRIVATE: consumes the three
+        // operand counts on 1; leaves everything untouched on 0 so STEP_GENERIC_DECLINED
+        // releases them and steps on frame.
+        let declined = run self.a.label()
+        let p = self.plan
+        let mut i: u32 = 0
+        while i < count {
+          let arg = function.inst(self.cursor - count + i)
+          let at = i32.wrappingToU32(p.operandAt(base + i))
+          run self.valueInto(&function, arg.a, SlotMode.Imm, Reg.Rbp, at)
+          run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rbp, p.operandAt(base + i)))
+          run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, p.operandAt(base + i) + 8))
+          run self.retainBits(Reg.Rax, Reg.Rdx)
+          i = i + 1
+        }
+        run self.a.mov(Width.W64, Reg.Rdi, Reg.R12)
+        run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rbp, p.operandAt(base)))
+        run self.keepXmm()
+        run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.PUT_PRIVATE)))
+        run self.restoreXmm()
+        run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+        run self.a.jcc(Cond.Equal, declined)
+        let shape = leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after)
+        run self.stepSlows.append(StepSlow { entry: declined, auxLabel: declined, back: stepped, inst: inst, step: step, shape: shape, out: out, extra: base, kind: STEP_GENERIC_DECLINED })
+        self.a.bind(stepped)
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.undefined()))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.storeImm(Width.W64, payloadOf(inst.result), 0)
+        return ()
+      }
       let cold = run self.deferStep(inst, step, leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after), out, stepped, STEP_PLAIN)
       run self.a.jmp(cold)
       self.a.bind(stepped)
@@ -5371,13 +5685,13 @@ impl Emitter {
 
   /// Fast path for 1- or 2-argument Math.* native calls on frame-mode operands where
   /// `[base + callee]` is the callee and `[base + callee + 16..]` are the arguments.
-  /// Branches to `PACK_COLD` (`STEP_MATH_SLOW`) only when the callee is a C function so
-  /// normal JS call sites avoid inline Math dispatch machinery.
+  /// Filters to `BuiltinFamily.Math` inline so non-Math C functions never jump to `PACK_COLD`.
   effect fn mathCallOnFrame(self: &mut Self, inst: Inst, base: Reg, callee: i32, done: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     let count = calls.countOf(inst)
     if (count != 1 && count != 2) || (inst.k & (calls.CONSTRUCT | calls.GENERIC | calls.LAZY_ARGUMENTS)) != 0 { return () }
     let layout = self.settings.layout
     let fields = self.fields
+    let math = self.math
     let notMath = run self.a.label()
     let coldMath = run self.a.label()
     if layout.tagWidth == 1 && layout.object() < 256 {
@@ -5390,7 +5704,15 @@ impl Emitter {
     run self.a.load(Width.W64, Reg.R9, Mem.at(base, callee + 8))
     run self.a.loadZero16(Reg.R8, Mem.at(Reg.R9, u32.wrappingToI32(fields.objectClass)))
     run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(classes.JS_CLASS_C_FUNCTION))
-    run self.a.jcc(Cond.Equal, coldMath)
+    run self.a.jcc(Cond.NotEqual, notMath)
+    if math.fnTagAt != u32.MAX && math.familyAt != u32.MAX {
+      run self.a.cmp8MemImm(Mem.at(Reg.R9, signed(math.fnTagAt)), math.builtinTag)
+      run self.a.jcc(Cond.NotEqual, notMath)
+      run self.a.cmp8MemImm(Mem.at(Reg.R9, signed(math.familyAt)), math.mathFamily)
+      run self.a.jcc(Cond.Equal, coldMath)
+    } else {
+      run self.a.jmp(coldMath)
+    }
     self.a.bind(notMath)
     let baseKind: u32 = if base == Reg.Rbp { 0 } else { 1 }
     run self.stepSlows.append(StepSlow { entry: coldMath, auxLabel: notMath, back: done, inst: inst, step: 0, shape: i32.wrappingToU32(callee), out: NONE, extra: baseKind, kind: STEP_MATH_SLOW })
@@ -5983,16 +6305,9 @@ impl Emitter {
       return ()
     }
     if item.kind == STEP_MATH_SLOW {
-      let math = self.math
       let base = if item.extra == 0 { Reg.Rbp } else { Reg.Rsp }
       let callee = u32.wrappingToI32(item.shape)
       let count = calls.countOf(inst)
-      if math.fnTagAt != u32.MAX && math.familyAt != u32.MAX {
-        run self.a.cmp8MemImm(Mem.at(Reg.R9, signed(math.fnTagAt)), math.builtinTag)
-        run self.a.jcc(Cond.NotEqual, item.auxLabel)
-        run self.a.cmp8MemImm(Mem.at(Reg.R9, signed(math.familyAt)), math.mathFamily)
-        run self.a.jcc(Cond.NotEqual, item.auxLabel)
-      }
       run self.a.lea(Width.W64, Reg.Rsi, Mem.at(base, callee))
       run self.a.movImm32(Reg.Rdx, count)
       run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
@@ -6090,7 +6405,6 @@ impl Emitter {
         run self.callHelper(helpers.TYPEOF)
         run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
         run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
-        let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
         run self.a.jmp(item.back)
         return ()
       }
@@ -6118,8 +6432,15 @@ impl Emitter {
       if op == Op.GetScope || op == Op.PutScope {
         run self.coldFrameInto(Reg.Rsi, inst.frame, item.out)
         run self.a.movImm32(Reg.Rdx, item.extra)
-        if op == Op.GetScope { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result)) run self.callHelper(helpers.GET_SCOPE) }
-        else { run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a)) run self.callHelper(helpers.PUT_SCOPE) }
+        if op == Op.GetScope {
+          run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
+          run self.keepXmm()
+          run self.callHelper(helpers.GET_SCOPE)
+          run self.restoreXmm()
+        } else {
+          run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.a))
+          run self.callHelper(helpers.PUT_SCOPE)
+        }
         run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
         run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
         run self.a.jmp(item.back)
