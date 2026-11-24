@@ -27,6 +27,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.num.i32
+import silk.num.i64
 import silk.num.u32
 import silk.num.u64
 import silk.num.u8
@@ -398,24 +399,146 @@ fn r11Kept(function: &Function, inst: Inst) -> bool {
   }
   return false
 }
-/// Whether the i32 v is never negative: a constant that is not, an `and` with one, or a
-/// logical shift right by a nonzero constant.
-fn nonNegative(function: &Function, v: u32) -> bool {
+const I32_MIN_64: i64 = -2147483648
+const I32_MAX_64: i64 = 2147483647
+
+struct I32Range { lo: i64, hi: i64 }
+impl Copy for I32Range {}
+
+fn clampI32Range(lo: i64, hi: i64) -> I32Range {
+  let cLo = if lo < I32_MIN_64 { I32_MIN_64 } else { lo }
+  let cHi = if hi > I32_MAX_64 { I32_MAX_64 } else { hi }
+  if cLo > cHi { return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 } }
+  return I32Range { lo: cLo, hi: cHi }
+}
+
+/// Conservative signed 64-bit interval `[lo, hi]` for SSA `i32` value `v` (bounded recursion
+/// depth 6). Every surviving `Op.Add`/`Op.Sub`/`Op.Mul` value already exited on i32 overflow.
+fn i32Range(function: &Function, v: u32, depth: u32) -> I32Range {
+  if v == NONE || depth >= 6 { return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 } }
   let def = function.value(v).def
-  if def == NONE { return false }
+  if def == NONE { return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 } }
   let inst = function.inst(def)
-  if inst.op == Op.ConstI32 { return inst.k >= 0 }
-  if inst.op == Op.BitAnd { return nonNegativeConstant(function, inst.a) || nonNegativeConstant(function, inst.b) }
+  if inst.op == Op.ConstI32 {
+    let k = i32.toI64(inst.k)
+    return I32Range { lo: k, hi: k }
+  }
+  if inst.op == Op.BitAnd {
+    let ra = i32Range(&function, inst.a, depth + 1)
+    let rb = i32Range(&function, inst.b, depth + 1)
+    if ra.lo >= 0 && rb.lo >= 0 { return I32Range { lo: 0, hi: if ra.hi < rb.hi { ra.hi } else { rb.hi } } }
+    if ra.lo >= 0 { return I32Range { lo: 0, hi: ra.hi } }
+    if rb.lo >= 0 { return I32Range { lo: 0, hi: rb.hi } }
+    return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 }
+  }
+  if inst.op == Op.BitOr || inst.op == Op.BitXor {
+    let ra = i32Range(&function, inst.a, depth + 1)
+    let rb = i32Range(&function, inst.b, depth + 1)
+    if ra.lo >= 0 && rb.lo >= 0 { return I32Range { lo: 0, hi: I32_MAX_64 } }
+    return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 }
+  }
+  if inst.op == Op.Sar {
+    let shiftDef = function.value(inst.b).def
+    if shiftDef != NONE && function.inst(shiftDef).op == Op.ConstI32 {
+      let s = i32.toI64(function.inst(shiftDef).k & 31)
+      let ra = i32Range(&function, inst.a, depth + 1)
+      return I32Range { lo: i64.shiftRight(ra.lo, s), hi: i64.shiftRight(ra.hi, s) }
+    }
+    return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 }
+  }
   if inst.op == Op.Shr {
-    let shift = function.value(inst.b).def
-    return shift != NONE && function.inst(shift).op == Op.ConstI32 && (function.inst(shift).k & 31) != 0
+    let shiftDef = function.value(inst.b).def
+    if shiftDef != NONE && function.inst(shiftDef).op == Op.ConstI32 {
+      let s = function.inst(shiftDef).k & 31
+      if s != 0 {
+        let hi = u64.wrappingToI64(u64.shiftRight(4294967295, i32.wrappingToU64(s)))
+        return I32Range { lo: 0, hi: hi }
+      }
+    }
+    return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 }
+  }
+  if inst.op == Op.Shl {
+    let shiftDef = function.value(inst.b).def
+    if shiftDef != NONE && function.inst(shiftDef).op == Op.ConstI32 {
+      let s = function.inst(shiftDef).k & 31
+      let ra = i32Range(&function, inst.a, depth + 1)
+      if ra.lo >= 0 && s < 31 {
+        let hi = i64.shiftLeft(ra.hi, i32.toI64(s))
+        if hi <= I32_MAX_64 { return I32Range { lo: i64.shiftLeft(ra.lo, i32.toI64(s)), hi: hi } }
+      }
+    }
+    return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 }
+  }
+  if inst.op == Op.Add {
+    let ra = i32Range(&function, inst.a, depth + 1)
+    let rb = i32Range(&function, inst.b, depth + 1)
+    return clampI32Range(ra.lo + rb.lo, ra.hi + rb.hi)
+  }
+  if inst.op == Op.Sub {
+    let ra = i32Range(&function, inst.a, depth + 1)
+    let rb = i32Range(&function, inst.b, depth + 1)
+    return clampI32Range(ra.lo - rb.hi, ra.hi - rb.lo)
+  }
+  if inst.op == Op.Mul {
+    let ra = i32Range(&function, inst.a, depth + 1)
+    let rb = i32Range(&function, inst.b, depth + 1)
+    let p0 = ra.lo * rb.lo
+    let p1 = ra.lo * rb.hi
+    let p2 = ra.hi * rb.lo
+    let p3 = ra.hi * rb.hi
+    let mut lo = p0
+    if p1 < lo { lo = p1 }
+    if p2 < lo { lo = p2 }
+    if p3 < lo { lo = p3 }
+    let mut hi = p0
+    if p1 > hi { hi = p1 }
+    if p2 > hi { hi = p2 }
+    if p3 > hi { hi = p3 }
+    return clampI32Range(lo, hi)
+  }
+  return I32Range { lo: I32_MIN_64, hi: I32_MAX_64 }
+}
+
+fn addSubRangeSafe(function: &Function, inst: Inst) -> bool {
+  let ra = i32Range(&function, inst.a, 0)
+  let rb = i32Range(&function, inst.b, 0)
+  if inst.op == Op.Add {
+    let lo = ra.lo + rb.lo
+    let hi = ra.hi + rb.hi
+    return lo >= I32_MIN_64 && hi <= I32_MAX_64
+  }
+  if inst.op == Op.Sub {
+    let lo = ra.lo - rb.hi
+    let hi = ra.hi - rb.lo
+    return lo >= I32_MIN_64 && hi <= I32_MAX_64
   }
   return false
 }
-fn nonNegativeConstant(function: &Function, v: u32) -> bool {
-  let def = function.value(v).def
-  return def != NONE && function.inst(def).op == Op.ConstI32 && function.inst(def).k >= 0
+
+fn mulRangeSafe(function: &Function, a: u32, b: u32) -> bool {
+  let ra = i32Range(&function, a, 0)
+  let rb = i32Range(&function, b, 0)
+  let p0 = ra.lo * rb.lo
+  let p1 = ra.lo * rb.hi
+  let p2 = ra.hi * rb.lo
+  let p3 = ra.hi * rb.hi
+  let mut lo = p0
+  if p1 < lo { lo = p1 }
+  if p2 < lo { lo = p2 }
+  if p3 < lo { lo = p3 }
+  let mut hi = p0
+  if p1 > hi { hi = p1 }
+  if p2 > hi { hi = p2 }
+  if p3 > hi { hi = p3 }
+  return lo >= I32_MIN_64 && hi <= I32_MAX_64
 }
+
+fn mulNoNegZero(function: &Function, a: u32, b: u32) -> bool {
+  let ra = i32Range(&function, a, 0)
+  let rb = i32Range(&function, b, 0)
+  return (ra.lo >= 0 && rb.lo >= 0) || ra.lo > 0 || rb.lo > 0
+}
+
 /// The constant when it is positive, else 0.
 fn positiveConstant(constant: Option<i32>) -> i32 {
   return match constant { Option<i32>.Some { value } => if value > 0 { value } else { 0 } Option<i32>.None => 0 }
@@ -1220,22 +1343,36 @@ impl Emitter {
       let place = self.at(inst.a) run getI32(&mut self.a, Reg.Rax, place)
       run self.stressGuard(inst.exit)
       run self.a.imulImm(Width.W32, Reg.Rax, Reg.Rax, factor)
-      run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
+      if !mulRangeSafe(&function, inst.a, inst.b) { run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit))) }
       run self.a.mov(Width.W32, Reg.Rax, Reg.Rax)
       let out = self.at(inst.result) run putI32(&mut self.a, out, Reg.Rax)
       return ()
     }
     if op == Op.Mul {
-      // In the result's register when that holds neither operand (the exits read both).
+      let overflowFree = mulRangeSafe(&function, inst.a, inst.b)
+      let noNegZero = mulNoNegZero(&function, inst.a, inst.b)
       let out = self.at(inst.result)
+      if self.settings.stress == 0 && overflowFree && noNegZero && out.kind == GPR {
+        if self.key(inst.a) == self.key(inst.result) {
+          let placeB = self.at(inst.b)
+          if placeB.kind == GPR { run self.a.imul(Width.W32, out.gpr, placeB.gpr) } else { run self.a.imulLoad(Width.W32, out.gpr, placeB.mem) }
+          return ()
+        }
+        if self.key(inst.b) == self.key(inst.result) {
+          let placeA = self.at(inst.a)
+          if placeA.kind == GPR { run self.a.imul(Width.W32, out.gpr, placeA.gpr) } else { run self.a.imulLoad(Width.W32, out.gpr, placeA.mem) }
+          return ()
+        }
+      }
+      // In the result's register when that holds neither operand (the exits read both).
       let mut work = Reg.Rax
       if out.kind == GPR && self.key(inst.a) != self.key(inst.result) && self.key(inst.b) != self.key(inst.result) { work = out.gpr }
       let place5 = self.at(inst.a) run getI32(&mut self.a, work, place5)
       run self.stressGuard(inst.exit)
       let place6 = self.at(inst.b)
       if place6.kind == GPR { run self.a.imul(Width.W32, work, place6.gpr) } else { run self.a.imulLoad(Width.W32, work, place6.mem) }
-      run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit)))
-      if !(nonNegative(&function, inst.a) && nonNegative(&function, inst.b)) {
+      if !overflowFree { run self.a.jcc(Cond.Overflow, self.exitLabels.get(u32.toUsize(inst.exit))) }
+      if !noNegZero {
         // A zero product is -0 when an operand is negative: that test is out of line
         // (zeroInsts), where both operands are still in their places.
         let zero = run self.a.label()
@@ -2572,6 +2709,9 @@ impl Emitter {
       // Fresh-object observation disables escape-eliminated constructs.
       run self.a.cmp8MemImm(Mem.at(Reg.R13, signed(c.rtObserveFresh)), 0)
       run self.a.jcc(Cond.NotEqual, miss)
+      // Nested pre-initialized constructs validate outer + inner descriptors in coldSlow.
+      run self.a.cmp8MemImm(Mem.at(Reg.R11, signed(c.descNestedKind)), 0)
+      run self.a.jcc(Cond.NotEqual, coldSlow)
       // Epoch change goes to coldSlow (helpers.CHECK_CONSTRUCT) to revalidate prototype chain.
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R13, signed(fields.shapeEpoch)))
       run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R11, signed(c.descShapeEpoch)))
@@ -5081,7 +5221,7 @@ impl Emitter {
     while cc < self.checkConstructSlows.length() {
       let item = self.checkConstructSlows.get(cc)
       let pollBody = run self.a.label()
-      // Epoch changed or post-poll revalidation: call helpers.CHECK_CONSTRUCT with fragile
+      // Epoch change or post-poll revalidation: call helpers.CHECK_CONSTRUCT with fragile
       // GPRs and live XMM registers preserved across the C call.
       self.a.bind(item.coldSlow)
       run self.keepFragile()
@@ -5198,6 +5338,7 @@ impl Emitter {
   /// Whether `add.i32 x, 1` cannot overflow: x is an index a trusted access earlier in the
   /// block bounded (bound), below a count of elements, which is far below 2^31.
   fn cannotOverflow(self: &Self, function: &Function, inst: Inst) -> bool {
+    if addSubRangeSafe(&function, inst) { return true }
     if inst.op != Op.Add || inst.b == NONE || function.inst(self.cursor).block != self.boundedBlock { return false }
     match self.constants.get(u32.toUsize(inst.b)) {
       Option<i32>.Some { value } => { if value != 1 { return false } }
