@@ -579,6 +579,93 @@ pub struct DeferredSource { pub data: *const u8, pub length: usize, pub flags: u
 impl Copy for DeferredSource {}
 
 pub struct RuntimeState {
+  // Hot interpreter, call-frame, property-cache, allocation, and GC fields
+  // packed onto the first page so disp8/disp16 addressing and a single L1 dTLB
+  // entry cover the fast paths instead of spanning across the large cache tables.
+  pub currentStackFrame: ?*mut StackFrame,
+  /// Storage top/end pointers for frameless JS-to-JS calls (js_vm.callInline).
+  pub callFramesTop: ?*mut ValueBits,
+  pub callFramesEnd: ?*mut ValueBits,
+  /// debugger.enabled || coverage.enabled || cpuProfile.enabled || debugger.restricted,
+  /// kept by js_debugger.refreshObservation: the one flag the dispatch loop tests
+  /// before every instruction.
+  pub observeInstructions: bool,
+  /// Set when observeInstructions turns on: inline frames entered before have
+  /// no debugger activation until js_vm_activation.adoptFrames links them in.
+  pub adoptFrames: bool,
+  /// debugger.restricted || allocationRealmsUsed: the one flag publishing a fresh
+  /// cell tests (js_gc.noteFresh) before anything else watches it.
+  pub observeFresh: bool,
+  /// Set, and kept, once any realm starts recording allocation realms.
+  pub allocationRealmsUsed: bool,
+  /// Dispatch loops running the plain copy (js_vm.execute). While observation is
+  /// on and one is live, every interrupt poll re-arms the poll in all contexts:
+  /// each plain run then hands off at its next backward jump, even after another
+  /// loop (often a nested observed one) consumed the poll configure forced.
+  pub plainRuns: u32,
+  /// Bumped whenever any shape gets a new version or any existing object changes
+  /// shape, so a cache that verified a prototype chain's versions at an epoch can
+  /// skip the walk while the epoch stays the same.
+  pub shapeEpoch: u64,
+  /// The next ShapeData.version; starts at 1 so no live shape has version 0.
+  pub nextShapeVersion: u64,
+  /// The ShapeData.version of the last object spread source js_copy_data_properties
+  /// found to be all plain enumerable data properties; versions are never reused.
+  pub plainCloneVersion: u64,
+  /// Live entries of zeroStack.
+  pub zeroStackCount: u16,
+  pub spareVarRefCount: u16,
+  pub gcPhase: GcPhase,
+  /// Drains still to defer their releases early (js_gc.drainZeroFrom): set when a
+  /// drain measures its dead cells as out of cache, counted down by each drain
+  /// that defers on that word, so a warm heap is found again by a fresh probe.
+  pub coldDrains: u8,
+  /// Set when an object that weak references target dies (js_gc.destroyObject), so the weak
+  /// sweep runs again in the same collection: a WeakMap value or cycle freed by one pass can
+  /// be the target of a FinalizationRegistry, which Node finalizes in that same gc().
+  pub weakTargetsDied: bool,
+  /// While a heap image is laid out (js_runtime.setLayoutIndependent): the caches
+  /// keyed by cell address (spare closures, shape transitions, receiver plans)
+  /// stay empty. A hit there changes what is allocated next, and the image's
+  /// layout moves cells, so with them the build would allocate differently under
+  /// each layout and the ids that name its blocks would drift.
+  pub layoutIndependent: bool,
+  /// Counts of work since the runtime was made, for the bench census (censusBump,
+  /// js_census): the CENSUS_* constants index it. The runtime starts zeroed.
+  pub census: [usize; 16],
+  /// Dead plain object cells, kept whole (header owner byte included) for new
+  /// objects so that a short-lived object skips one allocate/free pair. Bin b
+  /// (js_gc.spareBin) holds its cells from b * SPARE_CELLS, the first
+  /// spareCellCounts[b] of them live; other entries are stale. js_gc and
+  /// js_object_allocate own this cache.
+  pub spareCells: ThinList<?*mut HeapHeader>,
+  pub spareCellCounts: [usize; 5],
+  /// The pool arenas holding this runtime's pooled GC cells (runtime_memory.addCell).
+  pub gcArenas: ?*mut u8,
+  /// Those of gcArenas with young bits set (runtime_memory.addCell).
+  pub gcYoungArenas: ?*mut u8,
+  /// Those of gcArenas with scratch bits set (runtime_memory.listPending).
+  pub gcPendingArenas: ?*mut u8,
+  /// Pooled dead cells waiting for drainZero, marked in their arenas' scratch bits.
+  pub zeroPending: usize,
+  pub mallocGcThreshold: usize,
+  pub stackLimit: usize,
+  pub stackTop: usize,
+  pub stackSize: usize,
+  pub currentException: ValueBits,
+  /// The last String.prototype.charCodeAt lookup js_vm_property_ops.noteStringCharCodeAt verified.
+  pub stringCharCode: StringCharCodeCache,
+  pub spareScopeCounts: [u16; 8],
+  pub spareSlotCounts: [usize; 7],
+  pub spareValueCounts: [usize; 8],
+  /// Emptied property slot lists of capacity 1 to 4, 8, 16 and 32, kept for
+  /// reuse by new objects so that a short-lived object skips one allocate/free
+  /// pair. Each bin (js_shapes.spareSlotBin) occupies SPARE_SLOTS_PER_BIN entries;
+  /// js_gc owns this cache.
+  pub spareSlots: List<ThinList<SlotBits>>,
+  /// Emptied fast-array value lists of capacity 1 to SPARE_VALUE_CAPACITY, by capacity (js_shapes).
+  pub spareValues: List<ThinList<ValueBits>>,
+
   pub runtimeInfo: Option<ByteStorage>,
   pub atoms: AtomTable,
   pub classes: List<ClassDef>,
@@ -598,30 +685,6 @@ pub struct RuntimeState {
   /// Collector scratch: linked cells found unreachable, then their zombies.
   pub temporaryGcObjects: HeapList,
   pub zombieGcObjects: HeapList,
-  /// The pool arenas holding this runtime's pooled GC cells (runtime_memory.addCell).
-  pub gcArenas: ?*mut u8,
-  /// Those of gcArenas with scratch bits set (runtime_memory.listPending).
-  pub gcPendingArenas: ?*mut u8,
-  /// Those of gcArenas with young bits set (runtime_memory.addCell).
-  pub gcYoungArenas: ?*mut u8,
-  /// Pooled dead cells waiting for drainZero, marked in their arenas' scratch bits.
-  pub zeroPending: usize,
-  /// Drains still to defer their releases early (js_gc.drainZeroFrom): set when a
-  /// drain measures its dead cells as out of cache, counted down by each drain
-  /// that defers on that word, so a warm heap is found again by a fresh probe.
-  pub coldDrains: u8,
-  /// Set when an object that weak references target dies (js_gc.destroyObject), so the weak
-  /// sweep runs again in the same collection: a WeakMap value or cycle freed by one pass can
-  /// be the target of a FinalizationRegistry, which Node finalizes in that same gc().
-  pub weakTargetsDied: bool,
-  pub gcPhase: GcPhase,
-  pub mallocGcThreshold: usize,
-  /// While a heap image is laid out (js_runtime.setLayoutIndependent): the caches
-  /// keyed by cell address (spare closures, shape transitions, receiver plans)
-  /// stay empty. A hit there changes what is allocated next, and the image's
-  /// layout moves cells, so with them the build would allocate differently under
-  /// each layout and the ids that name its blocks would drift.
-  pub layoutIndependent: bool,
   /// Consecutive collections that freed little, 0 to 3; each widens the next
   /// threshold so a growing acyclic heap is not rescanned at every 1.5x step.
   pub quietCollections: u8,
@@ -672,14 +735,8 @@ pub struct RuntimeState {
   pub dateZoneNames: ZoneNames,
   /// Whether dateZone came from the OS zone (no TZ), which is looked up only once.
   pub dateZoneLinked: bool,
-  /// Live entries of zeroStack.
-  pub zeroStackCount: u16,
   pub weakReferences: WeakRefList,
   pub leakTracking: Option<LeakTrackingState>,
-  pub stackSize: usize,
-  pub stackTop: usize,
-  pub stackLimit: usize,
-  pub currentException: ValueBits,
   /// The value the last `throw` statement threw, the FunctionBytecode it ran in
   /// and the pc just past it (js_errors.throwSite). Owned until the next throw
   /// replaces them, so a fatal exception report can point at the throw site.
@@ -717,26 +774,8 @@ pub struct RuntimeState {
   pub asyncPromiseParent: ValueBits,
   pub currentExceptionIsUncatchable: bool,
   pub inOutOfMemory: bool,
-  pub currentStackFrame: ?*mut StackFrame,
   pub debugger: DebuggerState,
   pub coverage: CoverageState,
-  /// debugger.enabled || coverage.enabled || cpuProfile.enabled || debugger.restricted,
-  /// kept by js_debugger.refreshObservation: the one flag the dispatch loop tests
-  /// before every instruction.
-  pub observeInstructions: bool,
-  /// Set when observeInstructions turns on: inline frames entered before have
-  /// no debugger activation until js_vm_activation.adoptFrames links them in.
-  pub adoptFrames: bool,
-  /// Dispatch loops running the plain copy (js_vm.execute). While observation is
-  /// on and one is live, every interrupt poll re-arms the poll in all contexts:
-  /// each plain run then hands off at its next backward jump, even after another
-  /// loop (often a nested observed one) consumed the poll configure forced.
-  pub plainRuns: u32,
-  /// debugger.restricted || allocationRealmsUsed: the one flag publishing a fresh
-  /// cell tests (js_gc.noteFresh) before anything else watches it.
-  pub observeFresh: bool,
-  /// Set, and kept, once any realm starts recording allocation realms.
-  pub allocationRealmsUsed: bool,
   pub cpuProfile: CpuProfileState,
   /// Monotonic compilation identity shared by all realms; zero means no script.
   pub nextScriptId: u64,
@@ -760,22 +799,6 @@ pub struct RuntimeState {
   /// Members are detached from the GC lists; js_shapes owns this cache.
   pub parkedShapes: HeapList,
   pub parkedShapeCount: usize,
-  /// Emptied property slot lists of capacity 1 to 4, 8, 16 and 32, kept for
-  /// reuse by new objects so that a short-lived object skips one allocate/free
-  /// pair. Each bin (js_shapes.spareSlotBin) occupies SPARE_SLOTS_PER_BIN entries;
-  /// js_gc owns this cache.
-  pub spareSlots: List<ThinList<SlotBits>>,
-  pub spareSlotCounts: [usize; 7],
-  /// Emptied fast-array value lists of capacity 1 to SPARE_VALUE_CAPACITY, by capacity (js_shapes).
-  pub spareValues: List<ThinList<ValueBits>>,
-  pub spareValueCounts: [usize; 8],
-  /// Dead plain object cells, kept whole (header owner byte included) for new
-  /// objects so that a short-lived object skips one allocate/free pair. Bin b
-  /// (js_gc.spareBin) holds its cells from b * SPARE_CELLS, the first
-  /// spareCellCounts[b] of them live; other entries are stale. js_gc and
-  /// js_object_allocate own this cache.
-  pub spareCells: ThinList<?*mut HeapHeader>,
-  pub spareCellCounts: [usize; 5],
   /// Two-way memo of recent hashed-shape transitions; js_shapes owns it. An
   /// entry hits only while its base keeps the version it was recorded at, and
   /// unlinking a target clears the one slot that names it (ShapeData.memoSlot).
@@ -784,15 +807,6 @@ pub struct RuntimeState {
   pub transitions: [TransitionEntry; 2048],
   /// The verified prototype chain of transitions[i], read only once its entry matches.
   pub transitionChains: [TransitionChain; 2048],
-  /// The next ShapeData.version; starts at 1 so no live shape has version 0.
-  pub nextShapeVersion: u64,
-  /// Bumped whenever any shape gets a new version or any existing object changes
-  /// shape, so a cache that verified a prototype chain's versions at an epoch can
-  /// skip the walk while the epoch stays the same.
-  pub shapeEpoch: u64,
-  /// The ShapeData.version of the last object spread source js_copy_data_properties
-  /// found to be all plain enumerable data properties; versions are never reused.
-  pub plainCloneVersion: u64,
   /// get_field site cache, indexed by a hash of the site's bytecode address;
   /// js_vm_property_ops owns it.
   pub fieldCache: [FieldCacheEntry; 4096],
@@ -804,8 +818,6 @@ pub struct RuntimeState {
   pub typedLengthCache: [TypedLengthEntry; 12],
   /// The last RegExp layout js_regexp_intrinsics_symbols.standard proved; it owns it.
   pub regexpStandard: RegExpStandardCache,
-  /// The last String.prototype.charCodeAt lookup js_vm_property_ops.noteStringCharCodeAt verified.
-  pub stringCharCode: StringCharCodeCache,
   /// Shape chains of recently constructed objects, each held by one reference
   /// so that `new F()` revives no parked shape on its way from the empty shape
   /// to the final one; js_gc owns these and releases them before each collection.
@@ -887,12 +899,10 @@ pub struct RuntimeState {
   /// Dead VarRef cells kept for reuse (see js_gc.destroyVarRef), the first
   /// spareVarRefCount live. A parked cell is no GC member.
   pub spareVarRefs: [?*mut HeapHeader; 512],
-  pub spareVarRefCount: u16,
   /// Dead Scope cells kept for reuse (see js_gc.destroyScope), bin b (scopes of
   /// b + 1 slots) at b * js_gc.SPARE_SCOPES, the first spareScopeCounts[b] live;
   /// parked like spareVarRefs.
   pub spareScopes: [?*mut HeapHeader; 2048],
-  pub spareScopeCounts: [u16; 8],
   /// The shape a new closure takes (length, name, then prototype when the
   /// function has one), indexed by that: shapedFunction's transition walk once
   /// per prototype. Each held shape is owned and holds its prototype, whose
@@ -904,17 +914,12 @@ pub struct RuntimeState {
   /// set (js_gc.spareClosureSet). js_gc.parkClosure
   /// fills it, js_closures.takeSpare empties it, releasePins flushes it.
   pub spareClosures: [?*mut HeapHeader; 256],
-  /// Scratch undo log for outermost frameless leaf field stores (js_vm_leaf):
-  /// never re-entered and never live across GC, so kept off evaluate's stack.
-  pub leafUndo: [LeafUndoSlot; 8],
   pub userOpaque: ?*mut u8,
   /// Storage for frames of JS-to-JS calls the dispatch loop makes without native
   /// recursion (js_vm.callInline). Allocated once and never moved; the slots
   /// below callFramesTop hold live frames, innermost last, and callFramesEnd ends
   /// the region. Both are null without a region. js_vm_activation owns it.
   pub callFrames: Option<Intrinsic.RawBuffer<ValueBits>>,
-  pub callFramesTop: ?*mut ValueBits,
-  pub callFramesEnd: ?*mut ValueBits,
   /// Allocation realms of the objects allocated in a recording realm, by object
   /// address (js_allocation_realms). Each entry owns one reference to its realm
   /// and is a GC edge of its object; the object's OBJECT_ROLE_RECORDED_REALM bit
@@ -930,10 +935,7 @@ pub struct RuntimeState {
   pub reactionResolve: ValueBits,
   /// A for-in iterator object kept for reuse (js_for_in.build), owning one
   /// count, or Undefined. While that count is its only one, no loop uses it.
-  pub parkedForIn: ValueBits,
-  /// Counts of work since the runtime was made, for the bench census (censusBump,
-  /// js_census): the CENSUS_* constants index it. The runtime starts zeroed.
-  pub census: [usize; 16]
+  pub parkedForIn: ValueBits
 }
 pub const CENSUS_GC_FULL: usize = 0
 pub const CENSUS_GC_YOUNG: usize = 1
@@ -2268,13 +2270,6 @@ pub enum FunctionKind { Normal, Generator, Async, AsyncGenerator }
 /// texts nest inside each other. plain: the whole shared input has no CR, LS, PS or
 /// four-byte sequence, so its two coordinate systems never drift apart
 /// (js_debug_positions.SourcePositionCache.shareCoordinates).
-/// One overwritten own object slot recorded by an outermost frameless leaf run
-/// (js_vm_leaf) so it can release the old value on commit or restore on decline.
-pub struct LeafUndoSlot { pub node: ?*mut HeapHeader, pub index: usize, pub old: ValueBits }
-impl Copy for LeafUndoSlot {}
-pub fn blankLeafUndo() -> LeafUndoSlot {
-  return LeafUndoSlot { node: Pointer.null<HeapHeader>(), index: 0, old: ValueBits.Undefined }
-}
 /// An identifier spelling cached by js_lexer.
 /// For 1..8-byte plain ASCII identifiers, `word` holds the exact zero-padded
 /// little-endian bytes (bit 63 == 0), so hits require no source-buffer read and

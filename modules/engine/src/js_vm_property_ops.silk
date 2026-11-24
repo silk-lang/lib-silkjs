@@ -19,7 +19,7 @@ import js_core_types as census
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { lendBits, lendFor, Value }
-import js_core_types { storeFieldEntry, fieldGetterKey, LeafUndoSlot, PolyFieldEntry, polyFieldIndex, POLY_OWN, POLY_PROTO, POLY_GETTER, POLY_ABSENT, POLY_WRITABLE, RuntimeState, StringCharCodeCache, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldAbsentKey, fieldCacheIndex, fieldSpareIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
+import js_core_types { storeFieldEntry, fieldGetterKey, PolyFieldEntry, polyFieldIndex, POLY_OWN, POLY_PROTO, POLY_GETTER, POLY_ABSENT, POLY_WRITABLE, RuntimeState, StringCharCodeCache, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldAbsentKey, fieldCacheIndex, fieldSpareIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
   PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -530,7 +530,7 @@ pub unsafe fn readFieldKeyedAt(runtime: *mut HeapHeader, ip: *const u8, object: 
   return unsafe refillFieldKey(runtime, ip, object, target, retain)
 }
 /// readFieldKeyedAt's fast miss (5 register args, zero-push true leaf on
-/// non-exotic polyFields POLY_OWN hits — ~95% of refills). Prototype, exotic,
+/// non-exotic polyFields POLY_OWN/POLY_PROTO/POLY_ABSENT hits). Exotic,
 /// fieldCache, and cold misses tail-call refillFieldKeySecondary.
 @inlineNever
 unsafe fn refillFieldKey(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
@@ -540,14 +540,29 @@ unsafe fn refillFieldKey(runtime: *mut HeapHeader, ip: *const u8, object: *mut H
   let atom = unsafe fieldAtomAt(ip)
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let poly = &state.polyFields[polyFieldIndex(version, atom)]
-  if poly.version == version && poly.atom == atom && !data.isExotic() && (poly.kind & ~POLY_WRITABLE) == POLY_OWN {
-    let index = u64.toUsize(poly.stamp & 0xffff)
-    let found = (unsafe data.slotUnchecked(index)).valueBits()
-    if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
-    drop state drop data
-    let key = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut align(1) u64>(unsafe Intrinsic.pointerRequalify<*const u8, *mut u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 4)))
-    unsafe Pointer.writeUnaligned<u64>(key, u64.shiftLeft(version, 16) | usize.toU64(index))
-    return true
+  if poly.version == version && poly.atom == atom && !data.isExotic() {
+    let answer = poly.kind & 0x7f
+    if answer == POLY_OWN {
+      let index = u64.toUsize(poly.stamp & 0xffff)
+      let found = (unsafe data.slotUnchecked(index)).valueBits()
+      if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+      drop state drop data
+      let key = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut align(1) u64>(unsafe Intrinsic.pointerRequalify<*const u8, *mut u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 4)))
+      unsafe Pointer.writeUnaligned<u64>(key, u64.shiftLeft(version, 16) | usize.toU64(index))
+      return true
+    }
+    if u64.shiftRight(poly.stamp, 16) == state.shapeEpoch {
+      if answer == POLY_PROTO {
+        let known = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(poly.holder))
+        let found = (unsafe known.slotUnchecked(u64.toUsize(poly.stamp & 0xffff))).valueBits()
+        if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+        return true
+      }
+      if answer == POLY_ABSENT {
+        unsafe Pointer.write<ValueBits>(target, ValueBits.Undefined)
+        return true
+      }
+    }
   }
   drop state drop data
   return unsafe refillFieldKeySecondary(runtime, ip, object, target, retain)
@@ -2514,86 +2529,6 @@ pub unsafe fn writeOwnField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
     }
   }
   return true
-}
-/// Stores value (taking its reference) into an existing own writable data
-/// property of node at the store site ip (atom + 8-byte inline key), recording
-/// the slot index and previous (unreleased) value in RuntimeState.leafUndo[undoIndex].
-/// Returns -1 with nothing changed on miss/non-writable/accessor/length, 0 when
-/// stored over a non-heap value, or 1 when stored over a heap value needing commit release.
-@inlineAlways
-pub unsafe fn writeOwnFieldUndo(runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader, value: ValueBits, undoIndex: usize) -> i32 {
-  let key = unsafe fieldKeyAt(ip)
-  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
-  let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
-  if u64.shiftRight(key, 16) == shape.version {
-    drop shape
-    let index = u64.toUsize(key & 0xffff)
-    let old = (unsafe data.slotUnchecked(index)).valueBits()
-    unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe value.retained()))
-    drop data
-    let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
-    state.leafUndo[undoIndex] = LeafUndoSlot { node: node, index: index, old: old }
-    drop state
-    return if old.tag() < 0 { 1 } else { 0 }
-  }
-  drop shape drop data
-  return unsafe writeOwnFieldUndoMiss(runtime, ip, node, value, undoIndex)
-}
-@inlineNever
-unsafe fn writeOwnFieldUndoMiss(runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader, value: ValueBits, undoIndex: usize) -> i32 {
-  let atom = unsafe fieldAtomAt(ip)
-  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
-  let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
-  let version = shape.version
-  if shape.isHashed {
-    let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
-    let poly = &state.polyFields[polyFieldIndex(version, atom)]
-    if poly.version == version && poly.atom == atom && (poly.kind & POLY_WRITABLE) != 0 {
-      let kind = poly.kind
-      let valid = if data.isExotic() {
-        u32.shiftRight(kind, 8) == data.classId() && (data.classId() != classes.JS_CLASS_ARRAY || data.fastArray())
-      } else { kind <= 0xff }
-      if valid {
-        let index = u64.toUsize(poly.stamp & 0xffff)
-        drop state drop shape
-        unsafe writeFieldKey(ip, u64.shiftLeft(version, 16) | usize.toU64(index))
-        let old = (unsafe data.slotUnchecked(index)).valueBits()
-        unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe value.retained()))
-        drop data
-        let mut undoAnchor = () let undoState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut undoAnchor, runtime)
-        undoState.leafUndo[undoIndex] = LeafUndoSlot { node: node, index: index, old: old }
-        drop undoState
-        return if old.tag() < 0 { 1 } else { 0 }
-      }
-    }
-    drop state
-  }
-  let mut probe = unsafe shapes.unchecked<u32>(&shape.hashIndices, u32.toUsize(atom & shape.propertyHashMask))
-  while probe != 0 {
-    let index = u32.toUsize(probe - 1)
-    let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
-    if property.atom == atom {
-      let flags = u8.toU32(property.flags)
-      if (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return -1 }
-      if index < 0x10000 {
-        if shape.isHashed && unsafe namedOrdinary(runtime, &data, atom) {
-          let classTag = if data.isExotic() { u32.shiftLeft(data.classId(), 8) } else { 0 }
-          unsafe storePolyField(runtime, version, atom, POLY_OWN | POLY_WRITABLE | classTag, Pointer.null<HeapHeader>(), index)
-        }
-        unsafe writeFieldKey(ip, u64.shiftLeft(version, 16) | usize.toU64(index))
-      }
-      drop shape
-      let old = (unsafe data.slotUnchecked(index)).valueBits()
-      unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe value.retained()))
-      drop data
-      let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
-      state.leafUndo[undoIndex] = LeafUndoSlot { node: node, index: index, old: old }
-      drop state
-      return if old.tag() < 0 { 1 } else { 0 }
-    }
-    probe = property.hashNext
-  }
-  return -1
 }
 /// writeOwnField by the first own probe for atom, for stores with no inline
 /// key (js_vm_leaf.store).
