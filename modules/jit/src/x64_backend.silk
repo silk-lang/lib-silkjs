@@ -1085,7 +1085,71 @@ impl Emitter {
       if self.on {
         let slow = run self.a.label()
         let done = run self.a.label()
-        run self.a.jmp(slow)
+        let layout = self.settings.layout
+        let fields = self.fields
+        let c = self.construct
+        // Inline quickInstanceOf: right is a JS/C function whose shape version hits
+        // RuntimeState.instanceCache[version & 63]; non-object left answers 0 immediately;
+        // otherwise walk left's non-exotic (or fast-array) prototype chain comparing to prototype.
+        if c.icEntryStride == 16 && layout.tagWidth == 1 && layout.object() < 256 {
+          let isFn = run self.a.label()
+          let retFalse = run self.a.label()
+          let retTrue = run self.a.label()
+          let store = run self.a.label()
+          let walk = run self.a.label()
+          let checkProto = run self.a.label()
+          run self.unlessTag(inst.b, layout.object(), slow)
+          run self.payloadInto(Reg.R8, inst.b)
+          run self.a.loadZero16(Reg.Rax, Mem.at(Reg.R8, signed(fields.objectClass)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, signed(c.bytecodeFnClass))
+          run self.a.jcc(Cond.Equal, isFn)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, signed(c.cFnClass))
+          run self.a.jcc(Cond.NotEqual, slow)
+          self.a.bind(isFn)
+          run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.R8, signed(fields.objectShape)))
+          run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.Rcx, signed(fields.shapeVersion)))
+          run self.a.mov(Width.W64, Reg.Rdx, Reg.Rcx)
+          run self.a.aluImm(Alu.And, Width.W64, Reg.Rdx, 63)
+          run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rdx, 4)
+          run self.a.alu(Alu.Add, Width.W64, Reg.Rdx, Reg.R13)
+          run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rcx, Mem.at(Reg.Rdx, signed(c.rtInstanceCache + c.icEntryVersion)))
+          run self.a.jcc(Cond.NotEqual, slow)
+          // Non-object left returns false without reading constructor.prototype (matches quickInstanceOf).
+          run self.unlessTag(inst.a, layout.object(), retFalse)
+          run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.Rdx, signed(c.rtInstanceCache + c.icEntryIndex)))
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(fields.objectSlots)))
+          run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rdx, 4)
+          run self.a.alu(Alu.Add, Width.W64, Reg.R8, Reg.Rdx)
+          run self.a.cmp8MemImm(Mem.at(Reg.R8, signed(layout.tagOffset)), u32.wrappingToU8(layout.object()))
+          run self.a.jcc(Cond.NotEqual, slow)
+          run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, 8))
+          run self.payloadInto(Reg.R8, inst.a)
+          self.a.bind(walk)
+          run self.a.test8MemImm(Mem.at(Reg.R8, signed(fields.objectFlags)), u32.wrappingToU8(fields.exotic))
+          run self.a.jcc(Cond.Equal, checkProto)
+          run self.a.test8MemImm(Mem.at(Reg.R8, signed(fields.objectFlags)), u32.wrappingToU8(fields.fastArray))
+          run self.a.jcc(Cond.Equal, slow)
+          run self.a.loadZero16(Reg.Rax, Mem.at(Reg.R8, signed(fields.objectClass)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, signed(fields.arrayClass))
+          run self.a.jcc(Cond.NotEqual, slow)
+          self.a.bind(checkProto)
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(fields.objectShape)))
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(fields.shapePrototype)))
+          run self.a.test(Width.W64, Reg.R8, Reg.R8)
+          run self.a.jcc(Cond.Equal, retFalse)
+          run self.a.alu(Alu.Cmp, Width.W64, Reg.R8, Reg.R9)
+          run self.a.jcc(Cond.Equal, retTrue)
+          run self.a.jmp(walk)
+          self.a.bind(retFalse)
+          run self.a.alu(Alu.Xor, Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jmp(store)
+          self.a.bind(retTrue)
+          run self.a.movImm32(Reg.Rax, 1)
+          self.a.bind(store)
+          let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
+        } else {
+          run self.a.jmp(slow)
+        }
         self.a.bind(done)
         run self.stepSlows.append(StepSlow { entry: slow, auxLabel: slow, back: done, inst: inst, step: 0, shape: 0, out: NONE, extra: 0, kind: STEP_HELPER_SLOW })
         return ()
@@ -2214,6 +2278,57 @@ impl Emitter {
         self.setFresh(inst.result)
         return ()
       }
+      if op == Op.PutVar && self.on && self.plan.f.refTag != u32.MAX && inst.k <= 4096 {
+        let f = self.plan.f
+        let c = self.construct
+        let slow = run self.a.label()
+        let oldNotHeap = run self.a.label()
+        if self.frameOf == 0 { let own = self.plan.sf(f.currentFunction + 8) run self.a.load(Width.W64, Reg.R8, own) }
+        else if self.exact(&function, self.frameOf - 1) {
+          let closureSym = self.symbol((self.frameOf - 1) * 3 + 2)
+          run self.a.movSymbol(Reg.R8, closureSym)
+        }
+        else { run self.a.load(Width.W64, Reg.R8, payloadOf(self.inlineClosures.get(u32.toUsize(self.frameOf - 1)))) }
+        if self.frameOf == 0 && self.plan.known {
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.knownRefs)))
+          run self.a.test(Width.W64, Reg.R8, Reg.R8)
+          run self.a.jcc(Cond.Equal, slow)
+        } else {
+          run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.closureVarRefs)))
+        }
+        run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.boxHeader + i32.wrappingToU32(inst.k) * 8)))
+        run self.a.test(Width.W64, Reg.R8, Reg.R8)
+        run self.a.jcc(Cond.Equal, slow)
+        run self.a.cmp8MemImm(Mem.at(Reg.R8, signed(f.refTag)), u32.wrappingToU8(f.refDetached))
+        run self.a.jcc(Cond.NotEqual, slow)
+        run self.a.cmp8MemImm(Mem.at(Reg.R8, signed(c.varRefIsConst)), 0)
+        run self.a.jcc(Cond.NotEqual, slow)
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R8, signed(f.refValue)))
+        run self.a.cmp8Imm(Reg.Rax, u32.wrappingToU8(self.settings.layout.uninitialized()))
+        run self.a.jcc(Cond.Equal, slow)
+        run self.heapTest(Reg.Rax, oldNotHeap)
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, signed(f.refValue + 8)))
+        run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R9, 0), 1)
+        run self.a.jcc(Cond.LessOrEqual, slow)
+        run self.a.load(Width.W64, Reg.Rcx, slotOf(inst.a))
+        run self.a.load(Width.W64, Reg.Rdx, payloadOf(inst.a))
+        if function.value(inst.a).own != Own.Imm { run self.retainBits(Reg.Rcx, Reg.Rdx) }
+        run self.a.store(Width.W64, Mem.at(Reg.R8, signed(f.refValue)), Reg.Rcx)
+        run self.a.store(Width.W64, Mem.at(Reg.R8, signed(f.refValue + 8)), Reg.Rdx)
+        run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R9, 0), 1)
+        run self.a.jmp(read)
+        self.a.bind(oldNotHeap)
+        run self.a.load(Width.W64, Reg.Rcx, slotOf(inst.a))
+        run self.a.load(Width.W64, Reg.Rdx, payloadOf(inst.a))
+        if function.value(inst.a).own != Own.Imm { run self.retainBits(Reg.Rcx, Reg.Rdx) }
+        run self.a.store(Width.W64, Mem.at(Reg.R8, signed(f.refValue)), Reg.Rcx)
+        run self.a.store(Width.W64, Mem.at(Reg.R8, signed(f.refValue + 8)), Reg.Rdx)
+        self.a.bind(read)
+        let mut closure = NONE
+        if inst.frame != 0 { closure = self.inlineClosures.get(u32.toUsize(inst.frame - 1)) }
+        run self.stepSlows.append(StepSlow { entry: slow, auxLabel: slow, back: read, inst: inst, step: 0, shape: 0, out: closure, extra: i32.wrappingToU32(inst.k), kind: STEP_HELPER_SLOW })
+        return ()
+      }
       // get_var(env, frame, index, out) / put_var(env, frame, index, value) -> 1 when done.
       let mut index = i32.wrappingToU32(inst.k)
       // A borrowed result (ssa_opt_borrow) takes no count: bit 31.
@@ -2461,10 +2576,6 @@ impl Emitter {
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R13, signed(fields.shapeEpoch)))
       run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R11, signed(c.descShapeEpoch)))
       run self.a.jcc(Cond.NotEqual, coldSlow)
-      // Receiver cache slot still belongs to desc.ctor.
-      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R11, signed(c.descReceiverSlot)))
-      run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R9, Mem.indexed(Reg.R13, Reg.R8, Scale.Eight, signed(c.rtReceiverFunctions)))
-      run self.a.jcc(Cond.NotEqual, miss)
       // ctor.shape.version == desc.ctorVersion && ctor.slots[protoSlot] == Object(desc.proto).
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R9, signed(fields.objectShape)))
       run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(fields.shapeVersion)))
@@ -2522,24 +2633,6 @@ impl Emitter {
       run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R9, Mem.at(Reg.R11, signed(c.descApplyFn)))
       run self.a.jcc(Cond.NotEqual, miss)
       self.a.bind(noForward)
-      // Final / empty shape match on receiverCache[receiverSlot] (r8 still holds receiverSlot).
-      run self.a.imulImm(Width.W64, Reg.R8, Reg.R8, signed(c.rcEntryStride))
-      run self.a.alu(Alu.Add, Width.W64, Reg.R8, Reg.R13)
-      let checkEmpty = run self.a.label()
-      let shapeOk = run self.a.label()
-      run self.a.cmp8MemImm(Mem.at(Reg.R11, signed(c.descFromEmpty)), 0)
-      run self.a.jcc(Cond.NotEqual, checkEmpty)
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R8, signed(c.rtReceiverCache + c.rcEntryFinal)))
-      run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R11, signed(c.descFinalShape)))
-      run self.a.jcc(Cond.NotEqual, miss)
-      run self.a.jmp(shapeOk)
-      self.a.bind(checkEmpty)
-      // Safe on unchanged shapeEpoch: all prototype links are verified non-exotic prototypes
-      // with no setters/non-writable properties for addAtoms, and finalShapePtr is pinned.
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R8, signed(c.rtReceiverCache + c.rcEntryEmpty)))
-      run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, Mem.at(Reg.R11, signed(c.descEmptyShape)))
-      run self.a.jcc(Cond.NotEqual, miss)
-      self.a.bind(shapeOk)
       // Tick realm interrupt counter if required (leave desc.realm in rax for pollSlow).
       run self.a.cmp8MemImm(Mem.at(Reg.R11, signed(c.descCheckInterrupt)), 0)
       run self.a.jcc(Cond.Equal, done)

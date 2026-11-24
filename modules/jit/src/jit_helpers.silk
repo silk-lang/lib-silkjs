@@ -22,7 +22,7 @@ import silk.num.usize
 import silkjs.thin_list { ThinList }
 import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
 import silkjs.js_value { ValueBits }
-import silkjs.js_core_types { ObjectData, ObjectPayload, BuiltinFamily, NativeFunctionId, NativeFunctionData, NativeCallProtocol, RuntimeState, ReceiverCacheEntry, ShapeData, SlotBits, GcPhase }
+import silkjs.js_core_types { ObjectData, ObjectPayload, BuiltinFamily, NativeFunctionId, NativeFunctionData, NativeCallProtocol, RuntimeState, ReceiverCacheEntry, InstanceCacheEntry, VarRef, ShapeData, SlotBits, GcPhase }
 import silkjs.js_core_types as census
 import silkjs.js_class_data as classes
 import silkjs.js_gc as gc
@@ -33,6 +33,8 @@ import silkjs.js_compiled_objects as objects
 import silkjs.js_compiled_math as mathematics
 import silkjs.js_vm as vm
 import silkjs.js_compiled as compiled
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
 import jit_exit_state { jitExitState }
 import silkjs.js_primitives as primitives
 
@@ -170,7 +172,14 @@ pub struct ConstructLayout {
   pub rtReceiverCache: u32,
   pub rcEntryStride: u32,
   pub rcEntryEmpty: u32,
-  pub rcEntryFinal: u32
+  pub rcEntryFinal: u32,
+  pub rtInstanceCache: u32,
+  pub icEntryStride: u32,
+  pub icEntryVersion: u32,
+  pub icEntryIndex: u32,
+  pub bytecodeFnClass: u32,
+  pub cFnClass: u32,
+  pub varRefIsConst: u32
 }
 impl Copy for ConstructLayout {}
 
@@ -183,9 +192,13 @@ pub fn constructLayout() -> ConstructLayout {
   let descPtr = unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut ConstructDesc>(header)
   let desc = unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, header)
+  let variable = unsafe HeapCell.payload<VarRef, ()>(&anchor, header)
   let rc0 = &state.receiverCache[0]
   let rc0Addr = Pointer.address<ReceiverCacheEntry>(Pointer.fromRef<ReceiverCacheEntry>(rc0))
   let rc1Addr = Pointer.address<ReceiverCacheEntry>(Pointer.fromRef<ReceiverCacheEntry>(&state.receiverCache[1]))
+  let ic0 = &state.instanceCache[0]
+  let ic0Addr = Pointer.address<InstanceCacheEntry>(Pointer.fromRef<InstanceCacheEntry>(ic0))
+  let ic1Addr = Pointer.address<InstanceCacheEntry>(Pointer.fromRef<InstanceCacheEntry>(&state.instanceCache[1]))
   return ConstructLayout {
     descCtor: usize.toU32(Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&desc.ctor)) - base),
     descProto: usize.toU32(Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&desc.proto)) - base),
@@ -211,7 +224,14 @@ pub fn constructLayout() -> ConstructLayout {
     rtReceiverCache: usize.toU32(rc0Addr - base),
     rcEntryStride: usize.toU32(rc1Addr - rc0Addr),
     rcEntryEmpty: usize.toU32(Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&rc0.empty)) - rc0Addr),
-    rcEntryFinal: usize.toU32(Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&rc0.final)) - rc0Addr)
+    rcEntryFinal: usize.toU32(Pointer.address<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&rc0.final)) - rc0Addr),
+    rtInstanceCache: usize.toU32(ic0Addr - base),
+    icEntryStride: usize.toU32(ic1Addr - ic0Addr),
+    icEntryVersion: usize.toU32(Pointer.address<u64>(Pointer.fromRef<u64>(&ic0.version)) - ic0Addr),
+    icEntryIndex: usize.toU32(Pointer.address<usize>(Pointer.fromRef<usize>(&ic0.index)) - ic0Addr),
+    bytecodeFnClass: classes.JS_CLASS_BYTECODE_FUNCTION,
+    cFnClass: classes.JS_CLASS_C_FUNCTION,
+    varRefIsConst: usize.toU32(Pointer.address<bool>(Pointer.fromRef<bool>(&variable.isConst)) - base)
   }
 }
 
@@ -335,6 +355,10 @@ pub const GET_ELEM_BORROWED: u32 = 121
 /// get_key(env, frame, object, key, out): an owned value on success; zero on a guard miss.
 pub const GET_KEY: u32 = 122
 
+/// Host callback that allocates a fresh pooled ObjectData cell with `tailBytes` of inline tail
+/// from the runtime's own allocator when below the runtime's GC threshold; returns null otherwise.
+pub type AllocCellFn = extern "C" fn(*mut u8, *mut u8, *mut HeapHeader, usize) -> ?*mut HeapHeader
+
 /// The layout compiled code reads: offsets below are part of the code ABI.
 pub struct CompiledEnv {
   /// The runtime the code runs in (offset 0).
@@ -346,7 +370,9 @@ pub struct CompiledEnv {
   pub directCalls: u64,
   /// Generic instruction exits taken (--jit-stats generic-runs), at GENERIC_RUNS_OFFSET: the
   /// code counts each before it leaves.
-  pub genericRuns: u64
+  pub genericRuns: u64,
+  /// Optional host callback (AllocCellFn) for Tier-3 pooled fresh-cell allocation.
+  pub allocCell: ?*const u8
 }
 pub const DIRECT_CALLS_OFFSET: i32 = 8 + 8 * 128
 pub const GENERIC_RUNS_OFFSET: i32 = DIRECT_CALLS_OFFSET + 8
@@ -358,7 +384,7 @@ pub fn helperOffset(index: u32) -> i32 { return u32.wrappingToI32(8 + index * 8)
 impl CompiledEnv {
   /// An environment with every helper this module defines installed.
   pub fn make() -> CompiledEnv {
-    let mut env = CompiledEnv { runtime: Pointer.null<HeapHeader>(), helpers: [Pointer.null<u8>(); 128], directCalls: 0, genericRuns: 0 }
+    let mut env = CompiledEnv { runtime: Pointer.null<HeapHeader>(), helpers: [Pointer.null<u8>(); 128], directCalls: 0, genericRuns: 0, allocCell: Pointer.null<u8>() }
     let release: extern "C" fn(*mut CompiledEnv, *const ValueBits) -> () = jitRelease
     env.helpers[u32.toUsize(RELEASE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut CompiledEnv, *const ValueBits) -> (), *const ?*const u8>(Pointer.fromRef(&release)))
     let getField: extern "C" fn(*mut CompiledEnv, *const CompiledFrame, u32, *const ValueBits, *mut ValueBits) -> u32 = jitGetField
@@ -949,21 +975,17 @@ unsafe fn validateConstruct(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, 
   let desc = unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)
   let ctor = unsafe nonnullHeader(desc.ctor)
   let proto = unsafe nonnullHeader(desc.proto)
-  let recvSlot = desc.receiverSlot
   let ctorVersion = desc.ctorVersion
   let protoSlot = desc.protoSlot
   let forward = desc.forward
-  let fromEmpty = desc.fromEmpty
-  let finalAddr = desc.finalShape
+  let finalOpt = desc.finalShapePtr
   let checkInterrupt = desc.checkInterrupt
   let descEpoch = desc.shapeEpoch
   let realm = unsafe nonnullHeader(desc.realm)
   drop desc
+  if Pointer.isNull<HeapHeader>(finalOpt) { return 0 }
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
   let epoch = state.shapeEpoch
-  if state.receiverFunctions[recvSlot] != Pointer.address<HeapHeader>(ctor) { return 0 }
-  let entryFinal = state.receiverCache[recvSlot].final
-  let entryEmpty = state.receiverCache[recvSlot].empty
   drop state
   if epoch != descEpoch {
     if !unsafe revalidateConstructEpoch(descPtr, epoch) { return 0 }
@@ -1006,15 +1028,6 @@ unsafe fn validateConstruct(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, 
     }
     drop fnProtoData
   }
-  let mut finalOpt = Pointer.null<HeapHeader>()
-  if fromEmpty == 0 {
-    if !Pointer.isNull<HeapHeader>(entryFinal) && Pointer.address<HeapHeader>(unsafe nonnullHeader(entryFinal)) == finalAddr {
-      finalOpt = entryFinal
-    }
-  } else {
-    finalOpt = unsafe resolveFromEmpty(rt, descPtr, entryEmpty)
-  }
-  if Pointer.isNull<HeapHeader>(finalOpt) { return 0 }
   if checkInterrupt != 0 {
     let counter = unsafe interrupts.counter(realm)
     let next = i32.wrappingSubtract(unsafe Pointer.read<i32>(counter), 1)
@@ -1031,6 +1044,89 @@ unsafe fn validateConstruct(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, 
 export "C" fn jitCheckConstruct(env: *mut CompiledEnv, descPtr: *mut ConstructDesc) -> u32 {
   let mut finalOpt = Pointer.null<HeapHeader>()
   return unsafe validateConstruct(env, descPtr, &mut finalOpt)
+}
+
+/// Generic host implementation for `AllocCellFn`: allocates a fresh pooled ObjectData cell
+/// from the runtime's own allocator `A` when `memory.usedBytes() + ObjectData <= mallocGcThreshold`.
+pub unsafe fn allocPooledCell<'m, S: EngineServices, A: Allocator>(
+  hooks: *mut u8, allocator: *mut u8, rt: *mut HeapHeader, tailBytes: usize
+) -> ?*mut HeapHeader {
+  let mut anchor = ()
+  let eng = unsafe Pointer.borrowMut<(), Engine<'m, S>>(&mut anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Engine<'m, S>>(hooks))
+  let memory = eng.memory
+  let stAnchor = ()
+  let threshold = (unsafe HeapCell.payload<RuntimeState, ()>(&stAnchor, rt)).mallocGcThreshold
+  if usize.wrappingAdd(memory.usedBytes(), Layout.of<ObjectData>().bytes) > threshold {
+    return Pointer.null<HeapHeader>()
+  }
+  let mut providerAnchor = ()
+  let provider = unsafe Pointer.borrowMut<(), A>(&mut providerAnchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut A>(allocator))
+  let allocated = run Effect.result(allocateFreshCell(tailBytes)) |> Effect.provideMut<Allocator>(&mut provider)
+  return match move allocated {
+    Result<FreshCell, OutOfMemoryError>.Success { value } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(value.node)
+    Result<FreshCell, OutOfMemoryError>.Failure { .. } => Pointer.null<HeapHeader>()
+  }
+}
+
+/// Invokes the host's optional `allocCell` callback to obtain a fresh uninitialized pooled
+/// `ObjectData` cell with inline capacity `tail`, respecting the runtime's GC threshold.
+@inlineNever
+pub unsafe fn takePooledCell(env: *mut CompiledEnv, rt: *mut HeapHeader, tail: usize) -> ?*mut HeapHeader {
+  let anchor = ()
+  let raw = (unsafe Pointer.borrow<(), CompiledEnv>(&anchor, env)).allocCell
+  if Pointer.isNull<u8>(raw) { return Pointer.null<HeapHeader>() }
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let hooksOpt = state.compiled.serviceHooks
+  let allocOpt = state.compiled.serviceAllocator
+  drop state
+  let hooks = match Pointer.nonNullMut<u8>(hooksOpt) { Option<*mut u8>.Some { value } => value Option<*mut u8>.None => { return Pointer.null<HeapHeader>() } }
+  let alloc = match Pointer.nonNullMut<u8>(allocOpt) { Option<*mut u8>.Some { value } => value Option<*mut u8>.None => { return Pointer.null<HeapHeader>() } }
+  let mut tailBytes = tail * Layout.of<SlotBits>().bytes
+  let reused = Layout.of<ObjectPayload>().bytes - CONSTRUCT_PAYLOAD_TAG_BYTES
+  if tailBytes > reused { tailBytes = tailBytes - reused } else { tailBytes = 0 }
+  let callback = unsafe Pointer.read<AllocCellFn>(unsafe Intrinsic.pointerReinterpret<*const ?*const u8, *const AllocCellFn>(Pointer.fromRef(&raw)))
+  return unsafe callback(hooks, alloc, rt, tailBytes)
+}
+
+@inlineNever
+unsafe fn allocPooledNewObject(env: *mut CompiledEnv, rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
+  let mut headerAnchor = ()
+  let shapeHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, final)
+  if shapeHeader.referenceCount <= 0 { return Pointer.null<HeapHeader>() }
+  drop shapeHeader
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe takePooledCell(env, rt, tail)) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+  }
+  let mut retainAnchor = ()
+  let finalHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut retainAnchor, final)
+  finalHeader.referenceCount = i32.wrappingAdd(finalHeader.referenceCount, 1)
+  drop finalHeader
+  unsafe census.censusBump(rt, census.CENSUS_OBJECTS_ALLOCATED, 1)
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let payload = Pointer.fromMutRef<ObjectPayload>(&mut data.payload)
+  unsafe Pointer.put<ObjectPayload>(payload, ObjectPayload.Empty)
+  let slotPtr = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(
+    unsafe Intrinsic.pointerReinterpret<*mut ObjectPayload, *mut u8>(payload)), CONSTRUCT_PAYLOAD_TAG_BYTES))
+  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotPtr, tail)
+  unsafe slots.extendFilled(stores)
+  unsafe data.putSlots(move slots)
+  data.setIsStandardArrayPrototype(false)
+  data.setExtensible(true)
+  data.setFreeMark(false)
+  data.setIsExotic(false)
+  data.setFastArray(false)
+  data.setIsConstructor(false)
+  data.setHasImmutablePrototype(false)
+  data.setIsHtmlDda(false)
+  data.clearRoles()
+  data.setClassId(classes.JS_CLASS_OBJECT)
+  data.weakRefCount = 0
+  data.shape = final
+  drop data
+  unsafe gc.publishObject(rt, node)
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(node)
 }
 
 export "C" fn jitNewObject(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, out: *mut ValueBits) -> u32 {
@@ -1051,6 +1147,10 @@ export "C" fn jitNewObject(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, o
   }
   if zeroCount < 240 {
     if let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut<HeapHeader>(unsafe allocSpareNewObject(rt, final, stores, tail)) {
+      unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: node })
+      return 1
+    }
+    if let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut<HeapHeader>(unsafe allocPooledNewObject(env, rt, final, stores, tail)) {
       unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: node })
       return 1
     }

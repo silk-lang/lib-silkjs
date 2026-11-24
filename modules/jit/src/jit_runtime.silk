@@ -331,6 +331,12 @@ impl Jit {
   pub fn setupData(self: &mut Self) -> ?*mut u8 {
     return unsafe Intrinsic.pointerReinterpret<*mut Jit, *mut u8>(Pointer.fromMutRef<Jit>(&mut self))
   }
+  /// Installs the host's optional Tier-3 pooled fresh-cell allocator callback (AllocCellFn).
+  pub fn setAllocCell(self: &mut Self, raw: ?*const u8) -> () {
+    let mut env = self.env.asSlice()[0]
+    env.allocCell = raw
+    self.env.set(0, env)
+  }
   /// The counters (--jit-stats) as one line.
   pub effect fn statsLine(self: &Self) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
     let mut line = List<u8>.make()
@@ -519,8 +525,10 @@ pub unsafe fn enable(jit: &mut Jit, rt: *mut HeapHeader) -> () {
 /// session sets its own hot function handler and calls compileHot from it.
 pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
   jit.runtime = rt
+  let prevAlloc = jit.env.asSlice()[0].allocCell
   let mut env = CompiledEnv.make()
   env.runtime = rt
+  env.allocCell = prevAlloc
   jit.env.set(0, env)
   let mut threshold = jit.options.threshold
   if threshold == 0 && jit.options.baseline { threshold = BASELINE_ENTRIES }
@@ -895,16 +903,30 @@ unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32, ar
 }
 /// Adds to sites (the sites the code is to keep general, FunctionInput.doubleSites) the
 /// element and field instructions of function that baseline code noted where the optimized
+/// Collects all non-zero entries from BaselineEnv.misses once per compilation so missedSites
+/// and calleeDoubleSites (called across many inline candidates) scan only populated slots.
+effect fn collectActiveMisses(jit: &Jit) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut active = List<usize>.make()
+  if jit.baselineEnv.length() == 0 { return move active }
+  let misses = &jit.baselineEnv.asSlice()[0].misses
+  let mut i: usize = 0
+  while i < baseline_env.MISSES {
+    let raw = misses[i]
+    if raw != 0 { run active.append(raw) }
+    i = i + 1
+  }
+  return move active
+}
 /// code's inline read or store would miss too (BaselineEnv.misses): the optimizer compiles
 /// the helper and a step behind it from the start, instead of a guess that leaves.
-effect fn missedSites(jit: &Jit, function: &FunctionBytecode, sites: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn missedSites(activeMisses: &List<usize>, function: &FunctionBytecode, sites: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
   let length = function.code.length()
-  if length == 0 || jit.baselineEnv.length() == 0 { return () }
+  if length == 0 || activeMisses.length() == 0 { return () }
   let first = Pointer.address<u8>(unsafe function.code.start()) + 1
   let bytes = unsafe function.code.asSlice()
   let mut i: usize = 0
-  while i < baseline_env.MISSES {
-    let raw = jit.baselineEnv.asSlice()[0].misses[i]
+  while i < activeMisses.length() {
+    let raw = activeMisses.get(i)
     let concat = (raw & baseline_env.MISS_CONCAT) != 0
     let site = raw & usize.bitNot(baseline_env.MISS_CONCAT)
     if site >= first && site < first + length {
@@ -928,16 +950,16 @@ effect fn missedSites(jit: &Jit, function: &FunctionBytecode, sites: &mut List<u
 }
 /// The numeric sites of an inline candidate (callee) that baseline code or earlier compiles
 /// saw with non-Int numbers, so the inlined body widens them to doubles from the start.
-effect fn calleeDoubleSites(jit: &Jit, callee: &FunctionBytecode) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+effect fn calleeDoubleSites(jit: &Jit, activeMisses: &List<usize>, callee: &FunctionBytecode) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
   let mut sites = List<u32>.make()
   let length = callee.code.length()
   if length == 0 { return move sites }
   let bytes = unsafe callee.code.asSlice()
-  if jit.baselineEnv.length() != 0 {
+  if activeMisses.length() != 0 {
     let first = Pointer.address<u8>(unsafe callee.code.start()) + 1
     let mut i: usize = 0
-    while i < baseline_env.MISSES {
-      let raw = jit.baselineEnv.asSlice()[0].misses[i]
+    while i < activeMisses.length() {
+      let raw = activeMisses.get(i)
       let concat = (raw & baseline_env.MISS_CONCAT) != 0
       let site = raw & usize.bitNot(baseline_env.MISS_CONCAT)
       if !concat && site >= first && site < first + length && numericOpcode(bytes[site - first]) {
@@ -1097,6 +1119,7 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
   let mut holders = List<?*mut HeapHeader>.make()
   let mut localDescs = List<ConstructDesc>.make()
   let mut rootConstructs = List<ConstructTarget>.make()
+  let activeMisses = run collectActiveMisses(&jit)
   if jit.options.inlining {
     // First the watches (they change versions the sites' shapes are read with), over the
     // same walk; then the candidates.
@@ -1105,9 +1128,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     let mut firstHolders = List<?*mut HeapHeader>.make()
     let mut dummyDescs = List<ConstructDesc>.make()
     let mut dummyConstructs = List<ConstructTarget>.make()
-    let _watched = run unsafe candidates(&jit, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs)
+    let _watched = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs)
     run unsafe watchRecords(&mut jit, rt, &firstClosures)
-    targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>(), &mut localDescs, &mut rootConstructs)
+    targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>(), &mut localDescs, &mut rootConstructs)
   }
   // Where its earlier code left at guards.
   let mut sites = List<u32>.make()
@@ -1160,7 +1183,7 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
   if arrayShape >= 2147483648 { arrayShape = 0 }
   let elements = run keyedSites(&jit, &function)
   let earlier = sites.length()
-  run missedSites(&jit, &function, &mut sites)
+  run missedSites(&activeMisses, &function, &mut sites)
   if jit.options.dump && sites.length() > earlier {
     // `jit: noted: <pc>...`, the sites baseline code noted (BaselineEnv.misses).
     let mut line = List<u8>.make()
@@ -1529,7 +1552,8 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let mut holders = List<?*mut HeapHeader>.make()
   let mut dummyDescs = List<ConstructDesc>.make()
   let mut dummyConstructs = List<ConstructTarget>.make()
-  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs) }
+  let activeMisses = run collectActiveMisses(&jit)
+  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs) }
   let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &plan.elements, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
@@ -1929,7 +1953,7 @@ unsafe fn ownedCells(closure: ?*mut HeapHeader) -> u64 {
 /// (null else): the variables it reads are its, and a method read off one is a target too;
 /// receiver is the object its `this` is when that is known (an own method read off a
 /// variable, inlined there), and a method read off `this` is a target too.
-unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, receiver: ?*mut HeapHeader, constructDescs: &mut List<ConstructDesc>, outConstructs: &mut List<ConstructTarget>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, receiver: ?*mut HeapHeader, constructDescs: &mut List<ConstructDesc>, outConstructs: &mut List<ConstructTarget>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
   let mut targets = List<CallTarget>.make()
   let rt = match Pointer.nonNullMut<HeapHeader>(jit.runtime) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return move targets } }
   let anchor = ()
@@ -1954,14 +1978,16 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           continue
         }
         let mut input = run inputOf(&callee)
-        input.doubleSites = run calleeDoubleSites(jit, &callee)
-        input.siteShapes = run unsafe siteShapesOf(rt, cell)
+        if !watch {
+          input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+          input.siteShapes = run unsafe siteShapesOf(rt, cell)
+        }
         let id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(Pointer.null<HeapHeader>())
         run appendKnown(&mut holders, &KnownMethod.none())
         let mut childConstructs = List<ConstructTarget>.make()
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
         input.constructs = move childConstructs
         run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
       }
@@ -2013,8 +2039,10 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           continue
         }
         let mut input = run inputOf(&callee)
-        input.doubleSites = run calleeDoubleSites(jit, &callee)
-        input.siteShapes = run unsafe siteShapesOf(rt, cell)
+        if !watch {
+          input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+          input.siteShapes = run unsafe siteShapesOf(rt, cell)
+        }
         let mut id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(object)
@@ -2033,7 +2061,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           run say(b"jit: chained target: ", line.asSlice())
         }
         let mut childConstructs = List<ConstructTarget>.make()
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
         input.constructs = move childConstructs
         run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), known: knownShapes(&found) })
       }
@@ -2062,8 +2090,10 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
         let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
         if (unsafe callee.code.asSlice()).length <= CANDIDATE_BYTES {
           let mut input = run inputOf(&callee)
-          input.doubleSites = run calleeDoubleSites(jit, &callee)
-          input.siteShapes = run unsafe siteShapesOf(rt, cell)
+          if !watch {
+            input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+            input.siteShapes = run unsafe siteShapesOf(rt, cell)
+          }
           let mut id = usize.toU32(cells.length())
           run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
           run closures.append(object)
@@ -2075,7 +2105,7 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
           if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
           if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
           let mut childConstructs = List<ConstructTarget>.make()
-          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, holder, &mut constructDescs, &mut childConstructs) }
+          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, holder, &mut constructDescs, &mut childConstructs) }
           input.constructs = move childConstructs
           run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), known: knownShapes(&found) })
         } else if jit.options.dump && depth == 0 && !watch { run say(b"jit: no inline target: ", b"the method is too long") }
@@ -2115,14 +2145,16 @@ unsafe effect fn candidates(jit: &Jit, bytecode: *mut HeapHeader, depth: u32, ce
                   && Pointer.address<HeapHeader>(callee.realm) == Pointer.address<HeapHeader>(function.realm)
                   && codeLen > 0 && codeLen <= VAR_CALL_BYTES && !hasBackEdge(calleeBytes) {
                   let mut input = run inputOf(&callee)
-                  input.doubleSites = run calleeDoubleSites(jit, &callee)
-                  input.siteShapes = run unsafe siteShapesOf(rt, cell)
+                  if !watch {
+                    input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+                    input.siteShapes = run unsafe siteShapesOf(rt, cell)
+                  }
                   let id = u32.bitOr(usize.toU32(cells.length()), TARGET_EXACT)
                   run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
                   run closures.append(calleeOpt)
                   run appendKnown(&mut holders, &KnownMethod.none())
                   let mut childConstructs = List<ConstructTarget>.make()
-                  if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, calleeOpt, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+                  if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, calleeOpt, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
                   input.constructs = move childConstructs
                   run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: unsafe ownedCells(calleeOpt), known: KnownShapes.none() })
                 }
@@ -2343,7 +2375,7 @@ fn hasBackEdge(bytes: &[u8]) -> bool {
 fn tierUpWait(optimizeEntries: u32, bytes: &[u8]) -> u32 {
   if optimizeEntries != OPTIMIZE_ENTRIES { return optimizeEntries }
   let looped = hasBackEdge(bytes)
-  if looped && bytes.length <= 650 { return optimizeEntries }
+  if looped && bytes.length <= 650 { return 250 }
   let mut callCount: u32 = 0
   let mut hasForInOrOf = false
   let mut pc: usize = 0
@@ -2363,13 +2395,13 @@ fn tierUpWait(optimizeEntries: u32, bytes: &[u8]) -> u32 {
     // Oversized loop functions with for-in/for-of or heavy call density expand into huge
     // optimized bodies without loop payoff; keep them parked in compact baseline.
     if hasForInOrOf || callCount >= 10 { return PARKED }
-    return optimizeEntries
+    return 250
   }
   // Large or call-heavy loop-free glue expands in the optimizer without loop payoff;
   // park it in compact baseline so it does not tier up mid-measurement or split hot code
   // across lanes.
   if bytes.length > 140 || callCount >= 3 || (bytes.length > 72 && callCount >= 2) { return PARKED }
-  return optimizeEntries
+  return 250
 }
 
 const CTOR_FORM_STORES: u8 = 1

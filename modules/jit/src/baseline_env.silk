@@ -33,6 +33,8 @@ import silkjs.js_atom_data as atoms
 import silkjs.js_strings { Strings }
 import silkjs.js_string_types { StringLengthError }
 import silkjs.js_baseline as engine
+import jit_helpers as compiledHelpers
+import jit_helpers { CompiledEnv }
 
 pub const HELPER_COUNT: usize = 32
 /// Machine code, not a C function: drops the count of the heap value whose tag word is in
@@ -890,20 +892,33 @@ unsafe fn tryRecycleZero(rt: *mut HeapHeader, final: *mut HeapHeader, stores: us
 /// by the caller, and explicit inline slot capacity `tail` (INLINE_SLOTS or PAIR_SLOTS).
 /// Consumes caller's +1 reference on `final` on success; returns null with `final` untouched.
 @inlineAlways
-unsafe fn allocSpareTail(rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
+unsafe fn allocSpareTail(env: *mut BaselineEnv, rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
   if tail != shapes.INLINE_SLOTS && tail != shapes.PAIR_SLOTS { return Pointer.null<HeapHeader>() }
   if stores > tail { return Pointer.null<HeapHeader>() }
   if let Option<*mut HeapHeader>.Some { value: recycled } = Pointer.nonNullMut<HeapHeader>(unsafe tryRecycleZero(rt, final, stores, tail)) {
     return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(recycled)
   }
-  let spare = match Pointer.nonNullMut<HeapHeader>(unsafe gc.takeSpareCell(rt, tail, true)) {
+  let mut node = Pointer.null<HeapHeader>()
+  if let Option<*mut HeapHeader>.Some { value: spare } = Pointer.nonNullMut<HeapHeader>(unsafe gc.takeSpareCell(rt, tail, true)) {
+    node = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, spare))
+  } else {
+    let zAnchor = ()
+    let zeroCount = (unsafe HeapCell.payload<RuntimeState, ()>(&zAnchor, rt)).zeroStackCount
+    if zeroCount < 240 {
+      let cOpt = (unsafe Pointer.borrow<(), BaselineEnv>(&zAnchor, env)).compiled
+      if let Option<*mut u8>.Some { value: cPtr } = Pointer.nonNullMut<u8>(cOpt) {
+        let cEnv = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut CompiledEnv>(cPtr)
+        node = unsafe compiledHelpers.takePooledCell(cEnv, rt, tail)
+      }
+    }
+  }
+  let live = match Pointer.nonNullMut<HeapHeader>(node) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
   }
   unsafe census.censusBump(rt, census.CENSUS_OBJECTS_ALLOCATED, 1)
-  let node = unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, spare)
   let mut anchor = ()
-  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, live)
   let payload = Pointer.fromMutRef<ObjectPayload>(&mut data.payload)
   unsafe Pointer.put<ObjectPayload>(payload, ObjectPayload.Empty)
   let slotPtr = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(
@@ -924,17 +939,17 @@ unsafe fn allocSpareTail(rt: *mut HeapHeader, final: *mut HeapHeader, stores: us
   data.weakRefCount = 0
   data.shape = final
   drop data
-  unsafe gc.publishObject(rt, node)
-  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(node)
+  unsafe gc.publishObject(rt, live)
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(live)
 }
 
 /// Allocates a published plain inline object with final shape and `stores` uninitialized
 /// slot entries ready to be written by the caller. Returns null if no cell fits or is available.
 @inlineAlways
-unsafe fn allocSparePlanned(rt: *mut HeapHeader, final: *mut HeapHeader, empty: *mut HeapHeader, stores: usize) -> ?*mut HeapHeader {
+unsafe fn allocSparePlanned(env: *mut BaselineEnv, rt: *mut HeapHeader, final: *mut HeapHeader, empty: *mut HeapHeader, stores: usize) -> ?*mut HeapHeader {
   let mut tail = unsafe shapes.planInline(empty, stores)
   if tail != 0 && tail < stores { tail = shapes.INLINE_SLOTS }
-  return unsafe allocSpareTail(rt, final, stores, tail)
+  return unsafe allocSpareTail(env, rt, final, stores, tail)
 }
 
 /// Looks up callee's cached empty receiver shape in RuntimeState.receiverCache without
@@ -1015,7 +1030,7 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { return 0 }
     }
-    let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSparePlanned(rt, empty, empty, 0)) {
+    let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSparePlanned(env, rt, empty, empty, 0)) {
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { unsafe dropShapeRef(empty) return 0 }
     }
@@ -1032,7 +1047,7 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
     let empty = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(plan.empty)
     let stores = plan.stores
     if stores > 8 { unsafe dropShapeRef(final) return 2 }
-    let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSparePlanned(rt, final, empty, stores)) {
+    let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSparePlanned(env, rt, final, empty, stores)) {
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { unsafe dropShapeRef(final) return 2 }
     }
@@ -1089,7 +1104,7 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
       let initDerived = initCode.isDerivedClassConstructor
       drop initCode
       if initBaseline == 0 || initDerived { unsafe dropShapeRef(empty) return 2 }
-      let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSpareTail(rt, empty, 0, shapes.INLINE_SLOTS)) {
+      let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSpareTail(env, rt, empty, 0, shapes.INLINE_SLOTS)) {
         Option<*mut HeapHeader>.Some { value } => value
         Option<*mut HeapHeader>.None => { unsafe dropShapeRef(empty) return 2 }
       }
@@ -1145,7 +1160,7 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
   }
   let roots = entry.recipe.roots
   drop entry drop state
-  let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSparePlanned(rt, final, empty, stores)) {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe allocSparePlanned(env, rt, final, empty, stores)) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => { unsafe dropShapeRef(final) return 2 }
   }
