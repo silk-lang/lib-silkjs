@@ -1,0 +1,485 @@
+//! Native Silk incoming HTTP/1 header and trailer materializer for IncomingMessage.
+//! Implements Node 24's exact duplicate-header joining rules (matchKnownFields,
+//! _addHeaderLine, _addHeaderLineDistinct) in Silk without intermediate JS allocations.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.js_proxy_core as core
+import silkjs.js_realm { lendRealm }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_object_allocate as objects
+import silkjsruntime.libs.core.common as common
+import silkjsruntime.libs.core.owners as owners
+import silkjsruntime.libs.core.owners { Scope }
+
+// Header join rules matching Node.js _http_incoming.js matchKnownFields:
+// 0 = comma-joined (", "), 1 = set-cookie array, 2 = cookie semicolon-joined ("; "), 3 = single (first wins unless joinDuplicateHeaders).
+pub const KIND_COMMA: i32 = 0
+pub const KIND_SET_COOKIE: i32 = 1
+pub const KIND_COOKIE: i32 = 2
+pub const KIND_SINGLE: i32 = 3
+
+fn eqBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+pub fn classifyLowerHeader(name: &[u8]) -> i32 {
+  let len = name.length
+  if len == 3 {
+    if eqBytes(name, b"age") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 4 {
+    if eqBytes(name, b"host") || eqBytes(name, b"from") || eqBytes(name, b"etag") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 6 {
+    if eqBytes(name, b"server") { return KIND_SINGLE }
+    if eqBytes(name, b"cookie") { return KIND_COOKIE }
+    return KIND_COMMA
+  }
+  if len == 7 {
+    if eqBytes(name, b"referer") || eqBytes(name, b"expires") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 8 {
+    if eqBytes(name, b"location") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 10 {
+    if eqBytes(name, b"user-agent") { return KIND_SINGLE }
+    if eqBytes(name, b"set-cookie") { return KIND_SET_COOKIE }
+    return KIND_COMMA
+  }
+  if len == 11 {
+    if eqBytes(name, b"retry-after") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 12 {
+    if eqBytes(name, b"content-type") || eqBytes(name, b"max-forwards") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 13 {
+    if eqBytes(name, b"authorization") || eqBytes(name, b"last-modified") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 14 {
+    if eqBytes(name, b"content-length") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 17 {
+    if eqBytes(name, b"if-modified-since") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  if len == 19 {
+    if eqBytes(name, b"proxy-authorization") || eqBytes(name, b"if-unmodified-since") { return KIND_SINGLE }
+    return KIND_COMMA
+  }
+  return KIND_COMMA
+}
+
+effect fn appendLowerLatin1(out: &mut Bytes, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    let src = unsafe Strings.flatLatin1(&anchor, value)
+    run out.reserve(src.length)
+    let mut i: usize = 0
+    while i < src.length {
+      let b = src[i]
+      let lo: u8 = if b >= 65 && b <= 90 { b + 32 } else { b }
+      let one: [u8; 1] = [lo]
+      run out.append(&one)
+      i = i + 1
+    }
+    return ()
+  }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => {
+        let b = u16.toU8(unit & 255)
+        let lo: u8 = if b >= 65 && b <= 90 { b + 32 } else { b }
+        let one: [u8; 1] = [lo]
+        run out.append(&one)
+      }
+      Option<u16>.None => { return () }
+    }
+  }
+}
+
+effect fn appendLatin1Value(out: &mut Bytes, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    return run out.append(unsafe Strings.flatLatin1(&anchor, value))
+  }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => {
+        let one: [u8; 1] = [u16.toU8(unit & 255)]
+        run out.append(&one)
+      }
+      Option<u16>.None => { return () }
+    }
+  }
+}
+
+fn isLatin1Value(value: ValueBits) -> bool {
+  if Strings.isFlatAscii(value) { return true }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => { if unit > 255 { return false } }
+      Option<u16>.None => { return true }
+    }
+  }
+  return true
+}
+
+unsafe effect fn makeLatin1String<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, bytes: &[u8]) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let made = run Effect.result(Strings.fromLatin1(bytes))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}
+
+struct HeaderSlot {
+  nameStart: usize,
+  nameLen: usize,
+  kind: i32,
+  // First value kept as owned JS ValueBits to avoid round-tripping when non-duplicate.
+  firstVal: ValueBits,
+  // If joined (or set-cookie array), extra values are accumulated in joinedBytes or arrayVal.
+  joined: bool,
+  valStart: usize,
+  valLen: usize,
+  arrayVal: ValueBits,
+  arrayCount: u32,
+}
+
+/// Builds IncomingMessage.headers / trailers object from raw [name, value, ...] array.
+pub unsafe effect fn buildHeaders<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, rawHeaders: ValueBits, count: u32, joinDuplicates: bool, scope: &mut Scope) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+  if count < 2 { return scope.take(0) }
+  let mut nameBuf = Bytes.make()
+  let mut scratch = Bytes.make()
+  let mut slots = List<HeaderSlot>.make()
+  let mut joinedBufs = List<Bytes>.make()
+  let mut n: u32 = 0
+  let mut failed = false
+  let mut hasOom = false
+  while n + 1 < count {
+    let rawName = run unsafe owners.getIndex(&mut engine, context, rawHeaders, n)
+    let rawVal = run unsafe owners.getIndex(&mut engine, context, rawHeaders, n + 1)
+    let nameStr = if rawName.isString() { rawName } else {
+      let s = run unsafe common.toString(&mut engine, context, rawName)
+      unsafe owners.release(&mut engine, context, rawName)
+      s
+    }
+    let valStr = if rawVal.isString() { rawVal } else {
+      let s = run unsafe common.toString(&mut engine, context, rawVal)
+      unsafe owners.release(&mut engine, context, rawVal)
+      s
+    }
+    scratch.clear()
+    let appRes = run Effect.result(appendLowerLatin1(&mut scratch, nameStr))
+    unsafe owners.release(&mut engine, context, nameStr)
+    match move appRes {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { .. } => {
+        unsafe owners.release(&mut engine, context, valStr)
+        hasOom = true failed = true break
+      }
+    }
+    let keyBytes = scratch.asSlice()
+    // Find existing slot with same lowercased name.
+    let mut foundIdx: usize = slots.length()
+    let mut si: usize = 0
+    while si < slots.length() {
+      let sl = &slots.asSlice()[si]
+      if sl.nameLen == keyBytes.length && eqBytes(Slice.view<u8>(nameBuf.asSlice(), sl.nameStart, sl.nameLen), keyBytes) {
+        foundIdx = si
+        break
+      }
+      si = si + 1
+    }
+    if foundIdx == slots.length() {
+      let kind = classifyLowerHeader(keyBytes)
+      let start = nameBuf.length()
+      let pushName = run Effect.result(nameBuf.append(keyBytes))
+      match move pushName {
+        Result<(), OutOfMemoryError>.Success { .. } => ()
+        Result<(), OutOfMemoryError>.Failure { .. } => {
+          unsafe owners.release(&mut engine, context, valStr)
+          hasOom = true failed = true break
+        }
+      }
+      if kind == KIND_SET_COOKIE {
+        let arr = run unsafe common.array(&mut engine, memory, context)
+        run unsafe common.defineIndex(&mut engine, context, arr, 0, valStr)
+        let pushSlot = run Effect.result(slots.append(HeaderSlot {
+          nameStart: start, nameLen: keyBytes.length, kind: kind,
+          firstVal: ValueBits.Undefined, joined: false, valStart: 0, valLen: 0,
+          arrayVal: arr, arrayCount: 1,
+        }))
+        match move pushSlot {
+          Result<(), OutOfMemoryError>.Success { .. } => ()
+          Result<(), OutOfMemoryError>.Failure { .. } => {
+            unsafe owners.release(&mut engine, context, arr)
+            hasOom = true failed = true break
+          }
+        }
+      } else {
+        let pushSlot = run Effect.result(slots.append(HeaderSlot {
+          nameStart: start, nameLen: keyBytes.length, kind: kind,
+          firstVal: valStr, joined: false, valStart: 0, valLen: 0,
+          arrayVal: ValueBits.Undefined, arrayCount: 0,
+        }))
+        match move pushSlot {
+          Result<(), OutOfMemoryError>.Success { .. } => ()
+          Result<(), OutOfMemoryError>.Failure { .. } => {
+            unsafe owners.release(&mut engine, context, valStr)
+            hasOom = true failed = true break
+          }
+        }
+      }
+    } else {
+      let slKind = slots.asSlice()[foundIdx].kind
+      let slJoined = slots.asSlice()[foundIdx].joined
+      let slFirstVal = slots.asSlice()[foundIdx].firstVal
+      let slValStart = slots.asSlice()[foundIdx].valStart
+      let slArrayVal = slots.asSlice()[foundIdx].arrayVal
+      let slArrayCount = slots.asSlice()[foundIdx].arrayCount
+      if slKind == KIND_SET_COOKIE {
+        run unsafe common.defineIndex(&mut engine, context, slArrayVal, slArrayCount, valStr)
+        let sm = slots.asMutSlice()
+        sm[foundIdx].arrayCount = slArrayCount + 1
+      } else if slKind == KIND_SINGLE && !joinDuplicates {
+        // Drop duplicate.
+        unsafe owners.release(&mut engine, context, valStr)
+      } else {
+        // Join with ", " (KIND_COMMA / KIND_SINGLE+joinDuplicates) or "; " (KIND_COOKIE).
+        let sep: &[u8] = if slKind == KIND_COOKIE { b"; " } else { b", " }
+        if !slJoined && isLatin1Value(slFirstVal) && isLatin1Value(valStr) {
+          let mut buf = Bytes.make()
+          let r1 = run Effect.result(appendLatin1Value(&mut buf, slFirstVal))
+          let r2 = run Effect.result(buf.append(sep))
+          let r3 = run Effect.result(appendLatin1Value(&mut buf, valStr))
+          unsafe owners.release(&mut engine, context, slFirstVal)
+          unsafe owners.release(&mut engine, context, valStr)
+          let sm1 = slots.asMutSlice()
+          sm1[foundIdx].firstVal = ValueBits.Undefined
+          let mut ok = true
+          match move r1 { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => { ok = false } }
+          match move r2 { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => { ok = false } }
+          match move r3 { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => { ok = false } }
+          if !ok { hasOom = true failed = true break }
+          let idx = joinedBufs.length()
+          let r4 = run Effect.result(joinedBufs.append(move buf))
+          match move r4 {
+            Result<(), OutOfMemoryError>.Success { .. } => {
+              let sm2 = slots.asMutSlice()
+              sm2[foundIdx].joined = true
+              sm2[foundIdx].valStart = idx
+            }
+            Result<(), OutOfMemoryError>.Failure { .. } => { hasOom = true failed = true break }
+          }
+        } else if slJoined && isLatin1Value(valStr) {
+          let jbm1 = joinedBufs.asMutSlice()
+          let mut buf = Intrinsic.replace(jbm1[slValStart], Bytes.make())
+          let r1 = run Effect.result(buf.append(sep))
+          let r2 = run Effect.result(appendLatin1Value(&mut buf, valStr))
+          unsafe owners.release(&mut engine, context, valStr)
+          let jbm2 = joinedBufs.asMutSlice()
+          jbm2[slValStart] = move buf
+          let mut ok = true
+          match move r1 { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => { ok = false } }
+          match move r2 { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => { ok = false } }
+          if !ok { hasOom = true failed = true break }
+        } else {
+          // Non-Latin1 fallback: materialize firstVal if joined, then concatenate via UTF-8.
+          let mut combined = Bytes.make()
+          if slJoined {
+            let prev = run unsafe makeLatin1String(&mut engine, context, joinedBufs.asSlice()[slValStart].asSlice())
+            let pBytes = run Strings.toUtf8(prev, false)
+            unsafe owners.release(&mut engine, context, prev)
+            run combined.append(pBytes.asSlice())
+            let sm3 = slots.asMutSlice()
+            sm3[foundIdx].joined = false
+          } else {
+            let pBytes = run Strings.toUtf8(slFirstVal, false)
+            unsafe owners.release(&mut engine, context, slFirstVal)
+            run combined.append(pBytes.asSlice())
+          }
+          run combined.append(sep)
+          let vBytes = run Strings.toUtf8(valStr, false)
+          unsafe owners.release(&mut engine, context, valStr)
+          run combined.append(vBytes.asSlice())
+          let made = run Effect.result(Strings.fromUtf8(combined.asSlice()))
+          let newVal = match move made {
+            Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+            Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+          }
+          let sm4 = slots.asMutSlice()
+          sm4[foundIdx].firstVal = newVal
+        }
+      }
+    }
+    n = n + 2
+  }
+  if failed {
+    let mut k: usize = 0
+    while k < slots.length() {
+      let fv = slots.asSlice()[k].firstVal
+      let av = slots.asSlice()[k].arrayVal
+      unsafe owners.release(&mut engine, context, fv)
+      unsafe owners.release(&mut engine, context, av)
+      k = k + 1
+    }
+    if hasOom { fail OutOfMemoryError {} }
+    return scope.take(0)
+  }
+  // Define all collected properties on scope.values[0] in insertion order.
+  let mut k: usize = 0
+  while k < slots.length() {
+    let slNameStart = slots.asSlice()[k].nameStart
+    let slNameLen = slots.asSlice()[k].nameLen
+    let slKind = slots.asSlice()[k].kind
+    let slJoined = slots.asSlice()[k].joined
+    let slValStart = slots.asSlice()[k].valStart
+    let slFirstVal = slots.asSlice()[k].firstVal
+    let slArrayVal = slots.asSlice()[k].arrayVal
+    let keySlice = Slice.view<u8>(nameBuf.asSlice(), slNameStart, slNameLen)
+    let val = if slKind == KIND_SET_COOKIE {
+      slArrayVal
+    } else if slJoined {
+      run unsafe makeLatin1String(&mut engine, context, joinedBufs.asSlice()[slValStart].asSlice())
+    } else {
+      slFirstVal
+    }
+    run unsafe common.define(&mut engine, context, scope.values[0], keySlice, val, 7)
+    k = k + 1
+  }
+  return scope.take(0)
+}
+
+/// Builds IncomingMessage.headersDistinct / trailersDistinct ({ __proto__: null } with string[] values).
+pub unsafe effect fn buildHeadersDistinct<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, rawHeaders: ValueBits, count: u32, scope: &mut Scope) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run objects.withPrototype(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(ValueBits.Null))
+  if count < 2 { return scope.take(0) }
+  let mut nameBuf = Bytes.make()
+  let mut scratch = Bytes.make()
+  let mut slots = List<HeaderSlot>.make()
+  let mut n: u32 = 0
+  let mut hasOom = false
+  while n + 1 < count {
+    let rawName = run unsafe owners.getIndex(&mut engine, context, rawHeaders, n)
+    let rawVal = run unsafe owners.getIndex(&mut engine, context, rawHeaders, n + 1)
+    let nameStr = if rawName.isString() { rawName } else {
+      let s = run unsafe common.toString(&mut engine, context, rawName)
+      unsafe owners.release(&mut engine, context, rawName)
+      s
+    }
+    scratch.clear()
+    let appRes = run Effect.result(appendLowerLatin1(&mut scratch, nameStr))
+    unsafe owners.release(&mut engine, context, nameStr)
+    match move appRes {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { .. } => {
+        unsafe owners.release(&mut engine, context, rawVal)
+        hasOom = true break
+      }
+    }
+    let keyBytes = scratch.asSlice()
+    let mut foundIdx: usize = slots.length()
+    let mut si: usize = 0
+    while si < slots.length() {
+      let sl = &slots.asSlice()[si]
+      if sl.nameLen == keyBytes.length && eqBytes(Slice.view<u8>(nameBuf.asSlice(), sl.nameStart, sl.nameLen), keyBytes) {
+        foundIdx = si
+        break
+      }
+      si = si + 1
+    }
+    if foundIdx == slots.length() {
+      let start = nameBuf.length()
+      let pushName = run Effect.result(nameBuf.append(keyBytes))
+      match move pushName {
+        Result<(), OutOfMemoryError>.Success { .. } => ()
+        Result<(), OutOfMemoryError>.Failure { .. } => {
+          unsafe owners.release(&mut engine, context, rawVal)
+          hasOom = true break
+        }
+      }
+      let arr = run unsafe common.array(&mut engine, memory, context)
+      run unsafe common.defineIndex(&mut engine, context, arr, 0, rawVal)
+      let pushSlot = run Effect.result(slots.append(HeaderSlot {
+        nameStart: start, nameLen: keyBytes.length, kind: KIND_SET_COOKIE,
+        firstVal: ValueBits.Undefined, joined: false, valStart: 0, valLen: 0,
+        arrayVal: arr, arrayCount: 1,
+      }))
+      match move pushSlot {
+        Result<(), OutOfMemoryError>.Success { .. } => ()
+        Result<(), OutOfMemoryError>.Failure { .. } => {
+          unsafe owners.release(&mut engine, context, arr)
+          hasOom = true break
+        }
+      }
+    } else {
+      let slArrayVal = slots.asSlice()[foundIdx].arrayVal
+      let slArrayCount = slots.asSlice()[foundIdx].arrayCount
+      run unsafe common.defineIndex(&mut engine, context, slArrayVal, slArrayCount, rawVal)
+      let sm = slots.asMutSlice()
+      sm[foundIdx].arrayCount = slArrayCount + 1
+    }
+    n = n + 2
+  }
+  if hasOom {
+    let mut k: usize = 0
+    while k < slots.length() {
+      let av = slots.asSlice()[k].arrayVal
+      unsafe owners.release(&mut engine, context, av)
+      k = k + 1
+    }
+    fail OutOfMemoryError {}
+  }
+  let mut k: usize = 0
+  while k < slots.length() {
+    let slNameStart = slots.asSlice()[k].nameStart
+    let slNameLen = slots.asSlice()[k].nameLen
+    let slArrayVal = slots.asSlice()[k].arrayVal
+    let keySlice = Slice.view<u8>(nameBuf.asSlice(), slNameStart, slNameLen)
+    run unsafe common.define(&mut engine, context, scope.values[0], keySlice, slArrayVal, 7)
+    k = k + 1
+  }
+  return scope.take(0)
+}

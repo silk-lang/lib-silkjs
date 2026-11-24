@@ -60,7 +60,7 @@ function resetMessage(state) {
 // The native side gathers the url and fields of a head and calls once at headers
 // complete (kind 7, value [major, minor, method, statusCode, upgrade, keepAlive,
 // eof, url or status text, fields]); trailers arrive with message complete (kind 9).
-function event(parser, state, kind, value, remaining) {
+function event(parser, state, kind, value, remaining, syncConn) {
   state.remaining = remaining;
   // Like Node, a parser removed from its socket (freeParser) runs no more callbacks for
   // the rest of the input it is executing.
@@ -69,7 +69,7 @@ function event(parser, state, kind, value, remaining) {
     case 0:
       state.inMessage = true;
       resetMessage(state);
-      if (state.connections) state.connections._begin(parser, state);
+      if (syncConn && state.connections) state.connections._begin(parser, state, false);
       callback(parser, state, HTTPParser.kOnMessageBegin, call0);
       break;
     case 7: {
@@ -77,6 +77,7 @@ function event(parser, state, kind, value, remaining) {
       state.headersComplete = true;
       state.upgrade = value[4];
       state.eof = value[6];
+      if (syncConn && state.connections) native(30, state.id);
       const result = callback(parser, state, HTTPParser.kOnHeadersComplete, request ? callRequestHead : callResponseHead, value);
       return state.pauseRequested && !result ? 21 : result | 0;
     }
@@ -92,7 +93,7 @@ function event(parser, state, kind, value, remaining) {
       state.inMessage = false;
       if (value !== undefined) callback(parser, state, HTTPParser.kOnHeaders, call2, [value, '']);
       state.headersComplete = false;
-      if (state.connections) state.connections._complete(parser, state);
+      if (syncConn && state.connections) state.connections._complete(parser, state);
       callback(parser, state, HTTPParser.kOnMessageComplete, call0);
       break;
   }
@@ -125,11 +126,12 @@ function resetAsync(state, owner, id) {
 }
 class HTTPParser {
   constructor() {
-    const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, topLevel: false, provider: 0, frame: undefined, consuming: null,
-      currentRead: null, list: null, executing: false, pauseRequested: false, remaining: 0, remainder: null,
-      native: null, nativeBegun: false, inMessage: false, nativeLater: 0 };
+    const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, beingFreed: false, topLevel: false, provider: 0, frame: undefined, consuming: null,
+      currentRead: null, list: 0, executing: false, pauseRequested: false, remaining: 0, remainder: null,
+      native: null, nativeBegun: false, inMessage: false, nativeLater: 0, weakSelf: null };
     resetMessage(state);
-    state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
+    state.weakSelf = new WeakRef(this);
+    state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining, false);
     state.id = native(0, new WeakRef(state.callback));
     states.set(this, state);
     finalizers.register(this, state.id, this);
@@ -249,7 +251,7 @@ class HTTPParser {
     HTTPParser.prototype.unconsume.call(this);
     const state = stateOf(this);
     state.beingFreed = true;
-    if (state.connections) { state.connections._remove(this); state.connections = null; state.list = null; }
+    if (state.connections) { state.connections._remove(this, state); state.connections = null; state.list = 0; }
   }
   free() {
     const state = stateOf(this);
@@ -284,59 +286,39 @@ for (const [name, value] of Object.entries({
 })) Object.defineProperty(HTTPParser, name, { value, enumerable: true });
 
 // The connections of an HTTP server, for its header and request deadlines (Node's
-// ConnectionsList binding). A parser is active from the start of a message (or from
-// initialize) until the message completes.
+// ConnectionsList binding), backed by Silk's O(1) intrusive doubly-linked lists.
 const listStates = new WeakMap();
+const listFinalizers = new FinalizationRegistry(id => native(28, id));
 function listOf(list) {
-  const state = listStates.get(list);
-  if (!state) throw error('ERR_INVALID_THIS', 'Value of this must be a ConnectionsList');
-  return state;
+  const id = listStates.get(list);
+  if (!id) throw error('ERR_INVALID_THIS', 'Value of this must be a ConnectionsList');
+  return id;
 }
-const byStart = (a, b) => {
-  const x = states.get(a).messageStart, y = states.get(b).messageStart;
-  if (x === 0 || y === 0) return x === y ? 0 : x === 0 ? -1 : 1;
-  return x - y;
-};
 class ConnectionsList {
-  constructor() { listStates.set(this, { all: new Set(), active: new Set() }); }
-  all() { return [...listOf(this).all].sort(byStart); }
-  idle() { return this.all().filter(parser => states.get(parser).messageStart === 0); }
-  active() { return [...listOf(this).active].sort(byStart); }
+  constructor() {
+    const id = native(27);
+    listStates.set(this, id);
+    listFinalizers.register(this, id, this);
+  }
+  all() { return native(33, listOf(this), 0); }
+  idle() { return native(33, listOf(this), 1); }
+  active() { return native(33, listOf(this), 2); }
   expired(headersTimeout, requestTimeout) {
     if (typeof headersTimeout !== 'number' || typeof requestTimeout !== 'number')
       throw error('ERR_INVALID_ARG_TYPE', 'timeouts must be numbers');
-    headersTimeout >>>= 0; requestTimeout >>>= 0;
-    if (headersTimeout === 0 && requestTimeout === 0) return [];
-    if (requestTimeout > 0 && headersTimeout > requestTimeout) [headersTimeout, requestTimeout] = [requestTimeout, headersTimeout];
-    const now = host.now();
-    const headersDeadline = headersTimeout > 0 && now > headersTimeout ? now - headersTimeout : 0;
-    const requestDeadline = requestTimeout > 0 && now > requestTimeout ? now - requestTimeout : 0;
-    if (headersDeadline === 0 && requestDeadline === 0) return [];
-    const list = listOf(this), result = [];
-    for (const parser of this.active()) {
-      const state = states.get(parser);
-      if ((!state.headersComplete && headersDeadline > 0 && state.messageStart < headersDeadline) ||
-          (requestDeadline > 0 && state.messageStart < requestDeadline)) {
-        result.push(parser);
-        list.active.delete(parser);
-      }
-    }
-    return result;
+    return native(34, listOf(this), headersTimeout >>> 0, requestTimeout >>> 0);
   }
-  _begin(parser, state) {
-    const list = state.list ?? listOf(this);
-    state.messageStart = host.now();
-    list.all.add(parser); list.active.add(parser);
+  _begin(parser, state, headersComplete = false) {
+    const listId = state.list || listOf(this);
+    if (state.id) native(29, listId, state.id, state.weakSelf, Boolean(headersComplete));
   }
   _complete(parser, state) {
-    const list = state.list ?? listOf(this);
-    list.active.delete(parser);
-    state.messageStart = 0;
-    list.all.add(parser);
+    const listId = state.list || listOf(this);
+    if (state.id) native(31, listId, state.id);
   }
-  _remove(parser) {
-    const list = listOf(this);
-    list.all.delete(parser); list.active.delete(parser);
+  _remove(parser, state) {
+    const s = state ?? states.get(parser);
+    if (s && s.id) native(32, s.id);
   }
 }
 
@@ -365,7 +347,7 @@ function nativeBegin(parser, state, first) {
   if (!state.id) return;
   if (first && !state.nativeBegun) {
     state.nativeBegun = true;
-    event(parser, state, 0, undefined, 0);
+    event(parser, state, 0, undefined, 0, true);
   }
   state.topLevel = true;
   try { callback(parser, state, HTTPParser.kOnExecute, call1, 0); }
@@ -385,16 +367,20 @@ function nativeRequest(parser, state, link, flags, record) {
   state.topLevel = true;
   state.executing = true;
   try {
-    if (!state.nativeBegun) event(parser, state, 0, undefined, 0);
+    const alreadyBegun = state.nativeBegun;
+    if (!alreadyBegun) {
+      if (state.connections) state.connections._begin(parser, state, true);
+      event(parser, state, 0, undefined, 0, false);
+    }
     state.nativeBegun = false;
     // [major, minor, method, statusCode, upgrade, keepAlive, eof, url, fields]
     const head = [1, (flags & 4) !== 0 ? 0 : 1, methodIndex.get(record[0]), 0, false, true, false, record[1], record.slice(2)];
     // The request's stream starts lean (_http_incoming kLean).
     incoming ??= require('_http_incoming');
     incoming.makeLeanNext(true);
-    try { event(parser, state, 7, head, 0); }
+    try { event(parser, state, 7, head, 0, alreadyBegun); }
     finally { incoming.makeLeanNext(false); }
-    event(parser, state, 9, undefined, 0);
+    event(parser, state, 9, undefined, 0, true);
   } finally { state.executing = false; }
   // The last request of a read ends its execute (HTTP_MORE, 16, marks the others).
   try { if ((flags & 16) === 0) callback(parser, state, HTTPParser.kOnExecute, call1, 0); }

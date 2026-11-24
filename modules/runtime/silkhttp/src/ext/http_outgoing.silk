@@ -1,0 +1,512 @@
+//! Native Silk HTTP/1 outgoing header & trailer serializer for OutgoingMessage,
+//! ServerResponse, and ClientRequest. Performs RFC 7230/Fetch validation, header
+//! scanning (Connection, Transfer-Encoding, Content-Length, Date, Expect, Trailer,
+//! Keep-Alive), automatic Date/Connection/Keep-Alive/Content-Length/Transfer-Encoding
+//! injection, and wire serialization in a single Silk buffer pass.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.f64
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.js_proxy_core as core
+import silkjs.js_realm { lendRealm }
+import silkjsruntime.libs.core.common as common
+import silkjsruntime.libs.core.owners as owners
+import silkjsruntime.libs.core.owners { Scope }
+import ext.http_core as hcore
+
+/// Per-runtime reusable scratch buffers and per-second cached header middle
+/// so outgoing head/trailer serialization performs zero heap mallocs on the hot path.
+pub struct OutgoingScratch {
+  headBuf: Bytes,
+  nameScratch: Bytes,
+  valScratch: Bytes,
+  simpleMiddle: Bytes,
+  cachedSec: i64,
+  cachedSendDate: bool,
+  cachedKeepAliveSec: i32,
+  cachedMaxReq: i32,
+}
+
+pub fn makeOutgoingScratch() -> OutgoingScratch {
+  return OutgoingScratch {
+    headBuf: Bytes.make(),
+    nameScratch: Bytes.make(),
+    valScratch: Bytes.make(),
+    simpleMiddle: Bytes.make(),
+    cachedSec: -2,
+    cachedSendDate: false,
+    cachedKeepAliveSec: -2,
+    cachedMaxReq: -1,
+  }
+}
+
+// Input flag bits for serializeHead:
+const IN_SEND_DATE: u32 = 1
+const IN_SHOULD_KEEP_ALIVE: u32 = 2
+const IN_USE_CHUNKED_DEFAULT: u32 = 4
+const IN_HAS_AGENT: u32 = 8
+const IN_MAX_REQ_REACHED: u32 = 16
+const IN_DEFAULT_KEEP_ALIVE: u32 = 32
+const IN_REMOVED_CONN: u32 = 64
+const IN_REMOVED_CL: u32 = 128
+const IN_REMOVED_TE: u32 = 256
+const IN_HAS_BODY: u32 = 512
+const IN_HAS_CL: u32 = 1024
+const IN_LENIENT: u32 = 2048
+const IN_VALIDATE: u32 = 4096
+const IN_STATUS_204_304: u32 = 8192
+const IN_CHUNKED: u32 = 16384
+const IN_LAST: u32 = 32768
+
+// Output flag bits returned from serializeHead:
+const OUT_LAST: u32 = 1
+const OUT_SHOULD_KEEP_ALIVE: u32 = 2
+const OUT_CHUNKED: u32 = 4
+const OUT_REMOVED_CONN: u32 = 8
+const OUT_REMOVED_CL: u32 = 16
+const OUT_REMOVED_TE: u32 = 32
+const OUT_DEFAULT_KEEP_ALIVE: u32 = 64
+const OUT_EXPECT: u32 = 128
+const OUT_CL_UPDATED: u32 = 256
+
+// Error codes returned when validation fails (JS throws the exact Node error class):
+const ERR_INVALID_TOKEN: i32 = 1
+const ERR_INVALID_HEADER_VALUE: i32 = 2
+const ERR_INVALID_CHAR: i32 = 3
+const ERR_TRAILER_INVALID: i32 = 4
+
+fn lowerAscii(b: u8) -> u8 {
+  if b >= 65 && b <= 90 { return b + 32 }
+  return b
+}
+
+fn isWordByte(b: u8) -> bool {
+  return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95
+}
+
+fn eqFold(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if lowerAscii(a[i]) != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// Exact equivalent of JS `/(?:^|\W)<word>(?:$|\W)/i` where `word` is lowercase ASCII.
+pub fn containsWordFold(haystack: &[u8], word: &[u8]) -> bool {
+  if haystack.length < word.length { return false }
+  let limit = haystack.length - word.length
+  let mut i: usize = 0
+  while i <= limit {
+    let leftOk = i == 0 || !isWordByte(haystack[i - 1])
+    if leftOk {
+      let mut j: usize = 0
+      let mut matched = true
+      while j < word.length {
+        if lowerAscii(haystack[i + j]) != word[j] { matched = false break }
+        j = j + 1
+      }
+      if matched {
+        let end = i + word.length
+        if end == haystack.length || !isWordByte(haystack[end]) { return true }
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn appendDecimal(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 24] = [0; 24]
+  let mut n = value
+  let mut count: usize = 0
+  while true {
+    digits[23 - count] = u64.toU8(48 + n % 10)
+    n = n / 10
+    count = count + 1
+    if n == 0 { break }
+  }
+  run out.append(Slice.view<u8>(&digits, 24 - count, count))
+}
+
+effect fn appendSignedDecimal(out: &mut Bytes, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value < 0 {
+    run out.append(b"-")
+    let mag = i32.toU64(0 - value)
+    return run appendDecimal(&mut out, mag)
+  }
+  return run appendDecimal(&mut out, i32.toU64(value))
+}
+
+effect fn appendLatin1(out: &mut Bytes, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    return run out.append(unsafe Strings.flatLatin1(&anchor, value))
+  }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => {
+        let one: [u8; 1] = [u16.toU8(unit & 255)]
+        run out.append(&one)
+      }
+      Option<u16>.None => { return () }
+    }
+  }
+}
+
+unsafe effect fn makeLatin1<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, bytes: &[u8]) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let made = run Effect.result(Strings.fromLatin1(bytes))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}
+
+unsafe effect fn errorResult<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, code: i32, name: ValueBits, value: ValueBits, scope: &mut Scope) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 0, ValueBits.Int { value: code })
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 1, unsafe name.retained())
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 2, unsafe value.retained())
+  return scope.take(0)
+}
+
+/// Zero-array fast path for standard keep-alive fixed-length responses with no custom headers.
+/// Returns the serialized header string directly.
+pub unsafe effect fn serializeSimpleHead<'m, S: EngineServices>(
+  engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader,
+  dateCache: &mut hcore.DateCache,
+  scratch: &mut OutgoingScratch,
+  firstLine: ValueBits,
+  contentLengthF: f64,
+  keepAliveTimeoutSeconds: i32,
+  maxRequestsPerSocket: i32,
+  sendDate: bool
+) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let dateBytes: [u8; 29] = if sendDate { unsafe hcore.currentDateBytes(&mut dateCache) } else { [0; 29] }
+  let sec = if sendDate { hcore.dateCacheSecond(&dateCache.*) } else { -1 }
+  if scratch.cachedSec != sec || scratch.cachedSendDate != sendDate ||
+     scratch.cachedKeepAliveSec != keepAliveTimeoutSeconds || scratch.cachedMaxReq != maxRequestsPerSocket {
+    scratch.simpleMiddle.clear()
+    if sendDate {
+      run scratch.simpleMiddle.append(b"Date: ")
+      run scratch.simpleMiddle.append(&dateBytes)
+      run scratch.simpleMiddle.append(b"\r\n")
+    }
+    run scratch.simpleMiddle.append(b"Connection: keep-alive\r\n")
+    if keepAliveTimeoutSeconds >= 0 {
+      run scratch.simpleMiddle.append(b"Keep-Alive: timeout=")
+      run appendSignedDecimal(&mut scratch.simpleMiddle, keepAliveTimeoutSeconds)
+      if maxRequestsPerSocket > 0 {
+        run scratch.simpleMiddle.append(b", max=")
+        run appendSignedDecimal(&mut scratch.simpleMiddle, maxRequestsPerSocket)
+      }
+      run scratch.simpleMiddle.append(b"\r\n")
+    }
+    run scratch.simpleMiddle.append(b"Content-Length: ")
+    scratch.cachedSec = sec
+    scratch.cachedSendDate = sendDate
+    scratch.cachedKeepAliveSec = keepAliveTimeoutSeconds
+    scratch.cachedMaxReq = maxRequestsPerSocket
+  }
+  scratch.headBuf.clear()
+  run appendLatin1(&mut scratch.headBuf, firstLine)
+  run scratch.headBuf.append(scratch.simpleMiddle.asSlice())
+  if contentLengthF >= 0.0 && f64.isFinite(contentLengthF) && f64.floor(contentLengthF) == contentLengthF && contentLengthF < 9007199254740992.0 {
+    run appendDecimal(&mut scratch.headBuf, f64.toU64(contentLengthF))
+  } else {
+    let numStr = run unsafe common.toString(&mut engine, context, ValueBits.number(contentLengthF))
+    run appendLatin1(&mut scratch.headBuf, numStr)
+    unsafe owners.release(&mut engine, context, numStr)
+  }
+  run scratch.headBuf.append(b"\r\n\r\n")
+  return run unsafe makeLatin1(&mut engine, context, scratch.headBuf.asSlice())
+}
+
+/// Serializes an HTTP/1 head in Silk using reusable scratch buffers.
+/// `pairs` is a flat JS array `[name0, val0, name1, val1, ...]` with `pairCount` elements.
+/// Returns `[0, headerString, outFlags, parsedContentLengthValue]` on success, or `[errCode, badName, badValue]` on validation error.
+pub unsafe effect fn serializeHead<'m, S: EngineServices>(
+  engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader,
+  dateCache: &mut hcore.DateCache,
+  scratch: &mut OutgoingScratch,
+  firstLine: ValueBits,
+  pairs: ValueBits,
+  pairCount: u32,
+  inFlags: u32,
+  contentLengthF: f64,
+  keepAliveTimeoutSeconds: i32,
+  maxRequestsPerSocket: i32,
+  scope: &mut Scope
+) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let validate = u32.bitAnd(inFlags, IN_VALIDATE) != 0
+  let lenient = u32.bitAnd(inFlags, IN_LENIENT) != 0
+  scratch.headBuf.clear()
+  run appendLatin1(&mut scratch.headBuf, firstLine)
+
+  let mut sawConnection = false
+  let mut sawContLen = false
+  let mut sawTE = false
+  let mut sawDate = false
+  let mut sawExpect = false
+  let mut sawTrailer = false
+
+  let mut last = u32.bitAnd(inFlags, IN_LAST) != 0
+  let mut shouldKeepAlive = u32.bitAnd(inFlags, IN_SHOULD_KEEP_ALIVE) != 0
+  let mut chunkedEncoding = u32.bitAnd(inFlags, IN_CHUNKED) != 0
+  let mut removedConnection = u32.bitAnd(inFlags, IN_REMOVED_CONN) != 0
+  let mut removedContLen = u32.bitAnd(inFlags, IN_REMOVED_CL) != 0
+  let mut removedTE = u32.bitAnd(inFlags, IN_REMOVED_TE) != 0
+  let mut defaultKeepAlive = u32.bitAnd(inFlags, IN_DEFAULT_KEEP_ALIVE) != 0
+  let mut clValue = ValueBits.Undefined
+
+  let mut i: u32 = 0
+  while i + 1 < pairCount {
+    let rawName = run unsafe owners.getIndex(&mut engine, context, pairs, i)
+    let rawVal = run unsafe owners.getIndex(&mut engine, context, pairs, i + 1)
+    if validate {
+      if !hcore.checkIsHttpToken(rawName) {
+        let err = run unsafe errorResult(&mut engine, context, ERR_INVALID_TOKEN, rawName, rawVal, &mut scope)
+        unsafe owners.release(&mut engine, context, rawName)
+        unsafe owners.release(&mut engine, context, rawVal)
+        unsafe owners.release(&mut engine, context, clValue)
+        return err
+      }
+      if rawVal.tag() == 3 {
+        let err = run unsafe errorResult(&mut engine, context, ERR_INVALID_HEADER_VALUE, rawName, rawVal, &mut scope)
+        unsafe owners.release(&mut engine, context, rawName)
+        unsafe owners.release(&mut engine, context, rawVal)
+        unsafe owners.release(&mut engine, context, clValue)
+        return err
+      }
+    }
+    let valStr = if rawVal.isString() { rawVal } else {
+      let s = run unsafe common.toString(&mut engine, context, rawVal)
+      unsafe owners.release(&mut engine, context, rawVal)
+      s
+    }
+    if validate {
+      if hcore.checkInvalidHeaderCharString(valStr, lenient) {
+        let err = run unsafe errorResult(&mut engine, context, ERR_INVALID_CHAR, rawName, valStr, &mut scope)
+        unsafe owners.release(&mut engine, context, rawName)
+        unsafe owners.release(&mut engine, context, valStr)
+        unsafe owners.release(&mut engine, context, clValue)
+        return err
+      }
+    }
+    // Append "Name: Value\r\n"
+    run appendLatin1(&mut scratch.headBuf, rawName)
+    run scratch.headBuf.append(b": ")
+    run appendLatin1(&mut scratch.headBuf, valStr)
+    run scratch.headBuf.append(b"\r\n")
+
+    // Scan known headers (length 4..17).
+    let nameLen = Strings.length(rawName)
+    if nameLen >= 4 && nameLen <= 17 {
+      scratch.nameScratch.clear()
+      run appendLatin1(&mut scratch.nameScratch, rawName)
+      let ns = scratch.nameScratch.asSlice()
+      if nameLen == 4 && eqFold(ns, b"date") {
+        sawDate = true
+      } else if nameLen == 6 && eqFold(ns, b"expect") {
+        sawExpect = true
+      } else if nameLen == 7 && eqFold(ns, b"trailer") {
+        sawTrailer = true
+      } else if nameLen == 10 {
+        if eqFold(ns, b"connection") {
+          sawConnection = true
+          removedConnection = false
+          scratch.valScratch.clear()
+          run appendLatin1(&mut scratch.valScratch, valStr)
+          if containsWordFold(scratch.valScratch.asSlice(), b"close") {
+            last = true
+          } else {
+            shouldKeepAlive = true
+          }
+        } else if eqFold(ns, b"keep-alive") {
+          defaultKeepAlive = false
+        }
+      } else if nameLen == 14 && eqFold(ns, b"content-length") {
+        sawContLen = true
+        removedContLen = false
+        unsafe owners.release(&mut engine, context, clValue)
+        clValue = unsafe valStr.retained()
+      } else if nameLen == 17 && eqFold(ns, b"transfer-encoding") {
+        sawTE = true
+        removedTE = false
+        scratch.valScratch.clear()
+        run appendLatin1(&mut scratch.valScratch, valStr)
+        if containsWordFold(scratch.valScratch.asSlice(), b"chunked") {
+          chunkedEncoding = true
+        }
+      }
+    }
+    unsafe owners.release(&mut engine, context, rawName)
+    unsafe owners.release(&mut engine, context, valStr)
+    i = i + 2
+  }
+
+  // Date header
+  if u32.bitAnd(inFlags, IN_SEND_DATE) != 0 && !sawDate {
+    let dateBytes = unsafe hcore.currentDateBytes(&mut dateCache)
+    run scratch.headBuf.append(b"Date: ")
+    run scratch.headBuf.append(&dateBytes)
+    run scratch.headBuf.append(b"\r\n")
+  }
+
+  // RFC 2616: 204 / 304 must not use chunked encoding
+  if chunkedEncoding && u32.bitAnd(inFlags, IN_STATUS_204_304) != 0 {
+    chunkedEncoding = false
+    shouldKeepAlive = false
+  }
+
+  // Keep-alive logic
+  if removedConnection {
+    last = !shouldKeepAlive
+  } else if !sawConnection {
+    let useChunkedDefault = u32.bitAnd(inFlags, IN_USE_CHUNKED_DEFAULT) != 0
+    let hasAgent = u32.bitAnd(inFlags, IN_HAS_AGENT) != 0
+    let shouldSendKeepAlive = shouldKeepAlive && (sawContLen || useChunkedDefault || hasAgent)
+    if shouldSendKeepAlive && u32.bitAnd(inFlags, IN_MAX_REQ_REACHED) != 0 {
+      run scratch.headBuf.append(b"Connection: close\r\n")
+    } else if shouldSendKeepAlive {
+      run scratch.headBuf.append(b"Connection: keep-alive\r\n")
+      if keepAliveTimeoutSeconds >= 0 && defaultKeepAlive {
+        run scratch.headBuf.append(b"Keep-Alive: timeout=")
+        run appendSignedDecimal(&mut scratch.headBuf, keepAliveTimeoutSeconds)
+        if maxRequestsPerSocket > 0 {
+          run scratch.headBuf.append(b", max=")
+          run appendSignedDecimal(&mut scratch.headBuf, maxRequestsPerSocket)
+        }
+        run scratch.headBuf.append(b"\r\n")
+      }
+    } else {
+      last = true
+      run scratch.headBuf.append(b"Connection: close\r\n")
+    }
+  }
+
+  // Framing headers (Content-Length / Transfer-Encoding)
+  if !sawContLen && !sawTE {
+    if u32.bitAnd(inFlags, IN_HAS_BODY) == 0 {
+      chunkedEncoding = false
+    } else if u32.bitAnd(inFlags, IN_USE_CHUNKED_DEFAULT) == 0 {
+      last = true
+    } else if !sawTrailer && !removedContLen && u32.bitAnd(inFlags, IN_HAS_CL) != 0 {
+      run scratch.headBuf.append(b"Content-Length: ")
+      if contentLengthF >= 0.0 && f64.isFinite(contentLengthF) && f64.floor(contentLengthF) == contentLengthF && contentLengthF < 9007199254740992.0 {
+        run appendDecimal(&mut scratch.headBuf, f64.toU64(contentLengthF))
+      } else {
+        let numStr = run unsafe common.toString(&mut engine, context, ValueBits.number(contentLengthF))
+        run appendLatin1(&mut scratch.headBuf, numStr)
+        unsafe owners.release(&mut engine, context, numStr)
+      }
+      run scratch.headBuf.append(b"\r\n")
+    } else if !removedTE {
+      run scratch.headBuf.append(b"Transfer-Encoding: chunked\r\n")
+      chunkedEncoding = true
+    } else {
+      last = true
+    }
+  }
+
+  if !chunkedEncoding && sawTrailer {
+    unsafe owners.release(&mut engine, context, clValue)
+    return run unsafe errorResult(&mut engine, context, ERR_TRAILER_INVALID, ValueBits.Undefined, ValueBits.Undefined, &mut scope)
+  }
+
+  run scratch.headBuf.append(b"\r\n")
+
+  let mut outFlags: u32 = 0
+  if last { outFlags = outFlags | OUT_LAST }
+  if shouldKeepAlive { outFlags = outFlags | OUT_SHOULD_KEEP_ALIVE }
+  if chunkedEncoding { outFlags = outFlags | OUT_CHUNKED }
+  if removedConnection { outFlags = outFlags | OUT_REMOVED_CONN }
+  if removedContLen { outFlags = outFlags | OUT_REMOVED_CL }
+  if removedTE { outFlags = outFlags | OUT_REMOVED_TE }
+  if defaultKeepAlive { outFlags = outFlags | OUT_DEFAULT_KEEP_ALIVE }
+  if sawExpect { outFlags = outFlags | OUT_EXPECT }
+  if sawContLen { outFlags = outFlags | OUT_CL_UPDATED }
+
+  let memory = engine.memory
+  scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 0, ValueBits.Int { value: 0 })
+  let headStr = run unsafe makeLatin1(&mut engine, context, scratch.headBuf.asSlice())
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 1, headStr)
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 2, ValueBits.Int { value: u32.toI32(outFlags) })
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 3, clValue)
+  return scope.take(0)
+}
+
+/// Validates and serializes HTTP trailers from a flat `[name, value, ...]` array into a single string.
+/// Returns `[0, trailerString]` or `[errCode, badName, badValue]`.
+pub unsafe effect fn serializeTrailers<'m, S: EngineServices>(
+  engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader,
+  pairs: ValueBits,
+  pairCount: u32,
+  lenient: bool,
+  scope: &mut Scope
+) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut out = Bytes.make()
+  let mut i: u32 = 0
+  while i + 1 < pairCount {
+    let rawName = run unsafe owners.getIndex(&mut engine, context, pairs, i)
+    let rawVal = run unsafe owners.getIndex(&mut engine, context, pairs, i + 1)
+    if !hcore.checkIsHttpToken(rawName) {
+      let err = run unsafe errorResult(&mut engine, context, ERR_INVALID_TOKEN, rawName, rawVal, &mut scope)
+      unsafe owners.release(&mut engine, context, rawName)
+      unsafe owners.release(&mut engine, context, rawVal)
+      return err
+    }
+    let valStr = if rawVal.isString() { rawVal } else {
+      let s = run unsafe common.toString(&mut engine, context, rawVal)
+      unsafe owners.release(&mut engine, context, rawVal)
+      s
+    }
+    if hcore.checkInvalidHeaderCharString(valStr, lenient) {
+      let err = run unsafe errorResult(&mut engine, context, ERR_INVALID_CHAR, rawName, valStr, &mut scope)
+      unsafe owners.release(&mut engine, context, rawName)
+      unsafe owners.release(&mut engine, context, valStr)
+      return err
+    }
+    run appendLatin1(&mut out, rawName)
+    run out.append(b": ")
+    run appendLatin1(&mut out, valStr)
+    run out.append(b"\r\n")
+    unsafe owners.release(&mut engine, context, rawName)
+    unsafe owners.release(&mut engine, context, valStr)
+    i = i + 2
+  }
+  let memory = engine.memory
+  scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 0, ValueBits.Int { value: 0 })
+  let strVal = run unsafe makeLatin1(&mut engine, context, out.asSlice())
+  run unsafe common.defineIndex(&mut engine, context, scope.values[0], 1, strVal)
+  return scope.take(0)
+}

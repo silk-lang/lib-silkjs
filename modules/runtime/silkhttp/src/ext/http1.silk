@@ -66,6 +66,11 @@ const L_KEEP_ALIVE: u32 = 4
 const L_TRANSFER_ENCODING: u32 = 8
 const L_VERSION: u32 = 16
 const L_DATA_AFTER_CLOSE: u32 = 32
+const L_OPTIONAL_LF_AFTER_CR: u32 = 64
+const L_OPTIONAL_CRLF_AFTER_CHUNK: u32 = 128
+const L_OPTIONAL_CR_BEFORE_LF: u32 = 256
+const L_SPACES_AFTER_CHUNK_SIZE: u32 = 512
+const L_HEADER_VALUE_RELAXED: u32 = 1024
 // finish.
 const FINISH_SAFE: i32 = 0
 const FINISH_SAFE_WITH_CB: i32 = 1
@@ -82,6 +87,8 @@ const EV_BODY: i32 = 8
 const EV_MESSAGE_COMPLETE: i32 = 9
 const EV_CHUNK_HEADER: i32 = 10
 const EV_CHUNK_COMPLETE: i32 = 11
+const EV_CHUNK_EXTENSION_NAME: i32 = 12
+const EV_CHUNK_EXTENSION_VALUE: i32 = 13
 // States. Those from S_AFTER_HEADERS read no byte.
 const S_START: i32 = 0
 const S_METHOD: i32 = 1
@@ -121,6 +128,7 @@ const S_TRAILERS_DONE: i32 = 43
 const S_VALUE_DONE: i32 = 44
 // The rest of the HTTP/2 connection preface after `PRI * HTTP/2.0`.
 const S_PRI_PREFACE: i32 = 45
+const S_CHUNK_SIZE_SPACES: i32 = 46
 const E_PAUSED_H2_UPGRADE: i32 = 23
 // What the header being read is.
 const H_GENERAL: i32 = 0
@@ -469,21 +477,25 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
       drop s return unsafe refuse(p, E_INVALID_URL, b"Unexpected start char in url\0", unsafe address(data, i))
     }
     if state == S_URL {
-      if byte == 32 {
+      let mut ch = byte
+      while ch >= 33 && ch != 127 {
+        if ch == 63 { s.query = true }
+        else if ch == 35 { s.fragment = true }
+        i = i + 1
+        if i == length { break }
+        ch = unsafe byteAt(data, i)
+      }
+      if i == length { continue }
+      if ch == 32 {
         s.state = S_PROTOCOL s.constant = 0 drop s
         let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
         if code != 0 { return code }
         i = i + 1 continue
       }
-      if byte < 33 || byte == 127 {
-        let fragment = s.fragment let query = s.query drop s
-        if fragment { return unsafe refuse(p, E_INVALID_URL, b"Invalid char in url fragment start\0", unsafe address(data, i)) }
-        if query { return unsafe refuse(p, E_INVALID_URL, b"Invalid char in url query\0", unsafe address(data, i)) }
-        return unsafe refuse(p, E_INVALID_URL, b"Invalid char in url path\0", unsafe address(data, i))
-      }
-      if byte == 63 { s.query = true }
-      if byte == 35 { s.fragment = true }
-      i = i + 1 continue
+      let fragment = s.fragment let query = s.query drop s
+      if fragment { return unsafe refuse(p, E_INVALID_URL, b"Invalid char in url fragment start\0", unsafe address(data, i)) }
+      if query { return unsafe refuse(p, E_INVALID_URL, b"Invalid char in url query\0", unsafe address(data, i)) }
+      return unsafe refuse(p, E_INVALID_URL, b"Invalid char in url path\0", unsafe address(data, i))
     }
     if state == S_PROTOCOL {
       let expected = b"HTTP/"
@@ -520,9 +532,13 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
       // After the version: CR, then LF.
       if s.digits == 0 {
         if byte == 13 { s.digits = 1 i = i + 1 continue }
+        if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_FIELD_START i = i + 1 continue }
         drop s return unsafe refuse(p, E_INVALID_VERSION, b"Expected CRLF after version\0", unsafe address(data, i + 1))
       }
-      if byte != 10 { drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after CR\0", unsafe address(data, i)) }
+      if byte != 10 {
+        if u32.bitAnd(s.lenient, L_OPTIONAL_LF_AFTER_CR) != 0 { s.state = S_FIELD_START continue }
+        drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after CR\0", unsafe address(data, i))
+      }
       s.state = S_FIELD_START i = i + 1 continue
     }
     if state == S_AFTER_VERSION {
@@ -538,31 +554,57 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
     if state == S_AFTER_STATUS {
       if byte == 32 { s.state = S_REASON drop s unsafe openSpan(p, EV_STATUS, i + 1) i = i + 1 continue }
       if byte == 13 { s.state = S_RESPONSE_LF i = i + 1 continue }
+      if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_FIELD_START i = i + 1 continue }
       drop s return unsafe refuse(p, E_INVALID_STATUS, b"Invalid response status\0", unsafe address(data, i))
     }
     if state == S_REASON {
-      if byte == 13 {
+      let mut ch = byte
+      while isValueByte(ch) {
+        i = i + 1
+        if i == length { break }
+        ch = unsafe byteAt(data, i)
+      }
+      if i == length { continue }
+      if ch == 13 {
         s.state = S_RESPONSE_LF drop s
         let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
         if code != 0 { return code }
         i = i + 1 continue
       }
-      if !isValueByte(byte) { drop s return unsafe refuse(p, E_INVALID_STATUS, b"Invalid response status\0", unsafe address(data, i)) }
-      i = i + 1 continue
+      if ch == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 {
+        s.state = S_FIELD_START drop s
+        let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+        if code != 0 { return code }
+        i = i + 1 continue
+      }
+      drop s return unsafe refuse(p, E_INVALID_STATUS, b"Invalid response status\0", unsafe address(data, i))
     }
     if state == S_RESPONSE_LF {
-      if byte != 10 { drop s return unsafe refuse(p, E_CR_EXPECTED, b"Missing expected CR after response line\0", unsafe address(data, i)) }
+      if byte != 10 {
+        if u32.bitAnd(s.lenient, L_OPTIONAL_LF_AFTER_CR) != 0 { s.state = S_FIELD_START continue }
+        drop s return unsafe refuse(p, E_CR_EXPECTED, b"Missing expected CR after response line\0", unsafe address(data, i))
+      }
       s.state = S_FIELD_START i = i + 1 continue
     }
     if state == S_FIELD_START {
       if byte == 13 { s.state = S_HEADERS_LF i = i + 1 continue }
+      if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_HEADERS_LF continue }
       if !isToken(byte) { drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Invalid header token\0", unsafe address(data, i)) }
       s.state = S_FIELD s.wordLength = 0
       s.word[0] = lower(byte) s.wordLength = 1
       drop s unsafe openSpan(p, EV_FIELD, i) i = i + 1 continue
     }
     if state == S_FIELD {
-      if byte == 58 {
+      let mut ch = byte
+      while isToken(ch) {
+        if s.wordLength < 24 { s.word[s.wordLength] = lower(ch) }
+        s.wordLength = s.wordLength + 1
+        i = i + 1
+        if i == length { break }
+        ch = unsafe byteAt(data, i)
+      }
+      if i == length { continue }
+      if ch == 58 {
         let kind = if s.wordLength <= 24 { headerKind(&s.word, s.wordLength) } else { H_GENERAL }
         s.header = kind s.state = S_VALUE_WS s.sawValue = false s.digits = 0 s.tokenLength = 0 s.tokenOverflow = false s.quoted = false
         if kind == H_CONTENT_LENGTH && u32.bitAnd(s.flags, F_TRANSFER_ENCODING) != 0 && u32.bitAnd(s.lenient, L_CHUNKED_LENGTH) == 0 {
@@ -575,37 +617,87 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
           drop s
           let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
           if code != 0 { return code }
-          return unsafe refuse(p, E_UNEXPECTED_CONTENT_LENGTH, b"Transfer-Encoding can't be present with Content-Length\0", unsafe address(data, i + 1))
+          return unsafe refuse(p, E_INVALID_TRANSFER_ENCODING, b"Transfer-Encoding can't be present with Content-Length\0", unsafe address(data, i + 1))
         }
         drop s
         let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
         if code != 0 { return code }
         i = i + 1 continue
       }
-      if !isToken(byte) { drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Invalid header token\0", unsafe address(data, i)) }
-      if s.wordLength < 24 { s.word[s.wordLength] = lower(byte) }
-      s.wordLength = s.wordLength + 1
-      i = i + 1 continue
+      drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Invalid header token\0", unsafe address(data, i))
     }
     if state == S_VALUE_WS {
-      if byte == 32 || byte == 9 { i = i + 1 continue }
-      if byte == 13 { s.state = S_VALUE_LF i = i + 1 continue }
+      let mut ch = byte
+      while ch == 32 || ch == 9 {
+        i = i + 1
+        if i == length { break }
+        ch = unsafe byteAt(data, i)
+      }
+      if i == length { continue }
+      if ch == 13 { s.state = S_VALUE_LF i = i + 1 continue }
+      if ch == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_VALUE_NEXT i = i + 1 continue }
       s.state = S_VALUE continue
     }
     if state == S_VALUE {
+      if s.sawValue && (s.header == H_GENERAL || s.header == H_UPGRADE) {
+        let allowAll = u32.bitAnd(s.lenient, L_HEADERS) != 0
+        let allowRelaxed = u32.bitAnd(s.lenient, L_HEADER_VALUE_RELAXED) != 0
+        let mut ch = byte
+        while ch != 13 && ch != 10 && (isValueByte(ch) || allowAll || (allowRelaxed && ch != 0)) {
+          i = i + 1
+          if i == length { break }
+          ch = unsafe byteAt(data, i)
+        }
+        if i == length { continue }
+        if ch == 13 {
+          s.state = S_VALUE_LF drop s
+          let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+          if code != 0 { return code }
+          i = i + 1 continue
+        }
+        if ch == 10 {
+          if u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 {
+            s.state = S_VALUE_NEXT drop s
+            let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+            if code != 0 { return code }
+            i = i + 1 continue
+          }
+          drop s
+          let code = unsafe closeSpan(p, data, i, unsafe address(data, i))
+          if code != 0 { return code }
+          return unsafe refuse(p, E_CR_EXPECTED, b"Missing expected CR after header value\0", unsafe address(data, i))
+        }
+        drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Invalid header value char\0", unsafe address(data, i))
+      }
       if byte == 13 {
         s.state = S_VALUE_LF drop s
         let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
         if code != 0 { return code }
         i = i + 1 continue
       }
-      if !isValueByte(byte) && u32.bitAnd(s.lenient, L_HEADERS) == 0 {
+      if byte == 10 {
+        if u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 {
+          s.state = S_VALUE_NEXT drop s
+          let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+          if code != 0 { return code }
+          i = i + 1 continue
+        }
+        drop s
+        let code = unsafe closeSpan(p, data, i, unsafe address(data, i))
+        if code != 0 { return code }
+        return unsafe refuse(p, E_CR_EXPECTED, b"Missing expected CR after header value\0", unsafe address(data, i))
+      }
+      let valueOk = isValueByte(byte) || u32.bitAnd(s.lenient, L_HEADERS) != 0 || (u32.bitAnd(s.lenient, L_HEADER_VALUE_RELAXED) != 0 && byte != 0)
+      if !valueOk {
         drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Invalid header value char\0", unsafe address(data, i))
       }
       if !s.sawValue {
         s.sawValue = true
         if s.header == H_CONTENT_LENGTH && u32.bitAnd(s.flags, F_CONTENT_LENGTH) != 0 {
           drop s return unsafe refuse(p, E_UNEXPECTED_CONTENT_LENGTH, b"Duplicate Content-Length\0", unsafe address(data, i))
+        }
+        if s.header == H_TRANSFER_ENCODING && u32.bitAnd(s.flags, F_CHUNKED) != 0 && s.kind == REQUEST && u32.bitAnd(s.lenient, L_TRANSFER_ENCODING) == 0 {
+          drop s return unsafe refuse(p, E_INVALID_TRANSFER_ENCODING, b"Invalid `Transfer-Encoding` header value\0", unsafe address(data, i + 1))
         }
         drop s unsafe openSpan(p, EV_VALUE, i)
         let mut c = () let t = unsafe Pointer.borrowMut<(), Parser>(&mut c, p)
@@ -621,7 +713,15 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
         } else if byte == 32 || byte == 9 { s.digits = 1 }
         else { drop s return unsafe refuse(p, E_INVALID_CONTENT_LENGTH, b"Invalid character in Content-Length\0", unsafe address(data, i)) }
       } else if s.header == H_CONNECTION || s.header == H_TRANSFER_ENCODING {
-        if byte == 44 { unsafe endToken(&mut s) }
+        if byte == 44 {
+          unsafe endToken(&mut s)
+          if s.header == H_TRANSFER_ENCODING && s.lastChunked && s.kind == REQUEST && u32.bitAnd(s.lenient, L_TRANSFER_ENCODING) == 0 {
+            drop s
+            let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+            if code != 0 { return code }
+            return unsafe refuse(p, E_INVALID_TRANSFER_ENCODING, b"Invalid `Transfer-Encoding` header value\0", unsafe address(data, i + 1))
+          }
+        }
         else if s.tokenLength == 0 && (byte == 32 || byte == 9) {}
         else if s.tokenLength < 16 { s.token[s.tokenLength] = lower(byte) s.tokenLength = s.tokenLength + 1 }
         else { s.tokenOverflow = true }
@@ -629,15 +729,25 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
       i = i + 1 continue
     }
     if state == S_VALUE_LF {
-      if byte != 10 { drop s return unsafe refuse(p, E_LF_EXPECTED, b"Missing expected LF after header value\0", unsafe address(data, i)) }
+      if byte != 10 {
+        if !s.sawValue && u32.bitAnd(s.lenient, L_HEADERS) != 0 { s.state = S_VALUE_NEXT continue }
+        drop s return unsafe refuse(p, E_LF_EXPECTED, b"Missing expected LF after header value\0", unsafe address(data, i))
+      }
       s.state = S_VALUE_NEXT i = i + 1 continue
     }
     if state == S_VALUE_NEXT {
-      if (byte == 32 || byte == 9) && u32.bitAnd(s.lenient, L_HEADERS) == 0 {
-        drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Unexpected whitespace after header value\0", unsafe address(data, i))
+      if byte == 32 || byte == 9 {
+        if u32.bitAnd(s.lenient, L_HEADERS) == 0 {
+          drop s return unsafe refuse(p, E_INVALID_HEADER_TOKEN, b"Unexpected whitespace after header value\0", unsafe address(data, i))
+        }
+        // obs-fold continuation line under LENIENT_HEADERS.
+        s.sawValue = true s.state = S_VALUE drop s
+        unsafe openSpan(p, EV_VALUE, i)
+        continue
       }
       // The value is complete.
       if s.header == H_CONTENT_LENGTH && !s.sawValue { drop s return unsafe refuse(p, E_INVALID_CONTENT_LENGTH, b"Empty Content-Length\0", unsafe address(data, i)) }
+      if s.header == H_TRANSFER_ENCODING && !s.sawValue { drop s return unsafe refuse(p, E_INVALID_TRANSFER_ENCODING, b"Empty Transfer-Encoding\0", unsafe address(data, i)) }
       if s.header == H_CONTENT_LENGTH { s.flags = u32.bitOr(s.flags, F_CONTENT_LENGTH) }
       if s.header == H_CONNECTION { unsafe endToken(&mut s) }
       if s.header == H_TRANSFER_ENCODING {
@@ -653,8 +763,10 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
       continue
     }
     if state == S_HEADERS_LF {
-      if byte != 10 { drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after headers\0", unsafe address(data, i)) }
-      i = i + 1
+      if byte == 10 { i = i + 1 }
+      else if u32.bitAnd(s.lenient, L_OPTIONAL_LF_AFTER_CR) == 0 {
+        drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after headers\0", unsafe address(data, i))
+      }
       if u32.bitAnd(s.flags, F_TRAILING) != 0 { s.state = S_TRAILERS_DONE continue }
       // llhttp__before_headers_complete.
       if u32.bitAnd(s.flags, F_UPGRADE) != 0 && u32.bitAnd(s.flags, F_CONNECTION_UPGRADE) != 0 { s.upgrade = s.kind == REQUEST || s.status == 101 }
@@ -705,22 +817,66 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
         if s.chunkSize > 1152921504606846975 { drop s return unsafe refuse(p, E_INVALID_CHUNK_SIZE, b"Chunk size overflow\0", unsafe address(data, i)) }
         s.chunkSize = s.chunkSize * 16 + i32.toU64(value) i = i + 1 continue
       }
-      if byte == 59 { s.state = S_CHUNK_EXTENSION s.quoted = false i = i + 1 continue }
+      if (byte == 32 || byte == 9) && u32.bitAnd(s.lenient, L_SPACES_AFTER_CHUNK_SIZE) != 0 { s.state = S_CHUNK_SIZE_SPACES i = i + 1 continue }
+      if byte == 59 { s.state = S_CHUNK_EXTENSION s.quoted = false drop s unsafe openSpan(p, EV_CHUNK_EXTENSION_NAME, i + 1) i = i + 1 continue }
       if byte == 13 { s.state = S_CHUNK_LF i = i + 1 continue }
+      if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_CHUNK_LF continue }
+      drop s return unsafe refuse(p, E_INVALID_CHUNK_SIZE, b"Invalid character in chunk size\0", unsafe address(data, i))
+    }
+    if state == S_CHUNK_SIZE_SPACES {
+      if byte == 32 || byte == 9 { i = i + 1 continue }
+      if byte == 59 { s.state = S_CHUNK_EXTENSION s.quoted = false drop s unsafe openSpan(p, EV_CHUNK_EXTENSION_NAME, i + 1) i = i + 1 continue }
+      if byte == 13 { s.state = S_CHUNK_LF i = i + 1 continue }
+      if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_CHUNK_LF continue }
       drop s return unsafe refuse(p, E_INVALID_CHUNK_SIZE, b"Invalid character in chunk size\0", unsafe address(data, i))
     }
     if state == S_CHUNK_EXTENSION {
-      if s.quoted { if byte == 34 { s.quoted = false } i = i + 1 continue }
+      if s.quoted {
+        if byte == 13 || byte == 10 || byte == 0 {
+          s.spanOpen = false s.span = -1 drop s
+          return unsafe refuse(p, E_INVALID_CHUNK_SIZE, b"Invalid character in chunk extensions\0", unsafe address(data, i))
+        }
+        if byte == 34 { s.quoted = false }
+        i = i + 1 continue
+      }
       if byte == 34 { s.quoted = true i = i + 1 continue }
-      if byte == 13 { s.state = S_CHUNK_LF i = i + 1 continue }
-      if !isToken(byte) && byte != 59 && byte != 61 && byte != 32 && byte != 9 {
-        drop s return unsafe refuse(p, E_INVALID_CHUNK_SIZE, b"Invalid character in chunk extensions\0", unsafe address(data, i))
+      if byte == 13 {
+        s.state = S_CHUNK_LF drop s
+        let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+        if code != 0 { return code }
+        i = i + 1 continue
+      }
+      if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 {
+        s.state = S_CHUNK_LF drop s
+        let code = unsafe closeSpan(p, data, i, unsafe address(data, i))
+        if code != 0 { return code }
+        continue
+      }
+      if byte == 61 {
+        drop s
+        let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+        if code != 0 { return code }
+        unsafe openSpan(p, EV_CHUNK_EXTENSION_VALUE, i + 1)
+        i = i + 1 continue
+      }
+      if byte == 59 {
+        drop s
+        let code = unsafe closeSpan(p, data, i, unsafe address(data, i + 1))
+        if code != 0 { return code }
+        unsafe openSpan(p, EV_CHUNK_EXTENSION_NAME, i + 1)
+        i = i + 1 continue
+      }
+      if !isToken(byte) && byte != 32 && byte != 9 {
+        s.spanOpen = false s.span = -1 drop s
+        return unsafe refuse(p, E_INVALID_CHUNK_SIZE, b"Invalid character in chunk extensions\0", unsafe address(data, i))
       }
       i = i + 1 continue
     }
     if state == S_CHUNK_LF {
-      if byte != 10 { drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after chunk size\0", unsafe address(data, i)) }
-      i = i + 1
+      if byte == 10 { i = i + 1 }
+      else if u32.bitAnd(s.lenient, L_OPTIONAL_LF_AFTER_CR) == 0 {
+        drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after chunk size\0", unsafe address(data, i))
+      }
       let size = s.chunkSize
       s.state = if size == 0 { S_FIELD_START } else { S_CHUNK_DATA }
       if size == 0 { s.flags = u32.bitOr(s.flags, F_TRAILING) }
@@ -731,12 +887,23 @@ pub unsafe fn llhttp_execute(parser: *mut u8, data: *const u8, length: usize) ->
       continue
     }
     if state == S_CHUNK_DATA_CR {
-      if byte != 13 { drop s return unsafe refuse(p, E_CR_EXPECTED, b"Missing expected CR after chunk data\0", unsafe address(data, i)) }
-      s.state = S_CHUNK_DATA_LF i = i + 1 continue
+      if byte == 13 { s.state = S_CHUNK_DATA_LF i = i + 1 continue }
+      if byte == 10 && u32.bitAnd(s.lenient, L_OPTIONAL_CR_BEFORE_LF) != 0 { s.state = S_CHUNK_DATA_LF continue }
+      if u32.bitAnd(s.lenient, L_OPTIONAL_CRLF_AFTER_CHUNK) != 0 {
+        s.state = S_CHUNK_START drop s
+        let result = unsafe emit(p, EV_CHUNK_COMPLETE, Pointer.null<u8>(), 0, unsafe address(data, i))
+        let code = unsafe noticeResult(p, result, E_CB_CHUNK_COMPLETE, b"`on_chunk_complete` callback error\0", b"on_chunk_complete pause\0", unsafe address(data, i))
+        if code != 0 { return code }
+        continue
+      }
+      drop s return unsafe refuse(p, E_CR_EXPECTED, b"Missing expected CR after chunk data\0", unsafe address(data, i))
     }
     if state == S_CHUNK_DATA_LF {
-      if byte != 10 { drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after chunk data\0", unsafe address(data, i)) }
-      i = i + 1 s.state = S_CHUNK_START drop s
+      if byte == 10 { i = i + 1 }
+      else if u32.bitAnd(s.lenient, L_OPTIONAL_CRLF_AFTER_CHUNK) == 0 {
+        drop s return unsafe refuse(p, E_LF_EXPECTED, b"Expected LF after chunk data\0", unsafe address(data, i))
+      }
+      s.state = S_CHUNK_START drop s
       let result = unsafe emit(p, EV_CHUNK_COMPLETE, Pointer.null<u8>(), 0, unsafe address(data, i))
       let code = unsafe noticeResult(p, result, E_CB_CHUNK_COMPLETE, b"`on_chunk_complete` callback error\0", b"on_chunk_complete pause\0", unsafe address(data, i))
       if code != 0 { return code }

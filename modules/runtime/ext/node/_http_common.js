@@ -208,29 +208,7 @@ function freeParser(parser, req, socket) {
   }
 }
 
-// Character code ranges for valid HTTP tokens
-// Valid chars: ^_`a-zA-Z-0-9!#$%&'*+.|~
-// Based on RFC 7230 Section 3.2.6 token definition
-// See https://tools.ietf.org/html/rfc7230#section-3.2.6
-const tokenRegExp = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
-const validTokenChars = new Uint8Array([
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0-15
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16-31
-  0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, // 32-47 (!"#$%&'()*+,-./)
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48-63 (0-9:;<=>?)
-  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64-79 (@A-O)
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, // 80-95 (P-Z[\]^_)
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96-111 (`a-o)
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, // 112-127 (p-z{|}~)
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 128-143
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 144-159
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 160-175
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 176-191
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 192-207
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 208-223
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 224-239
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 240-255
-]);
+const httpNative = require('internal/host').httpParserNative;
 
 /**
  * Verifies that the given val is a valid HTTP token
@@ -240,34 +218,8 @@ const validTokenChars = new Uint8Array([
  * @returns {boolean}
  */
 function checkIsHttpToken(val) {
-  if (val.length >= 10) {
-    return tokenRegExp.test(val);
-  }
-
-  if (val.length === 0) return false;
-
-  // Use lookup table for short strings, regex for longer ones
-  for (let i = 0; i < val.length; i++) {
-    if (!validTokenChars[val.charCodeAt(i)]) {
-      return false;
-    }
-  }
-  return true;
+  return typeof val === 'string' && httpNative(20, val);
 }
-
-// Strict header value regex per RFC 7230 (original/default behavior):
-// field-value = *( field-content / obs-fold )
-// field-content = field-vchar [ 1*( SP / HTAB ) field-vchar ]
-// field-vchar = VCHAR / obs-text
-// This rejects control characters (0x00-0x1f except HTAB) and DEL (0x7f).
-const strictHeaderCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
-
-// Lenient header value regex per Fetch spec (https://fetch.spec.whatwg.org/#header-value):
-// - Must contain no 0x00 (NUL) or HTTP newline bytes (0x0a LF, 0x0d CR)
-// - Must be byte sequences (0x00-0xff), not arbitrary unicode
-// This allows most control characters except NUL, CR, and LF.
-// eslint-disable-next-line no-control-regex
-const lenientHeaderCharRegex = /[\x00\x0a\x0d]|[^\x00-\xff]/;
 
 /**
  * True if val contains an invalid header value character.
@@ -278,8 +230,7 @@ const lenientHeaderCharRegex = /[\x00\x0a\x0d]|[^\x00-\xff]/;
  * @returns {boolean}
  */
 function checkInvalidHeaderChar(val, lenient = false) {
-  const regex = lenient ? lenientHeaderCharRegex : strictHeaderCharRegex;
-  return regex.test(val);
+  return httpNative(21, val, Boolean(lenient));
 }
 
 function cleanParser(parser) {

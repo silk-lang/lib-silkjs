@@ -27,12 +27,12 @@ const assert = require('internal/assert');
 const EE = require('events');
 const Stream = require('stream');
 const { streamHooks } = require('internal/streams/utils');
-const { kOutHeaders, utcDate, kNeedDrain } = require('internal/http');
+const { kOutHeaders, kNeedDrain } = require('internal/http');
+const httpNative = require('internal/host').httpParserNative;
 const { Buffer } = require('buffer');
 const {
   _checkIsHttpToken: checkIsHttpToken,
   _checkInvalidHeaderChar: checkInvalidHeaderChar,
-  chunkExpression: RE_TE_CHUNKED,
   isLenient,
 } = require('_http_common');
 const {
@@ -82,8 +82,6 @@ const kHighWaterMark = Symbol('kHighWaterMark');
 const kRejectNonStandardBodyWrites = Symbol('kRejectNonStandardBodyWrites');
 
 const nop = () => {};
-
-const RE_CONN_CLOSE = /(?:^|\W)close(?:$|\W)/i;
 
 // isCookieField performs a case-insensitive comparison of a provided string
 // against the word "cookie." As of V8 6.6 this is faster than handrolling or
@@ -444,177 +442,16 @@ function _writeRaw(data, encoding, callback, size) {
 }
 
 
-OutgoingMessage.prototype._storeHeader = _storeHeader;
-function _storeHeader(firstLine, headers) {
-  // firstLine in the case of request is: 'GET /index.html HTTP/1.1\r\n'
-  // in the case of response it is: 'HTTP/1.1 200 OK\r\n'
-  const state = {
-    connection: false,
-    contLen: false,
-    te: false,
-    date: false,
-    expect: false,
-    trailer: false,
-    header: firstLine,
-  };
-  const lenient = this._isLenientHeaderValidation();
-
-  if (headers) {
-    if (headers === this[kOutHeaders]) {
-      for (const key in headers) {
-        const entry = headers[key];
-        processHeader(this, state, entry[0], entry[1], false, lenient);
-      }
-    } else if (Array.isArray(headers)) {
-      if (headers.length && Array.isArray(headers[0])) {
-        for (let i = 0; i < headers.length; i++) {
-          const entry = headers[i];
-          processHeader(this, state, entry[0], entry[1], true, lenient);
-        }
-      } else {
-        if (headers.length % 2 !== 0) {
-          throw new ERR_INVALID_ARG_VALUE('headers', headers);
-        }
-
-        for (let n = 0; n < headers.length; n += 2) {
-          processHeader(this, state, headers[n + 0], headers[n + 1], true, lenient);
-        }
-      }
-    } else {
-      for (const key in headers) {
-        if (Object.hasOwn(headers, key)) {
-          processHeader(this, state, key, headers[key], true, lenient);
-        }
-      }
-    }
-  }
-
-  let { header } = state;
-
-  // Date header
-  if (this.sendDate && !state.date) {
-    header += dateLine();
-  }
-
-  // Force the connection to close when the response is a 204 No Content or
-  // a 304 Not Modified and the user has set a "Transfer-Encoding: chunked"
-  // header.
-  //
-  // RFC 2616 mandates that 204 and 304 responses MUST NOT have a body but
-  // node.js used to send out a zero chunk anyway to accommodate clients
-  // that don't have special handling for those responses.
-  //
-  // It was pointed out that this might confuse reverse proxies to the point
-  // of creating security liabilities, so suppress the zero chunk and force
-  // the connection to close.
-  if (this.chunkedEncoding && (this.statusCode === 204 ||
-                               this.statusCode === 304)) {
-    debug(this.statusCode + ' response should not use chunked encoding,' +
-          ' closing connection.');
-    this.chunkedEncoding = false;
-    this.shouldKeepAlive = false;
-  }
-
-  // keep-alive logic
-  if (this._removedConnection) {
-    // shouldKeepAlive is generally true for HTTP/1.1. In that common case,
-    // even if the connection header isn't sent, we still persist by default.
-    this._last = !this.shouldKeepAlive;
-  } else if (!state.connection) {
-    const shouldSendKeepAlive = this.shouldKeepAlive &&
-        (state.contLen || this.useChunkedEncodingByDefault || this.agent);
-    if (shouldSendKeepAlive && this.maxRequestsOnConnectionReached) {
-      header += 'Connection: close\r\n';
-    } else if (shouldSendKeepAlive) {
-      header += 'Connection: keep-alive\r\n';
-      if (this._keepAliveTimeout && this._defaultKeepAlive) {
-        const timeoutSeconds = Math.floor(this._keepAliveTimeout / 1000);
-        let max = '';
-        if (~~this._maxRequestsPerSocket > 0) {
-          max = `, max=${this._maxRequestsPerSocket}`;
-        }
-        header += keepAliveLine(timeoutSeconds, max);
-      }
-    } else {
-      this._last = true;
-      header += 'Connection: close\r\n';
-    }
-  }
-
-  if (!state.contLen && !state.te) {
-    if (!this._hasBody) {
-      // Make sure we don't end the 0\r\n\r\n at the end of the message.
-      this.chunkedEncoding = false;
-    } else if (!this.useChunkedEncodingByDefault) {
-      this._last = true;
-    } else if (!state.trailer &&
-               !this._removedContLen &&
-               typeof this._contentLength === 'number') {
-      header += 'Content-Length: ' + this._contentLength + '\r\n';
-    } else if (!this._removedTE) {
-      header += 'Transfer-Encoding: chunked\r\n';
-      this.chunkedEncoding = true;
-    } else {
-      // We should only be able to get here if both Content-Length and
-      // Transfer-Encoding are removed by the user.
-      // See: test/parallel/test-http-remove-header-stays-removed.js
-      debug('Both Content-Length and Transfer-Encoding are removed');
-
-      // We can't keep alive in this case, because with no header info the body
-      // is defined as all data until the connection is closed.
-      this._last = true;
-    }
-  }
-
-  // Test non-chunked message does not have trailer header set,
-  // message will be terminated by the first empty line after the
-  // header fields, regardless of the header fields present in the
-  // message, and thus cannot contain a message body or 'trailers'.
-  if (this.chunkedEncoding !== true && state.trailer) {
-    throw new ERR_HTTP_TRAILER_INVALID();
-  }
-
-  this._header = header + '\r\n';
-  this._headerSent = false;
-
-  // Wait until the first body chunk, or close(), is sent to flush,
-  // UNLESS we're sending Expect: 100-continue.
-  if (state.expect) this._send('');
-}
-
-// The Date and Keep-Alive lines of the last response, rebuilt when their values change.
-let lastUtcDate;
-let lastDateLine = '';
-function dateLine() {
-  const date = utcDate();
-  if (date !== lastUtcDate) {
-    lastUtcDate = date;
-    lastDateLine = 'Date: ' + date + '\r\n';
-  }
-  return lastDateLine;
-}
-let lastKeepAliveSeconds = -1;
-let lastKeepAliveMax = '';
-let lastKeepAliveLine = '';
-function keepAliveLine(timeoutSeconds, max) {
-  if (timeoutSeconds !== lastKeepAliveSeconds || max !== lastKeepAliveMax) {
-    lastKeepAliveSeconds = timeoutSeconds;
-    lastKeepAliveMax = max;
-    lastKeepAliveLine = `Keep-Alive: timeout=${timeoutSeconds}${max}\r\n`;
-  }
-  return lastKeepAliveLine;
-}
-
-function processHeader(self, state, key, value, validate, lenient) {
-  if (validate)
+function pushHeaderPair(self, pairs, key, value, validate, hasCL) {
+  if (validate && (typeof key !== 'string' || !key)) {
     validateHeaderName(key);
+  }
 
   // If key is content-disposition and there is content-length
   // encode the value in latin1
   // https://www.rfc-editor.org/rfc/rfc6266#section-4.3
   // Refs: https://github.com/nodejs/node/pull/46528
-  if (isContentDispositionField(key) && self._contentLength) {
-    // The value could be an array here
+  if (hasCL && isContentDispositionField(key)) {
     if (Array.isArray(value)) {
       for (let i = 0; i < value.length; i++) {
         value[i] = Buffer.from(value[i], 'latin1');
@@ -625,61 +462,156 @@ function processHeader(self, state, key, value, validate, lenient) {
   }
 
   if (Array.isArray(value)) {
+    if (validate && value.length === 0) {
+      validateHeaderName(key);
+      return hasCL;
+    }
     if (
       (value.length < 2 || !isCookieField(key)) &&
       (!self[kUniqueHeaders] || !self[kUniqueHeaders].has(key.toLowerCase()))
     ) {
-      // Retain for(;;) loop for performance reasons
-      // Refs: https://github.com/nodejs/node/pull/30958
-      for (let i = 0; i < value.length; i++)
-        storeHeader(self, state, key, value[i], validate, lenient);
-      return;
+      for (let i = 0; i < value.length; i++) {
+        pairs.push(key, value[i]);
+      }
+      return hasCL;
     }
     value = value.join('; ');
   }
-  storeHeader(self, state, key, value, validate, lenient);
-}
-
-function storeHeader(self, state, key, value, validate, lenient) {
-  if (validate)
-    validateHeaderValue(key, value, lenient);
-  state.header += key + ': ' + value + '\r\n';
-  matchHeader(self, state, key, value);
-}
-
-function matchHeader(self, state, field, value) {
-  if (field.length < 4 || field.length > 17)
-    return;
-  field = field.toLowerCase();
-  switch (field) {
-    case 'connection':
-      state.connection = true;
-      self._removedConnection = false;
-      if (RE_CONN_CLOSE.test(value))
-        self._last = true;
-      else
-        self.shouldKeepAlive = true;
-      break;
-    case 'transfer-encoding':
-      state.te = true;
-      self._removedTE = false;
-      if (RE_TE_CHUNKED.test(value))
-        self.chunkedEncoding = true;
-      break;
-    case 'content-length':
-      state.contLen = true;
-      self._contentLength = +value;
-      self._removedContLen = false;
-      break;
-    case 'date':
-    case 'expect':
-    case 'trailer':
-      state[field] = true;
-      break;
-    case 'keep-alive':
-      self._defaultKeepAlive = false;
-      break;
+  pairs.push(key, value);
+  if (key.length === 14 && key.toLowerCase() === 'content-length') {
+    return Boolean(+value);
   }
+  return hasCL;
+}
+
+OutgoingMessage.prototype._storeHeader = _storeHeader;
+function _storeHeader(firstLine, headers) {
+  // firstLine in the case of request is: 'GET /index.html HTTP/1.1\r\n'
+  // in the case of response it is: 'HTTP/1.1 200 OK\r\n'
+  const hasCL = typeof this._contentLength === 'number';
+  if (!headers &&
+      hasCL &&
+      this.shouldKeepAlive &&
+      !this._removedConnection &&
+      !this.maxRequestsOnConnectionReached &&
+      this._defaultKeepAlive &&
+      this._hasBody &&
+      this.useChunkedEncodingByDefault &&
+      !this._removedContLen &&
+      !this.chunkedEncoding) {
+    this._header = httpNative(
+      42,
+      firstLine,
+      this._contentLength,
+      this._keepAliveTimeout ? Math.floor(this._keepAliveTimeout / 1000) : -1,
+      ~~this._maxRequestsPerSocket,
+      Boolean(this.sendDate)
+    );
+    this._headerSent = false;
+    return;
+  }
+
+  let pairs = null;
+  let pairCount = 0;
+  let validate = false;
+  let seenCL = Boolean(this._contentLength);
+
+  if (headers) {
+    pairs = [];
+    if (headers === this[kOutHeaders]) {
+      for (const key in headers) {
+        const entry = headers[key];
+        seenCL = pushHeaderPair(this, pairs, entry[0], entry[1], false, seenCL);
+      }
+    } else if (Array.isArray(headers)) {
+      validate = true;
+      if (headers.length && Array.isArray(headers[0])) {
+        for (let i = 0; i < headers.length; i++) {
+          const entry = headers[i];
+          seenCL = pushHeaderPair(this, pairs, entry[0], entry[1], true, seenCL);
+        }
+      } else {
+        if (headers.length % 2 !== 0) {
+          throw new ERR_INVALID_ARG_VALUE('headers', headers);
+        }
+
+        for (let n = 0; n < headers.length; n += 2) {
+          seenCL = pushHeaderPair(this, pairs, headers[n + 0], headers[n + 1], true, seenCL);
+        }
+      }
+    } else {
+      validate = true;
+      for (const key in headers) {
+        if (Object.hasOwn(headers, key)) {
+          seenCL = pushHeaderPair(this, pairs, key, headers[key], true, seenCL);
+        }
+      }
+    }
+    pairCount = pairs.length;
+  }
+
+  const inFlags =
+    (this.sendDate ? 1 : 0) |
+    (this.shouldKeepAlive ? 2 : 0) |
+    (this.useChunkedEncodingByDefault ? 4 : 0) |
+    (this.agent ? 8 : 0) |
+    (this.maxRequestsOnConnectionReached ? 16 : 0) |
+    (this._defaultKeepAlive ? 32 : 0) |
+    (this._removedConnection ? 64 : 0) |
+    (this._removedContLen ? 128 : 0) |
+    (this._removedTE ? 256 : 0) |
+    (this._hasBody ? 512 : 0) |
+    (hasCL ? 1024 : 0) |
+    (this._isLenientHeaderValidation() ? 2048 : 0) |
+    (validate ? 4096 : 0) |
+    ((this.statusCode === 204 || this.statusCode === 304) ? 8192 : 0) |
+    (this.chunkedEncoding ? 16384 : 0) |
+    (this._last ? 32768 : 0);
+
+  const keepAliveTimeoutSeconds = this._keepAliveTimeout ?
+    Math.floor(this._keepAliveTimeout / 1000) : -1;
+  const maxRequestsPerSocket = ~~this._maxRequestsPerSocket;
+
+  const res = httpNative(
+    37,
+    firstLine,
+    pairs,
+    pairCount,
+    inFlags,
+    hasCL ? this._contentLength : 0,
+    keepAliveTimeoutSeconds,
+    maxRequestsPerSocket
+  );
+
+  const errCode = res[0];
+  if (errCode !== 0) {
+    if (errCode === 1) throw new ERR_INVALID_HTTP_TOKEN('Header name', res[1]);
+    if (errCode === 2) throw new ERR_HTTP_INVALID_HEADER_VALUE(res[2], res[1]);
+    if (errCode === 3) {
+      debug('Header "%s" contains invalid characters', res[1]);
+      throw new ERR_INVALID_CHAR('header content', res[1]);
+    }
+    throw new ERR_HTTP_TRAILER_INVALID();
+  }
+
+  const outFlags = res[2];
+  this._last = (outFlags & 1) !== 0;
+  this.shouldKeepAlive = (outFlags & 2) !== 0;
+  this.chunkedEncoding = (outFlags & 4) !== 0;
+  this._removedConnection = (outFlags & 8) !== 0;
+  this._removedContLen = (outFlags & 16) !== 0;
+  this._removedTE = (outFlags & 32) !== 0;
+  this._defaultKeepAlive = (outFlags & 64) !== 0;
+  if ((outFlags & 256) !== 0) {
+    this._contentLength = +res[3];
+  }
+
+  this._header = res[1];
+  this._headerSent = false;
+
+  // Wait until the first body chunk, or close(), is sent to flush,
+  // UNLESS we're sending Expect: 100-continue.
+  if ((outFlags & 128) !== 0) this._send('');
 }
 
 const validateHeaderName = assignFunctionName('validateHeaderName', hideStackFrames((name, label) => {
@@ -1098,8 +1030,7 @@ OutgoingMessage.prototype.addTrailers = function addTrailers(headers) {
   this._trailer = '';
   const keys = Object.keys(headers);
   const isArray = Array.isArray(headers);
-  // Retain for(;;) loop for performance reasons
-  // Refs: https://github.com/nodejs/node/pull/30958
+  const pairs = [];
   for (let i = 0, l = keys.length; i < l; i++) {
     let field, value;
     const key = keys[i];
@@ -1110,34 +1041,32 @@ OutgoingMessage.prototype.addTrailers = function addTrailers(headers) {
       field = key;
       value = headers[key];
     }
-    validateHeaderName(field, 'Trailer name');
-
-    // Check if the field must be sent several times
+    if (typeof field !== 'string' || !field) {
+      validateHeaderName(field, 'Trailer name');
+    }
     const isArrayValue = Array.isArray(value);
-    const lenient = this._isLenientHeaderValidation();
     if (
       isArrayValue && value.length > 1 &&
       (!this[kUniqueHeaders] || !this[kUniqueHeaders].has(field.toLowerCase()))
     ) {
-      for (let j = 0, l = value.length; j < l; j++) {
-        if (checkInvalidHeaderChar(value[j], lenient)) {
-          debug('Trailer "%s"[%d] contains invalid characters', field, j);
-          throw new ERR_INVALID_CHAR('trailer content', field);
-        }
-        this._trailer += field + ': ' + value[j] + '\r\n';
+      for (let j = 0, vl = value.length; j < vl; j++) {
+        pairs.push(field, value[j]);
       }
     } else {
       if (isArrayValue) {
         value = value.join('; ');
       }
-
-      if (checkInvalidHeaderChar(value, lenient)) {
-        debug('Trailer "%s" contains invalid characters', field);
-        throw new ERR_INVALID_CHAR('trailer content', field);
-      }
-      this._trailer += field + ': ' + value + '\r\n';
+      pairs.push(field, value);
     }
   }
+  if (pairs.length === 0) return;
+  const res = httpNative(38, pairs, pairs.length, Boolean(this._isLenientHeaderValidation()));
+  if (res[0] !== 0) {
+    if (res[0] === 1) throw new ERR_INVALID_HTTP_TOKEN('Trailer name', res[1]);
+    debug('Trailer "%s" contains invalid characters', res[1]);
+    throw new ERR_INVALID_CHAR('trailer content', res[1]);
+  }
+  this._trailer = res[1];
 };
 
 // Deliver end() callbacks, mirroring Writable: null on successful finish,

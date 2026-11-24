@@ -338,27 +338,18 @@ Agent.prototype.createConnection = function createConnection(...args) {
 
 };
 
+const httpNative = require('internal/host').httpParserNative;
+
 // Get the key for a given set of request options
 Agent.prototype.getName = function getName(options = kEmptyObject) {
-  let name = options.host || 'localhost';
-
-  name += ':';
-  if (options.port)
-    name += options.port;
-
-  name += ':';
-  if (options.localAddress)
-    name += options.localAddress;
-
-  // Pacify parallel/test-http-agent-getname by only appending
-  // the ':' when options.family is set.
-  if (options.family === 4 || options.family === 6)
-    name += `:${options.family}`;
-
-  if (options.socketPath)
-    name += `:${options.socketPath}`;
-
-  return name;
+  return httpNative(
+    39,
+    options.host ? String(options.host) : '',
+    options.port ?? '',
+    options.localAddress ? String(options.localAddress) : '',
+    (options.family === 4 || options.family === 6) ? options.family : 0,
+    options.socketPath ? String(options.socketPath) : ''
+  );
 };
 
 function handleSocketAfterProxy(err, req) {
@@ -511,31 +502,12 @@ function normalizeServerName(options, req) {
 }
 
 function calculateServerName(options, req) {
-  let servername = options.host;
   const hostHeader = req.getHeader('host');
   if (hostHeader) {
     validateString(hostHeader, 'options.headers.host');
-
-    // abc => abc
-    // abc:123 => abc
-    // [::1] => ::1
-    // [::1]:123 => ::1
-    if (hostHeader[0] === '[') {
-      const index = hostHeader.indexOf(']');
-      if (index === -1) {
-        // Leading '[', but no ']'. Need to do something...
-        servername = hostHeader;
-      } else {
-        servername = hostHeader.substring(1, index);
-      }
-    } else {
-      servername = hostHeader.split(':', 1)[0];
-    }
+    return httpNative(40, options.host, hostHeader);
   }
-  // Don't implicitly set invalid (IP) servernames.
-  if (net.isIP(servername))
-    servername = '';
-  return servername;
+  return httpNative(40, options.host, '');
 }
 
 function installListeners(agent, s, options) {
@@ -658,12 +630,12 @@ Agent.prototype.keepSocketAlive = function keepSocketAlive(socket) {
     const keepAliveHint = socket._httpMessage.res.headers['keep-alive'];
 
     if (keepAliveHint) {
-      const hint = /^timeout=(\d+)/.exec(keepAliveHint)?.[1];
+      const hint = httpNative(41, keepAliveHint);
 
-      if (hint) {
+      if (hint >= 0) {
         // Let the timer expire before the announced timeout to reduce
         // the likelihood of ECONNRESET errors
-        let serverHintTimeout = (Number.parseInt(hint) * 1000) - this.agentKeepAliveTimeoutBuffer;
+        let serverHintTimeout = (hint * 1000) - this.agentKeepAliveTimeoutBuffer;
         serverHintTimeout = serverHintTimeout > 0 ? serverHintTimeout : 0;
         if (serverHintTimeout === 0) {
           // Cannot safely reuse the socket because the server timeout is

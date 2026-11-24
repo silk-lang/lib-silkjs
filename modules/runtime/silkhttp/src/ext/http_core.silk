@@ -1,0 +1,895 @@
+//! Core HTTP/1 primitives in Silk: RFC 7230/Fetch header validation, cached IMF-fixdate
+//! formatting, the Node 24 STATUS_CODES table, NO_PROXY matching, and intrusive O(1)
+//! ConnectionsList tracking for HTTP server timeouts.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.slice { Slice }
+import silk.net.address { AddressError, Ipv4Address }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.f64
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.js_proxy_core as core
+import silkjs.js_object_allocate as objects
+import silkjs.js_realm { lendRealm }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_std_support as text
+import silkjs.js_weakref_intrinsics_storage as weak
+import silkjs.js_os_events_platform as clock
+import silkjsruntime.libs.core.common as common
+import silkjsruntime.libs.core.owners as owners
+import silkjsruntime.libs.core.owners { Scope }
+import ext.http1 as c
+
+unsafe extern "C" fn currentTime(t: ?*mut i64) -> i64 as "time"
+pub fn monotonicMs() -> f64 { return i64.toF64(clock.nowNanoseconds()) / 1000000.0 }
+
+// ---- RFC 7230 token and header value validation ----
+
+// Valid RFC 7230 Section 3.2.6 token byte: ^_`a-zA-Z-0-9!#$%&'*+.|~
+pub fn isTokenByte(b: u8) -> bool {
+  if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) { return true }
+  return b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 || b == 45
+    || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126
+}
+
+// Strict RFC 7230 header value byte: HTAB (9), VCHAR/SP (32..126), obs-text (128..255).
+pub fn isStrictHeaderValueUnit(u: u16) -> bool {
+  return u == 9 || (u >= 32 && u <= 126) || (u >= 128 && u <= 255)
+}
+
+// Lenient Fetch header value unit: byte sequence (0..255) without NUL, LF, CR.
+pub fn isLenientHeaderValueUnit(u: u16) -> bool {
+  return u <= 255 && u != 0 && u != 10 && u != 13
+}
+
+pub fn checkIsHttpToken(value: ValueBits) -> bool {
+  if !value.isString() { return false }
+  let length = Strings.length(value)
+  if length == 0 { return false }
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    let bytes = unsafe Strings.flatLatin1(&anchor, value)
+    let mut i: usize = 0
+    while i < bytes.length {
+      if !isTokenByte(bytes[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => {
+        if unit > 127 || !isTokenByte(u16.toU8(unit)) { return false }
+      }
+      Option<u16>.None => { return true }
+    }
+  }
+  return true
+}
+
+pub fn checkInvalidHeaderCharString(value: ValueBits, lenient: bool) -> bool {
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    let bytes = unsafe Strings.flatLatin1(&anchor, value)
+    let mut i: usize = 0
+    if lenient {
+      while i < bytes.length {
+        let b = bytes[i]
+        if b == 0 || b == 10 || b == 13 { return true }
+        i = i + 1
+      }
+    } else {
+      while i < bytes.length {
+        let b = bytes[i]
+        if b != 9 && (b < 32 || b == 127) { return true }
+        i = i + 1
+      }
+    }
+    return false
+  }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => {
+        if lenient {
+          if !isLenientHeaderValueUnit(unit) { return true }
+        } else {
+          if !isStrictHeaderValueUnit(unit) { return true }
+        }
+      }
+      Option<u16>.None => { return false }
+    }
+  }
+  return false
+}
+
+pub fn checkInvalidRequestPath(value: ValueBits) -> bool {
+  if !value.isString() { return false }
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    let bytes = unsafe Strings.flatLatin1(&anchor, value)
+    let mut i: usize = 0
+    while i < bytes.length {
+      if bytes[i] < 0x21 { return true }
+      i = i + 1
+    }
+    return false
+  }
+  let mut iter = RopeIterator.make(&value)
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: unit } => {
+        if unit < 0x21 || unit > 0xff { return true }
+      }
+      Option<u16>.None => { return false }
+    }
+  }
+  return false
+}
+
+// ---- Cached IMF-fixdate formatting ----
+
+pub struct DateCache {
+  second: i64,
+  valueSecond: i64,
+  dateValue: ValueBits,
+  lineValue: ValueBits,
+  text: [u8; 29],
+}
+
+pub fn makeDateCache() -> DateCache {
+  return DateCache {
+    second: -1,
+    valueSecond: -1,
+    dateValue: ValueBits.Undefined,
+    lineValue: ValueBits.Undefined,
+    text: [0; 29],
+  }
+}
+
+pub fn dateCacheSecond(cache: &DateCache) -> i64 { return cache.second }
+
+pub unsafe fn releaseDateCache<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cache: &mut DateCache) -> () {
+  unsafe owners.release(&mut engine, context, cache.dateValue)
+  unsafe owners.release(&mut engine, context, cache.lineValue)
+  cache.dateValue = ValueBits.Undefined
+  cache.lineValue = ValueBits.Undefined
+  cache.second = -1
+  cache.valueSecond = -1
+}
+
+pub fn formatHttpDate(seconds: i64) -> [u8; 29] {
+  let days = seconds / 86400
+  let mut rest = seconds % 86400
+  let mut adjDays = days
+  if rest < 0 { rest = rest + 86400 adjDays = adjDays - 1 }
+  let weekdays = b"ThuFriSatSunMonTueWed"
+  let months = b"JanFebMarAprMayJunJulAugSepOctNovDec"
+  let w = i64.toUsize((adjDays % 7 + 7) % 7)
+  // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+  let z = adjDays + 719468
+  let era = (if z >= 0 { z } else { z - 146096 }) / 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let day = doy - (153 * mp + 2) / 5 + 1
+  let month = if mp < 10 { mp + 3 } else { mp - 9 }
+  let carry: i64 = if month <= 2 { 1 } else { 0 }
+  let year = yoe + era * 400 + carry
+  let mut out: [u8; 29] = [0; 29]
+  let mut i: usize = 0
+  while i < 3 { out[i] = weekdays[w * 3 + i] i = i + 1 }
+  out[3] = 44 out[4] = 32
+  out[5] = i64.toU8(48 + day / 10) out[6] = i64.toU8(48 + day % 10) out[7] = 32
+  let m = i64.toUsize(month - 1)
+  let mut j: usize = 0
+  while j < 3 { out[8 + j] = months[m * 3 + j] j = j + 1 }
+  out[11] = 32
+  out[12] = i64.toU8(48 + year / 1000 % 10)
+  out[13] = i64.toU8(48 + year / 100 % 10)
+  out[14] = i64.toU8(48 + year / 10 % 10)
+  out[15] = i64.toU8(48 + year % 10)
+  out[16] = 32
+  let hour = rest / 3600
+  let minute = rest / 60 % 60
+  let second = rest % 60
+  out[17] = i64.toU8(48 + hour / 10) out[18] = i64.toU8(48 + hour % 10) out[19] = 58
+  out[20] = i64.toU8(48 + minute / 10) out[21] = i64.toU8(48 + minute % 10) out[22] = 58
+  out[23] = i64.toU8(48 + second / 10) out[24] = i64.toU8(48 + second % 10)
+  out[25] = 32 out[26] = 71 out[27] = 77 out[28] = 84
+  return out
+}
+
+pub unsafe fn currentDateBytes(cache: &mut DateCache) -> [u8; 29] {
+  let now = unsafe currentTime(Pointer.null<i64>())
+  if cache.second != now {
+    cache.text = formatHttpDate(now)
+    cache.second = now
+  }
+  return cache.text
+}
+
+pub unsafe effect fn utcDateValue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cache: &mut DateCache, asHeaderLine: bool) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let now = unsafe currentTime(Pointer.null<i64>())
+  if cache.second != now {
+    cache.text = formatHttpDate(now)
+    cache.second = now
+  }
+  if cache.valueSecond != now {
+    unsafe owners.release(&mut engine, context, cache.dateValue)
+    unsafe owners.release(&mut engine, context, cache.lineValue)
+    cache.dateValue = ValueBits.Undefined
+    cache.lineValue = ValueBits.Undefined
+    cache.valueSecond = now
+  }
+  if asHeaderLine {
+    if cache.lineValue.isString() { return unsafe cache.lineValue.retained() }
+    let mut line: [u8; 37] = [0; 37]
+    let prefix = b"Date: "
+    let mut k: usize = 0
+    while k < 6 { line[k] = prefix[k] k = k + 1 }
+    let mut i: usize = 0
+    while i < 29 { line[6 + i] = cache.text[i] i = i + 1 }
+    line[35] = 13 line[36] = 10
+    let made = run Effect.result(Strings.fromLatin1(&line))
+    let val = match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+    }
+    cache.lineValue = unsafe val.retained()
+    return val
+  }
+  if cache.dateValue.isString() { return unsafe cache.dateValue.retained() }
+  let dateBytes = cache.text
+  let made = run Effect.result(Strings.fromLatin1(&dateBytes))
+  let val = match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+  cache.dateValue = unsafe val.retained()
+  return val
+}
+
+// ---- Node 24 STATUS_CODES table ----
+
+pub fn statusCodeText(code: i32) -> &'static [u8] {
+  return match code {
+    100 => b"Continue"
+    101 => b"Switching Protocols"
+    102 => b"Processing"
+    103 => b"Early Hints"
+    200 => b"OK"
+    201 => b"Created"
+    202 => b"Accepted"
+    203 => b"Non-Authoritative Information"
+    204 => b"No Content"
+    205 => b"Reset Content"
+    206 => b"Partial Content"
+    207 => b"Multi-Status"
+    208 => b"Already Reported"
+    226 => b"IM Used"
+    300 => b"Multiple Choices"
+    301 => b"Moved Permanently"
+    302 => b"Found"
+    303 => b"See Other"
+    304 => b"Not Modified"
+    305 => b"Use Proxy"
+    307 => b"Temporary Redirect"
+    308 => b"Permanent Redirect"
+    400 => b"Bad Request"
+    401 => b"Unauthorized"
+    402 => b"Payment Required"
+    403 => b"Forbidden"
+    404 => b"Not Found"
+    405 => b"Method Not Allowed"
+    406 => b"Not Acceptable"
+    407 => b"Proxy Authentication Required"
+    408 => b"Request Timeout"
+    409 => b"Conflict"
+    410 => b"Gone"
+    411 => b"Length Required"
+    412 => b"Precondition Failed"
+    413 => b"Payload Too Large"
+    414 => b"URI Too Long"
+    415 => b"Unsupported Media Type"
+    416 => b"Range Not Satisfiable"
+    417 => b"Expectation Failed"
+    418 => b"I'm a Teapot"
+    421 => b"Misdirected Request"
+    422 => b"Unprocessable Entity"
+    423 => b"Locked"
+    424 => b"Failed Dependency"
+    425 => b"Too Early"
+    426 => b"Upgrade Required"
+    428 => b"Precondition Required"
+    429 => b"Too Many Requests"
+    431 => b"Request Header Fields Too Large"
+    451 => b"Unavailable For Legal Reasons"
+    500 => b"Internal Server Error"
+    501 => b"Not Implemented"
+    502 => b"Bad Gateway"
+    503 => b"Service Unavailable"
+    504 => b"Gateway Timeout"
+    505 => b"HTTP Version Not Supported"
+    506 => b"Variant Also Negotiates"
+    507 => b"Insufficient Storage"
+    508 => b"Loop Detected"
+    509 => b"Bandwidth Limit Exceeded"
+    510 => b"Not Extended"
+    511 => b"Network Authentication Required"
+    _ => b""
+  }
+}
+
+const KNOWN_STATUS_CODES: [i32; 63] = [
+  100, 101, 102, 103,
+  200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+  300, 301, 302, 303, 304, 305, 307, 308,
+  400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
+  421, 422, 423, 424, 425, 426, 428, 429, 431, 451,
+  500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511
+]
+
+pub unsafe effect fn buildStatusCodes<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, scope: &mut Scope) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+  let mut i: usize = 0
+  while i < KNOWN_STATUS_CODES.length {
+    let code = KNOWN_STATUS_CODES[i]
+    let phrase = run text.string(&mut engine, unsafe lendRealm(&context, context), statusCodeText(code))
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], i32.toU32(code), phrase.intoBits())
+    i = i + 1
+  }
+  return scope.take(0)
+}
+
+// ---- NO_PROXY / ProxyConfig bypass matching in Silk ----
+
+fn lowerAscii(b: u8) -> u8 {
+  if b >= 65 && b <= 90 { return b + 32 }
+  return b
+}
+
+fn isSpace(b: u8) -> bool {
+  return b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12
+}
+
+fn eqFold(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if lowerAscii(a[i]) != lowerAscii(b[i]) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn endsWithFold(haystack: &[u8], suffix: &[u8]) -> bool {
+  if haystack.length < suffix.length { return false }
+  let offset = haystack.length - suffix.length
+  let mut i: usize = 0
+  while i < suffix.length {
+    if lowerAscii(haystack[offset + i]) != lowerAscii(suffix[i]) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn ipv4ToU32(bytes: &[u8]) -> Option<u32> {
+  match Ipv4Address.parseBytes(bytes) {
+    Result<Ipv4Address, AddressError>.Success { value } => {
+      let o = value.octets()
+      let result = u32.shiftLeft(u8.toU32(o[0]), 24)
+        | u32.shiftLeft(u8.toU32(o[1]), 16)
+        | u32.shiftLeft(u8.toU32(o[2]), 8)
+        | u8.toU32(o[3])
+      return Option<u32>.Some { value: result }
+    }
+    Result<Ipv4Address, AddressError>.Failure { .. } => { return Option<u32>.None }
+  }
+}
+
+fn trimSlice(s: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  let mut end = s.length
+  while start < end && isSpace(s[start]) { start = start + 1 }
+  while end > start && isSpace(s[end - 1]) { end = end - 1 }
+  return Slice.view<u8>(s, start, end - start)
+}
+
+/// Returns true if a request to (hostname, port) should use the proxy given `noProxyList`.
+/// Matches curl / Node internal/http.js ProxyConfig.prototype.shouldUseProxy semantics.
+pub fn shouldUseProxy(noProxyList: &[u8], hostname: &[u8], port: i32) -> bool {
+  if noProxyList.length == 0 { return true }
+  // Build hostWithPort buffer if port > 0.
+  let mut hostPortBuf: [u8; 320] = [0; 320]
+  let mut hasHostPort = false
+  let mut hostPortLen: usize = 0
+  if port > 0 && hostname.length <= 300 {
+    let mut k: usize = 0
+    while k < hostname.length { hostPortBuf[k] = lowerAscii(hostname[k]) k = k + 1 }
+    hostPortBuf[k] = 58
+    k = k + 1
+    let mut digits: [u8; 12] = [0; 12]
+    let mut n = i32.toU32(port)
+    let mut d: usize = 0
+    while true { digits[11 - d] = u32.toU8(48 + n % 10) n = n / 10 d = d + 1 if n == 0 { break } }
+    let mut j: usize = 0
+    while j < d { hostPortBuf[k + j] = digits[12 - d + j] j = j + 1 }
+    hostPortLen = k + d
+    hasHostPort = true
+  }
+  let hostIp = ipv4ToU32(hostname)
+  let mut pos: usize = 0
+  while pos <= noProxyList.length {
+    let mut next = pos
+    while next < noProxyList.length && noProxyList[next] != 44 { next = next + 1 }
+    let entry = trimSlice(Slice.view<u8>(noProxyList, pos, next - pos))
+    if entry.length > 0 {
+      if entry.length == 1 && entry[0] == 42 { return false }
+      if eqFold(entry, hostname) { return false }
+      if hasHostPort && eqFold(entry, Slice.view<u8>(&hostPortBuf, 0, hostPortLen)) { return false }
+      // Leading dot suffix (.example.com matches example.com and a.example.com)
+      if entry[0] == 46 {
+        let suffix = Slice.view<u8>(entry, 1, entry.length - 1)
+        if eqFold(hostname, suffix) { return false }
+        if hostname.length > suffix.length && endsWithFold(hostname, suffix) && hostname[hostname.length - suffix.length - 1] == 46 {
+          return false
+        }
+      }
+      // Wildcard *.example.com matches anything ending in .example.com
+      if entry.length >= 2 && entry[0] == 42 && entry[1] == 46 {
+        let suffix = Slice.view<u8>(entry, 1, entry.length - 1)
+        if endsWithFold(hostname, suffix) { return false }
+      }
+      // IPv4 range: startIP-endIP
+      match hostIp {
+        Option<u32>.Some { value: hostInt } => {
+          let mut dash: usize = entry.length
+          let mut di: usize = 0
+          while di < entry.length { if entry[di] == 45 { dash = di break } di = di + 1 }
+          if dash < entry.length {
+            let startSlice = trimSlice(Slice.view<u8>(entry, 0, dash))
+            let endSlice = trimSlice(Slice.view<u8>(entry, dash + 1, entry.length - dash - 1))
+            match ipv4ToU32(startSlice) {
+              Option<u32>.Some { value: startInt } => {
+                match ipv4ToU32(endSlice) {
+                  Option<u32>.Some { value: endInt } => {
+                    if hostInt >= startInt && hostInt <= endInt { return false }
+                  }
+                  Option<u32>.None => ()
+                }
+              }
+              Option<u32>.None => ()
+            }
+          }
+        }
+        Option<u32>.None => ()
+      }
+    }
+    if next == noProxyList.length { break }
+    pos = next + 1
+  }
+  return true
+}
+
+// ---- Native ConnectionsList (O(1) doubly-linked list per HTTP server) ----
+
+struct ConnNode {
+  parserId: u64,
+  parserRef: ValueBits,
+  listId: u64,
+  messageStart: f64,
+  headersComplete: bool,
+  inAll: bool,
+  inActive: bool,
+  allPrev: ?*mut ConnNode,
+  allNext: ?*mut ConnNode,
+  actPrev: ?*mut ConnNode,
+  actNext: ?*mut ConnNode,
+}
+
+struct ConnList {
+  id: u64,
+  allHead: ?*mut ConnNode,
+  allTail: ?*mut ConnNode,
+  actHead: ?*mut ConnNode,
+  actTail: ?*mut ConnNode,
+}
+
+pub struct ConnectionsState {
+  lists: HashMap<Word, *mut ConnList>,
+  nodes: HashMap<Word, *mut ConnNode>,
+  nextListId: u64,
+}
+
+unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+unsafe fn cast<T>(p: ?*mut u8) -> *mut T { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nn(p)) }
+
+pub fn makeConnectionsState() -> ConnectionsState {
+  return ConnectionsState {
+    lists: HashMap<Word, *mut ConnList>.make(Hash.seed(11001)),
+    nodes: HashMap<Word, *mut ConnNode>.make(Hash.seed(11002)),
+    nextListId: 1,
+  }
+}
+
+unsafe fn unlinkAll(list: &mut ConnList, nodePtr: *mut ConnNode) -> () {
+  let mut a = () let node = unsafe Pointer.borrowMut<(), ConnNode>(&mut a, nodePtr)
+  if !node.inAll { return () }
+  let prev = node.allPrev let next = node.allNext
+  node.inAll = false node.allPrev = Pointer.null<ConnNode>() node.allNext = Pointer.null<ConnNode>()
+  drop node
+  if !Pointer.isNull<ConnNode>(prev) {
+    let mut b = () let p = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(prev))
+    p.allNext = next
+  } else {
+    list.allHead = next
+  }
+  if !Pointer.isNull<ConnNode>(next) {
+    let mut b = () let n = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(next))
+    n.allPrev = prev
+  } else {
+    list.allTail = prev
+  }
+}
+
+unsafe fn unlinkActive(list: &mut ConnList, nodePtr: *mut ConnNode) -> () {
+  let mut a = () let node = unsafe Pointer.borrowMut<(), ConnNode>(&mut a, nodePtr)
+  if !node.inActive { return () }
+  let prev = node.actPrev let next = node.actNext
+  node.inActive = false node.actPrev = Pointer.null<ConnNode>() node.actNext = Pointer.null<ConnNode>()
+  drop node
+  if !Pointer.isNull<ConnNode>(prev) {
+    let mut b = () let p = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(prev))
+    p.actNext = next
+  } else {
+    list.actHead = next
+  }
+  if !Pointer.isNull<ConnNode>(next) {
+    let mut b = () let n = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(next))
+    n.actPrev = prev
+  } else {
+    list.actTail = prev
+  }
+}
+
+unsafe fn pushAllTail(list: &mut ConnList, nodePtr: *mut ConnNode) -> () {
+  let tail = list.allTail
+  let mut a = () let node = unsafe Pointer.borrowMut<(), ConnNode>(&mut a, nodePtr)
+  node.inAll = true node.allPrev = tail node.allNext = Pointer.null<ConnNode>()
+  drop node
+  if !Pointer.isNull<ConnNode>(tail) {
+    let mut b = () let t = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(tail))
+    t.allNext = nodePtr
+  } else {
+    list.allHead = nodePtr
+  }
+  list.allTail = nodePtr
+}
+
+unsafe fn pushAllHead(list: &mut ConnList, nodePtr: *mut ConnNode) -> () {
+  let head = list.allHead
+  let mut a = () let node = unsafe Pointer.borrowMut<(), ConnNode>(&mut a, nodePtr)
+  node.inAll = true node.allPrev = Pointer.null<ConnNode>() node.allNext = head
+  drop node
+  if !Pointer.isNull<ConnNode>(head) {
+    let mut b = () let h = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(head))
+    h.allPrev = nodePtr
+  } else {
+    list.allTail = nodePtr
+  }
+  list.allHead = nodePtr
+}
+
+unsafe fn pushActiveTail(list: &mut ConnList, nodePtr: *mut ConnNode) -> () {
+  let tail = list.actTail
+  let mut a = () let node = unsafe Pointer.borrowMut<(), ConnNode>(&mut a, nodePtr)
+  node.inActive = true node.actPrev = tail node.actNext = Pointer.null<ConnNode>()
+  drop node
+  if !Pointer.isNull<ConnNode>(tail) {
+    let mut b = () let t = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, unsafe nn(tail))
+    t.actNext = nodePtr
+  } else {
+    list.actHead = nodePtr
+  }
+  list.actTail = nodePtr
+}
+
+pub effect fn createConnectionsList(cs: &mut ConnectionsState) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let id = cs.nextListId
+  cs.nextListId = id + 1
+  let mem = unsafe c.calloc(1, Layout.of<ConnList>().bytes)
+  if Pointer.isNull<u8>(mem) { fail OutOfMemoryError {} }
+  let listPtr = unsafe cast<ConnList>(mem)
+  unsafe Pointer.put<ConnList>(listPtr, ConnList {
+    id: id,
+    allHead: Pointer.null<ConnNode>(), allTail: Pointer.null<ConnNode>(),
+    actHead: Pointer.null<ConnNode>(), actTail: Pointer.null<ConnNode>(),
+  })
+  let inserted = run Effect.result(cs.lists.insert(Hash.word(id), listPtr))
+  match move inserted {
+    Result<Option<*mut ConnList>, OutOfMemoryError>.Success { .. } => { return id }
+    Result<Option<*mut ConnList>, OutOfMemoryError>.Failure { error } => {
+      let owned = unsafe Pointer.take<ConnList>(listPtr) drop owned
+      unsafe c.free(unsafe raw(listPtr))
+      fail move error
+    }
+  }
+}
+
+unsafe fn lookupList(cs: &ConnectionsState, listId: u64) -> ?*mut ConnList {
+  return match cs.lists.get(Hash.word(listId)) {
+    Option<*mut ConnList>.Some { value } => value
+    Option<*mut ConnList>.None => Pointer.null<ConnList>()
+  }
+}
+
+unsafe fn lookupNode(cs: &ConnectionsState, parserId: u64) -> ?*mut ConnNode {
+  return match cs.nodes.get(Hash.word(parserId)) {
+    Option<*mut ConnNode>.Some { value } => value
+    Option<*mut ConnNode>.None => Pointer.null<ConnNode>()
+  }
+}
+
+pub unsafe fn connectionsRemoveNode<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cs: &mut ConnectionsState, parserId: u64) -> () {
+  let found = unsafe lookupNode(&cs.*, parserId)
+  if Pointer.isNull<ConnNode>(found) { return () }
+  let nodePtr = unsafe nn(found)
+  let a = () let n = unsafe Pointer.borrow<(), ConnNode>(&a, nodePtr)
+  let listId = n.listId
+  drop n
+  let foundList = unsafe lookupList(&cs.*, listId)
+  if !Pointer.isNull<ConnList>(foundList) {
+    let mut b = () let list = unsafe Pointer.borrowMut<(), ConnList>(&mut b, unsafe nn(foundList))
+    unsafe unlinkAll(&mut list, nodePtr)
+    unsafe unlinkActive(&mut list, nodePtr)
+  }
+  let _removed = cs.nodes.remove(Hash.word(parserId))
+  let owned = unsafe Pointer.take<ConnNode>(nodePtr)
+  unsafe owners.release(&mut engine, context, owned.parserRef)
+  unsafe c.free(unsafe raw(nodePtr))
+}
+
+pub unsafe effect fn connectionsBegin<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cs: &mut ConnectionsState, listId: u64, parserId: u64, parserRef: ValueBits, headersComplete: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let foundList = unsafe lookupList(&cs.*, listId)
+  if Pointer.isNull<ConnList>(foundList) { return () }
+  let nowMs = monotonicMs()
+  let existing = unsafe lookupNode(&cs.*, parserId)
+  let mut nodePtr = Pointer.null<ConnNode>()
+  if !Pointer.isNull<ConnNode>(existing) {
+    let p = unsafe nn(existing)
+    let a = () let n = unsafe Pointer.borrow<(), ConnNode>(&a, p)
+    let oldListId = n.listId
+    drop n
+    if oldListId != listId {
+      unsafe connectionsRemoveNode(&mut engine, context, &mut cs, parserId)
+    } else {
+      nodePtr = p
+      let mut b = () let list = unsafe Pointer.borrowMut<(), ConnList>(&mut b, unsafe nn(foundList))
+      unsafe unlinkAll(&mut list, p)
+      unsafe unlinkActive(&mut list, p)
+      drop list
+      let mut c2 = () let n2 = unsafe Pointer.borrowMut<(), ConnNode>(&mut c2, p)
+      n2.messageStart = nowMs
+      n2.headersComplete = headersComplete
+    }
+  }
+  if Pointer.isNull<ConnNode>(nodePtr) {
+    let mem = unsafe c.calloc(1, Layout.of<ConnNode>().bytes)
+    if Pointer.isNull<u8>(mem) { fail OutOfMemoryError {} }
+    let p = unsafe cast<ConnNode>(mem)
+    unsafe Pointer.put<ConnNode>(p, ConnNode {
+      parserId: parserId,
+      parserRef: unsafe parserRef.retained(),
+      listId: listId,
+      messageStart: nowMs,
+      headersComplete: headersComplete,
+      inAll: false, inActive: false,
+      allPrev: Pointer.null<ConnNode>(), allNext: Pointer.null<ConnNode>(),
+      actPrev: Pointer.null<ConnNode>(), actNext: Pointer.null<ConnNode>(),
+    })
+    let inserted = run Effect.result(cs.nodes.insert(Hash.word(parserId), p))
+    match move inserted {
+      Result<Option<*mut ConnNode>, OutOfMemoryError>.Success { .. } => { nodePtr = p }
+      Result<Option<*mut ConnNode>, OutOfMemoryError>.Failure { error } => {
+        let owned = unsafe Pointer.take<ConnNode>(p)
+        unsafe owners.release(&mut engine, context, owned.parserRef)
+        unsafe c.free(unsafe raw(p))
+        fail move error
+      }
+    }
+  }
+  let mut b = () let list = unsafe Pointer.borrowMut<(), ConnList>(&mut b, unsafe nn(foundList))
+  unsafe pushAllTail(&mut list, unsafe nn(nodePtr))
+  unsafe pushActiveTail(&mut list, unsafe nn(nodePtr))
+}
+
+/// Fast non-allocating begin update for a parser node already registered in `listId` (used inside native parser callbacks).
+pub unsafe fn connectionsBeginExisting(cs: &mut ConnectionsState, listId: u64, parserId: u64, headersComplete: bool) -> () {
+  let foundList = unsafe lookupList(&cs.*, listId)
+  let foundNode = unsafe lookupNode(&cs.*, parserId)
+  if Pointer.isNull<ConnList>(foundList) || Pointer.isNull<ConnNode>(foundNode) { return () }
+  let p = unsafe nn(foundNode)
+  let mut a = () let list = unsafe Pointer.borrowMut<(), ConnList>(&mut a, unsafe nn(foundList))
+  unsafe unlinkAll(&mut list, p)
+  unsafe unlinkActive(&mut list, p)
+  let mut b = () let n = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, p)
+  n.messageStart = monotonicMs()
+  n.headersComplete = headersComplete
+  drop n
+  unsafe pushAllTail(&mut list, p)
+  unsafe pushActiveTail(&mut list, p)
+}
+
+pub unsafe fn connectionsMarkHeadersComplete(cs: &ConnectionsState, parserId: u64) -> () {
+  let found = unsafe lookupNode(cs, parserId)
+  if Pointer.isNull<ConnNode>(found) { return () }
+  let mut a = () let n = unsafe Pointer.borrowMut<(), ConnNode>(&mut a, unsafe nn(found))
+  n.headersComplete = true
+}
+
+pub unsafe fn connectionsComplete(cs: &mut ConnectionsState, listId: u64, parserId: u64) -> () {
+  let foundList = unsafe lookupList(&cs.*, listId)
+  let foundNode = unsafe lookupNode(&cs.*, parserId)
+  if Pointer.isNull<ConnList>(foundList) || Pointer.isNull<ConnNode>(foundNode) { return () }
+  let p = unsafe nn(foundNode)
+  let mut a = () let list = unsafe Pointer.borrowMut<(), ConnList>(&mut a, unsafe nn(foundList))
+  unsafe unlinkActive(&mut list, p)
+  unsafe unlinkAll(&mut list, p)
+  let mut b = () let n = unsafe Pointer.borrowMut<(), ConnNode>(&mut b, p)
+  n.messageStart = 0.0
+  n.headersComplete = false
+  drop n
+  unsafe pushAllHead(&mut list, p)
+}
+
+pub unsafe fn destroyConnectionsList<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cs: &mut ConnectionsState, listId: u64) -> () {
+  let foundList = unsafe lookupList(&cs.*, listId)
+  if Pointer.isNull<ConnList>(foundList) { return () }
+  let listPtr = unsafe nn(foundList)
+  while true {
+    let a = () let list = unsafe Pointer.borrow<(), ConnList>(&a, listPtr)
+    let head = list.allHead
+    drop list
+    if Pointer.isNull<ConnNode>(head) { break }
+    let b = () let n = unsafe Pointer.borrow<(), ConnNode>(&b, unsafe nn(head))
+    let pid = n.parserId
+    drop n
+    unsafe connectionsRemoveNode(&mut engine, context, &mut cs, pid)
+  }
+  let _removed = cs.lists.remove(Hash.word(listId))
+  let owned = unsafe Pointer.take<ConnList>(listPtr) drop owned
+  unsafe c.free(unsafe raw(listPtr))
+}
+
+pub unsafe fn closeConnectionsState<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cs: &mut ConnectionsState) -> () {
+  let count = cs.nodes.bucketCount()
+  let mut i: usize = 0
+  while i < count {
+    if cs.nodes.occupiedAt(i) {
+      let nodePtr = cs.nodes.valueAt(i)
+      let owned = unsafe Pointer.take<ConnNode>(nodePtr)
+      unsafe owners.release(&mut engine, context, owned.parserRef)
+      unsafe c.free(unsafe raw(nodePtr))
+    }
+    i = i + 1
+  }
+  let lcount = cs.lists.bucketCount()
+  let mut j: usize = 0
+  while j < lcount {
+    if cs.lists.occupiedAt(j) {
+      let listPtr = cs.lists.valueAt(j)
+      let owned = unsafe Pointer.take<ConnList>(listPtr) drop owned
+      unsafe c.free(unsafe raw(listPtr))
+    }
+    j = j + 1
+  }
+}
+
+unsafe effect fn pushParserFromRef<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits, index: &mut u32, refValue: ValueBits) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let cell = unsafe weak.state(refValue, false)
+  if Pointer.isNull<HeapHeader>(cell) { return () }
+  let target = owners.weakTarget(unsafe lendFor(refValue))
+  if !target.isObject() { return () }
+  run unsafe common.defineIndex(&mut engine, context, array, index.*, target)
+  index.* = index.* + 1
+}
+
+/// mode: 0 = all, 1 = idle, 2 = active
+pub unsafe effect fn connectionsCollect<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cs: &ConnectionsState, listId: u64, mode: i32, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  let foundList = unsafe lookupList(cs, listId)
+  if Pointer.isNull<ConnList>(foundList) { return scope.take(0) }
+  let a = () let list = unsafe Pointer.borrow<(), ConnList>(&a, unsafe nn(foundList))
+  let mut cursor = if mode == 2 { list.actHead } else { list.allHead }
+  drop list
+  let mut idx: u32 = 0
+  while !Pointer.isNull<ConnNode>(cursor) {
+    let b = () let node = unsafe Pointer.borrow<(), ConnNode>(&b, unsafe nn(cursor))
+    let next = if mode == 2 { node.actNext } else { node.allNext }
+    let start = node.messageStart
+    let refVal = node.parserRef
+    drop node
+    if mode == 1 {
+      if start != 0.0 { break }
+      run unsafe pushParserFromRef(&mut engine, context, scope.values[0], &mut idx, refVal)
+    } else {
+      run unsafe pushParserFromRef(&mut engine, context, scope.values[0], &mut idx, refVal)
+    }
+    cursor = next
+  }
+  return scope.take(0)
+}
+
+pub unsafe effect fn connectionsExpired<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, cs: &mut ConnectionsState, listId: u64, headersTimeoutIn: u32, requestTimeoutIn: u32, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  if headersTimeoutIn == 0 && requestTimeoutIn == 0 { return scope.take(0) }
+  let mut headersTimeout = headersTimeoutIn
+  let mut requestTimeout = requestTimeoutIn
+  if requestTimeout > 0 && headersTimeout > requestTimeout {
+    let tmp = headersTimeout
+    headersTimeout = requestTimeout
+    requestTimeout = tmp
+  }
+  let nowMs = monotonicMs()
+  let htF = u32.toF64(headersTimeout)
+  let rtF = u32.toF64(requestTimeout)
+  let headersDeadline = if headersTimeout > 0 && nowMs > htF { nowMs - htF } else { 0.0 }
+  let requestDeadline = if requestTimeout > 0 && nowMs > rtF { nowMs - rtF } else { 0.0 }
+  if headersDeadline == 0.0 && requestDeadline == 0.0 { return scope.take(0) }
+  let foundList = unsafe lookupList(&cs.*, listId)
+  if Pointer.isNull<ConnList>(foundList) { return scope.take(0) }
+  let listPtr = unsafe nn(foundList)
+  let a = () let listRead = unsafe Pointer.borrow<(), ConnList>(&a, listPtr)
+  let mut cursor = listRead.actHead
+  drop listRead
+  let mut idx: u32 = 0
+  while !Pointer.isNull<ConnNode>(cursor) {
+    let p = unsafe nn(cursor)
+    let b = () let node = unsafe Pointer.borrow<(), ConnNode>(&b, p)
+    let next = node.actNext
+    let start = node.messageStart
+    let hc = node.headersComplete
+    let refVal = node.parserRef
+    drop node
+    // Active list is sorted ascending by messageStart: once start >= max(headersDeadline, requestDeadline), stop early.
+    let maxDeadline = if headersDeadline > requestDeadline { headersDeadline } else { requestDeadline }
+    if start >= maxDeadline { break }
+    let expired = (!hc && headersDeadline > 0.0 && start < headersDeadline) || (requestDeadline > 0.0 && start < requestDeadline)
+    if expired {
+      let mut m = () let listMut = unsafe Pointer.borrowMut<(), ConnList>(&mut m, listPtr)
+      unsafe unlinkActive(&mut listMut, p)
+      drop listMut
+      run unsafe pushParserFromRef(&mut engine, context, scope.values[0], &mut idx, refVal)
+    }
+    cursor = next
+  }
+  return scope.take(0)
+}
