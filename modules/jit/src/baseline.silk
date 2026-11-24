@@ -969,7 +969,7 @@ impl Emitter {
     }
   }
 
-  /// The shared tails: `leave` (return rax:rdx) and the construct entry stay in hot; the
+  /// The shared tails: `leave` (return rax:rdx) stays in hot; the construct entry, the
   /// resume entry, `finish` (the interpreter finishes the activation), `stepEnded`, `moved`,
   /// `overflow`, every slow path, every exit and the resume table go into cold.
   effect fn tails(self: &mut Self, shape: &Shape) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -1011,11 +1011,12 @@ impl Emitter {
       self.a.bind(ended)
       run self.unlink()
     }
-    // The construct entry: the prologue's head with the frame in the construct state, which
-    // tells the engine that new.target is the function (js_baseline.build).
-    // Kept in hot (~35 bytes) so constructor-heavy workloads avoid cold jumps.
+    // Everything below goes into the cold section (PACK_COLD).
     // The entries run before the frame has its cell base.
     self.a.unalias()
+    self.a.markCold()
+    // The construct entry: the prologue's head with the frame in the construct state, which
+    // tells the engine that new.target is the function (js_baseline.build).
     run self.mark(0, MARK_CONSTRUCT)
     run self.a.push(Reg.Rbp)
     run self.a.mov(Width.W64, Reg.Rbp, Reg.Rsp)
@@ -1025,8 +1026,6 @@ impl Emitter {
     run self.codeInto(Reg.R9, shape)
     run self.a.movImm32(Reg.Rax, u64.wrappingToU32(engine.FRAME_BARE_CONSTRUCT))
     run self.a.jmp(self.entered)
-    // Everything below goes into the cold section (PACK_COLD).
-    self.a.markCold()
     // The resume entry: an activation the interpreter was running goes on here from a back
     // edge. rsi is its js_baseline.Resume in place of the arguments; the engine fills the
     // cells from it and says where the activation was (SERVICE_RESUME).
@@ -1508,6 +1507,9 @@ impl Emitter {
         if opcode == op.OP_mod && p.tier {
           let declined = run self.a.label()
           run self.a.jcc(Cond.Equal, declined)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+          run self.a.jcc(Cond.Equal, item.back)
+          run self.noteSite(u32.toUsize(item.pc), false)
           run self.a.jmp(item.back)
           self.a.bind(declined)
           run self.noteSite(u32.toUsize(item.pc), false)
@@ -1533,6 +1535,22 @@ impl Emitter {
       // replaces the left value, in the out cell; a right operand on the stack is consumed.
       // The site is noted for the optimizer, which then joins there from the start.
       run self.noteSite(u32.toUsize(item.pc), true)
+      let owned = !item.flag && item.b >= p.operandAt(0)
+      let prim = run self.a.label()
+      let mut rightCell = framed(item.b)
+      if item.flag { run self.argumentBase() rightCell = Cell { base: Reg.Rcx, at: item.b } }
+      run self.a.cmp8MemImm(word(item.a), i32.wrappingToU8(p.boolean()))
+      run self.a.jcc(Cond.Equal, prim)
+      run self.a.cmp8MemImm(rightCell.word(), i32.wrappingToU8(p.boolean()))
+      run self.a.jcc(Cond.Equal, prim)
+      run self.a.cmp8MemImm(word(item.a), i32.wrappingToU8(p.null()))
+      run self.a.jcc(Cond.Equal, prim)
+      run self.a.cmp8MemImm(rightCell.word(), i32.wrappingToU8(p.null()))
+      run self.a.jcc(Cond.Equal, prim)
+      run self.a.cmp8MemImm(word(item.a), i32.wrappingToU8(p.undefined()))
+      run self.a.jcc(Cond.Equal, prim)
+      run self.a.cmp8MemImm(rightCell.word(), i32.wrappingToU8(p.undefined()))
+      run self.a.jcc(Cond.Equal, prim)
       let threw = run self.exit(u32.toUsize(item.pc), u32.wrappingToI32(item.depth), true)
       run self.a.storeImm(Width.W64, p.sf(f.currentPc), signed(item.pc))
       if item.c != item.a {
@@ -1542,7 +1560,6 @@ impl Emitter {
         run self.a.store(Width.W64, payload(item.c), Reg.Rdx)
         run self.retain(Reg.Rax, Reg.Rdx)
       }
-      let owned = !item.flag && item.b >= p.operandAt(0)
       let mut request = engine.SERVICE_CONCAT
       if !owned { request = request | engine.CONCAT_BORROWED }
       // The result of an add on the stack may take a following literal with it (CONCAT_STACK).
@@ -1559,6 +1576,18 @@ impl Emitter {
       run self.a.cmp8Imm(Reg.Rax, u64.wrappingToU8(engine.SERVICE_MOVED))
       run self.a.jcc(Cond.Equal, self.moved)
       if item.c != item.a { run self.releaseCell(item.c) }
+      run self.a.jmp(item.other)
+      self.a.bind(prim)
+      run self.a.lea(Width.W64, Reg.Rsi, word(item.a))
+      run self.a.lea(Width.W64, Reg.Rdx, rightCell.word())
+      run self.a.lea(Width.W64, Reg.Rcx, word(item.c))
+      let mut flags: u32 = 0
+      if item.c == item.a { flags = flags | 1 }
+      if owned { flags = flags | 2 }
+      run self.a.movImm32(Reg.R8, flags)
+      run self.helper(env.CONCAT_PRIM)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.NotEqual, item.back)
       run self.a.jmp(item.other)
       return ()
     }
@@ -1958,7 +1987,7 @@ impl Emitter {
       self.a.bind(generic)
       run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(request))
       self.a.bind(serviced)
-      run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1)
+      if p.count { run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1) }
       run self.a.mov(Width.W64, Reg.R8, Reg.R14)
       run self.a.mov(Width.W32, Reg.R9, Reg.Rdx)
       run self.a.push(Reg.Rdx)
@@ -2102,7 +2131,7 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, threw)
       // Declined: the engine constructs.
       self.a.bind(serviceConstruct)
-      run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1)
+      if p.count { run self.a.aluStoreImm(Alu.Add, Width.W64, Mem.at(Reg.R12, env.SERVICE_CALLS_OFFSET), 1) }
       run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_CONSTRUCT))
       run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.Rsp, 32))
       run self.a.load(Width.W32, Reg.R9, Mem.at(Reg.Rsp, 40))

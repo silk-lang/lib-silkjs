@@ -33,7 +33,7 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.usize
 import silk.core.option { Option }
-import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, Scale, Shift, SplitCode, SplitInfo, Unary, UnboundLabelError, Width, Xmm }
+import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, ScalarOp, Scale, Shift, SplitCode, SplitInfo, Unary, UnboundLabelError, Width, Xmm }
 import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS, UNBOX_EXACT }
 import ssa_verify { readsA, readsB }
 import ssa
@@ -160,6 +160,17 @@ const OUT_PUT_LAST: u32 = 3
 const PUT_HELD: u32 = 1
 const PUT_MOVED: u32 = 2
 
+/// A deferred cold branch edge emitted after `markCold()` so a straight-line true fall-through
+/// stays hot even when the false edge carries parallel moves.
+struct ColdEdge { entry: Label, edge: u32 }
+impl Copy for ColdEdge {}
+
+/// Return codes of `equalsFast`: whether the comparison needs no cold slow path, a direct
+/// `helpers.EQUALS` slow path (no tag-dispatch preamble), or the full generic `STEP_EQUALS_SLOW`.
+const EQUALS_NO_SLOW: u32 = 0
+const EQUALS_DIRECT_SLOW: u32 = 1
+const EQUALS_GENERIC_SLOW: u32 = 2
+
 /// A deferred slow path emitted after `markCold()` in frame mode: runs the helper / typed
 /// fallback / getter / setter / quick-step / `stepOnFrame` sequence and jumps back to `back`.
 struct StepSlow { entry: Label, auxLabel: Label, back: Label, inst: Inst, step: u32, shape: u32, out: u32, extra: u32, kind: u8 }
@@ -207,9 +218,10 @@ pub struct Emitter {
   pub places: Allocation,
   /// Where an object keeps its shape and slots (inline field access).
   fields: FieldLayout,
-  /// Probed ConstructDesc/RuntimeState and Math native offsets.
+  /// Probed ConstructDesc/RuntimeState, Math native, and BytecodeClosure.homeObject offsets.
   construct: helpers.ConstructLayout,
   math: helpers.MathLayout,
+  closureHome: u32,
   /// Bitmask of used allocatable XMM registers (bits 0..13 -> xmm2..xmm15).
   usedXmm: u32,
   /// Per value: its reads (operands, edge arguments, exit slots; an over-count only costs
@@ -288,6 +300,7 @@ pub struct Emitter {
   checkConstructSlows: List<CheckConstructSlow>,
   outs: List<Out>,
   stepSlows: List<StepSlow>,
+  coldEdges: List<ColdEdge>,
   /// Frame mode: where the prologue goes when the native stack has no room.
   overflow: Label,
   /// Frame mode: the construct entry's offset before placing (frameTails), and where it
@@ -417,6 +430,7 @@ pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FrameP
   }
   // What the interpreter may run on the frame for the code: an instruction without a
   // template (a generic call) and a site that left compiled code before.
+  let closureHome = baseline_env.closureHomeOffset()
   let mut steps = List<u32>.make()
   run steps.appendRepeated(0, function.insts.length())
   i = 0
@@ -433,7 +447,7 @@ pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FrameP
         if calls.kindOf(inst) == compiled.SITE_ADD && u32.toUsize(inst.pc) < code.length && code[u32.toUsize(inst.pc)] == opcodes.OP_add_loc { wanted = false }
       }
     }
-    if wanted { steps.set(i, stepFor(&function, inst, code)) }
+    if wanted { steps.set(i, stepFor(&function, inst, code, plan.known, closureHome)) }
     i = i + 1
   }
   return run lowerIn(&function, move settings, true, plan, move methods, move shapes, move steps)
@@ -446,7 +460,8 @@ pub effect fn lowerOnFrame(function: &Function, settings: Settings, plan: FrameP
 const STEP_QUICK: u32 = 0x80000000
 const STEP_GET_PRIVATE: u32 = 0x40000000
 const STEP_PUT_PRIVATE: u32 = 0x20000000
-fn stepFor(function: &Function, inst: Inst, code: &[u8]) -> u32 {
+const STEP_HOME_OBJECT: u32 = 0x10000000
+fn stepFor(function: &Function, inst: Inst, code: &[u8], known: bool, closureHome: u32) -> u32 {
   let mut step = stubs.stepAlone(code, u32.toUsize(inst.pc))
   if step == 0 { return 0 }
   let opcode = code[u32.toUsize(inst.pc)]
@@ -455,6 +470,9 @@ fn stepFor(function: &Function, inst: Inst, code: &[u8]) -> u32 {
       || opcode == opcodes.OP_array_from || opcode == opcodes.OP_rest { step = step | STEP_QUICK }
     else if opcode == opcodes.OP_get_private_field { step = step | STEP_GET_PRIVATE }
     else if opcode == opcodes.OP_put_private_field { step = step | STEP_PUT_PRIVATE }
+    else if opcode == opcodes.OP_special_object && (step & 65535) == 2 && u32.toUsize(inst.pc) + 1 < code.length && code[u32.toUsize(inst.pc) + 1] == 4 && !known && closureHome != u32.MAX {
+      step = step | STEP_HOME_OBJECT
+    }
   }
   if (inst.op == Op.PutField || (inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_PUT_FIELD)) && opcode == opcodes.OP_put_field { step = step | STEP_QUICK }
   let before = function.exit(inst.exit).stackDepth
@@ -567,10 +585,10 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   let mut emitter = Emitter { a: move assembler, blockLabels: List<Label>.make(), armLabels: List<Label>.make(), exitLabels: List<Label>.make(),
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
-    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(), construct: helpers.constructLayout(), math: helpers.mathLayout(), usedXmm: usedXmm,
+    uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(), construct: helpers.constructLayout(), math: helpers.mathLayout(), closureHome: baseline_env.closureHomeOffset(), usedXmm: usedXmm,
     undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cachedArr: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
-    on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), checkConstructSlows: List<CheckConstructSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
+    on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), checkConstructSlows: List<CheckConstructSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), coldEdges: List<ColdEdge>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(), aliased: List<bool>.make(),
     leaveAt: u32.wrappingToI32(leaveAt), leaveBytes: leaveBytes, callAt: callAt, bodyAt: callAt + bodyCells * SLOT_BYTES }
   run emitter.inlineClosures.appendRepeated(NONE, u32.toUsize(inlined))
@@ -650,9 +668,16 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     }
     b = b + 1
   }
-  // Everything after the hot blocks (undo/zero stubs, cold slow paths, frame tails, exit
-  // stubs and exit tables) belongs to the cold region in frame mode.
+  // Everything after the hot blocks (cold edges, undo/zero stubs, cold slow paths, frame
+  // tails, exit stubs and exit tables) belongs to the cold region in frame mode.
   if on { emitter.a.markCold() }
+  let mut ce: usize = 0
+  while ce < emitter.coldEdges.length() {
+    let item = emitter.coldEdges.get(ce)
+    emitter.a.bind(item.entry)
+    run emitter.edgeThen(&function, item.edge, false)
+    ce = ce + 1
+  }
   let mut u: usize = 0
   while u < emitter.undoInsts.length() {
     let inst = emitter.undoInsts.get(u)
@@ -1035,10 +1060,14 @@ impl Emitter {
       if self.on {
         let answered = run self.a.label()
         let slow = run self.a.label()
-        run self.equalsFast(inst.a, inst.b, inst.k != 0, slow, answered, false, answered)
+        let mode = run self.equalsFast(&function, inst.a, inst.b, inst.k != 0, slow, answered, false, answered)
         self.a.bind(answered)
         let place = self.at(inst.result) run putI32(&mut self.a, place, Reg.Rax)
-        run self.stepSlows.append(StepSlow { entry: slow, auxLabel: answered, back: answered, inst: inst, step: 0, shape: 0, out: NONE, extra: i32.wrappingToU32(inst.k), kind: STEP_EQUALS_SLOW })
+        if mode != EQUALS_NO_SLOW {
+          let mut extra = i32.wrappingToU32(inst.k)
+          if mode == EQUALS_DIRECT_SLOW { extra = extra | 8 }
+          run self.stepSlows.append(StepSlow { entry: slow, auxLabel: answered, back: answered, inst: inst, step: 0, shape: 0, out: NONE, extra: extra, kind: STEP_EQUALS_SLOW })
+        }
         return ()
       }
       // equals(env, left, right, strict) -> 0 or 1, 2 to decline.
@@ -1328,9 +1357,16 @@ impl Emitter {
         else { run self.a.load(Width.W32, Reg.Rax, slotOf(inst.a)) run self.a.test(Width.W32, Reg.Rax, Reg.Rax) }
       }
       // An edge without moves is a conditional jump straight to its block; when the true edge
-      // falls through to the next block, jump on the false one instead.
-      if !self.moves(&function, inst.edge) && !self.moves(&function, inst.edge + 1) && function.edge(inst.edge).target == self.current + 1 {
-        run self.a.jcc(untaken, self.blockLabels.get(u32.toUsize(function.edge(inst.edge + 1).target)))
+      // falls through to the next block, jump on the false one instead (deferring its moves
+      // out of line so the hot loop stays straight-line).
+      if !self.moves(&function, inst.edge) && function.edge(inst.edge).target == self.current + 1 {
+        if !self.moves(&function, inst.edge + 1) {
+          run self.a.jcc(untaken, self.blockLabels.get(u32.toUsize(function.edge(inst.edge + 1).target)))
+        } else {
+          let coldFalse = run self.a.label()
+          run self.a.jcc(untaken, coldFalse)
+          run self.coldEdges.append(ColdEdge { entry: coldFalse, edge: inst.edge + 1 })
+        }
         return ()
       }
       if !self.moves(&function, inst.edge) {
@@ -3154,10 +3190,13 @@ impl Emitter {
     run self.stressGuard(inst.exit)
     let slow = run self.a.label()
     let decided = run self.a.label()
-    run self.equalsFast(inst.a, inst.b, inst.k != 0, slow, decided, true, decided)
+    let mode = run self.equalsFast(&function, inst.a, inst.b, inst.k != 0, slow, decided, true, decided)
     self.a.bind(decided)
-    let extra = u32.bitOr(i32.wrappingToU32(inst.k), 2)
-    run self.stepSlows.append(StepSlow { entry: slow, auxLabel: decided, back: decided, inst: inst, step: 0, shape: 0, out: NONE, extra: extra, kind: STEP_EQUALS_SLOW })
+    if mode != EQUALS_NO_SLOW {
+      let mut extra = u32.bitOr(i32.wrappingToU32(inst.k), 2)
+      if mode == EQUALS_DIRECT_SLOW { extra = extra | 8 }
+      run self.stepSlows.append(StepSlow { entry: slow, auxLabel: decided, back: decided, inst: inst, step: 0, shape: 0, out: NONE, extra: extra, kind: STEP_EQUALS_SLOW })
+    }
   }
   /// fusedTag for `is.callee`.
   fn fusedCallee(self: &Self, function: &Function, test: Inst) -> bool {
@@ -5279,15 +5318,132 @@ impl Emitter {
     if info.own == Own.Imm || info.own == Own.Owned { return () }
     run self.retainBits(Reg.Rax, Reg.Rdx)
   }
-  /// Frame mode: hot fast path for `a == b` / `a === b`. Handles same-tag int32, object,
-  /// flat-string pointer equality, bool, null, and undefined inline, plus strict different-tag
-  /// mismatches (excluding float64/rope/bigint) and loose null/undefined comparisons inline;
-  /// anything else jumps to `slow` (STEP_EQUALS_SLOW in PACK_COLD) with tag(a) in RAX and
-  /// tag(b) in R8. When `fused`, reaches `decided` with ZF=1 iff equal; otherwise reaches
-  /// `answered` with EAX = 0 or 1.
-  effect fn equalsFast(self: &mut Self, a: u32, b: u32, strict: bool, slow: Label, answered: Label, fused: bool, decided: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  /// Frame mode: hot fast path for `a == b` / `a === b`. Specializes comparisons against
+  /// constant `Null`/`Undefined`/`False`/`True`/`AtomValue` into compact inline checks;
+  /// otherwise handles same-tag int32, object, flat-string pointer equality, bool, null, and
+  /// undefined inline, plus strict different-tag mismatches and loose null/undefined inline.
+  /// Returns `EQUALS_NO_SLOW` if `slow` is never targeted, `EQUALS_DIRECT_SLOW` if `slow`
+  /// may jump directly to `helpers.EQUALS` (without needing RAX/R8 tags), or
+  /// `EQUALS_GENERIC_SLOW` if `slow` expects tag(a) in RAX and tag(b) in R8. When `fused`,
+  /// reaches `decided` with ZF=1 iff equal; otherwise reaches `answered` with EAX = 0 or 1.
+  effect fn equalsFast(self: &mut Self, function: &Function, a: u32, b: u32, strict: bool, slow: Label, answered: Label, fused: bool, decided: Label) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let fields = self.fields
+    // Constant-specialized compact fast paths: Null/Undefined (strict & loose),
+    // False/True (strict), and AtomValue string (strict).
+    let defA = self.defs.get(u32.toUsize(a))
+    let defB = self.defs.get(u32.toUsize(b))
+    let mut immK: i32 = -1
+    let mut other: u32 = a
+    if defB != NONE && function.inst(defB).op == Op.Imm {
+      let k = function.inst(defB).k
+      if k >= 0 && k <= 3 { immK = k other = a }
+    } else if defA != NONE && function.inst(defA).op == Op.Imm {
+      let k = function.inst(defA).k
+      if k >= 0 && k <= 3 { immK = k other = b }
+    }
+    if immK == 0 || immK == 1 {
+      let tagMem = Mem.at(Reg.Rsp, u32.wrappingToI32(other * SLOT_BYTES + layout.tagOffset))
+      if strict {
+        let targetTag = if immK == 0 { layout.undefined() } else { layout.null() }
+        if fused {
+          if layout.tagWidth == 1 && targetTag < 256 {
+            run self.a.cmp8MemImm(tagMem, u32.wrappingToU8(targetTag))
+          } else {
+            run self.loadTag(Reg.Rax, tagMem)
+            run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(targetTag))
+          }
+        } else {
+          run self.a.movImm32(Reg.Rax, 0)
+          if layout.tagWidth == 1 && targetTag < 256 {
+            run self.a.cmp8MemImm(tagMem, u32.wrappingToU8(targetTag))
+          } else {
+            run self.loadTag(Reg.R8, tagMem)
+            run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(targetTag))
+          }
+          run self.a.setcc(Cond.Equal, Reg.Rax)
+        }
+        return EQUALS_NO_SLOW
+      }
+      // Loose compare against Null or Undefined: null/undefined -> equal; falsy object -> slow; else not equal.
+      let isNeq = run self.a.label()
+      let mut eqTarget = decided
+      if !fused { eqTarget = run self.a.label() }
+      run self.loadTag(Reg.Rax, tagMem)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.null()))
+      run self.a.jcc(Cond.Equal, eqTarget)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.undefined()))
+      run self.a.jcc(Cond.Equal, eqTarget)
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.object()))
+      run self.a.jcc(Cond.NotEqual, isNeq)
+      run self.a.load(Width.W64, Reg.R11, payloadOf(other))
+      run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.falsy))
+      run self.a.jcc(Cond.NotEqual, slow)
+      self.a.bind(isNeq)
+      if fused {
+        run self.a.aluImm(Alu.Or, Width.W32, Reg.Rax, 1)
+      } else {
+        run self.a.movImm32(Reg.Rax, 0)
+        run self.a.jmp(answered)
+        self.a.bind(eqTarget)
+        run self.a.movImm32(Reg.Rax, 1)
+      }
+      return EQUALS_DIRECT_SLOW
+    }
+    if strict && (immK == 2 || immK == 3) {
+      let tagMem = Mem.at(Reg.Rsp, u32.wrappingToI32(other * SLOT_BYTES + layout.tagOffset))
+      let want: u8 = if immK == 3 { 1 } else { 0 }
+      if fused {
+        if layout.tagWidth == 1 && layout.boolean() < 256 {
+          run self.a.cmp8MemImm(tagMem, u32.wrappingToU8(layout.boolean()))
+        } else {
+          run self.loadTag(Reg.Rax, tagMem)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.boolean()))
+        }
+        run self.a.jcc(Cond.NotEqual, decided)
+        run self.a.cmp8MemImm(payloadOf(other), want)
+      } else {
+        run self.a.movImm32(Reg.Rax, 0)
+        if layout.tagWidth == 1 && layout.boolean() < 256 {
+          run self.a.cmp8MemImm(tagMem, u32.wrappingToU8(layout.boolean()))
+        } else {
+          run self.loadTag(Reg.R8, tagMem)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.boolean()))
+        }
+        run self.a.jcc(Cond.NotEqual, answered)
+        run self.a.cmp8MemImm(payloadOf(other), want)
+        run self.a.setcc(Cond.Equal, Reg.Rax)
+      }
+      return EQUALS_NO_SLOW
+    }
+    if strict {
+      let mut strConst: u32 = NONE
+      if defB != NONE && function.inst(defB).op == Op.AtomValue { strConst = b other = a }
+      else if defA != NONE && function.inst(defA).op == Op.AtomValue { strConst = a other = b }
+      if strConst != NONE {
+        let notFlat = run self.a.label()
+        run self.loadTag(Reg.Rax, Mem.at(Reg.Rsp, u32.wrappingToI32(other * SLOT_BYTES + layout.tagOffset)))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.tagOf(-7)))
+        run self.a.jcc(Cond.NotEqual, notFlat)
+        run self.a.load(Width.W64, Reg.R11, payloadOf(other))
+        run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R11, payloadOf(strConst))
+        run self.a.jcc(Cond.NotEqual, slow)
+        if fused {
+          run self.a.jmp(decided)
+          self.a.bind(notFlat)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.tagOf(-6)))
+          run self.a.jcc(Cond.Equal, slow)
+        } else {
+          run self.a.movImm32(Reg.Rax, 1)
+          run self.a.jmp(answered)
+          self.a.bind(notFlat)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.tagOf(-6)))
+          run self.a.jcc(Cond.Equal, slow)
+          run self.a.movImm32(Reg.Rax, 0)
+        }
+        return EQUALS_DIRECT_SLOW
+      }
+    }
     let diffTag = run self.a.label()
     let notInt = run self.a.label()
     let notObj = run self.a.label()
@@ -5413,6 +5569,7 @@ impl Emitter {
       self.a.bind(eqTarget)
       run self.a.movImm32(Reg.Rax, 1)
     }
+    return EQUALS_GENERIC_SLOW
   }
   /// The `call` the `call.arg` being lowered belongs to: the next one in its block.
   fn callOf(self: &Self, function: &Function) -> Inst {
@@ -5495,19 +5652,23 @@ impl Emitter {
       let inPlace = run self.a.label()
       let slow = run self.a.label()
       let done = run self.a.label()
-      run self.equalsFast(inst.a, inst.b, false, slow, inPlace, false, inPlace)
+      let mode = run self.equalsFast(&function, inst.a, inst.b, false, slow, inPlace, false, inPlace)
       self.a.bind(inPlace)
       if calls.notEqualOf(inst) { run self.a.aluImm(Alu.Xor, Width.W32, Reg.Rax, 1) }
       run self.a.movImm64(Reg.R9, layout.tagWord(layout.boolean()))
       run self.a.store(Width.W64, slotOf(inst.result), Reg.R9)
       run self.a.store(Width.W64, payloadOf(inst.result), Reg.Rax)
-      let step = self.stepAt()
-      let mut shape: u32 = 0
-      if step != 0 {
-        let after = self.depthAfter(&function, inst, step)
-        shape = leaving.stepShape(after - 1, 1, 0, after)
+      if mode != EQUALS_NO_SLOW {
+        let step = self.stepAt()
+        let mut shape: u32 = 0
+        if step != 0 {
+          let after = self.depthAfter(&function, inst, step)
+          shape = leaving.stepShape(after - 1, 1, 0, after)
+        }
+        let mut extra: u32 = 4
+        if mode == EQUALS_DIRECT_SLOW { extra = extra | 8 }
+        run self.stepSlows.append(StepSlow { entry: slow, auxLabel: done, back: inPlace, inst: inst, step: step, shape: shape, out: NONE, extra: extra, kind: STEP_EQUALS_SLOW })
       }
-      run self.stepSlows.append(StepSlow { entry: slow, auxLabel: done, back: inPlace, inst: inst, step: step, shape: shape, out: NONE, extra: 4, kind: STEP_EQUALS_SLOW })
       self.a.bind(done)
       return ()
     }
@@ -5623,6 +5784,37 @@ impl Emitter {
         run self.a.storeImm(Width.W64, payloadOf(inst.result), 0)
         return ()
       }
+      if (step & STEP_HOME_OBJECT) != 0 && inst.frame == 0 && count == 0 && first && after == base + 1 && calls.keptCells(inst.k) == 0 && inst.result != NONE && self.closureHome != u32.MAX {
+        // OP_special_object kind=4 (HOME_OBJECT): loads currentFunction's homeObject
+        // (or undefined if null), retained into inst.result; falls back to stepOnFrame if
+        // currentFunction is not an object.
+        let p = self.plan
+        let shape = leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after)
+        let cold = run self.deferStep(inst, step, shape, out, stepped, STEP_PLAIN)
+        let isNull = run self.a.label()
+        if layout.tagWidth == 1 && layout.object() < 256 {
+          run self.a.cmp8MemImm(p.sf(p.f.currentFunction + layout.tagOffset), u32.wrappingToU8(layout.object()))
+        } else {
+          run self.loadTag(Reg.Rax, p.sf(p.f.currentFunction + layout.tagOffset))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.object()))
+        }
+        run self.a.jcc(Cond.NotEqual, cold)
+        run self.a.load(Width.W64, Reg.R9, p.sf(p.f.currentFunction + 8))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R9, signed(self.closureHome)))
+        run self.a.test(Width.W64, Reg.R9, Reg.R9)
+        run self.a.jcc(Cond.Equal, isNull)
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.object()))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R9, 0), 1)
+        run self.a.jmp(stepped)
+        self.a.bind(isNull)
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.undefined()))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.storeImm(Width.W64, payloadOf(inst.result), 0)
+        self.a.bind(stepped)
+        return ()
+      }
       let cold = run self.deferStep(inst, step, leaving.stepShape(base, results, i32.wrappingToU32(calls.keptCells(inst.k)), after), out, stepped, STEP_PLAIN)
       run self.a.jmp(cold)
       self.a.bind(stepped)
@@ -5662,8 +5854,10 @@ impl Emitter {
     run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rbp, i32.wrappingToU32(callee))
     if method { run self.valueInto(&function, inst.b, SlotMode.Imm, Reg.Rbp, i32.wrappingToU32(callee - 16)) }
     let answered = run self.a.label()
-    if method { run self.arrayCall(&function, inst, Reg.Rbp, callee, inst.pc + 1, answered) }
-    run self.mathCallOnFrame(inst, Reg.Rbp, callee, answered)
+    if method {
+      run self.arrayCall(&function, inst, Reg.Rbp, callee, inst.pc + 1, answered)
+      run self.mathCallOnFrame(inst, Reg.Rbp, callee, answered)
+    }
     // The stub's site: r14 the callee's cell, edx the count (with bit 31 set for a known
     // local function so STUB_CALL_KEEP passes p.rec(f.scope) to sibling known callees), eax
     // the pc a frame the callee publishes is at (past the call).
@@ -5757,8 +5951,10 @@ impl Emitter {
     run self.valueInto(&function, inst.a, SlotMode.Imm, Reg.Rsp, callee)
     if method { run self.valueInto(&function, inst.b, SlotMode.Imm, Reg.Rsp, callee - SLOT_BYTES) }
     let answered = run self.a.label()
-    if method { run self.arrayCall(&function, inst, Reg.Rsp, u32.wrappingToI32(callee), exit.pc + 1, answered) }
-    run self.mathCallOnFrame(inst, Reg.Rsp, u32.wrappingToI32(callee), answered)
+    if method {
+      run self.arrayCall(&function, inst, Reg.Rsp, u32.wrappingToI32(callee), exit.pc + 1, answered)
+      run self.mathCallOnFrame(inst, Reg.Rsp, u32.wrappingToI32(callee), answered)
+    }
     let last = run self.bodyRecords(&function, exit, NONE)
     // The stub's site, as callOnFrame's, on the innermost body's record.
     run self.a.lea(Width.W64, Reg.R14, word(Reg.Rsp, callee))
@@ -6308,6 +6504,153 @@ impl Emitter {
       let base = if item.extra == 0 { Reg.Rbp } else { Reg.Rsp }
       let callee = u32.wrappingToI32(item.shape)
       let count = calls.countOf(inst)
+      let layout = self.settings.layout
+      let math = self.math
+      if math.fnTagAt != u32.MAX && math.familyAt != u32.MAX && math.methodAt != u32.MAX && (count == 1 || count == 2) {
+        let slowMath = run self.a.label()
+        run self.a.load(Width.W64, Reg.R9, Mem.at(base, callee + 8))
+        run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R9, signed(math.methodAt)))
+        if count == 1 {
+          let doSqrt = run self.a.label()
+          let sqrtNotF64 = run self.a.label()
+          let sqrtRun = run self.a.label()
+          let doAbs = run self.a.label()
+          let absNotF64 = run self.a.label()
+          let doFloor = run self.a.label()
+          let floorNotInt = run self.a.label()
+          let floorExact = run self.a.label()
+          let storeInt = run self.a.label()
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 6)
+          run self.a.jcc(Cond.Equal, doSqrt)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 2)
+          run self.a.jcc(Cond.Equal, doAbs)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 3)
+          run self.a.jcc(Cond.Equal, doFloor)
+          run self.a.jmp(slowMath)
+          // Math.sqrt(x): sqrtsd handles -0, NaN, +/-Infinity, and negatives per IEEE-754.
+          self.a.bind(doSqrt)
+          run self.loadTag(Reg.R8, Mem.at(base, callee + 16 + signed(layout.tagOffset)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+          run self.a.jcc(Cond.NotEqual, sqrtNotF64)
+          run self.a.loadDouble(Xmm.Xmm0, Mem.at(base, callee + 24))
+          run self.a.jmp(sqrtRun)
+          self.a.bind(sqrtNotF64)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+          run self.a.jcc(Cond.NotEqual, slowMath)
+          run self.a.load(Width.W32, Reg.Rax, Mem.at(base, callee + 24))
+          run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.Rax)
+          self.a.bind(sqrtRun)
+          run self.a.scalar(ScalarOp.Sqrt, Xmm.Xmm0, Xmm.Xmm0)
+          run self.a.movImm64(Reg.R8, layout.tagWord(layout.float64()))
+          run self.a.store(Width.W64, slotOf(inst.result), Reg.R8)
+          run self.a.storeDouble(payloadOf(inst.result), Xmm.Xmm0)
+          run self.a.jmp(item.back)
+          // Math.abs(x): clear sign bit for Float64 (handles -0, -NaN, -Inf); negate Int32 unless INT32_MIN.
+          self.a.bind(doAbs)
+          run self.loadTag(Reg.R8, Mem.at(base, callee + 16 + signed(layout.tagOffset)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+          run self.a.jcc(Cond.NotEqual, absNotF64)
+          run self.a.load(Width.W64, Reg.Rax, Mem.at(base, callee + 24))
+          run self.a.movImm64(Reg.R11, 0x7fffffffffffffff)
+          run self.a.alu(Alu.And, Width.W64, Reg.Rax, Reg.R11)
+          run self.boxDoubleInto(Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
+          run self.a.jmp(item.back)
+          self.a.bind(absNotF64)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+          run self.a.jcc(Cond.NotEqual, slowMath)
+          run self.a.load(Width.W32, Reg.Rax, Mem.at(base, callee + 24))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(0x80000000))
+          run self.a.jcc(Cond.Equal, slowMath)
+          run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jcc(Cond.GreaterOrEqual, storeInt)
+          run self.a.unary(Unary.Neg, Width.W32, Reg.Rax)
+          run self.a.jmp(storeInt)
+          // Math.floor(x): Int32 stays Int32; finite Float64 in (-2^31, 2^31) truncates and steps down on negative fraction, falling back to slowMath on -0 / NaN / Inf / large values.
+          self.a.bind(doFloor)
+          run self.loadTag(Reg.R8, Mem.at(base, callee + 16 + signed(layout.tagOffset)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+          run self.a.jcc(Cond.NotEqual, floorNotInt)
+          run self.a.load(Width.W32, Reg.Rax, Mem.at(base, callee + 24))
+          run self.a.jmp(storeInt)
+          self.a.bind(floorNotInt)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+          run self.a.jcc(Cond.NotEqual, slowMath)
+          run self.a.loadDouble(Xmm.Xmm0, Mem.at(base, callee + 24))
+          run self.a.doubleToInt(Width.W32, Reg.Rax, Xmm.Xmm0)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(0x80000000))
+          run self.a.jcc(Cond.Equal, slowMath)
+          run self.a.intToDouble(Width.W32, Xmm.Xmm1, Reg.Rax)
+          run self.a.packed(PackedOp.Ucomisd, Xmm.Xmm1, Xmm.Xmm0)
+          run self.a.jcc(Cond.BelowOrEqual, floorExact)
+          run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rax, 1)
+          run self.a.jmp(storeInt)
+          self.a.bind(floorExact)
+          run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jcc(Cond.NotEqual, storeInt)
+          run self.a.load(Width.W64, Reg.R9, Mem.at(base, callee + 24))
+          run self.a.test(Width.W64, Reg.R9, Reg.R9)
+          run self.a.jcc(Cond.Sign, slowMath)
+          self.a.bind(storeInt)
+          run self.boxInto(false, Reg.Rax, Reg.Rsp, inst.result * SLOT_BYTES)
+          run self.a.jmp(item.back)
+        } else {
+          // Math.min (0) / Math.max (1) on two Numbers; NaN or equal (including +/-0) falls back to slowMath.
+          let a0NotF64 = run self.a.label()
+          let a0Done = run self.a.label()
+          let a1NotF64 = run self.a.label()
+          let a1Done = run self.a.label()
+          let isLess = run self.a.label()
+          let storeXmm1 = run self.a.label()
+          let storeXmm0 = run self.a.label()
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 1)
+          run self.a.jcc(Cond.Above, slowMath)
+          run self.loadTag(Reg.R8, Mem.at(base, callee + 16 + signed(layout.tagOffset)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+          run self.a.jcc(Cond.NotEqual, a0NotF64)
+          run self.a.loadDouble(Xmm.Xmm0, Mem.at(base, callee + 24))
+          run self.a.jmp(a0Done)
+          self.a.bind(a0NotF64)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+          run self.a.jcc(Cond.NotEqual, slowMath)
+          run self.a.load(Width.W32, Reg.R9, Mem.at(base, callee + 24))
+          run self.a.intToDouble(Width.W32, Xmm.Xmm0, Reg.R9)
+          self.a.bind(a0Done)
+          run self.loadTag(Reg.R8, Mem.at(base, callee + 32 + signed(layout.tagOffset)))
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.float64()))
+          run self.a.jcc(Cond.NotEqual, a1NotF64)
+          run self.a.loadDouble(Xmm.Xmm1, Mem.at(base, callee + 40))
+          run self.a.jmp(a1Done)
+          self.a.bind(a1NotF64)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.int()))
+          run self.a.jcc(Cond.NotEqual, slowMath)
+          run self.a.load(Width.W32, Reg.R9, Mem.at(base, callee + 40))
+          run self.a.intToDouble(Width.W32, Xmm.Xmm1, Reg.R9)
+          self.a.bind(a1Done)
+          run self.a.packed(PackedOp.Ucomisd, Xmm.Xmm0, Xmm.Xmm1)
+          run self.a.jcc(Cond.Parity, slowMath)
+          run self.a.jcc(Cond.Equal, slowMath)
+          run self.a.jcc(Cond.Below, isLess)
+          run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jcc(Cond.NotEqual, storeXmm0)
+          run self.a.jmp(storeXmm1)
+          self.a.bind(isLess)
+          run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+          run self.a.jcc(Cond.Equal, storeXmm0)
+          self.a.bind(storeXmm1)
+          run self.a.load(Width.W64, Reg.R8, Mem.at(base, callee + 32))
+          run self.a.load(Width.W64, Reg.R9, Mem.at(base, callee + 40))
+          run self.a.store(Width.W64, slotOf(inst.result), Reg.R8)
+          run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+          run self.a.jmp(item.back)
+          self.a.bind(storeXmm0)
+          run self.a.load(Width.W64, Reg.R8, Mem.at(base, callee + 16))
+          run self.a.load(Width.W64, Reg.R9, Mem.at(base, callee + 24))
+          run self.a.store(Width.W64, slotOf(inst.result), Reg.R8)
+          run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+          run self.a.jmp(item.back)
+        }
+        self.a.bind(slowMath)
+      }
       run self.a.lea(Width.W64, Reg.Rsi, Mem.at(base, callee))
       run self.a.movImm32(Reg.Rdx, count)
       run self.a.lea(Width.W64, Reg.Rcx, slotOf(inst.result))
@@ -6321,61 +6664,64 @@ impl Emitter {
       let strict = (item.extra & 1) != 0
       let fused = (item.extra & 2) != 0
       let siteEqual = (item.extra & 4) != 0
+      let directHelper = (item.extra & 8) != 0
       let layout = self.settings.layout
       let fields = self.fields
-      let unlike = run self.a.label()
-      let other = run self.a.label()
-      let neither = run self.a.label()
-      let payloads = run self.a.label()
       let helper = run self.a.label()
-      let yes = run self.a.label()
-      let no = run self.a.label()
       let answered = run self.a.label()
-      // Left is object (right is not object, since (obj, obj) was handled in the hot path).
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.object()))
-      run self.a.jcc(Cond.NotEqual, unlike)
-      run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
-      run self.a.jmp(other)
-      // Left is not object; check whether right is object.
-      self.a.bind(unlike)
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
-      run self.a.jcc(Cond.NotEqual, neither)
-      run self.a.load(Width.W64, Reg.R11, payloadOf(inst.b))
-      run self.a.mov(Width.W32, Reg.R8, Reg.Rax)
-      // An object in R11 and the tag of what is none in R8.
-      self.a.bind(other)
-      if strict { run self.a.jmp(no) }
-      else {
-        let nullish = run self.a.label()
-        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null()))
-        run self.a.jcc(Cond.Equal, nullish)
-        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined()))
+      if !directHelper {
+        let unlike = run self.a.label()
+        let other = run self.a.label()
+        let neither = run self.a.label()
+        let payloads = run self.a.label()
+        let yes = run self.a.label()
+        let no = run self.a.label()
+        // Left is object (right is not object, since (obj, obj) was handled in the hot path).
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.object()))
+        run self.a.jcc(Cond.NotEqual, unlike)
+        run self.a.load(Width.W64, Reg.R11, payloadOf(inst.a))
+        run self.a.jmp(other)
+        // Left is not object; check whether right is object.
+        self.a.bind(unlike)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.object()))
+        run self.a.jcc(Cond.NotEqual, neither)
+        run self.a.load(Width.W64, Reg.R11, payloadOf(inst.b))
+        run self.a.mov(Width.W32, Reg.R8, Reg.Rax)
+        // An object in R11 and the tag of what is none in R8.
+        self.a.bind(other)
+        if strict { run self.a.jmp(no) }
+        else {
+          let nullish = run self.a.label()
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.null()))
+          run self.a.jcc(Cond.Equal, nullish)
+          run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.undefined()))
+          run self.a.jcc(Cond.NotEqual, helper)
+          self.a.bind(nullish)
+          run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.falsy))
+          run self.a.jcc(Cond.NotEqual, helper)
+          run self.a.jmp(no)
+        }
+        // Neither is an object (and not both int32): same tag handles bool, null, undefined.
+        self.a.bind(neither)
+        run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.R8)
         run self.a.jcc(Cond.NotEqual, helper)
-        self.a.bind(nullish)
-        run self.a.test8MemImm(Mem.at(Reg.R11, u32.wrappingToI32(fields.objectFlags)), u32.wrappingToU8(fields.falsy))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.boolean()))
+        run self.a.jcc(Cond.Equal, payloads)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.null()))
+        run self.a.jcc(Cond.Equal, yes)
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.undefined()))
         run self.a.jcc(Cond.NotEqual, helper)
-        run self.a.jmp(no)
+        self.a.bind(yes)
+        run self.a.movImm32(Reg.Rax, 1)
+        run self.a.jmp(answered)
+        self.a.bind(payloads)
+        run self.a.load(Width.W32, Reg.R11, payloadOf(inst.a))
+        run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R11, payloadOf(inst.b))
+        run self.a.jcc(Cond.Equal, yes)
+        self.a.bind(no)
+        run self.a.movImm32(Reg.Rax, 0)
+        run self.a.jmp(answered)
       }
-      // Neither is an object (and not both int32): same tag handles bool, null, undefined.
-      self.a.bind(neither)
-      run self.a.alu(Alu.Cmp, Width.W32, Reg.Rax, Reg.R8)
-      run self.a.jcc(Cond.NotEqual, helper)
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.boolean()))
-      run self.a.jcc(Cond.Equal, payloads)
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.null()))
-      run self.a.jcc(Cond.Equal, yes)
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, u32.wrappingToI32(layout.undefined()))
-      run self.a.jcc(Cond.NotEqual, helper)
-      self.a.bind(yes)
-      run self.a.movImm32(Reg.Rax, 1)
-      run self.a.jmp(answered)
-      self.a.bind(payloads)
-      run self.a.load(Width.W32, Reg.R11, payloadOf(inst.a))
-      run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R11, payloadOf(inst.b))
-      run self.a.jcc(Cond.Equal, yes)
-      self.a.bind(no)
-      run self.a.movImm32(Reg.Rax, 0)
-      run self.a.jmp(answered)
       self.a.bind(helper)
       run self.a.lea(Width.W64, Reg.Rsi, slotOf(inst.a))
       run self.a.lea(Width.W64, Reg.Rdx, slotOf(inst.b))

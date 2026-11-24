@@ -3,19 +3,24 @@
 //!
 //! The code names a helper by its index, never by address, so its bytes hold no
 //! process-local pointer (ahead-of-time compilation). One BaselineEnv serves a runtime.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
 import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.num.f64
 import silk.num.i32
 import silk.num.u8
+import silk.num.u16
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silkjs.thin_list { ThinList, BoxList }
 import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
 import silkjs.js_value { ValueBits }
-import silkjs.js_core_types { ObjectData, ObjectPayload, BytecodeClosure, FunctionBytecode, RuntimeState, ShapeData, SlotBits, PropertySlot, BuiltinFamily, NativeFunctionId, NativeFunctionData, NativeCallProtocol }
+import silkjs.js_core_types { ObjectData, ObjectPayload, BytecodeClosure, FunctionBytecode, RuntimeState, ShapeData, SlotBits, PropertySlot, BuiltinFamily, NativeFunctionId, NativeFunctionData, NativeCallProtocol, GcPhase }
 import silkjs.js_core_types as census
 import silkjs.js_class_data as classes
 import silkjs.js_gc as gc
@@ -23,6 +28,10 @@ import silkjs.js_shapes as shapes
 import silkjs.js_constructor_ops as constructors
 import silkjs.js_interrupts as interrupts
 import silkjs.js_primitives as primitives
+import silkjs.js_opcode_data as op
+import silkjs.js_atom_data as atoms
+import silkjs.js_strings { Strings }
+import silkjs.js_string_types { StringLengthError }
 import silkjs.js_baseline as engine
 
 pub const HELPER_COUNT: usize = 32
@@ -101,6 +110,10 @@ pub const GET_PRIVATE: u32 = 29
 /// it, and private symbol third; moves value into the own private data slot and drops the
 /// displaced value, symbol, and object.
 pub const PUT_PRIVATE: u32 = 30
+/// concat_prim(env, left, right, out, flags) -> u32: joins a String/Rope and a Bool, Null,
+/// or Undefined in either order; writes the owned result into out, releasing left when
+/// (flags & 1) != 0 and right when (flags & 2) != 0. Returns 1 on success, 0 unchanged.
+pub const CONCAT_PRIM: u32 = 31
 
 /// The layout baseline code reads: the offsets below are part of its ABI.
 pub struct BaselineEnv {
@@ -260,6 +273,8 @@ impl BaselineEnv {
     env.helpers[u32.toUsize(GET_PRIVATE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&getPrivate)))
     let putPrivate: extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32 = baselinePutPrivate
     env.helpers[u32.toUsize(PUT_PRIVATE)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut ValueBits) -> u32, *const ?*const u8>(Pointer.fromRef(&putPrivate)))
+    let concatPrim: extern "C" fn(*mut BaselineEnv, *const ValueBits, *const ValueBits, *mut ValueBits, u32) -> u32 = baselineConcatPrim
+    env.helpers[u32.toUsize(CONCAT_PRIM)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *const ValueBits, *const ValueBits, *mut ValueBits, u32) -> u32, *const ?*const u8>(Pointer.fromRef(&concatPrim)))
     return env
   }
 }
@@ -347,9 +362,97 @@ export "C" fn baselineStoreElement(env: *mut BaselineEnv, object: *const ValueBi
   if unsafe engine.storeElementOf(unsafe runtimeOf(env), object, key, value, Pointer.address<u8>(ip), unsafe sitesOf(env)) { return 1 }
   return 0
 }
+@inlineAlways
+fn toInt32Fast(value: ValueBits, out: &mut i32) -> bool {
+  return match value {
+    ValueBits.Int { value: n } => { out.* = n true }
+    ValueBits.Float64 { value: n } => { out.* = primitives.numberToInt32(n) true }
+    ValueBits.Bool { value: flag } => { out.* = if flag { 1 } else { 0 } true }
+    ValueBits.Null => { out.* = 0 true }
+    ValueBits.Undefined => { out.* = 0 true }
+    _ => false
+  }
+}
+
+@inlineAlways
+fn primitiveAtom(value: ValueBits) -> u32 {
+  return match value {
+    ValueBits.Bool { value: flag } => if flag { atoms.JS_ATOM_true } else { atoms.JS_ATOM_false }
+    ValueBits.Null => atoms.JS_ATOM_null
+    ValueBits.Undefined => atoms.JS_ATOM_undefined
+    _ => 0
+  }
+}
+
 export "C" fn baselineArithmetic(env: *mut BaselineEnv, left: *const ValueBits, right: *const ValueBits, opcode: u32, out: *mut ValueBits) -> u32 {
-  if unsafe engine.arithmetic(left, right, u32.wrappingToU8(opcode), out) { return 1 }
+  let code = u32.wrappingToU8(opcode)
+  if unsafe engine.arithmetic(left, right, code, out) { return 1 }
+  let a = unsafe Pointer.read<ValueBits>(left)
+  let b = unsafe Pointer.read<ValueBits>(right)
+  if code == op.OP_mod {
+    if a.isNumber() && b.isNumber() {
+      let res = f64.remainder(a.numericValue(), b.numericValue())
+      unsafe Pointer.write<ValueBits>(out, ValueBits.number(res))
+      // Return 2 so S_ARITHMETIC still notes the site for double OP_mod tiering.
+      return 2
+    }
+    return 0
+  }
+  if code == op.OP_and || code == op.OP_or || code == op.OP_xor
+    || code == op.OP_shl || code == op.OP_sar || code == op.OP_shr {
+    let mut x: i32 = 0
+    let mut y: i32 = 0
+    if toInt32Fast(a, &mut x) && toInt32Fast(b, &mut y) {
+      if code == op.OP_and { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: x & y }) return 1 }
+      if code == op.OP_or { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: x | y }) return 1 }
+      if code == op.OP_xor { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: x ^ y }) return 1 }
+      let xb = i32.wrappingToU32(x)
+      let shift = i32.wrappingToU32(y) & 31
+      if code == op.OP_shl { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: u32.wrappingToI32(u32.shiftLeft(xb, shift)) }) return 1 }
+      if code == op.OP_sar { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: i32.shiftRight(x, u32.toI32(shift)) }) return 1 }
+      unsafe Pointer.write<ValueBits>(out, ValueBits.number(u32.toF64(u32.shiftRight(xb, shift))))
+      return 1
+    }
+  }
   return 0
+}
+
+export "C" fn baselineConcatPrim(env: *mut BaselineEnv, left: *const ValueBits, right: *const ValueBits, out: *mut ValueBits, flags: u32) -> u32 {
+  let rt = unsafe runtimeOf(env)
+  if unsafe gc.observesFresh(rt) { return 0 }
+  let a = unsafe Pointer.read<ValueBits>(left)
+  let b = unsafe Pointer.read<ValueBits>(right)
+  let mut leftStr = a
+  let mut rightStr = b
+  if a.isString() {
+    let atom = primitiveAtom(b)
+    if atom == 0 { return 0 }
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    rightStr = state.atoms.borrowedString(atom)
+    drop state
+  } else if b.isString() {
+    let atom = primitiveAtom(a)
+    if atom == 0 { return 0 }
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    leftStr = state.atoms.borrowedString(atom)
+    drop state
+  } else {
+    return 0
+  }
+  if !leftStr.isString() || !rightStr.isString() { return 0 }
+  let mut system = Allocator.systemAllocatorProvider()
+  let joined = run Effect.result(Strings.concat(leftStr, rightStr)) |> Effect.provideMut<Allocator>(&mut system)
+  match move joined {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => {
+      unsafe Pointer.write<ValueBits>(out, value)
+      if (flags & 1) != 0 && a.isString() { Strings.release(a) }
+      if (flags & 2) != 0 && b.isString() { Strings.release(b) }
+      return 1
+    }
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { .. } => { return 0 }
+  }
 }
 export "C" fn baselinePutVar(env: *mut BaselineEnv, function: *mut HeapHeader, index: u32, cell: *const ValueBits) -> u32 {
   if unsafe engine.writeVariable(function, index, cell) { return 1 }
@@ -684,13 +787,115 @@ unsafe fn dropShapeRef(shape: *mut HeapHeader) -> () {
   header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1)
 }
 
-/// Allocates a plain inline object from a spare cell with final shape, `stores`
-/// uninitialized slot entries ready to be written by the caller, and explicit inline slot
-/// capacity `tail` (INLINE_SLOTS or PAIR_SLOTS). Returns null if the bin is empty.
+@inlineAlways
+unsafe fn nonnullHeader(p: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(p)
+}
+
+/// Tries to recycle a dead young plain inline object of capacity `tail` directly off
+/// `RuntimeState.zeroStack`, preferring one that already holds `final` shape.
+/// Consumes the caller's +1 reference on `final` on success (releasing it when `sameShape`,
+/// or transferring it to the recycled object and dropping `oldShape` otherwise).
+/// Returns an already-published live object (`rc == 1`, `mark == 0`) with `stores` slots
+/// ready to be written, or null (leaving `final`'s reference untouched).
+@inlineAlways
+unsafe fn tryRecycleZero(rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let depth = u16.toUsize(state.zeroStackCount)
+  if depth == 0 || state.gcPhase != GcPhase.None { return Pointer.null<HeapHeader>() }
+  let finalAddr = Pointer.address<HeapHeader>(final)
+  let mut bestIdx = usize.MAX
+  let mut sameShape = false
+  let mut limit: usize = 8
+  if depth >= 200 { limit = 24 }
+  if depth < limit { limit = depth }
+  let mut scan: usize = 0
+  while scan < limit {
+    let idx = depth - 1 - scan
+    let candOpt = state.zeroStack[idx]
+    if !Pointer.isNull<HeapHeader>(candOpt) {
+      let cand = unsafe nonnullHeader(candOpt)
+      let hdr = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cand)
+      if hdr.kind == HeapKind.Object && hdr.young == 1 && hdr.referenceCount == 0 && hdr.mark == 1 {
+        let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cand)
+        if data.classId() == classes.JS_CLASS_OBJECT && data.pristineFunction(false) && data.slotsInCell() && data.slotCapacity() == tail && data.slotCount() <= 8 {
+          let emptyPayload = match &data.payload { ObjectPayload.Empty => true _ => false }
+          if emptyPayload {
+            let oldShape = data.shape
+            if Pointer.address<HeapHeader>(oldShape) == finalAddr { bestIdx = idx sameShape = true break }
+            if bestIdx == usize.MAX && (unsafe Pointer.borrow<(), HeapHeader>(&anchor, oldShape)).referenceCount > 1 && unsafe shapes.plainRecords(oldShape) { bestIdx = idx }
+          }
+        }
+      }
+    }
+    scan = scan + 1
+  }
+  drop state
+  if bestIdx == usize.MAX { return Pointer.null<HeapHeader>() }
+  let mut stateAnchor = ()
+  let stateMut = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, rt)
+  let topIdx = u16.toUsize(stateMut.zeroStackCount) - 1
+  let chosen = unsafe nonnullHeader(stateMut.zeroStack[bestIdx])
+  if bestIdx != topIdx { stateMut.zeroStack[bestIdx] = stateMut.zeroStack[topIdx] }
+  stateMut.zeroStackCount = usize.toU16(topIdx)
+  drop stateMut
+  let mut hdrAnchor = ()
+  let hdr = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hdrAnchor, chosen)
+  hdr.referenceCount = 1
+  hdr.mark = 0
+  drop hdr
+  let mut oldVals: [ValueBits; 8] = [ValueBits.Undefined; 8]
+  let mut anyHeap = false
+  let mut oldShape = final
+  let mut dataAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut dataAnchor, chosen)
+  let oldCount = data.slotCount()
+  let mut i: usize = 0
+  while i < oldCount {
+    let v = (unsafe data.slotUnchecked(i)).valueBits()
+    if v.tag() < 0 { anyHeap = true }
+    oldVals[i] = v
+    i = i + 1
+  }
+  if oldCount != stores {
+    let mut s = data.takeSlots()
+    s.truncate(0)
+    unsafe s.extendFilled(stores)
+    data.setSlotsFresh(move s)
+  }
+  if !sameShape {
+    oldShape = data.shape
+    data.shape = final
+  }
+  drop data
+  if sameShape {
+    unsafe dropShapeRef(final)
+  } else {
+    unsafe dropShapeRef(oldShape)
+  }
+  if anyHeap {
+    i = 0
+    while i < oldCount {
+      if oldVals[i].tag() < 0 { unsafe gc.releaseDeferred(oldVals[i]) }
+      i = i + 1
+    }
+  }
+  unsafe census.censusBump(rt, census.CENSUS_OBJECTS_ALLOCATED, 1)
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(chosen)
+}
+
+/// Allocates a published plain inline object (recycling from zeroStack first, then from
+/// spare cells) with final shape, `stores` uninitialized slot entries ready to be written
+/// by the caller, and explicit inline slot capacity `tail` (INLINE_SLOTS or PAIR_SLOTS).
+/// Consumes caller's +1 reference on `final` on success; returns null with `final` untouched.
 @inlineAlways
 unsafe fn allocSpareTail(rt: *mut HeapHeader, final: *mut HeapHeader, stores: usize, tail: usize) -> ?*mut HeapHeader {
   if tail != shapes.INLINE_SLOTS && tail != shapes.PAIR_SLOTS { return Pointer.null<HeapHeader>() }
   if stores > tail { return Pointer.null<HeapHeader>() }
+  if let Option<*mut HeapHeader>.Some { value: recycled } = Pointer.nonNullMut<HeapHeader>(unsafe tryRecycleZero(rt, final, stores, tail)) {
+    return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(recycled)
+  }
   let spare = match Pointer.nonNullMut<HeapHeader>(unsafe gc.takeSpareCell(rt, tail, true)) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
@@ -718,12 +923,13 @@ unsafe fn allocSpareTail(rt: *mut HeapHeader, final: *mut HeapHeader, stores: us
   data.setClassId(classes.JS_CLASS_OBJECT)
   data.weakRefCount = 0
   data.shape = final
+  drop data
+  unsafe gc.publishObject(rt, node)
   return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(node)
 }
 
-/// Allocates a plain inline object from a spare cell with final shape and `stores`
-/// uninitialized slot entries ready to be written by the caller. Returns null if no
-/// spare cell fits or the bin is empty.
+/// Allocates a published plain inline object with final shape and `stores` uninitialized
+/// slot entries ready to be written by the caller. Returns null if no cell fits or is available.
 @inlineAlways
 unsafe fn allocSparePlanned(rt: *mut HeapHeader, final: *mut HeapHeader, empty: *mut HeapHeader, stores: usize) -> ?*mut HeapHeader {
   let mut tail = unsafe shapes.planInline(empty, stores)
@@ -802,9 +1008,6 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
   let realm = code.realm
   drop code
   if derived { return 2 }
-  // Drain the zero stack before it overflows into arena bitmaps, keeping spare cells warm.
-  let zeroCount = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)).zeroStackCount
-  if zeroCount >= 220 { return 2 }
   if form == CONSTRUCT_GENERIC {
     if compiled == 0 { return 0 }
     let mut proto = Pointer.null<HeapHeader>()
@@ -816,7 +1019,6 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { unsafe dropShapeRef(empty) return 0 }
     }
-    unsafe gc.publishObject(rt, node)
     unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: node })
     return 4
   }
@@ -855,7 +1057,6 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
       index = index + 1
     }
     drop data
-    unsafe gc.publishObject(rt, node)
     unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: node })
     return 1
   }
@@ -870,7 +1071,7 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
     let planProto = unsafe gc.planPrototype(rt, callee)
     if Pointer.isNull<HeapHeader>(planProto) {
       // No construct plan (e.g. initialize calls `new` or uses CONSTRUCT_STORES): allocate
-      // the receiver from a spare cell and call compiled `initialize` directly (return 3).
+      // the receiver from a recycled/spare cell and call compiled `initialize` directly (return 3).
       let mut proto = Pointer.null<HeapHeader>()
       let empty = match Pointer.nonNullMut<HeapHeader>(unsafe receiverEmptyShape(rt, callee, &mut proto)) {
         Option<*mut HeapHeader>.Some { value } => value
@@ -892,7 +1093,6 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
         Option<*mut HeapHeader>.Some { value } => value
         Option<*mut HeapHeader>.None => { unsafe dropShapeRef(empty) return 2 }
       }
-      unsafe gc.publishObject(rt, node)
       unsafe HeapCell.retain(targetObj)
       let outs = unsafe Pointer.assumeManyMut<ValueBits>(out)
       unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: node })
@@ -958,7 +1158,6 @@ export "C" fn baselineConstructFast(env: *mut BaselineEnv, base: *mut ValueBits,
     i = i + 1
   }
   drop data
-  unsafe gc.publishObject(rt, node)
   unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: node })
   return 1
 }
