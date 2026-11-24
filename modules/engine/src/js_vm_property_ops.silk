@@ -138,6 +138,84 @@ unsafe effect fn getField<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + C
   unsafe machine.publishPc()
   return run getters.getPropertyReceiver(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atom, unsafe lendBits(&receiver, receiver), false)
 }
+/// Cached typed array length without retaining or releasing the receiver:
+/// returns the Int-range length on a typedLengthCache hit, or -1 on miss.
+@inlineNever
+unsafe fn peekTypedLength(runtime: *mut HeapHeader, node: *mut HeapHeader, classId: u32) -> i64 {
+  let anchor = ()
+  let receiverData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, receiverData.shape)).version
+  drop receiverData
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.typedLengthCache[u32.toUsize(classId - classes.JS_CLASS_UINT8C_ARRAY)]
+  let hit = entry.version == version && entry.epoch == state.shapeEpoch && unsafe typedLengthHolds(entry)
+  drop state
+  if !hit { return -1 }
+  let count = unsafe typedRead.count(node)
+  if count > 0x7fffffff { return -1 }
+  return u64.toI64(count)
+}
+/// OP_get_length fast path inlined into executeLoop: answers Array, String,
+/// Rope, and cached TypedArray lengths when the operand has another reference
+/// (refCount > 1), avoiding sync and the out-of-line lengthOperand call.
+@inlineAlways
+pub unsafe fn fastLengthOperand(machine: &mut Machine) -> bool {
+  let top = unsafe machine.top(1)
+  match top {
+    ValueBits.Object { reference: node } => {
+      let anchor = ()
+      let receiver = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+      let classId = receiver.classId()
+      if classId == classes.JS_CLASS_ARRAY {
+        let length = receiver.slot(0).valueBits()
+        drop receiver
+        let mut hAnchor = ()
+        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
+        let rc = header.referenceCount
+        if rc <= 1 { return false }
+        header.referenceCount = i32.wrappingSubtract(rc, 1)
+        drop header
+        unsafe machine.set(1, length)
+        return true
+      }
+      drop receiver
+      if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+        let count = unsafe peekTypedLength(machine.runtime, node, classId)
+        if count < 0 { return false }
+        let mut hAnchor = ()
+        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
+        let rc = header.referenceCount
+        if rc <= 1 { return false }
+        header.referenceCount = i32.wrappingSubtract(rc, 1)
+        drop header
+        unsafe machine.set(1, ValueBits.Int { value: i64.toI32(count) })
+        return true
+      }
+      return false
+    }
+    ValueBits.String { reference: node } => {
+      let mut hAnchor = ()
+      let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
+      let rc = header.referenceCount
+      if rc <= 1 { return false }
+      header.referenceCount = i32.wrappingSubtract(rc, 1)
+      drop header
+      unsafe machine.set(1, ValueBits.Int { value: usize.toI32(Strings.length(top)) })
+      return true
+    }
+    ValueBits.Rope { reference: node } => {
+      let mut hAnchor = ()
+      let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
+      let rc = header.referenceCount
+      if rc <= 1 { return false }
+      header.referenceCount = i32.wrappingSubtract(rc, 1)
+      drop header
+      unsafe machine.set(1, ValueBits.Int { value: usize.toI32(Strings.length(top)) })
+      return true
+    }
+    _ => { return false }
+  }
+}
 /// get_length fast paths, out of the dispatch loop: a typed array whose prototype
 /// chain reaches the intrinsic length getter through ordinary objects with no own
 /// length (typedLength), else readLengthOperand. False leaves the operand and pc untouched.
@@ -1401,11 +1479,18 @@ pub unsafe fn pushCellLength(machine: &mut Machine, cell: *mut ValueBits) -> boo
     ValueBits.Rope { .. } => { unsafe machine.push(ValueBits.Int { value: usize.toI32(Strings.length(value)) }) }
     ValueBits.Object { reference } => {
       let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
-      if data.classId() != classes.JS_CLASS_ARRAY { return false }
-      // An Array's length is always its first own property, a plain number.
-      let length = data.slot(0).valueBits()
-      drop data
-      unsafe machine.push(length)
+      let classId = data.classId()
+      if classId == classes.JS_CLASS_ARRAY {
+        // An Array's length is always its first own property, a plain number.
+        let length = data.slot(0).valueBits()
+        drop data
+        unsafe machine.push(length)
+      } else if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+        drop data
+        let count = unsafe peekTypedLength(machine.runtime, reference, classId)
+        if count < 0 { return false }
+        unsafe machine.push(ValueBits.Int { value: i64.toI32(count) })
+      } else { return false }
     }
     _ => { return false }
   }
