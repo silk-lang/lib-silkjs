@@ -219,7 +219,26 @@ pub const STUB_CONSTRUCT: u32 = 33
 /// define_field: the value in the cell under r14 moves into the cached own slot of the
 /// plain object in the cell under that; declines on miss.
 pub const STUB_DEFINE_FIELD: u32 = 34
-pub const STUB_COUNT: u32 = 35
+/// get_var, get_var_ref and get_var_ref_check into r14's cell; eax is the variable index.
+/// STUB_GET_VAR_KNOWN is a known local function's. Declines an uninitialized binding.
+pub const STUB_GET_VAR: u32 = 35
+pub const STUB_GET_VAR_KNOWN: u32 = 36
+/// SERVICE_QUICK of the instruction at eax, with r14 the cell above its operands. Returns
+/// the service's answer in eax (0 when the engine did it; zero flag is clear when nonzero).
+pub const STUB_QUICK: u32 = 37
+/// get_length (STUB_LENGTH_TOP, consuming r14's cell) and get_loc_length8 / get_arg_length8
+/// (STUB_LENGTH_CELL, reading the cell at rdx into r14's). Declines what needs user code.
+pub const STUB_LENGTH_TOP: u32 = 38
+pub const STUB_LENGTH_CELL: u32 = 39
+/// `new` for baseline code: runs STUB_CONSTRUCT on the function at r14, new.target after it
+/// and edx arguments, then (when it did not throw) drops all edx + 2 cells and writes the
+/// result into r14's cell. Zero flag is clear when it threw.
+pub const STUB_CONSTRUCT_OWN: u32 = 40
+/// A field store of cells (put_loc_field_loc8 / put_loc_field_arg8) that a function setter
+/// takes: target cell at rdx, source cell at rcx, r14 at three free operand cells, eax the
+/// instruction's offset. Ends as STUB_CALL does.
+pub const STUB_SETTER_CELLS: u32 = 41
+pub const STUB_COUNT: u32 = 42
 
 // ---- Bytecode steps -------------------------------------------------------------------
 
@@ -429,6 +448,10 @@ fn stepOf(bytes: &[u8], pc: usize) -> Step {
   if opcode == op.OP_set_proto { if size != 1 { return departs(size) } return plain(1, 2, -1) }
   if opcode == op.OP_define_field { if size != 5 { return departs(size) } return plain(5, 2, -1) }
   if opcode == op.OP_rest { if size != 3 { return departs(size) } return plain(3, 0, 1) }
+  if opcode == op.OP_special_object && size == 2 {
+    let kind = bytes[pc + 1]
+    if kind == engine.LAZY_ARGUMENTS || kind == 2 || kind == 3 { return plain(2, 0, 1) }
+  }
   if opcode == op.OP_array_from && size == 3 {
     let argc = u32.wrappingToI32(u16At(bytes, pc + 1))
     if argc <= 16 { return plain(3, argc, 1 - argc) }
@@ -582,7 +605,6 @@ const S_BACK_EDGE: u8 = 5
 /// After a call stub that did not finish (callAt): the call threw, or other.
 const S_CALLED: u8 = 6
 const S_VARIABLE: u8 = 8
-const S_ATTACHED: u8 = 9
 /// S_HELPER whose second cell is an argument (b its offset in the argument area).
 const S_HELPER_ARGUMENT: u8 = 10
 /// arithmetic(a, b, opcode k): the result is in a at back; other when the helper declines.
@@ -599,7 +621,6 @@ const S_RELEASE_AT: u8 = 15
 /// SERVICE_QUICK for the instruction at pc with a the cell above its operands: back when
 /// the engine did it, other when it declined.
 const S_QUICK: u8 = 16
-const S_LENGTH: u8 = 18
 const S_TRUNCATE: u8 = 19
 /// A field read that a getter answers: the getter of the field at pc of the object in cell a
 /// (an argument's offset when flag) is called on it, with the object in the frame cell c
@@ -613,6 +634,12 @@ const S_SETTER: u8 = 23
 /// strict_eq_imm8 / strict_neq_imm8 (flag: negated) for non-Int values in cell a against
 /// signed immediate b: compares Float64, releases any other value and writes the Bool.
 const S_STRICT_IMM: u8 = 24
+/// After STUB_QUICK returned nonzero on fclosure/fclosure8: 1 threw, else other.
+const S_QUICK_THROW: u8 = 25
+/// A cell field store (put_loc_field_loc8 / put_loc_field_arg8) that a setter takes:
+/// target local at a, source at b (an argument offset when flag), three free operand cells
+/// starting at c; result dropped at back, other when no function setter takes the store.
+const S_SETTER_CELLS: u8 = 26
 /// S_HELPER.b when the helper takes no second cell.
 const NO_CELL: i32 = 1
 /// Code kept out of the straight path: a last release, a cache miss, a poll, a generic call.
@@ -1182,12 +1209,9 @@ impl Emitter {
     return run self.slow(S_STEP, back, back, depth + step.fall, signed(usize.toU32(second)), opcode, pc, depth, Reg.Rax, true)
   }
   /// SERVICE_QUICK for the instruction at pc, with top the cell above its operands: eax is 0
-  /// when the engine did it.
+  /// (zero flag set) when the engine did it.
   effect fn quick(self: &mut Self, pc: u32, top: i32) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(engine.SERVICE_QUICK) | u32.shiftLeft(pc, 8))
-    run self.a.lea(Width.W64, Reg.R8, word(top))
-    run self.a.movImm32(Reg.R9, 0)
-    run self.engineCall()
+    run self.site(STUB_QUICK, pc, top)
   }
   /// keyedSlot by the site cache entry of the define_field at pc (js_vm_object_ops
   /// defineFieldCached): an own entry of the shape version of a plain object. r11 = the
@@ -1317,9 +1341,15 @@ impl Emitter {
     }
     if item.kind == S_QUICK {
       run self.quick(item.pc, item.a)
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.NotEqual, item.other)
       run self.a.jmp(item.back)
+      return ()
+    }
+    if item.kind == S_QUICK_THROW {
+      let threw = run self.exit(u32.toUsize(item.pc), signed(item.depth), true)
+      run self.a.cmp8Imm(Reg.Rax, 1)
+      run self.a.jcc(Cond.Equal, threw)
+      run self.a.jmp(item.other)
       return ()
     }
     if item.kind == S_RELEASE {
@@ -1376,6 +1406,21 @@ impl Emitter {
       let above = (item.c - p.operandAt(0)) / 16 + 1
       let threw = run self.exit(u32.toUsize(item.pc) + 1, above, true)
       run self.site(STUB_SETTER, item.pc, item.c)
+      run self.a.jcc(Cond.NotEqual, item.back)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.NotEqual, threw)
+      run self.a.jmp(item.other)
+      return ()
+    }
+    if item.kind == S_SETTER_CELLS {
+      let above = (item.c - p.operandAt(0)) / 16 + 3
+      let threw = run self.exit(u32.toUsize(item.pc) + 1, above, true)
+      if item.flag {
+        run self.a.load(Width.W64, Reg.Rcx, p.sf(f.argumentsData))
+        if item.b != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rcx, item.b) }
+      } else { run self.a.lea(Width.W64, Reg.Rcx, word(item.b)) }
+      run self.a.lea(Width.W64, Reg.Rdx, word(item.a))
+      run self.site(STUB_SETTER_CELLS, item.pc, item.c)
       run self.a.jcc(Cond.NotEqual, item.back)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.NotEqual, threw)
@@ -1565,47 +1610,6 @@ impl Emitter {
       if p.known { run self.a.movImm32(Reg.Rdx, item.k | engine.KNOWN_VARIABLE) } else { run self.a.movImm32(Reg.Rdx, item.k) }
       run self.a.lea(Width.W64, Reg.Rcx, word(item.a))
       if item.flag { run self.helper(env.PUT_VAR) } else { run self.helper(env.GET_VAR) }
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.Equal, item.other)
-      run self.a.jmp(item.back)
-      return ()
-    }
-    if item.kind == S_ATTACHED {
-      // The variable cell in rax lives in a frame: r11 = its local's cell (an argument is
-      // the engine's, at other).
-      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rax, signed(f.refFrame)))
-      run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.Rax, signed(f.refSlot)))
-      run self.a.mov(Width.W64, Reg.R10, Reg.R9)
-      run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, 48)
-      run self.a.testImm(Width.W32, Reg.R10, 1)
-      run self.a.jcc(Cond.NotEqual, item.other)
-      run self.a.mov(Width.W32, Reg.R9, Reg.R9)
-      run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
-      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, signed(f.localsData)))
-      run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
-      run self.a.jmp(item.back)
-      return ()
-    }
-    if item.kind == S_LENGTH {
-      // The length of the value in cell b (an argument's offset when flag) into cell a;
-      // other: the helper declines. A flat string's is read here, and the string dropped
-      // when the length takes its cell; a rope's and an object's are the helper's.
-      let rope = run self.a.label()
-      let mut source = framed(item.b)
-      if item.flag { run self.argumentBase() source = Cell { base: Reg.Rcx, at: item.b } }
-      run self.a.cmp8MemImm(source.word(), i32.wrappingToU8(p.tag(-7)))
-      run self.a.jcc(Cond.NotEqual, rope)
-      run self.a.load(Width.W64, Reg.R11, source.payload())
-      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.stringLength)))
-      run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 0x7fffffff)
-      if !item.flag && item.a == item.b { run self.releaseCell(item.a) }
-      run self.boxed(item.a, p.int(), Reg.Rax)
-      run self.a.jmp(item.back)
-      self.a.bind(rope)
-      if item.flag { run self.a.lea(Width.W64, Reg.Rsi, Mem.at(Reg.Rcx, item.b)) }
-      else { run self.a.lea(Width.W64, Reg.Rsi, word(item.b)) }
-      run self.a.lea(Width.W64, Reg.Rdx, word(item.a))
-      run self.helper(env.LENGTH)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, item.other)
       run self.a.jmp(item.back)
@@ -2603,6 +2607,181 @@ impl Emitter {
       run self.unlink()
       return ()
     }
+    if index == STUB_GET_VAR || index == STUB_GET_VAR_KNOWN {
+      let known = index == STUB_GET_VAR_KNOWN
+      let miss = run self.a.label()
+      let found = run self.a.label()
+      let attached = run self.a.label()
+      let unset = run self.a.label()
+      // Keep index in ecx in case the fast path falls back to env.GET_VAR.
+      run self.a.mov(Width.W32, Reg.Rcx, Reg.Rax)
+      if f.refTag != u32.MAX {
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.Rax, 4096)
+        run self.a.jcc(Cond.Above, miss)
+        run self.a.load(Width.W64, Reg.R8, p.sf(f.currentFunction + 8))
+        if known { run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.knownRefs))) }
+        else { run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.closureVarRefs))) }
+        run self.a.load(Width.W64, Reg.R8, Mem.indexed(Reg.R8, Reg.Rax, Scale.Eight, signed(f.boxHeader)))
+        run self.a.test(Width.W64, Reg.R8, Reg.R8)
+        run self.a.jcc(Cond.Equal, miss)
+        run self.a.loadZero8(Reg.R10, Mem.at(Reg.R8, signed(f.refTag)))
+        run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, signed(f.refDetached))
+        run self.a.jcc(Cond.NotEqual, attached)
+        run self.a.lea(Width.W64, Reg.R11, Mem.at(Reg.R8, signed(f.refValue)))
+        self.a.bind(found)
+        // A binding still in its dead zone throws: the interpreter's.
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+        run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
+        run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.tag(4)))
+        run self.a.jcc(Cond.Equal, unset)
+        run self.a.store(Width.W64, next.word(), Reg.Rax)
+        run self.a.store(Width.W64, next.payload(), Reg.Rdx)
+        run self.retain(Reg.Rax, Reg.Rdx)
+        run self.stubDone()
+        self.a.bind(attached)
+        // The variable cell in r8 lives in a frame: r11 = its local's cell (an argument is
+        // the engine's, at miss).
+        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R8, signed(f.refFrame)))
+        run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R8, signed(f.refSlot)))
+        run self.a.mov(Width.W64, Reg.R10, Reg.R9)
+        run self.a.shiftImm(Shift.Shr, Width.W64, Reg.R10, 48)
+        run self.a.testImm(Width.W32, Reg.R10, 1)
+        run self.a.jcc(Cond.NotEqual, miss)
+        run self.a.mov(Width.W32, Reg.R9, Reg.R9)
+        run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R9, 4)
+        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, signed(f.localsData)))
+        run self.a.alu(Alu.Add, Width.W64, Reg.R11, Reg.R9)
+        run self.a.jmp(found)
+        self.a.bind(unset)
+        run self.stubDeclined()
+      } else {
+        self.a.bind(found)
+        self.a.bind(attached)
+        self.a.bind(unset)
+      }
+      self.a.bind(miss)
+      // get_var(env, function, index [| KNOWN_VARIABLE], out) -> 0: the interpreter runs it.
+      run self.a.load(Width.W64, Reg.Rsi, p.sf(f.currentFunction + 8))
+      run self.a.mov(Width.W32, Reg.Rdx, Reg.Rcx)
+      if known { run self.a.aluImm(Alu.Or, Width.W32, Reg.Rdx, u32.wrappingToI32(engine.KNOWN_VARIABLE)) }
+      run self.a.mov(Width.W64, Reg.Rcx, Reg.R14)
+      run self.helper(env.GET_VAR)
+      run self.stubAnswered()
+      return ()
+    }
+    if index == STUB_QUICK {
+      run self.a.mov(Width.W32, Reg.Rcx, Reg.Rax)
+      run self.a.shiftImm(Shift.Shl, Width.W32, Reg.Rcx, 8)
+      run self.a.aluImm(Alu.Or, Width.W32, Reg.Rcx, u64.wrappingToI32(engine.SERVICE_QUICK))
+      run self.a.mov(Width.W64, Reg.R8, Reg.R14)
+      run self.a.alu(Alu.Xor, Width.W32, Reg.R9, Reg.R9)
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.engineCall()
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
+      run self.stubAnswered()
+      return ()
+    }
+    if index == STUB_LENGTH_TOP || index == STUB_LENGTH_CELL {
+      let consumed = index == STUB_LENGTH_TOP
+      let mut source = next
+      if !consumed { source = Cell { base: Reg.Rdx, at: 0 } }
+      let notObject = run self.a.label()
+      let general = run self.a.label()
+      // An Array's length is its first own property, a plain number.
+      run self.tagIs(source.word(), p.object(), notObject)
+      run self.a.load(Width.W64, Reg.Rsi, source.payload())
+      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
+      run self.a.jcc(Cond.NotEqual, general)
+      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
+      run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.R11, 8))
+      run self.a.store(Width.W64, next.word(), Reg.Rax)
+      run self.a.store(Width.W64, next.payload(), Reg.Rcx)
+      if consumed { run self.releaseObject(Reg.Rsi) }
+      run self.stubDone()
+      // A flat string's length is in its header; ropes and other objects go to env.LENGTH.
+      self.a.bind(notObject)
+      run self.a.cmp8MemImm(source.word(), i32.wrappingToU8(p.tag(-7)))
+      run self.a.jcc(Cond.NotEqual, general)
+      run self.a.load(Width.W64, Reg.R11, source.payload())
+      run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R11, signed(f.stringLength)))
+      run self.a.aluImm(Alu.And, Width.W32, Reg.Rax, 0x7fffffff)
+      if consumed { run self.releaseAt(next) }
+      run self.a.storeImm(Width.W64, next.word(), p.int())
+      run self.a.store(Width.W64, next.payload(), Reg.Rax)
+      run self.stubDone()
+      self.a.bind(general)
+      if consumed { run self.a.mov(Width.W64, Reg.Rsi, Reg.R14) }
+      else { run self.a.mov(Width.W64, Reg.Rsi, Reg.Rdx) }
+      run self.a.mov(Width.W64, Reg.Rdx, Reg.R14)
+      run self.helper(env.LENGTH)
+      run self.stubAnswered()
+      return ()
+    }
+    if index == STUB_CONSTRUCT_OWN {
+      let again = run self.a.label()
+      let done = run self.a.label()
+      // Save r14 and argc across STUB_CONSTRUCT; three words keep rsp 16-byte aligned for the call.
+      run self.a.push(Reg.R14)
+      run self.a.push(Reg.Rdx)
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.a.call(self.labels.get(u32.toUsize(STUB_CONSTRUCT)))
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, 8)
+      run self.a.pop(Reg.Rdi)
+      run self.a.pop(Reg.R14)
+      run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
+      run self.a.jcc(Cond.NotEqual, done)
+      // Drop function, new.target and all argc argument cells (keeping rax:rdx), then store result.
+      run self.a.mov(Width.W64, Reg.Rsi, Reg.R14)
+      run self.a.aluImm(Alu.Add, Width.W32, Reg.Rdi, 2)
+      self.a.bind(again)
+      run self.releaseAt(Cell { base: Reg.Rsi, at: 0 })
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rsi, 16)
+      run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rdi, 1)
+      run self.a.jcc(Cond.NotEqual, again)
+      run self.a.store(Width.W64, next.word(), Reg.Rax)
+      run self.a.store(Width.W64, next.payload(), Reg.Rdx)
+      run self.a.alu(Alu.Xor, Width.W32, Reg.Rcx, Reg.Rcx)
+      self.a.bind(done)
+      run self.a.ret()
+      return ()
+    }
+    if index == STUB_SETTER_CELLS {
+      // setter(env, ip, object cell, out) -> 0: no function setter.
+      let declined = run self.a.label()
+      let out = run self.a.label()
+      run self.stubEnter()
+      run self.a.push(Reg.Rdx)
+      run self.a.push(Reg.Rcx)
+      run self.operandInto(Reg.Rsi, 0)
+      run self.a.lea(Width.W64, Reg.Rcx, Mem.at(Reg.R14, 16))
+      run self.helper(env.SETTER)
+      run self.a.pop(Reg.Rcx)
+      run self.a.pop(Reg.Rdx)
+      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
+      run self.a.jcc(Cond.Equal, declined)
+      // [r14+0] = receiver copy, [r14+16] = setter, [r14+32] = value copy: call_method's operands.
+      run self.copyInto(next, Mem.at(Reg.Rdx, 0), Mem.at(Reg.Rdx, 8))
+      run self.copyInto(Cell { base: Reg.R14, at: 32 }, Mem.at(Reg.Rcx, 0), Mem.at(Reg.Rcx, 8))
+      run self.a.mov(Width.W64, Reg.Rax, Reg.R15)
+      run self.a.aluLoad(Alu.Sub, Width.W64, Reg.Rax, p.rec(f.code))
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.Rax, 1)
+      run self.a.aluImm(Alu.Add, Width.W64, Reg.R14, 16)
+      run self.a.movImm32(Reg.Rdx, 1)
+      run self.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, 8)
+      run self.a.call(self.labels.get(u32.toUsize(STUB_CALL_METHOD)))
+      // lea keeps the flags of the call stub's end.
+      run self.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rsp, 8))
+      run self.a.jcc(Cond.Equal, out)
+      // The call left the setter's result where the receiver was: it is dropped.
+      run self.releaseAt(Cell { base: Reg.R14, at: -16 })
+      run self.stubDone()
+      self.a.bind(out)
+      run self.a.ret()
+      self.a.bind(declined)
+      run self.stubDeclined()
+      return ()
+    }
     // The scope reads: rcx = the slot's cell.
     let own = index == STUB_SCOPE_OWN || index == STUB_SCOPE_CHECK_OWN
     let checks = index == STUB_SCOPE_CHECK || index == STUB_SCOPE_CHECK_OWN
@@ -3173,13 +3352,12 @@ impl Emitter {
       self.a.bind(done)
       return true
     }
-    if opcode == op.OP_object || opcode == op.OP_array_from || opcode == op.OP_rest {
+    if opcode == op.OP_object || opcode == op.OP_array_from || opcode == op.OP_rest || opcode == op.OP_set_proto {
       // Through the engine, without the interpreter: the literal's object from the shape its
-      // site learned, the array of the values on the stack, or the array of the arguments
-      // past the named ones.
+      // site learned, the array of the values on the stack, the array of the arguments past
+      // the named ones, or the literal's prototype.
       let other = run self.bail(pc, depth, step)
       run self.quick(usize.toU32(pc), next)
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.NotEqual, other)
       return true
     }
@@ -3187,24 +3365,41 @@ impl Emitter {
       // The closure of a constant through the engine, without the interpreter; the frame's
       // own scope moves to the heap when it is captured (the record then names it there).
       let other = run self.bail(pc, depth, step)
-      let threw = run self.exit(pc, depth, true)
-      let done = run self.a.label()
+      let failed = run self.slow(S_QUICK_THROW, other, other, 0, 0, 0, pc, depth, Reg.Rax, false)
       run self.quick(usize.toU32(pc), next)
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.Equal, done)
-      run self.a.cmp8Imm(Reg.Rax, 1)
-      run self.a.jcc(Cond.Equal, threw)
-      run self.a.jmp(other)
-      self.a.bind(done)
+      run self.a.jcc(Cond.NotEqual, failed)
       return true
     }
-    if opcode == op.OP_set_proto {
-      // The literal's prototype through the engine, without the interpreter.
-      let other = run self.bail(pc, depth, step)
-      run self.quick(usize.toU32(pc), next)
-      run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.NotEqual, other)
-      return true
+    if opcode == op.OP_special_object {
+      let kind = bytes[pc + 1]
+      if kind == engine.LAZY_ARGUMENTS {
+        // A lazy arguments slot starts as Uninitialized until read or materialized.
+        run self.a.storeImm(Width.W64, word(next), p.uninitialized())
+        return true
+      }
+      if !p.known && kind == 2 {
+        // Current function (closure object), retained.
+        run self.a.load(Width.W64, Reg.Rdx, p.sf(f.currentFunction + 8))
+        run self.a.storeImm(Width.W64, word(next), p.object())
+        run self.a.store(Width.W64, payload(next), Reg.Rdx)
+        run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+        return true
+      }
+      if !p.known && kind == 3 {
+        // new.target: undefined on normal calls (state 1 or 3), currentFunction on construct (state 2 or 4).
+        let done = run self.a.label()
+        run self.a.storeImm(Width.W64, word(next), p.undefined())
+        run self.a.load(Width.W32, Reg.Rax, p.rec(f.state))
+        run self.a.testImm(Width.W32, Reg.Rax, 1)
+        run self.a.jcc(Cond.NotEqual, done)
+        run self.a.load(Width.W64, Reg.Rdx, p.sf(f.currentFunction + 8))
+        run self.a.storeImm(Width.W64, word(next), p.object())
+        run self.a.store(Width.W64, payload(next), Reg.Rdx)
+        run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.Rdx, 0), 1)
+        self.a.bind(done)
+        return true
+      }
+      return false
     }
     if opcode == op.OP_define_field {
       // A literal born with its final shape takes the value into the slot its site cached;
@@ -3238,22 +3433,11 @@ impl Emitter {
       return true
     }
     if opcode == op.OP_get_length {
-      // An Array's length is its first own property, a plain number (js_vm_property_ops
-      // lengthOperand); a string's and another object's out of line (S_LENGTH).
+      // An Array's length, a flat string's, or the helper's (STUB_LENGTH_TOP).
       let other = run self.bail(pc, depth, step)
-      let done = run self.a.label()
-      let text = run self.slow(S_LENGTH, done, other, top, top, 0, pc, depth, Reg.Rax, false)
-      run self.tagIs(word(top), p.object(), text)
-      run self.a.load(Width.W64, Reg.Rsi, payload(top))
-      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
-      run self.a.jcc(Cond.NotEqual, text)
-      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
-      run self.a.store(Width.W64, word(top), Reg.Rax)
-      run self.a.store(Width.W64, payload(top), Reg.Rdx)
-      run self.releaseObject(Reg.Rsi)
-      self.a.bind(done)
+      run self.a.lea(Width.W64, Reg.R14, word(top))
+      run self.a.callSymbol(STUB_LENGTH_TOP)
+      run self.a.jcc(Cond.Equal, other)
       return true
     }
     if opcode == op.OP_push_atom_value || opcode == op.OP_push_empty_string {
@@ -3268,21 +3452,15 @@ impl Emitter {
       return true
     }
     if opcode == op.OP_call_constructor {
-      // function, new.target, arguments; the result replaces them (STUB_CONSTRUCT).
+      // function, new.target, arguments; the result replaces them (STUB_CONSTRUCT_OWN).
       let argc = u16At(bytes, pc + 1)
       let callee = p.operandAt(depth - signed(argc) - 2)
       let threw = run self.exit(pc + 1, depth, true)
       run self.a.lea(Width.W64, Reg.R14, word(callee))
       run self.a.movImm32(Reg.Rdx, argc)
       run self.a.movImm32(Reg.Rax, usize.toU32(pc + 1))
-      run self.a.callSymbol(STUB_CONSTRUCT)
-      run self.a.test(Width.W32, Reg.Rcx, Reg.Rcx)
+      run self.a.callSymbol(STUB_CONSTRUCT_OWN)
       run self.a.jcc(Cond.NotEqual, threw)
-      // Each release keeps rax:rdx.
-      let mut index: u32 = 0
-      while index < argc + 2 { run self.releaseCell(callee + signed(index * 16)) index = index + 1 }
-      run self.a.store(Width.W64, word(callee), Reg.Rax)
-      run self.a.store(Width.W64, payload(callee), Reg.Rdx)
       return true
     }
     if opcode == op.OP_if_nullish8 || opcode == op.OP_if_not_nullish8 || opcode == op.OP_if_null8 || opcode == op.OP_if_not_null8 {
@@ -3410,19 +3588,30 @@ impl Emitter {
       let target = u8.toU32(bytes[pc + 13])
       let source = u8.toU32(bytes[pc + 14])
       if target >= p.locals { return false }
-      if opcode == op.OP_put_loc_field_arg8 {
+      let isArg = opcode == op.OP_put_loc_field_arg8
+      let mut sourceAt: i32 = 0
+      if isArg {
         if source >= p.arguments { return false }
+        sourceAt = signed(source * 16)
         run self.a.load(Width.W64, Reg.Rcx, p.sf(f.argumentsData))
-        if source != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rcx, signed(source * 16)) }
+        if source != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rcx, sourceAt) }
       } else {
         if source >= p.locals { return false }
-        run self.a.lea(Width.W64, Reg.Rcx, word(p.localAt(source)))
+        sourceAt = p.localAt(source)
+        run self.a.lea(Width.W64, Reg.Rcx, word(sourceAt))
       }
       let other = run self.bail(pc, depth, step)
+      let done = run self.a.label()
+      let mut declined = other
+      if next + 32 < p.operandAt(u32.wrappingToI32(p.stack)) {
+        declined = run self.a.label()
+        run self.slows.append(Slow { kind: S_SETTER_CELLS, entry: declined, back: done, other: other, a: p.localAt(target), b: sourceAt, c: next, k: 0, pc: usize.toU32(pc), depth: i32.wrappingToU32(depth), reg: Reg.Rax, flag: isArg })
+      }
       run self.a.lea(Width.W64, Reg.Rdx, word(p.localAt(target)))
       run self.a.movImm32(Reg.Rax, usize.toU32(pc))
       run self.a.callSymbol(STUB_PUT_FIELD_CELLS)
-      run self.a.jcc(Cond.Equal, other)
+      run self.a.jcc(Cond.Equal, declined)
+      self.a.bind(done)
       return true
     }
     if (opcode == op.OP_get_var_ref || opcode == op.OP_get_var_ref_check) && u16At(bytes, pc + 1) >= engine.SCOPE_OPERAND {
@@ -3447,31 +3636,10 @@ impl Emitter {
       // (get_var_ref of a cell that holds no value yet is the interpreter's too.)
       let index = u16At(bytes, pc + 1)
       let other = run self.bail(pc, depth, step)
-      let done = run self.a.label()
-      let found = run self.a.label()
-      let miss = run self.slow(S_VARIABLE, done, other, next, 0, index, pc, depth, Reg.Rax, false)
-      if f.refTag == u32.MAX || index > 4096 { run self.a.jmp(miss) self.a.bind(done) return true }
-      let attached = run self.slow(S_ATTACHED, found, miss, 0, 0, 0, pc, depth, Reg.Rax, false)
-      run self.a.load(Width.W64, Reg.Rax, p.sf(f.currentFunction + 8))
-      if p.known { run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.knownRefs))) }
-      else { run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.closureVarRefs))) }
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.boxHeader + index * 8)))
-      run self.a.test(Width.W64, Reg.Rax, Reg.Rax)
-      run self.a.jcc(Cond.Equal, miss)
-      run self.a.loadZero8(Reg.R10, Mem.at(Reg.Rax, signed(f.refTag)))
-      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R10, signed(f.refDetached))
-      run self.a.jcc(Cond.NotEqual, attached)
-      run self.a.lea(Width.W64, Reg.R11, Mem.at(Reg.Rax, signed(f.refValue)))
-      self.a.bind(found)
-      // A binding still in its dead zone throws: the interpreter's.
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
-      run self.a.cmp8Imm(Reg.Rax, i32.wrappingToU8(p.tag(4)))
-      run self.a.jcc(Cond.Equal, miss)
-      run self.a.store(Width.W64, word(next), Reg.Rax)
-      run self.a.store(Width.W64, payload(next), Reg.Rdx)
-      run self.retain(Reg.Rax, Reg.Rdx)
-      self.a.bind(done)
+      let mut which = STUB_GET_VAR
+      if p.known { which = STUB_GET_VAR_KNOWN }
+      run self.site(which, index, next)
+      run self.a.jcc(Cond.Equal, other)
       return true
     }
     if opcode == op.OP_put_var {
@@ -3909,28 +4077,18 @@ impl Emitter {
     }
     if opcode == op.OP_get_loc_length8 || opcode == op.OP_get_arg_length8 {
       let index = u8.toU32(bytes[pc + 1])
-      let mut cell = framed(0)
       if opcode == op.OP_get_loc_length8 {
         if index >= p.locals { return false }
-        cell = framed(p.localAt(index))
+        run self.a.lea(Width.W64, Reg.Rdx, word(p.localAt(index)))
       } else {
         if index >= p.arguments { return false }
-        run self.argumentBase()
-        cell = Cell { base: Reg.Rcx, at: signed(index * 16) }
+        run self.a.load(Width.W64, Reg.Rdx, p.sf(f.argumentsData))
+        if index != 0 { run self.a.aluImm(Alu.Add, Width.W64, Reg.Rdx, signed(index * 16)) }
       }
       let other = run self.bail(pc, depth, step)
-      let done = run self.a.label()
-      let text = run self.slow(S_LENGTH, done, other, next, cell.at, 0, pc, depth, Reg.Rax, opcode == op.OP_get_arg_length8)
-      run self.tagIs(cell.word(), p.object(), text)
-      run self.a.load(Width.W64, Reg.Rsi, cell.payload())
-      run self.a.cmp16MemImm(Mem.at(Reg.Rsi, signed(p.fields.objectClass)), u32.wrappingToU16(p.fields.arrayClass))
-      run self.a.jcc(Cond.NotEqual, text)
-      run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rsi, signed(p.fields.objectSlots)))
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, 0))
-      run self.a.load(Width.W64, Reg.Rdx, Mem.at(Reg.R11, 8))
-      run self.a.store(Width.W64, word(next), Reg.Rax)
-      run self.a.store(Width.W64, payload(next), Reg.Rdx)
-      self.a.bind(done)
+      run self.a.lea(Width.W64, Reg.R14, word(next))
+      run self.a.callSymbol(STUB_LENGTH_CELL)
+      run self.a.jcc(Cond.Equal, other)
       return true
     }
     if opcode == op.OP_inc || opcode == op.OP_dec || opcode == op.OP_add_imm || opcode == op.OP_and_imm || opcode == op.OP_sar_imm {
