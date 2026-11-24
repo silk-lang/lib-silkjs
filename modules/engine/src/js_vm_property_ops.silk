@@ -156,8 +156,8 @@ unsafe fn peekTypedLength(runtime: *mut HeapHeader, node: *mut HeapHeader, class
   return u64.toI64(count)
 }
 /// OP_get_length fast path inlined into executeLoop: answers Array, String,
-/// Rope, and cached TypedArray lengths when the operand has another reference
-/// (refCount > 1), avoiding sync and the out-of-line lengthOperand call.
+/// and Rope lengths when the operand has another reference (refCount > 1),
+/// avoiding sync and the out-of-line lengthOperand call with zero calls inline.
 @inlineAlways
 pub unsafe fn fastLengthOperand(machine: &mut Machine) -> bool {
   let top = unsafe machine.top(1)
@@ -165,33 +165,17 @@ pub unsafe fn fastLengthOperand(machine: &mut Machine) -> bool {
     ValueBits.Object { reference: node } => {
       let anchor = ()
       let receiver = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-      let classId = receiver.classId()
-      if classId == classes.JS_CLASS_ARRAY {
-        let length = receiver.slot(0).valueBits()
-        drop receiver
-        let mut hAnchor = ()
-        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
-        let rc = header.referenceCount
-        if rc <= 1 { return false }
-        header.referenceCount = i32.wrappingSubtract(rc, 1)
-        drop header
-        unsafe machine.set(1, length)
-        return true
-      }
+      if receiver.classId() != classes.JS_CLASS_ARRAY { return false }
+      let length = receiver.slot(0).valueBits()
       drop receiver
-      if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
-        let count = unsafe peekTypedLength(machine.runtime, node, classId)
-        if count < 0 { return false }
-        let mut hAnchor = ()
-        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
-        let rc = header.referenceCount
-        if rc <= 1 { return false }
-        header.referenceCount = i32.wrappingSubtract(rc, 1)
-        drop header
-        unsafe machine.set(1, ValueBits.Int { value: i64.toI32(count) })
-        return true
-      }
-      return false
+      let mut hAnchor = ()
+      let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hAnchor, node)
+      let rc = header.referenceCount
+      if rc <= 1 { return false }
+      header.referenceCount = i32.wrappingSubtract(rc, 1)
+      drop header
+      unsafe machine.set(1, length)
+      return true
     }
     ValueBits.String { reference: node } => {
       let mut hAnchor = ()
@@ -1479,30 +1463,38 @@ pub unsafe fn pushCellLength(machine: &mut Machine, cell: *mut ValueBits) -> boo
     ValueBits.Rope { .. } => { unsafe machine.push(ValueBits.Int { value: usize.toI32(Strings.length(value)) }) }
     ValueBits.Object { reference } => {
       let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
-      let classId = data.classId()
-      if classId == classes.JS_CLASS_ARRAY {
-        // An Array's length is always its first own property, a plain number.
-        let length = data.slot(0).valueBits()
-        drop data
-        unsafe machine.push(length)
-      } else if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
-        drop data
-        let count = unsafe peekTypedLength(machine.runtime, reference, classId)
-        if count < 0 { return false }
-        unsafe machine.push(ValueBits.Int { value: i64.toI32(count) })
-      } else { return false }
+      if data.classId() != classes.JS_CLASS_ARRAY { return false }
+      // An Array's length is always its first own property, a plain number.
+      let length = data.slot(0).valueBits()
+      drop data
+      unsafe machine.push(length)
     }
     _ => { return false }
   }
   unsafe machine.skip(1)
   return true
 }
-/// get_loc_length8 and get_arg_length8 past pushCellLength: the get_loc or
-/// get_arg, then the get_length arm's paths, ending past the slot index.
+/// get_loc_length8 and get_arg_length8 past pushCellLength: answers cached
+/// TypedArray lengths without retaining/releasing cell, else runs get_loc/arg
+/// then get_length's paths, ending past the slot index.
 @inlineNever
 pub unsafe effect fn cellLengthStep<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  match unsafe Pointer.read<ValueBits>(cell) {
+    ValueBits.Object { reference } => {
+      let anchor = () let classId = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)).classId()
+      if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+        let count = unsafe peekTypedLength(machine.runtime, reference, classId)
+        if count >= 0 {
+          unsafe machine.push(ValueBits.Int { value: i64.toI32(count) })
+          unsafe machine.skip(1)
+          return
+        }
+      }
+    }
+    _ => ()
+  }
   unsafe machine.pushCopy(cell)
   if (unsafe machine.top(1)).tag() == 4 && run unsafe factories.lazyArgumentsRead(&mut hooks, memory, &mut machine, op.OP_get_length) {
     unsafe machine.skip(1)
@@ -2591,29 +2583,44 @@ unsafe effect fn writeFieldSlow<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapH
 /// value at source (taking its count) and returns true; anything else returns
 /// false having changed nothing, and the caller runs writeFieldFast/writeFieldSlow.
 @inlineAlways
-pub unsafe fn writeOwnField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader, source: *mut ValueBits) -> bool {
+pub unsafe fn writeOwnField(ip: *const u8, node: *mut HeapHeader, source: *mut ValueBits) -> bool {
   let key = unsafe fieldKeyAt(ip)
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
   if u64.shiftRight(key, 16) != shape.version { return false }
   drop shape
-  let index = u64.toUsize(key & 0xffff)
-  let old = (unsafe data.slotUnchecked(index)).valueBits()
-  unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source)))
-  drop data
-  if old.tag() < 0 {
-    match ValueBits.heapReference(&old) {
-      Option<*mut HeapHeader>.Some { value: reference } => {
-        let mut headerAnchor = ()
-        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, reference)
-        if header.referenceCount > 1 { header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1) return true }
-        drop header
-        unsafe gc.releaseLast(&mut hooks, runtime, reference)
+  return unsafe storeOwnSlot(&mut data, u64.toUsize(key & 0xffff), source)
+}
+/// Single out-of-line miss entry for putFieldOperand and storeCellsField so
+/// their fast paths stay leaf / shrink-wrapped with one cold call site.
+@inlineNever
+unsafe effect fn writeFieldMiss<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader, source: *mut ValueBits) -> bool ? &mut Allocator {
+  let key = unsafe fieldKeyAt(ip)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
+  if u64.shiftRight(key, 16) == shape.version {
+    drop shape
+    let index = u64.toUsize(key & 0xffff)
+    let old = (unsafe data.slotUnchecked(index)).valueBits()
+    unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source)))
+    drop data
+    if old.tag() < 0 {
+      match ValueBits.heapReference(&old) {
+        Option<*mut HeapHeader>.Some { value: reference } => {
+          let mut headerAnchor = ()
+          let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, reference)
+          if header.referenceCount > 1 { header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1) return true }
+          drop header
+          unsafe gc.releaseLast(&mut hooks, runtime, reference)
+        }
+        Option<*mut HeapHeader>.None => ()
       }
-      Option<*mut HeapHeader>.None => ()
     }
+    return true
   }
-  return true
+  drop shape drop data
+  if unsafe writeFieldFast(runtime, ip, node, source) { return true }
+  return run unsafe writeFieldSlow(&mut hooks, runtime, ip, node, source)
 }
 /// writeOwnField by the first own probe for atom, for stores with no inline
 /// key (js_vm_leaf.store).
@@ -2844,9 +2851,8 @@ pub unsafe effect fn putFieldOperand<H: HeapHooks>(hooks: &mut H, machine: &mut 
     _ => { return false }
   }
   let source = unsafe machine.topCell(1)
-  if !unsafe writeOwnField(&mut hooks, machine.runtime, machine.ip, node, source)
-    && !unsafe writeFieldFast(machine.runtime, machine.ip, node, source)
-    && !run unsafe writeFieldSlow(&mut hooks, machine.runtime, machine.ip, node, source) { return false }
+  if !unsafe writeOwnField(machine.ip, node, source)
+    && !run unsafe writeFieldMiss(&mut hooks, machine.runtime, machine.ip, node, source) { return false }
   unsafe machine.skip(FIELD_OPERAND_BYTES)
   unsafe machine.discard(2)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
@@ -2863,9 +2869,8 @@ pub unsafe effect fn storeCellsField<H: HeapHooks>(hooks: &mut H, runtime: *mut 
     ValueBits.Object { reference } => reference
     _ => { return false }
   }
-  if !(unsafe writeOwnField(&mut hooks, runtime, ip, node, source)
-    || unsafe writeFieldFast(runtime, ip, node, source)
-    || run unsafe writeFieldSlow(&mut hooks, runtime, ip, node, source)) { return false }
+  if !(unsafe writeOwnField(ip, node, source)
+    || run unsafe writeFieldMiss(&mut hooks, runtime, ip, node, source)) { return false }
   // The store copied source's bits; the slot keeps its own reference.
   drop unsafe (unsafe Pointer.read<ValueBits>(source)).retained()
   return true
