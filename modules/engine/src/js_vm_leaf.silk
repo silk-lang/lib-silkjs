@@ -573,13 +573,19 @@ unsafe fn accessor(runtime: *mut HeapHeader, function: ValueBits, code: *mut Hea
     if tail == op.OP_get_var { return unsafe selectAccessor(runtime, function, ip, object, result) }
     if tail != op.OP_get_field2 {
       if tail == op.OP_get_loc_field8 { return unsafe charCodeFieldAccessor(runtime, code, ip, object, result) }
-      return unsafe plainAccessor(runtime, ip, object, arguments, result)
+      return unsafe plainAccessorLeaf(runtime, ip, object, tail, arguments, result)
     }
-  } else if unsafe codeByte(ip, 2) == op.OP_get_arg0 {
+    return unsafe forwardingAccessor(runtime, ip, object, true, arguments, result)
+  }
+  if unsafe codeByte(ip, 2) == op.OP_get_arg0 {
     return unsafe charCodeArgAccessor(runtime, code, ip, object, arguments, result)
   }
-  // Forwarding (js_bytecode.forwardingAccessor): this.f, then its method g, run
-  // in place when g is a plain accessor taking the arguments this one got.
+  return unsafe forwardingAccessor(runtime, ip, object, false, arguments, result)
+}
+/// Forwarding (js_bytecode.forwardingAccessor): this.f, then its method g, run
+/// in place when g is a plain accessor taking the arguments this one got.
+@inlineNever
+unsafe fn forwardingAccessor(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, fused: bool, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
   let mut holder = ValueBits.Undefined
   let mut fieldSite: usize = 4
   if fused { fieldSite = 3 }
@@ -601,7 +607,7 @@ unsafe fn accessor(runtime: *mut HeapHeader, function: ValueBits, code: *mut Hea
   let innerTail = unsafe codeByte(innerIp, ACCESSOR_TAIL)
   if unsafe codeByte(innerIp, 2) != op.OP_get_loc_field8
     || (innerTail != op.OP_return && innerTail != op.OP_get_length && innerTail != op.OP_get_arg0) { return false }
-  return unsafe plainAccessor(runtime, innerIp, target, arguments, result)
+  return unsafe plainAccessorLeaf(runtime, innerIp, target, innerTail, arguments, result)
 }
 /// js_bytecode.charCodeAccessor (`if (this.i < this.len) return this.s.charCodeAt(this.i)`).
 /// Zero-call leaf: checks shape.version once against all three inline keys,
@@ -656,7 +662,7 @@ unsafe fn charCodeArgAccessor(runtime: *mut HeapHeader, code: *mut HeapHeader, i
 /// js_bytecode.selectAccessor at ip for this object: compares this.a with the
 /// variable (or its field) and returns this.b or this.c, borrowed; false when a
 /// read misses the site cache or the comparison needs more than identity.
-@inlineAlways
+@inlineNever
 unsafe fn selectAccessor(runtime: *mut HeapHeader, function: ValueBits, ip: *const u8, object: *mut HeapHeader, result: *mut ValueBits) -> bool {
   let objAnchor = ()
   let data = unsafe HeapCell.payload<ObjectData, ()>(&objAnchor, object)
@@ -680,7 +686,14 @@ unsafe fn selectAccessor(runtime: *mut HeapHeader, function: ValueBits, ip: *con
   let mut pos: usize = ACCESSOR_TAIL + 3
   if unsafe codeByte(ip, pos) == op.OP_get_field {
     let holder = match right { ValueBits.Object { reference } => reference _ => { return false } }
-    if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, pos + 1), holder, Pointer.fromMutRef<ValueBits>(&mut right), false) { return false }
+    let hAnchor = ()
+    let hData = unsafe HeapCell.payload<ObjectData, ()>(&hAnchor, holder)
+    let kRight = unsafe properties.fieldKeyAt(unsafe codeAt(ip, pos + 1))
+    if u64.shiftRight(kRight, 16) == (unsafe HeapCell.payload<ShapeData, ()>(&hAnchor, hData.shape)).version {
+      right = (unsafe hData.slotUnchecked(u64.toUsize(kRight & 0xffff))).valueBits()
+    } else if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, pos + 1), holder, Pointer.fromMutRef<ValueBits>(&mut right), false) {
+      return false
+    }
     pos = pos + 1 + properties.FIELD_OPERAND_BYTES
   }
   let compare = unsafe codeByte(ip, pos)
@@ -717,25 +730,40 @@ const ACCESSOR_TAIL: usize = 3 + properties.FIELD_OPERAND_BYTES + 1
 unsafe fn codeAt(ip: *const u8, offset: usize) -> *const u8 { return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), offset) }
 @inlineAlways
 unsafe fn codeByte(ip: *const u8, offset: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe codeAt(ip, offset)) }
-/// The plain accessor at ip (`return this.f`, `this.f.length`, `this.f[a]`)
-/// for this object: true with the borrowed result in result.
+/// Leaf fast path for plainAccessor (`return this.f`, `this.f.length`, `this.f[a]`):
+/// checks the inline key directly with zero function calls on hit so accessor
+/// stays a zero-push leaf, tail-calling plainAccessorSlow on key miss.
 @inlineAlways
-unsafe fn plainAccessor(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
+unsafe fn plainAccessorLeaf(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, tail: u8, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
+  let objAnchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&objAnchor, object)
+  let key = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 3))
+  if u64.shiftRight(key, 16) != (unsafe HeapCell.payload<ShapeData, ()>(&objAnchor, data.shape)).version {
+    return unsafe plainAccessorSlow(runtime, ip, object, tail, arguments, result)
+  }
+  let field = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+  drop data
+  return unsafe finishPlainAccessor(field, tail, arguments, result)
+}
+@inlineNever
+unsafe fn plainAccessorSlow(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, tail: u8, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
   let mut field = ValueBits.Undefined
-  // The site is the field read's atom operand, as the runner's (shared entry).
   if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, 3), object, Pointer.fromMutRef<ValueBits>(&mut field), false) { return false }
-  let tail = unsafe codeByte(ip, ACCESSOR_TAIL)
+  return unsafe finishPlainAccessor(field, tail, arguments, result)
+}
+@inlineAlways
+unsafe fn finishPlainAccessor(field: ValueBits, tail: u8, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
   if tail == op.OP_return { unsafe Pointer.write<ValueBits>(result, field) return true }
   let node = match field { ValueBits.Object { reference } => reference _ => { return false } }
   let objectAnchor = () let array = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, node)
   if array.classId() != classes.JS_CLASS_ARRAY { return false }
-  if tail == op.OP_get_length { unsafe Pointer.write<ValueBits>(result, array.slot(0).valueBits()) return true }
+  if tail == op.OP_get_length { unsafe Pointer.write<ValueBits>(result, (unsafe array.slotUnchecked(0)).valueBits()) return true }
   let at = match unsafe Pointer.read<ValueBits>(arguments) { ValueBits.Int { value } => value _ => { return false } }
   if at < 0 { return false }
   let element = match &array.payload {
     ObjectPayload.FastArray { array: fast } => {
-      if i32.toUsize(at) >= fast.values().length() { return false }
-      fast.values().get(i32.toUsize(at))
+      let idx = i32.toUsize(at)
+      if idx >= fast.values().length() { return false }
+      unsafe fast.values().getUnchecked(idx)
     }
     _ => { return false }
   }
