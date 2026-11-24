@@ -905,7 +905,7 @@ unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
           unsafe m.pushCopy(left) unsafe m.pushCopy(right)
           unsafe sync(&m, &mut machine)
           if !(unsafe operators.bigIntOperands(&machine) && run unsafe operators.bigOperands(&mut hooks, &mut machine, op.OP_add)) {
-            if !unsafe operators.addStoredShort(&mut machine) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, op.OP_add) }
+            if !(unsafe operators.hasStoredTarget(machine.ip) && unsafe operators.addStoredShort(&mut machine)) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, op.OP_add) }
           }
           unsafe sync(&machine, &mut m)
         }
@@ -945,7 +945,7 @@ unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
           unsafe m.pushCopy(right)
           unsafe sync(&m, &mut machine)
           if !(unsafe operators.bigIntOperands(&machine) && run unsafe operators.bigOperands(&mut hooks, &mut machine, op.OP_add)) {
-            if !unsafe operators.addStoredShort(&mut machine) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, op.OP_add) }
+            if !(unsafe operators.hasStoredTarget(machine.ip) && unsafe operators.addStoredShort(&mut machine)) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, op.OP_add) }
           }
           unsafe sync(&machine, &mut m)
         }
@@ -1133,7 +1133,7 @@ unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
         if !unsafe operators.cellArithmetic(left, right, left, op.OP_add) {
           unsafe m.pushCopy(right)
           unsafe sync(&m, &mut machine)
-          if !(unsafe operators.bigIntOperands(&machine) && run unsafe operators.bigOperands(&mut hooks, &mut machine, op.OP_add)) { if !unsafe operators.addStoredShort(&mut machine) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, op.OP_add) } }
+          if !(unsafe operators.bigIntOperands(&machine) && run unsafe operators.bigOperands(&mut hooks, &mut machine, op.OP_add)) { if !(unsafe operators.hasStoredTarget(machine.ip) && unsafe operators.addStoredShort(&mut machine)) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, op.OP_add) } }
           unsafe sync(&machine, &mut m)
         }
       }
@@ -1386,7 +1386,7 @@ unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
             // String building goes straight to addText, and two BigInts to
             // bigOperands, without step's frame.
             if !(unsafe operators.bigIntOperands(&machine) && run unsafe operators.bigOperands(&mut hooks, &mut machine, opcode)) {
-              if !unsafe operators.addStoredShort(&mut machine) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, opcode) }
+              if !(unsafe operators.hasStoredTarget(machine.ip) && unsafe operators.addStoredShort(&mut machine)) && !run unsafe operators.addTextEntry(&mut machine) { drop run unsafe operators.step(&mut hooks, memory, &mut machine, opcode) }
             }
             unsafe sync(&machine, &mut m)
           }
@@ -3856,69 +3856,35 @@ unsafe effect fn constructInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks
     return run unsafe constructDerived(&mut hooks, memory, &mut machine, count)
   }
   let form = unsafe constructors.formOf(function)
+  // A planned store-list constructor is straight-line and never polls;
+  // recipes and regular bodies may allocate in loops or call frames without
+  // their back edges, so only the paths that may run code poll here.
   let mut polled = false
-  if form != CONSTRUCT_GENERIC && unsafe sameValueBits(function, newTarget) {
-    if run unsafe constructPlannedOrRecipe(&mut hooks, memory, &mut machine, realm, function, form, &argv, data, first, &mut polled) {
-      return running
+  if unsafe sameValueBits(function, newTarget) && form != CONSTRUCT_GENERIC {
+    let mut planned = ValueBits.Uninitialized
+    let mut consumed = false
+    if form == CONSTRUCT_STORES { planned = run unsafe constructPlanned(&mut hooks, memory, realm, function, &argv, &mut consumed) }
+    else {
+      if interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
+      polled = true
+      planned = run unsafe constructRecipe(&mut hooks, memory, realm, machine.runtime, function, form, &argv)
+    }
+    match planned {
+      ValueBits.Object { reference } => {
+        // A plan's shapes are the receiver cache's own (held until collect), so
+        // only recipe forms need their chain pinned.
+        if form != CONSTRUCT_STORES { unsafe gc.pinConstructed(&mut hooks, machine.runtime, reference) }
+        // Consumed arguments moved into the object bitwise: drop them unreleased.
+        if consumed { unsafe releasePlannedFunction(&mut hooks, &mut machine, function, first) }
+        else { unsafe releasePlannedOperands(&mut hooks, &mut machine, function, data, first) }
+        unsafe machine.push(planned)
+        return running
+      }
+      _ => ()
     }
   }
   if !polled && interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
   let receiver = run unsafe constructors.createReceiver(&mut hooks, memory, unsafe lendRealm(&realm, realm), newTarget)
-  if form != CONSTRUCT_GENERIC {
-    match Pointer.nonNullMut<Machine>(run unsafe constructSpecial(&mut hooks, &mut machine, function, receiver, newTarget, form, &argv, first, running, context)) {
-      Option<*mut Machine>.Some { value } => { return value }
-      Option<*mut Machine>.None => ()
-    }
-  }
-  let entered = unsafe activation.enterInline(machine.runtime, function, argv, first, running, context, receiver,
-    newTarget, true, false)
-  match entered { Option<*mut Machine>.Some { value } => { return value } Option<*mut Machine>.None => () }
-  return run unsafe constructInlineFallback(&mut hooks, memory, &mut machine, context, function, receiver, newTarget, &argv, first, running)
-}
-/// Out-of-line planned/recipe fast path for non-generic constructors.
-@inlineNever
-unsafe effect fn constructPlannedOrRecipe<H: HeapHooks + CoercionHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, machine: &mut Machine, realm: *mut HeapHeader, function: ValueBits, form: u8,
-  argv: &FrameSlots, data: *mut ValueBits, first: *mut ValueBits, polled: &mut bool) -> bool ! JsException ? &mut Allocator {
-  let mut planned = ValueBits.Uninitialized
-  let mut consumed = false
-  if form == CONSTRUCT_STORES { planned = run unsafe constructPlanned(&mut hooks, memory, realm, function, &argv, &mut consumed) }
-  else {
-    let context = machine.context
-    if interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
-    polled.* = true
-    planned = run unsafe constructRecipe(&mut hooks, memory, realm, machine.runtime, function, form, &argv)
-  }
-  match planned {
-    ValueBits.Object { reference } => {
-      // A plan's shapes are the receiver cache's own (held until collect), so
-      // only recipe forms need their chain pinned.
-      if form != CONSTRUCT_STORES { unsafe gc.pinConstructed(&mut hooks, machine.runtime, reference) }
-      // Consumed arguments moved into the object bitwise: drop them unreleased.
-      if consumed { unsafe releasePlannedFunction(&mut hooks, &mut machine, function, first) }
-      else { unsafe releasePlannedOperands(&mut hooks, &mut machine, function, data, first) }
-      unsafe machine.push(planned)
-      return true
-    }
-    _ => { return false }
-  }
-}
-/// Out-of-line fallback when enterInline declines (call frame region full).
-@inlineNever
-unsafe effect fn constructInlineFallback<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
-  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
-  memory: &AllocationObserver, machine: &mut Machine, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits,
-  newTarget: ValueBits, argv: &FrameSlots, first: *mut ValueBits, running: *mut Machine) -> *mut Machine ! JsException ? &mut Allocator {
-  let result = run unsafe constructWith(&mut hooks, memory, context, function, receiver, newTarget, &argv, JS_CALL_FLAG_CONSTRUCTOR)
-  unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(result)
-  return running
-}
-/// Out-of-line non-generic constructor fast paths (CONSTRUCT_STORES/EVAL/FORWARD)
-/// so constructInline's common CONSTRUCT_GENERIC path stays small in L1i.
-@inlineNever
-unsafe effect fn constructSpecial<H: HeapHooks + CoercionHooks>(hooks: &mut H, machine: &mut Machine,
-  function: ValueBits, receiver: ValueBits, newTarget: ValueBits, form: u8, argv: &FrameSlots, first: *mut ValueBits,
-  running: *mut Machine, context: *mut HeapHeader) -> ?*mut Machine ? &mut Allocator {
   if form == CONSTRUCT_STORES && unsafe constructors.simpleConstruct(&mut hooks, machine.runtime, function, receiver, &argv) {
     match receiver { ValueBits.Object { reference } => { unsafe gc.pinConstructed(&mut hooks, machine.runtime, reference) } _ => () }
     unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(receiver)
@@ -3942,12 +3908,25 @@ unsafe effect fn constructSpecial<H: HeapHooks + CoercionHooks>(hooks: &mut H, m
       return running
     }
     if target.isObject() {
-      let forwarded = unsafe activation.enterInline(machine.runtime, target, argv.*, first, running, context, receiver,
+      let forwarded = unsafe activation.enterInline(machine.runtime, target, argv, first, running, context, receiver,
         newTarget, true, false)
       match forwarded { Option<*mut Machine>.Some { value } => { unsafe activation.markForwarded(value) return value } Option<*mut Machine>.None => () }
     }
   }
-  return Pointer.null<Machine>()
+  let entered = unsafe activation.enterInline(machine.runtime, function, argv, first, running, context, receiver,
+    newTarget, true, false)
+  match entered { Option<*mut Machine>.Some { value } => { return value } Option<*mut Machine>.None => () }
+  return run unsafe constructInlineFallback(&mut hooks, memory, &mut machine, context, function, receiver, newTarget, &argv, first, running)
+}
+/// Out-of-line fallback when enterInline declines (call frame region full).
+@inlineNever
+unsafe effect fn constructInlineFallback<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits,
+  newTarget: ValueBits, argv: &FrameSlots, first: *mut ValueBits, running: *mut Machine) -> *mut Machine ! JsException ? &mut Allocator {
+  let result = run unsafe constructWith(&mut hooks, memory, context, function, receiver, newTarget, &argv, JS_CALL_FLAG_CONSTRUCTOR)
+  unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(result)
+  return running
 }
 /// The function the wrapper body this[name].apply(this, arguments) calls, when
 /// both reads find plain data properties, apply is the intrinsic one and the
@@ -3987,7 +3966,7 @@ unsafe fn sameValueBits(left: ValueBits, right: ValueBits) -> bool {
 /// or the one its wrapper forwards to (CONSTRUCT_FORWARD, found from the plan's
 /// prototype; the plan then proves it is function.prototype). Allocation
 /// failure is raised as the pending exception; Uninitialized when no plan applies.
-@inlineNever
+@inlineAlways
 unsafe effect fn constructRecipe<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader,
   runtime: *mut HeapHeader, function: ValueBits, form: u8, argv: &FrameSlots) -> ValueBits ! JsException ? &mut Allocator {
   let owner = core.reference(function)
