@@ -35,7 +35,7 @@ import silk.num.u16
 import silk.num.usize
 import silk.core.option { Option }
 import asm_x64 { Alu, Assembler, Code, Cond, Label, Mem, PackedOp, Reg, ScalarOp, Scale, Shift, SplitCode, SplitInfo, Unary, UnboundLabelError, Width, Xmm }
-import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS, UNBOX_EXACT }
+import ssa { Function, Inst, Op, Type, Own, SlotMode, NONE, isNumberOp, numberOpReadsB, readsK, ELEM_STEP, ELEM_TRY, ELEM_STEPS, ELEM_ARGUMENTS, LENGTH_ARGUMENTS, FIELD_STEPS, UNBOX_EXACT }
 import ssa_verify { readsA, readsB }
 import ssa
 import value_layout { ValueLayout }
@@ -114,8 +114,9 @@ pub struct FramePlan {
   /// baseline.extent: the record and the first cell from rbp, the frame's bytes below rbp.
   pub record: i32, pub cells: i32, pub below: i32,
   pub arguments: u32, pub locals: u32,
-  /// Shape.copies, known, codeWord, codeDelta, and constants layout for prologue and Op.ConstVal.
-  pub copies: bool, pub known: bool, pub codeWord: u32, pub codeDelta: u32,
+  /// Shape.copies, known, scoped, scopeSlots, scopeAt, codeWord, codeDelta, and constants layout.
+  pub copies: bool, pub known: bool, pub scoped: bool, pub scopeSlots: u32, pub scopeAt: i32,
+  pub codeWord: u32, pub codeDelta: u32,
   pub constantsWord: u32, pub constantsDelta: i32, pub constants: u32
 }
 impl Copy for FramePlan {}
@@ -124,12 +125,13 @@ impl FramePlan {
   pub fn of(base: BaselineLayout, shape: &Shape) -> FramePlan {
     let at = stubs.extent(&base, &shape)
     return FramePlan { f: base, record: at.record, cells: at.cells, below: at.below, arguments: shape.arguments, locals: shape.locals,
-      copies: shape.copies, known: shape.known, codeWord: shape.codeWord, codeDelta: shape.codeDelta,
+      copies: shape.copies, known: shape.known, scoped: shape.scoped, scopeSlots: shape.scopeSlots, scopeAt: 0 - at.below,
+      codeWord: shape.codeWord, codeDelta: shape.codeDelta,
       constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants }
   }
   /// The plan of code for the compiled-entry ABI: no frame.
   fn none() -> FramePlan {
-    return FramePlan { f: frames.layout(), record: 0, cells: 0, below: 0, arguments: 0, locals: 0, copies: false, known: false, codeWord: 0, codeDelta: 0,
+    return FramePlan { f: frames.layout(), record: 0, cells: 0, below: 0, arguments: 0, locals: 0, copies: false, known: false, scoped: false, scopeSlots: 0, scopeAt: 0, codeWord: 0, codeDelta: 0,
       constantsWord: u32.MAX, constantsDelta: 0, constants: 0 }
   }
   /// A field of the record, and of its StackFrame.
@@ -593,7 +595,8 @@ fn stepFor(function: &Function, inst: Inst, code: &[u8], known: bool, closureHom
   let opcode = code[u32.toUsize(inst.pc)]
   if inst.op == Op.Call && (inst.k & calls.GENERIC) != 0 {
     if opcode == opcodes.OP_object || opcode == opcodes.OP_define_field || opcode == opcodes.OP_set_proto
-      || opcode == opcodes.OP_array_from || opcode == opcodes.OP_rest { step = step | STEP_QUICK }
+      || opcode == opcodes.OP_array_from || opcode == opcodes.OP_rest
+      || opcode == opcodes.OP_fclosure8 || opcode == opcodes.OP_fclosure { step = step | STEP_QUICK }
     else if opcode == opcodes.OP_get_private_field { step = step | STEP_GET_PRIVATE }
     else if opcode == opcodes.OP_put_private_field { step = step | STEP_PUT_PRIVATE }
     else if opcode == opcodes.OP_special_object && (step & 65535) == 2 && u32.toUsize(inst.pc) + 1 < code.length && code[u32.toUsize(inst.pc) + 1] == 4 && !known && closureHome != u32.MAX {
@@ -904,6 +907,10 @@ fn supported(function: &Function, on: bool, stress: u32, steps: &List<u32>) -> O
     if inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_ADD && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a concatenation off the function's own baseline frame") }
     if !on && (inst.op == Op.NewObject || inst.op == Op.InitSlot || inst.op == Op.CheckConstruct || inst.op == Op.KnownMethod || inst.op == Op.ConstVal) { return Option<&'static [u8]>.some(b"inlined construct or constant off a baseline frame") }
     if inst.op == Op.ConstVal && (inst.frame != 0 || inst.k < 0) { return Option<&'static [u8]>.some(b"constant load off own frame") }
+    if !on && inst.op == Op.Call && calls.countOf(inst) > calls.MAX_COMPILED_ARGUMENTS { return Option<&'static [u8]>.some(b"too many call arguments off a baseline frame") }
+    if !on && inst.op == Op.CallArg && i32.wrappingToU32(inst.k) >= calls.MAX_COMPILED_ARGUMENTS { return Option<&'static [u8]>.some(b"too many call arguments off a baseline frame") }
+    if inst.op == Op.GetLength && inst.k == LENGTH_ARGUMENTS && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"lazy arguments length off own baseline frame") }
+    if inst.op == Op.GetElem && inst.k == ELEM_ARGUMENTS && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"lazy arguments element off own baseline frame") }
     i = i + 1
   }
   if !on && function.virtualObjs.length() != 0 { return Option<&'static [u8]>.some(b"virtual object off a baseline frame") }
@@ -1607,7 +1614,7 @@ impl Emitter {
       // here, as STUB_LEAVE does (baseline unlink), the built frame's end out of line.
       let p = self.plan
       run self.resultInto(&function, inst.a)
-      if p.copies { run self.a.jmp(self.leaveOwn) return () }
+      if p.copies || p.scoped { run self.a.jmp(self.leaveOwn) return () }
       if p.arguments != 0 {
         run self.a.lea(Width.W64, Reg.R14, Mem.at(Reg.Rbp, p.argumentAt(0)))
         run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.R14, p.sf(p.f.argumentsData))
@@ -2044,6 +2051,34 @@ impl Emitter {
       // A borrowed result (ssa_opt_borrow) takes no count. A length is a number: no count
       // either way.
       let borrowed = inst.result != NONE && function.value(inst.result).own == Own.Borrowed
+      if op == Op.GetLength && inst.k == LENGTH_ARGUMENTS {
+        let layout = self.settings.layout
+        let p = self.plan
+        run self.a.load(Width.W32, Reg.R9, p.rec(p.f.argc))
+        run self.a.movImm64(Reg.Rax, layout.tagWord(layout.int()))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        return ()
+      }
+      if op == Op.GetElem && inst.k == ELEM_ARGUMENTS {
+        let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+        let p = self.plan
+        let index = self.at(inst.b)
+        run getI32(&mut self.a, Reg.Rdx, index)
+        run self.a.test(Width.W32, Reg.Rdx, Reg.Rdx)
+        run self.a.jcc(Cond.Sign, exit)
+        run self.a.mov(Width.W32, Reg.Rdx, Reg.Rdx)
+        run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rdx, p.rec(p.f.argc))
+        run self.a.jcc(Cond.AboveOrEqual, exit)
+        run self.a.load(Width.W64, Reg.R11, p.rec(p.f.argv))
+        run self.a.shiftImm(Shift.Shl, Width.W64, Reg.Rdx, 4)
+        run self.a.load(Width.W64, Reg.Rax, Mem.indexed(Reg.R11, Reg.Rdx, Scale.One, 0))
+        run self.a.load(Width.W64, Reg.R9, Mem.indexed(Reg.R11, Reg.Rdx, Scale.One, 8))
+        run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+        run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+        if !borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
+        return ()
+      }
       if op == Op.GetLength {
         // Inline: an Array keeps its length in slot 0.
         let layout = self.settings.layout
@@ -2341,10 +2376,14 @@ impl Emitter {
       let k = i32.wrappingToU32(inst.k)
       let captured = (k & 0x20000) != 0
       let operand = k & 0xffff
-      if op == Op.GetScope && (!captured || (operand & u16.toU32(SCOPE_OPERAND)) != 0) {
+      if (!captured || (operand & u16.toU32(SCOPE_OPERAND)) != 0) {
         let depth = if captured { u32.shiftRight(operand, u16.toU32(SCOPE_DEPTH_SHIFT)) & 7 } else { 0 }
         let slot = if captured { operand & u16.toU32(SCOPE_SLOT_MASK) } else { operand }
-        run self.readScope(&inst, depth, slot, captured || (k & 0x10000) != 0, function.value(inst.result).own)
+        if op == Op.GetScope {
+          run self.readScope(&inst, depth, slot, captured || (k & 0x10000) != 0, function.value(inst.result).own)
+        } else {
+          run self.writeScope(&inst, depth, slot, captured || (k & 0x10000) != 0, function.value(inst.a).own == Own.Imm)
+        }
         return ()
       }
       let mut site = u32.bitOr(u32.bitOr(k & 0xffff, u32.shiftLeft(u32.shiftRight(k, 16) & 1, 31)), u32.shiftLeft(u32.shiftRight(k, 17) & 1, 30))
@@ -4581,13 +4620,11 @@ impl Emitter {
   }
   /// The frame slot of ABI input k.
   pub fn input(self: &Self, k: u32) -> Mem { return Mem.at(Reg.Rsp, self.inputs + u32.wrappingToI32(k * 8)) }
-  /// Read the lexical slot addressed by the bytecode. Inlined callees use the scope
-  /// captured by their closure, the same pointer frameInto would put in their frame.
-  effect fn readScope(self: &mut Self, inst: &Inst, depth: u32, slot: u32, checked: bool, own: Own) -> () ! OutOfMemoryError ? &mut Allocator {
-    let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+  /// Load the lexical scope at `depth` hops into R11, jumping to `exit` if any link is null.
+  effect fn loadScopeAt(self: &mut Self, depth: u32, exit: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.frameOf == 0 && self.on {
       let p = self.plan
-      if p.known {
+      if p.known || p.scoped {
         run self.a.load(Width.W64, Reg.R11, p.rec(p.f.scope))
       } else {
         run self.a.load(Width.W64, Reg.R11, p.sf(p.f.currentFunction + 8))
@@ -4611,6 +4648,12 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, exit)
       hop = hop + 1
     }
+  }
+  /// Read the lexical slot addressed by the bytecode. Inlined callees use the scope
+  /// captured by their closure, the same pointer frameInto would put in their frame.
+  effect fn readScope(self: &mut Self, inst: &Inst, depth: u32, slot: u32, checked: bool, own: Own) -> () ! OutOfMemoryError ? &mut Allocator {
+    let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+    run self.loadScopeAt(depth, exit)
     let offset = u32.wrappingToI32(self.fields.scopeSlots + slot * SLOT_BYTES)
     if checked {
       let layout = self.settings.layout
@@ -4623,6 +4666,38 @@ impl Emitter {
     run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
     run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
     if own != Own.Borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
+  }
+  /// Write `inst.a` into the lexical slot addressed by the bytecode, deferring a count-1
+  /// displaced heap value through OUT_PUT_LAST.
+  effect fn writeScope(self: &mut Self, inst: &Inst, depth: u32, slot: u32, checked: bool, imm: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let exit = self.exitLabels.get(u32.toUsize(inst.exit))
+    run self.loadScopeAt(depth, exit)
+    let offset = u32.wrappingToI32(self.fields.scopeSlots + slot * SLOT_BYTES)
+    if checked {
+      let layout = self.settings.layout
+      run self.loadTag(Reg.R8, Mem.at(Reg.R11, offset + u32.wrappingToI32(layout.tagOffset)))
+      run self.a.aluImm(Alu.Cmp, Width.W32, Reg.R8, u32.wrappingToI32(layout.uninitialized()))
+      run self.a.jcc(Cond.Equal, exit)
+    }
+    let kept = run self.a.label()
+    let last = run self.a.label()
+    let done = run self.a.label()
+    run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R11, offset))
+    run self.a.load(Width.W64, Reg.Rax, slotOf(inst.a))
+    run self.a.load(Width.W64, Reg.R9, payloadOf(inst.a))
+    run self.heapTest(Reg.R8, kept)
+    run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.R11, offset + 8))
+    run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R10, 0), 1)
+    run self.a.jcc(Cond.LessOrEqual, last)
+    run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R10, 0), 1)
+    self.a.bind(kept)
+    run self.a.store(Width.W64, Mem.at(Reg.R11, offset), Reg.Rax)
+    run self.a.store(Width.W64, Mem.at(Reg.R11, offset + 8), Reg.R9)
+    if !imm { run self.retainBits(Reg.Rax, Reg.R9) }
+    self.a.bind(done)
+    let mut flags = PUT_HELD
+    if imm { flags = u32.bitOr(flags, PUT_MOVED) }
+    run self.outs.append(Out { kind: OUT_PUT_LAST, entry: last, back: done, frame: self.frameOf, inst: self.cursor, base: Reg.R11, at: offset, flags: flags })
   }
   /// dst = the CompiledFrame the instruction being lowered runs for, to pass to a helper: the
   /// function's own, or an inlined callee's (Inst.frame), which is built here, on the slow
@@ -4717,7 +4792,8 @@ impl Emitter {
       run self.a.test(Width.W64, Reg.R8, Reg.R8)
       run self.a.cmov(Cond.Equal, Width.W64, Reg.Rax, Reg.Rsp)
       run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 32), Reg.Rax)
-      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_SCOPE))
+      if p.scoped { run self.a.load(Width.W64, Reg.R8, p.rec(p.f.scope)) }
+      else { run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_SCOPE)) }
       run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 40), Reg.R8)
     }
     run self.a.storeImm(Width.W64, Mem.at(Reg.Rsp, f + 48), 0)
@@ -5126,6 +5202,13 @@ impl Emitter {
       }
     }
     self.a.bind(self.prologued)
+    if p.scoped {
+      // The activation's own scope, in the frame's scope cells, once arguments are in place.
+      run self.a.mov(Width.W64, Reg.Rdi, Reg.R12)
+      run self.a.lea(Width.W64, Reg.Rsi, p.rec(0))
+      run self.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, p.scopeAt))
+      run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.SCOPE)))
+    }
     // The realm, for the polls and for an inlined callee's CompiledFrame.
     let mut needed = function.inlineTargets.length() != 0 || function.constructTargets.length() != 0
     let mut i: usize = 0
@@ -5176,9 +5259,66 @@ impl Emitter {
     run self.a.jmp(self.prologued)
     // A return's ends (Op.Return): the result in rax:rdx.
     self.a.bind(self.leaveOwn)
-    run self.a.lea(Width.W64, Reg.R14, Mem.at(Reg.Rbp, p.argumentAt(0)))
-    run self.a.movImm32(Reg.Rcx, p.arguments)
-    run self.a.jmpSymbol(stubs.STUB_LEAVE)
+    if !p.scoped {
+      run self.a.lea(Width.W64, Reg.R14, Mem.at(Reg.Rbp, p.argumentAt(0)))
+      run self.a.movImm32(Reg.Rcx, p.arguments)
+      run self.a.jmpSymbol(stubs.STUB_LEAVE)
+    } else {
+      if p.arguments != 0 {
+        run self.a.lea(Width.W64, Reg.R14, Mem.at(Reg.Rbp, p.argumentAt(0)))
+        run self.a.movImm32(Reg.Rcx, p.arguments)
+        run self.a.callSymbol(stubs.STUB_LEAVE_CELLS)
+      }
+      let ended = run self.a.label()
+      if !p.known {
+        let inFrame = run self.a.label()
+        run self.a.lea(Width.W64, Reg.Rcx, Mem.at(Reg.Rbp, p.scopeAt))
+        run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rcx, p.rec(p.f.scope))
+        run self.a.jcc(Cond.Equal, inFrame)
+        run self.a.store(Width.W64, p.rec(p.f.result), Reg.Rax)
+        run self.a.store(Width.W64, p.rec(p.f.result + 8), Reg.Rdx)
+        run self.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_SCOPE))
+        run self.a.movImm32(Reg.R8, 0)
+        run self.a.movImm32(Reg.R9, 0)
+        run self.engineCall()
+        run self.a.load(Width.W64, Reg.Rax, p.rec(p.f.result))
+        run self.a.load(Width.W64, Reg.Rdx, p.rec(p.f.result + 8))
+        run self.a.jmp(ended)
+        self.a.bind(inFrame)
+      }
+      if p.scopeSlots != 0 {
+        let more = run self.a.label()
+        let next = run self.a.label()
+        let layout = self.settings.layout
+        run self.a.lea(Width.W64, Reg.Rdi, Mem.at(Reg.Rbp, p.scopeAt + signed(p.f.scopeSlots)))
+        run self.a.movImm32(Reg.Rcx, p.scopeSlots)
+        self.a.bind(more)
+        if layout.tagWidth == 1 && layout.heapLowest == 0 {
+          run self.a.cmp8MemImm(Mem.at(Reg.Rdi, u32.wrappingToI32(layout.tagOffset)), u32.wrappingToU8(layout.heapHighest))
+          run self.a.jcc(Cond.Above, next)
+        } else {
+          run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.Rdi, 0))
+          run self.heapTestWith(Reg.R10, Reg.R11, next)
+        }
+        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.Rdi, 8))
+        run self.a.aluStoreImm(Alu.Sub, Width.W32, Mem.at(Reg.R11, 0), 1)
+        run self.a.jcc(Cond.Greater, next)
+        run self.a.aluStoreImm(Alu.Add, Width.W32, Mem.at(Reg.R11, 0), 1)
+        run self.a.load(Width.W64, Reg.R10, Mem.at(Reg.Rdi, 0))
+        run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.RELEASE_STUB)))
+        self.a.bind(next)
+        run self.a.aluImm(Alu.Add, Width.W64, Reg.Rdi, 16)
+        run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rcx, 1)
+        run self.a.jcc(Cond.NotEqual, more)
+      }
+      self.a.bind(ended)
+      run self.a.aluStoreImm(Alu.Cmp, Width.W64, p.rec(p.f.state), u64.wrappingToI32(frames.FRAME_BARE_CONSTRUCT))
+      run self.a.jcc(Cond.Above, self.leaveBuilt)
+      run self.a.load(Width.W64, Reg.Rbx, p.rec(p.f.spare))
+      run self.a.mov(Width.W64, Reg.Rsp, Reg.Rbp)
+      run self.a.pop(Reg.Rbp)
+      run self.a.ret()
+    }
     self.a.bind(self.leaveBuilt)
     run self.a.load(Width.W64, Reg.Rcx, p.sf(p.f.previous))
     run self.a.store(Width.W64, Mem.at(Reg.R13, signed(p.f.currentStackFrame)), Reg.Rcx)
@@ -6125,7 +6265,7 @@ impl Emitter {
     // the pc a frame the callee publishes is at (past the call).
     run self.a.lea(Width.W64, Reg.R14, Mem.at(Reg.Rbp, callee))
     let mut callCount = count
-    if !method && self.plan.known { callCount = callCount | 0x80000000 }
+    if !method && (self.plan.known || self.plan.scoped) { callCount = callCount | 0x80000000 }
     run self.a.movImm32(Reg.Rdx, callCount)
     run self.a.movImm32(Reg.Rax, inst.pc + 1)
     if method { run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP) } else { run self.a.callSymbol(stubs.STUB_CALL_KEEP) }

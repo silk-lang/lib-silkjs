@@ -22,7 +22,7 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import silkjs.js_atom_data as atoms
-import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, KnownShapes, NONE, ELEM_STEP, ELEM_TRY, ELEM_STEPS, FIELD_STEPS }
+import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, KnownShapes, NONE, ELEM_STEP, ELEM_TRY, ELEM_STEPS, ELEM_ARGUMENTS, LENGTH_ARGUMENTS, FIELD_STEPS }
 import ssa_calls as calls
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_objects as objects
@@ -348,7 +348,7 @@ effect fn frameAllowed(input: &FunctionInput, pc: usize) -> () ! Refusal {
     if kind > 5 { fail refuse(at, opcode, b"import.meta or a source phase import") }
   }
   if opcode == op.OP_fclosure || opcode == op.OP_fclosure8 {
-    if input.scopeSlots != 0 { fail refuse(at, opcode, b"a closure in a function with its own scope") }
+    if input.scopeSlots != 0 && !input.leavesBodies { fail refuse(at, opcode, b"a closure in a function with its own scope") }
     let mut index: usize = 0
     if opcode == op.OP_fclosure { index = u32.toUsize(i32.wrappingToU32(i32At(input, pc + 1))) } else { index = u8.toUsize(byteAt(input, pc + 1)) }
     if index >= input.closures.length() || input.closures.get(index) != CLOSURE_SAFE { fail refuse(at, opcode, b"a closure that captures the frame's slots") }
@@ -2328,8 +2328,52 @@ impl Translator {
         return true
       }
     }
-    if self.lazyUse(opcode) { return run self.generic(input, pc) }
+    if self.lazyUse(opcode) {
+      if self.leaves && self.depth == 0 {
+        if opcode == op.OP_get_length {
+          let o = self.top(1)
+          let r = run self.f.emit(self.current, Op.GetLength, true, Type.Value, Own.Owned, o, NONE, LENGTH_ARGUMENTS, at)
+          let last = self.f.lastInst() run self.exitHere(last, at)
+          drop self.pop() run self.release(o, at)
+          run self.push(r)
+          return true
+        }
+        if opcode == op.OP_get_array_el {
+          let i = self.top(1)
+          let o = self.top(2)
+          let x = run self.int(i, at)
+          if x != NONE {
+            let r = run self.f.emit(self.current, Op.GetElem, true, Type.Value, Own.Owned, o, x, ELEM_ARGUMENTS, at)
+            let last = self.f.lastInst() run self.exitHere(last, at)
+            drop self.pop() drop self.pop()
+            run self.release(i, at) run self.release(o, at)
+            run self.push(r)
+            return true
+          }
+        }
+      }
+      return run self.generic(input, pc)
+    }
     if (opcode == op.OP_get_loc_length8 || opcode == op.OP_get_loc_el8) && self.lazyLocal(u8.toUsize(byteAt(input, pc + 1))) {
+      if self.leaves && self.depth == 0 {
+        if opcode == op.OP_get_loc_length8 {
+          let o = run self.imm(Imm.Uninitialized, at)
+          let r = run self.f.emit(self.current, Op.GetLength, true, Type.Value, Own.Owned, o, NONE, LENGTH_ARGUMENTS, at)
+          let last = self.f.lastInst() run self.exitHere(last, at)
+          run self.push(r)
+          return true
+        }
+        let b = u8.toUsize(byteAt(input, pc + 2))
+        if self.lazyLocal(b) { fail refuse(at, opcode, b"a fused read of a lazy arguments object") }
+        let i = run self.slotValue(false, b, at, opcode)
+        let x = run self.int(i, at)
+        if x == NONE { fail refuse(at, opcode, b"a boolean index") }
+        let o = run self.imm(Imm.Uninitialized, at)
+        let r = run self.f.emit(self.current, Op.GetElem, true, Type.Value, Own.Owned, o, x, ELEM_ARGUMENTS, at)
+        let last = self.f.lastInst() run self.exitHere(last, at)
+        run self.push(r)
+        return true
+      }
       fail refuse(at, opcode, b"a fused read of a lazy arguments object")
     }
     if opcode == op.OP_for_of_next && self.osr {
@@ -2503,7 +2547,7 @@ impl Translator {
     let results = genericResults(input, pc)
     let keptCells = genericKeptCells(input, pc)
     if results > i32.toUsize(calls.MAX_RESULTS) || i32.shiftRight(keptCells, usize.toI32(count)) != 0 { fail refuse(at, opcode, b"too many results for a generic instruction") }
-    if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many operands for a generic instruction") }
+    if count > u32.toUsize(calls.MAX_COMPILED_ARGUMENTS) { fail refuse(at, opcode, b"too many operands for a generic instruction") }
     if self.stack.length() < count { fail refuse(at, opcode, b"generic instruction operands missing") }
     // Boxes come before the call.arg run, which must stay contiguous.
     let mut operands = List<u32>.make()
@@ -2558,7 +2602,8 @@ impl Translator {
     let mut count: usize = 0
     if opcode >= op.OP_call0 && opcode <= op.OP_call3 { count = u8.toUsize(opcode - op.OP_call0) }
     else { count = u16.toUsize(u16At(input, pc + 1)) }
-    if count > u32.toUsize(calls.MAX_ARGUMENTS) { fail refuse(at, opcode, b"too many call arguments") }
+    let maxArgs = if self.leaves { calls.MAX_ARGUMENTS } else { calls.MAX_COMPILED_ARGUMENTS }
+    if count > u32.toUsize(maxArgs) { fail refuse(at, opcode, b"too many call arguments") }
     let method = opcode == op.OP_call_method
     // `new`: the function, then new.target in the receiver's place, then the arguments.
     let construct = opcode == op.OP_call_constructor
@@ -2772,7 +2817,7 @@ impl Translator {
   /// Inlines a planned `new C(...)` site as `Op.NewObject` (the sole exit, at `at`) followed
   /// by unconditional `Op.InitSlot` instructions (with zero exits). Returns true when handled.
   effect fn inlineConstruct(self: &mut Self, input: &FunctionInput, function: u32, receiver: u32, count: usize, at: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
-    if !self.leaves || input.constructs.length() == 0 || count > u32.toUsize(calls.MAX_ARGUMENTS) { return false }
+    if !self.leaves || input.constructs.length() == 0 || count > u32.toUsize(calls.MAX_COMPILED_ARGUMENTS) { return false }
     if self.depth == 0 {
       let mut s: usize = 0
       while s < self.doubleSites.length() { if self.doubleSites.get(s) == at { return false } s = s + 1 }
