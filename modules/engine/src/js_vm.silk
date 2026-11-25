@@ -2649,9 +2649,12 @@ unsafe effect fn objectKeysInline<H: HeapHooks>(hooks: &mut H, memory: &Allocati
   }
   let data = unsafe operandCell(machine.stackTop, 1)
   let input = unsafe Pointer.read<ValueBits>(data)
-  unsafe machine.publishPc()
-  let answer = run unsafe objectIntrinsics.quickKeys(&mut hooks, memory, unsafe lendRealm(&home, home), input)
-  if !answer.isObject() { return false }
+  let mut answer = unsafe objectIntrinsics.quickKeysSpare(machine.runtime, home, input)
+  if !answer.isObject() {
+    unsafe machine.publishPc()
+    answer = run unsafe objectIntrinsics.quickKeys(&mut hooks, memory, unsafe lendRealm(&home, home), input)
+    if !answer.isObject() { return false }
+  }
   let mut extra: usize = 1
   if opcode == op.OP_call_method { extra = 2 }
   if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
@@ -3133,13 +3136,72 @@ unsafe effect fn testInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   return true
 }
 @inlineNever
+unsafe effect fn leanInlineSlow<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, opcode: u8, count: usize, function: ValueBits, kind: u8) -> bool ! JsException ? &mut Allocator {
+  return run unsafe leanInline(&mut hooks, memory, &mut machine, opcode, count, function, kind)
+}
+@inlineNever
+unsafe effect fn quickInlineCold<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, opcode: u8, count: usize, function: ValueBits, receiver: ValueBits,
+  data: *mut ValueBits, extra: usize, target: &nativeFunctions.QuickTarget, counter: *mut i32, left: i32, fromQuickMiss: bool) -> bool ! JsException ? &mut Allocator {
+  let argv = FrameSlots { data: data, count: count }
+  let context = machine.context
+  if !fromQuickMiss {
+    if count == 1 && nativeFunctions.isStringConstructor(target) {
+      unsafe machine.publishPc()
+      if let Option<ValueBits>.Some { value: text } = run nativeFunctions.stringOfInteger(target, &argv) {
+        if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
+        unsafe Pointer.write<i32>(counter, left - 1)
+        unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
+        unsafe machine.push(text)
+        return true
+      }
+    }
+    if count != 0 && opcode == op.OP_call_method {
+      if let Option<*mut HeapHeader>.Some { value: home } = Pointer.nonNullMut<HeapHeader>(nativeFunctions.arraySpliceRealm(target)) {
+        let plan = run arrayMutation.quickSplicePlan(&mut hooks, unsafe lendRealm(&home, home), receiver, &argv)
+        if plan.start >= 0 {
+          unsafe machine.skip(2)
+          unsafe machine.publishPc()
+          unsafe Pointer.write<i32>(counter, left - 1)
+          let wanted = unsafe machine.peekU8(0) != op.OP_drop
+          let answer = run arrayMutation.quickSplice(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, &argv, plan, wanted)
+          unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
+          unsafe machine.push(answer)
+          return true
+        }
+      }
+    }
+    return false
+  }
+  unsafe machine.publishPc()
+  let mut result = ValueBits.Undefined
+  match run unsafe nativeFunctions.quickWrite(&mut hooks, target, receiver, &argv) {
+    Option<ValueBits>.Some { value } => { result = value }
+    Option<ValueBits>.None => {
+      unsafe Pointer.write<i32>(counter, left - 1)
+      result = run unsafe callNativePlain(&mut hooks, memory, context, function, receiver, &argv)
+      unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
+      unsafe machine.push(result)
+      return true
+    }
+  }
+  unsafe Pointer.write<i32>(counter, left - 1)
+  unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
+  unsafe machine.push(result)
+  return true
+}
+@inlineNever
 unsafe effect fn quickInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> bool ! JsException ? &mut Allocator {
   let count = unsafe callCount(&machine, opcode)
   let function = unsafe machine.top(count + 1)
   if !function.isObject() || unsafe classId(function) != classes.JS_CLASS_C_FUNCTION { return false }
   let kind = unsafe nativeFunctions.callKind(function)
-  if kind >= nativeFunctions.CALL_KIND_LEAN { return run unsafe leanInline(&mut hooks, memory, &mut machine, opcode, count, function, kind) }
+  if kind >= nativeFunctions.CALL_KIND_LEAN {
+    if kind == nativeFunctions.CALL_KIND_ANSWER && unsafe answerInline(&mut hooks, &mut machine, opcode, count, function) { return true }
+    return run unsafe leanInlineSlow(&mut hooks, memory, &mut machine, opcode, count, function, kind)
+  }
   let target = match unsafe nativeFunctions.quickTarget(function) {
     Option<nativeFunctions.QuickTarget>.Some { value } => value
     Option<nativeFunctions.QuickTarget>.None => { return run unsafe nativeInline(&mut hooks, memory, &mut machine, opcode, count, function) }
@@ -3152,54 +3214,15 @@ unsafe effect fn quickInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + P
   let data = unsafe operandCell(machine.stackTop, count)
   let argv = FrameSlots { data: data, count: count }
   let context = machine.context
-  // String(n) on an Int, as in key building: the text without the dispatch.
-  if count == 1 && nativeFunctions.isStringConstructor(&target) {
-    // The text may allocate, which may collect.
-    unsafe machine.publishPc()
-    if let Option<ValueBits>.Some { value: text } = run nativeFunctions.stringOfInteger(&target, &argv) {
-      if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
-      unsafe Pointer.write<i32>(counter, left - 1)
-      unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
-      unsafe machine.push(text)
-      return true
-    }
+  // String(n) on an Int or arr.splice(...) on a plain fast Array.
+  if (count == 1 && nativeFunctions.isStringConstructor(&target))
+    || (count != 0 && opcode == op.OP_call_method && !Pointer.isNull<HeapHeader>(nativeFunctions.arraySpliceRealm(&target))) {
+    if run unsafe quickInlineCold(&mut hooks, memory, &mut machine, opcode, count, function, receiver, data, extra, &target, counter, left, false) { return true }
   }
-  // arr.splice(...) on a plain fast Array: the dense splice without the native
-  // frame, species lookup and length store (font charstring edits in PdfJS).
-  if count != 0 && opcode == op.OP_call_method {
-    if let Option<*mut HeapHeader>.Some { value: home } = Pointer.nonNullMut<HeapHeader>(nativeFunctions.arraySpliceRealm(&target)) {
-      let plan = run arrayMutation.quickSplicePlan(&mut hooks, unsafe lendRealm(&home, home), receiver, &argv)
-      if plan.start >= 0 {
-        unsafe machine.skip(2)
-        unsafe machine.publishPc()
-        unsafe Pointer.write<i32>(counter, left - 1)
-        // `arr.splice(...);` as a statement: nobody sees the removed elements' Array.
-        let wanted = unsafe machine.peekU8(0) != op.OP_drop
-        let answer = run arrayMutation.quickSplice(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, &argv, plan, wanted)
-        unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
-        unsafe machine.push(answer)
-        return true
-      }
-    }
-  }
-  let mut result = nativeFunctions.quick(&mut hooks, unsafe lendRealm(&context, context), &target, unsafe lendBits(&receiver, receiver), argv)
-  let mut width: usize = 0
-  if opcode == op.OP_call || opcode == op.OP_call_method { width = 2 }
-  unsafe machine.skip(width)
+  let result = nativeFunctions.quick(&mut hooks, unsafe lendRealm(&context, context), &target, unsafe lendBits(&receiver, receiver), argv)
+  if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
   if let ValueBits.Uninitialized = result {
-    unsafe machine.publishPc()
-    match run unsafe nativeFunctions.quickWrite(&mut hooks, &target, receiver, &argv) {
-      Option<ValueBits>.Some { value } => { result = value }
-      Option<ValueBits>.None => {
-        // Neither answers: the full native call, without trying both again. The
-        // poll is charged first, as callFromBytecode's would be when not due.
-        unsafe Pointer.write<i32>(counter, left - 1)
-        result = run unsafe callNativePlain(&mut hooks, memory, context, function, receiver, &argv)
-        unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
-        unsafe machine.push(result)
-        return true
-      }
-    }
+    return run unsafe quickInlineCold(&mut hooks, memory, &mut machine, opcode, count, function, receiver, data, extra, &target, counter, left, true)
   }
   unsafe Pointer.write<i32>(counter, left - 1)
   unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
