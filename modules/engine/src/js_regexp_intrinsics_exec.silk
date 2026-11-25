@@ -434,6 +434,19 @@ effect fn resultArray<'a, 'b, H: HeapHooks>(
     ctx.regexpResultShape,
   )
   drop ctx
+  let fast = run unsafe allocate.regexpResultFast(
+    &mut hooks,
+    memory,
+    realm.runtime(),
+    shape,
+    count,
+    index,
+    string.view(),
+    groups.view(),
+  )
+  if fast.isObject() {
+    return fast
+  }
   unsafe HeapCell.retain(shape)
 
   // Slots and (for up to 16 captures) values in the array's own cell: no slot
@@ -1128,26 +1141,29 @@ effect fn answer<
   ? &mut Allocator {
   let anchor = ()
   let codeFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
+  let count = u8.toUsize(codeFlat.latin1.asSlice()[2])
   let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
+  let narrow = !text.wide
+  let inputLen = text.length()
   let mut inputBytes = Slice.view(codeFlat.latin1.asSlice(), 0, 0)
-  if !text.wide {
+  if narrow {
     inputBytes = unsafe latin1Bytes(&anchor, stringReference(input))
   }
 
   // A pattern that is one literal is a substring search: no matcher entry.
   let mut literal = LITERAL_NONE
   if (flags & FLAG_HINT) != 0 {
-    if text.wide {
+    if !narrow {
       literal = RegExpExecutor.literalInto16(
         codeFlat.latin1.asSlice(),
-        Slice.view(text.wideUnits(), 0, text.length()),
+        Slice.view(text.wideUnits(), 0, inputLen),
         lastIndex,
         &mut captures,
       )
     } else {
       literal = RegExpExecutor.literalInto8(
         codeFlat.latin1.asSlice(),
-        Slice.view(inputBytes, 0, text.length()),
+        Slice.view(inputBytes, 0, inputLen),
         lastIndex,
         &mut captures,
       )
@@ -1185,35 +1201,120 @@ effect fn answer<
     && run unsafe refillResult(&mut hooks, realm, previous, input, code, &captures) {
     return Option<ValueBits>.some(unsafe previous.retained())
   }
-  let mut state = ResultState {
-    object: ValueBits.Undefined,
-    groups: ValueBits.Undefined,
-    indices: ValueBits.Undefined,
-    indicesGroups: ValueBits.Undefined,
-    temporary: ValueBits.Undefined,
-    groupName: 0,
-  }
-  let built = run Effect.result(
-    buildResult(
-      &mut hooks,
-      memory,
-      realm,
-      unsafe lendFor(input),
-      unsafe lendFor(code),
-      &captures,
-      &mut state,
-    ),
+  return run buildPlainResult(&mut hooks, memory, realm, input, count, narrow, inputLen, &captures)
+}
+
+/// Lean plain-capture result builder for quickExec/literalExec (where flags
+/// already exclude named groups and match indices): uses regexpResultFast
+/// directly and skips ResultState, flag re-checks, and bytecode re-decoding.
+@inlineNever
+effect fn buildPlainResult<'a, H: HeapHooks>(
+  hooks: &mut H,
+  memory: &AllocationObserver,
+  realm: Realm<'a>,
+  input: ValueBits,
+  count: usize,
+  narrow: bool,
+  length: usize,
+  captures: &Captures,
+) -> Option<ValueBits>
+  ? &mut Allocator {
+  let ctxAnchor = ()
+  let shape = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(
+    realm.state(&ctxAnchor).regexpResultShape,
   )
-  return match move built {
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success {
-      value
-    } => Option<ValueBits>.some(value)
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => {
-      unsafe support.release(&mut hooks, realm, state.temporary)
-      unsafe support.release(&mut hooks, realm, state.object)
-      Option<ValueBits>.none()
+  let mut result = run unsafe allocate.regexpResultFast(
+    &mut hooks,
+    memory,
+    realm.runtime(),
+    shape,
+    count,
+    captures.get(0),
+    input,
+    ValueBits.Undefined,
+  )
+  if !result.isObject() {
+    let fallback = run Effect.result(
+      resultArray(
+        &mut hooks,
+        memory,
+        realm,
+        unsafe lendFor(input),
+        immediateRef(ValueBits.Undefined),
+        count,
+        captures.get(0),
+      ),
+    )
+    result = match move fallback {
+      Result<ValueBits, OutOfMemoryError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError>.Failure { .. } => {
+        return Option<ValueBits>.none()
+      }
     }
   }
+  let mut arrayAnchor = ()
+  let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(
+    &mut arrayAnchor,
+    core.reference(result),
+  )
+  let mut failed = false
+  match &mut arrayObject.payload {
+    ObjectPayload.FastArray { array } => {
+      if array.values().capacity() < count {
+        if array.values().capacity() == 0 {
+          if let Option<ThinList<ValueBits>>.Some { value: spare } = unsafe shapes.takeSpareValues(
+            realm.runtime(),
+            count,
+          ) {
+            let empty = array.replace(move spare)
+            drop empty
+          }
+        }
+        let reserved = run Effect.result(array.valuesMut().reserveExact(count))
+        match move reserved {
+          Result<(), OutOfMemoryError>.Success { .. } => ()
+          Result<(), OutOfMemoryError>.Failure { .. } => {
+            failed = true
+          }
+        }
+      }
+      if !failed {
+        let output = unsafe array.valuesMut().spareFor(count)
+        let inputAnchor = ()
+        let empty: [u8; 1] = [0]
+        let mut bytes = Slice.view(&empty, 0, 0)
+        if narrow {
+          bytes = unsafe latin1Bytes(&inputAnchor, stringReference(input))
+        }
+        let capSlice = captures.asSlice()
+        if capSlice.length < usize.wrappingMultiply(count, 2) { Intrinsic.trap("Captures.get: index out of range") }
+        let capPtr = unsafe Intrinsic.pointerRequalify<?[*]const i32, [*]const i32>(Pointer.fromSlice<i32>(capSlice))
+        let mut filled: usize = 0
+        let fillResult = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(
+          fillPlainCaptures(realm, unsafe lendFor(input), bytes, narrow, length, capPtr, output, count, &mut filled),
+          failedCapture,
+        )
+        match move fillResult {
+          bool _ => {
+            unsafe array.valuesMut().extendFilled(count)
+          }
+          FailedCapture { .. } => {
+            unsafe array.valuesMut().extendFilled(filled)
+            failed = true
+          }
+        }
+      }
+    }
+    _ => {
+      Intrinsic.trap("QuickJS invariant violated")
+    }
+  }
+  drop arrayObject
+  if failed {
+    unsafe support.release(&mut hooks, realm, result)
+    return Option<ValueBits>.none()
+  }
+  return Option<ValueBits>.some(result)
 }
 
 /// The most captures of a result refillResult reuses.

@@ -27,6 +27,7 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.i32
 import silk.num.i64
+import silk.num.usize
 import silk.num.f64
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
@@ -34,9 +35,9 @@ import js_value { ValueBits }
 import js_owned_value { Value, lendBits }
 import js_realm { Realm, lendRealm }
 import silk.core.result { Result }
-import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, FunctionBytecode, FunctionKind, KnownCall, ByteStorage,
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, ShapeData, SlotBits, FunctionBytecode, FunctionKind, KnownCall, ByteStorage,
   VarDef, ClosureVar, FunctionDebugInfo, HostEdges, NativeFunctionId, BuiltinFamily,
-  JS_MODE_STRICT, JS_PROP_C_W_E, JS_PROP_THROW, FrameSlots }
+  JS_MODE_STRICT, JS_PROP_C_W_E, JS_PROP_THROW, JS_PROP_WRITABLE, FrameSlots }
 import js_compiler_types { PendingFunction }
 import js_debugger_metadata { Metadata as DebuggerMetadata }
 import js_gc { HeapHooks }
@@ -59,6 +60,9 @@ import js_property_mutations as mutations
 import js_typed_array_methods_array_species as arraySpecies
 import js_array_intrinsics_support as arrays
 import js_array_intrinsics as arrayIds
+import js_object_allocate as allocate
+import js_primitives as primitives
+import js_atom_data as atoms
 import js_intl_realm as ops
 import js_proxy_core as core
 import js_class_data as classes
@@ -235,50 +239,146 @@ pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetP
   }
   return true
 }
-/// The executeLoop arm's first try, before step: forEach's and reduce's NEXT
-/// over a fast Array (nextFast), with no failure frame to set up.
+/// The executeLoop arm's first try, before step: NEXT for all seven Array
+/// callback methods over a fast Array (including loop completion and early
+/// exit for every/some), with no failure frame or publishPc.
 @inlineNever
 pub unsafe fn quick<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool {
   if !unsafe running(&machine) { return false }
   let method = match unsafe machine.local(LOCAL_METHOD) { ValueBits.Int { value } => i32.toU32(value) _ => { return false } }
-  if (method != FOR_EACH && method != REDUCE && method != REDUCE_RIGHT) || unsafe machine.peekU8(0) == INIT { return false }
-  if !unsafe nextFast(&mut hooks, &mut machine, method) { return false }
-  unsafe machine.skip(1)
-  return true
+  if unsafe machine.peekU8(0) == INIT { return false }
+  return unsafe nextFast(&mut hooks, &mut machine, method)
 }
-/// NEXT for forEach and reduce when the next element sits in a fast Array:
-/// no failure frame and no property lookup. False, with nothing changed, when
-/// the loop is done or the element needs the full path.
+/// Whether target is a fast extensible Array with writable length == expected
+/// and spare capacity for one more element without reallocation.
+@inlineAlways
+unsafe fn canAppendFast(target: ValueBits, expected: i64) -> bool {
+  if expected < 0 || expected >= 2147483647 { return false }
+  let reference = match target { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if data.classId() != classes.JS_CLASS_ARRAY || !data.fastArray() || !data.extensible() { return false }
+  let lenOk = match (unsafe data.slotUnchecked(0)).valueBits() {
+    ValueBits.Int { value } => i32.toI64(value) == expected
+    _ => false
+  }
+  if !lenOk { return false }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let writable = (u8.toU32((unsafe shape.properties.getUnchecked(0)).flags) & JS_PROP_WRITABLE) != 0
+  drop shape
+  if !writable { return false }
+  return match &data.payload {
+    ObjectPayload.FastArray { array } => {
+      let count = array.values().length()
+      count == i64.toUsize(expected) && count < array.values().capacity()
+    }
+    _ => false
+  }
+}
+/// Appends value (owned) to target, previously verified by canAppendFast.
+@inlineAlways
+unsafe fn appendFastInPlace(target: ValueBits, expected: i64, value: ValueBits) -> () {
+  let reference = match target { ValueBits.Object { reference } => reference _ => { return () } }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference)
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      let out = unsafe array.valuesMut().spareFor(1)
+      unsafe Pointer.put<ValueBits>(unsafe Pointer.atMut<ValueBits>(out, 0), value)
+      unsafe array.valuesMut().extendFilled(1)
+    }
+    _ => ()
+  }
+  unsafe data.setSlotUnchecked(0, SlotBits.value(ValueBits.Int { value: i64.toI32(expected + 1) }))
+}
+/// NEXT for all seven iteration methods when the target (if any) has spare
+/// capacity and the next element sits in a fast Array (or the loop is done).
+/// Checks every precondition before mutating state; false leaves machine intact.
 unsafe fn nextFast<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, method: u32) -> bool {
   let object = unsafe machine.local(LOCAL_OBJECT)
   let length = number(unsafe machine.local(LOCAL_LENGTH))
   let position = number(unsafe machine.local(LOCAL_POSITION))
-  if position >= length { return false }
-  let mut index = position
-  if method == REDUCE_RIGHT { index = length - position - 1 }
-  if index >= arrays.fastCount(unsafe lendBits(&object, object)) { return false }
-  let bits = arrays.fastGet(unsafe lendBits(&object, object), index).intoBits()
+  let done = position >= length
+  let mut nextIndex: i64 = 0
+  if !done {
+    nextIndex = if method == REDUCE_RIGHT { length - position - 1 } else { position }
+    if nextIndex >= arrays.fastCount(unsafe lendBits(&object, object)) { return false }
+  }
+  let mut prevIndex: i64 = 0
+  let mut selected: i64 = 0
+  let mut accepted = false
+  if method == MAP {
+    prevIndex = number(unsafe machine.local(LOCAL_INDEX))
+    if done && prevIndex + 1 != length { return false }
+    if !unsafe canAppendFast(unsafe machine.local(LOCAL_ACCUMULATOR), prevIndex) { return false }
+  } else if method == EVERY || method == SOME || method == FILTER {
+    let truth = unsafe primitives.toBoolean(unsafe machine.top(1))
+    if truth < 0 { return false }
+    accepted = truth > 0
+    if method == FILTER && accepted {
+      selected = number(unsafe machine.local(LOCAL_SELECTED))
+      if !unsafe canAppendFast(unsafe machine.local(LOCAL_ACCUMULATOR), selected) { return false }
+    }
+  }
+  // All preconditions met: consume the callback result and advance or finish.
   let result = unsafe machine.pop()
   let runtime = machine.runtime
-  let callback = unsafe (unsafe machine.argument(0)).retained()
-  let indexValue = ValueBits.number(i64.toF64(index))
-  drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position + 1)))
-  drop unsafe machine.setLocal(LOCAL_INDEX, indexValue)
   if method == FOR_EACH {
     unsafe gc.release(&mut hooks, runtime, result)
-    let thisArg = unsafe (unsafe machine.argument(1)).retained()
-    unsafe machine.push(thisArg)
-    unsafe machine.push(callback)
-  } else {
+  } else if method == REDUCE || method == REDUCE_RIGHT {
     unsafe gc.release(&mut hooks, runtime, unsafe machine.setLocal(LOCAL_ACCUMULATOR, result))
+  } else if method == MAP {
+    unsafe appendFastInPlace(unsafe machine.local(LOCAL_ACCUMULATOR), prevIndex, result)
+  } else if method == EVERY {
+    unsafe gc.release(&mut hooks, runtime, result)
+    if !accepted {
+      drop unsafe finish(&mut machine, ValueBits.Bool { value: false })
+      return true
+    }
+  } else if method == SOME {
+    unsafe gc.release(&mut hooks, runtime, result)
+    if accepted {
+      drop unsafe finish(&mut machine, ValueBits.Bool { value: true })
+      return true
+    }
+  } else if method == FILTER {
+    unsafe gc.release(&mut hooks, runtime, result)
+    let element = unsafe machine.setLocal(LOCAL_ELEMENT, ValueBits.Undefined)
+    if accepted {
+      unsafe appendFastInPlace(unsafe machine.local(LOCAL_ACCUMULATOR), selected, element)
+      drop unsafe machine.setLocal(LOCAL_SELECTED, ValueBits.number(i64.toF64(selected + 1)))
+    } else {
+      unsafe gc.release(&mut hooks, runtime, element)
+    }
+  }
+  if done {
+    drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position)))
+    let accumulator = unsafe machine.setLocal(LOCAL_ACCUMULATOR, ValueBits.Undefined)
+    drop unsafe finish(&mut machine, accumulator)
+    return true
+  }
+  let bits = arrays.fastGet(unsafe lendBits(&object, object), nextIndex).intoBits()
+  let callback = unsafe (unsafe machine.argument(0)).retained()
+  let indexValue = ValueBits.number(i64.toF64(nextIndex))
+  drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position + 1)))
+  drop unsafe machine.setLocal(LOCAL_INDEX, indexValue)
+  if method == FILTER {
+    drop unsafe machine.setLocal(LOCAL_ELEMENT, unsafe bits.retained())
+  }
+  if method == REDUCE || method == REDUCE_RIGHT {
     let accumulator = unsafe (unsafe machine.local(LOCAL_ACCUMULATOR)).retained()
     unsafe machine.push(ValueBits.Undefined)
     unsafe machine.push(callback)
     unsafe machine.push(accumulator)
+  } else {
+    let thisArg = unsafe (unsafe machine.argument(1)).retained()
+    unsafe machine.push(thisArg)
+    unsafe machine.push(callback)
   }
   unsafe machine.push(bits)
   unsafe machine.push(indexValue)
   unsafe machine.push(unsafe object.retained())
+  unsafe machine.skip(1)
   return true
 }
 /// Whether machine's code is its realm's iteration code.
@@ -308,8 +408,25 @@ unsafe effect fn advance<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
     let mut accumulator = ValueBits.Undefined
     if method == EVERY { accumulator = ValueBits.Bool { value: true } }
     if method == SOME { accumulator = ValueBits.Bool { value: false } }
-    if method == MAP { accumulator = (run arraySpecies.create(&mut hooks, memory, realm, unsafe lendBits(&object, object), length)).intoBits() }
-    if method == FILTER { accumulator = (run arraySpecies.create(&mut hooks, memory, realm, unsafe lendBits(&object, object), 0)).intoBits() }
+    if method == MAP {
+      let constructor = run arraySpecies.getConstructor(&mut hooks, memory, realm, unsafe lendBits(&object, object))
+      if core.undefined(constructor.view()) && length <= 65536 {
+        // Keep the fresh result array dense/fast while filling sequentially;
+        // trailing holes (if any) set its final length at loop completion.
+        accumulator = run allocate.arrayWithCapacity(&mut hooks, memory, realm, i64.toUsize(length))
+      } else {
+        accumulator = (run arraySpecies.createFromConstructor(&mut hooks, memory, realm, constructor.borrow(), length)).intoBits()
+      }
+    }
+    if method == FILTER {
+      let constructor = run arraySpecies.getConstructor(&mut hooks, memory, realm, unsafe lendBits(&object, object))
+      if core.undefined(constructor.view()) {
+        let cap: usize = if length <= 8 { i64.toUsize(length) } else { 8 }
+        accumulator = run allocate.arrayWithCapacity(&mut hooks, memory, realm, cap)
+      } else {
+        accumulator = (run arraySpecies.createFromConstructor(&mut hooks, memory, realm, constructor.borrow(), 0)).intoBits()
+      }
+    }
     if reducing {
       if unsafe activation.argumentCountOf(&machine) > 1 { accumulator = unsafe (unsafe machine.argument(1)).retained() }
       else { accumulator = (run initial(&mut hooks, realm, object, method, length, &mut position)).intoBits() }
@@ -378,6 +495,21 @@ unsafe effect fn advance<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
     return false
   }
   drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position)))
+  if method == MAP && length > 0 && length <= 65536 {
+    let target = unsafe machine.local(LOCAL_ACCUMULATOR)
+    if let ValueBits.Object { reference } = target {
+      let anchor = ()
+      let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      let needsLength = data.classId() == classes.JS_CLASS_ARRAY && match (unsafe data.slotUnchecked(0)).valueBits() {
+        ValueBits.Int { value } => i32.toI64(value) < length
+        _ => false
+      }
+      drop data
+      if needsLength {
+        let _written = run mutations.setProperty(&mut hooks, realm, unsafe lendBits(&target, target), atoms.JS_ATOM_length, unsafe Value.adoptBits(ValueBits.number(i64.toF64(length))))
+      }
+    }
+  }
   let accumulator = unsafe machine.setLocal(LOCAL_ACCUMULATOR, ValueBits.Undefined)
   return unsafe finish(&mut machine, accumulator)
 }
