@@ -486,6 +486,22 @@ function onError(self, error, cb) {
   }
 }
 
+function hasRawHeader(msg, lowerName) {
+  if (msg[kHeaders] !== null) {
+    return msg.headers[lowerName] !== undefined;
+  }
+  const raw = msg.rawHeaders;
+  const n = msg[kHeadersCount];
+  const len = lowerName.length;
+  for (let i = 0; i < n; i += 2) {
+    const k = raw[i];
+    if (typeof k === 'string' && k.length === len && k.toLowerCase() === lowerName) {
+      return true;
+    }
+  }
+  return false;
+}
+
 module.exports = {
   IncomingMessage,
   makeLeanNext,
@@ -493,6 +509,7 @@ module.exports = {
   resumeScheduled,
   readableEnded,
   isLean,
+  hasRawHeader,
   kDetachAbortSignal,
   readStart,
   readStop,

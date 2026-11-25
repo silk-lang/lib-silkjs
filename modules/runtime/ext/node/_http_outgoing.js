@@ -583,6 +583,12 @@ function _storeHeader(firstLine, headers) {
     maxRequestsPerSocket
   );
 
+  if (typeof res === 'string') {
+    this._header = res;
+    this._headerSent = false;
+    return;
+  }
+
   const errCode = res[0];
   if (errCode !== 0) {
     if (errCode === 1) throw new ERR_INVALID_HTTP_TOKEN('Header name', res[1]);
@@ -1199,13 +1205,19 @@ OutgoingMessage.prototype.end = function end(chunk, encoding, callback) {
     }
   }
 
-  if (this[kSocket]) {
-    // Fully uncork connection on end().
-    this[kSocket]._writableState.corked = 1;
-    this[kSocket].uncork();
+  const sock = this[kSocket];
+  if (sock) {
+    const ws = sock._writableState;
+    if (!ws || ws.corked > 0) {
+      // Fully uncork connection on end().
+      if (ws) ws.corked = 1;
+      sock.uncork();
+    }
   }
-  this[kCorked] = 1;
-  this.uncork();
+  if (this[kCorked] > 0) {
+    this[kCorked] = 1;
+    this.uncork();
+  }
 
   this.finished = true;
 

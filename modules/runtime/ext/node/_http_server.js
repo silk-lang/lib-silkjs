@@ -62,6 +62,7 @@ const {
   resumeScheduled,
   readableEnded,
   isLean: isLeanRequest,
+  hasRawHeader,
 } = require('_http_incoming');
 const {
   ConnResetException,
@@ -1141,15 +1142,23 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
     }
   }
 
-  const res = new server[kServerResponse](req,
-                                          {
-                                            highWaterMark: socket.writableHighWaterMark,
-                                            rejectNonStandardBodyWrites: server.rejectNonStandardBodyWrites,
-                                          });
+  let responseOptions = state.responseOptions;
+  const hwm = socket.writableHighWaterMark;
+  const rejectNonStd = server.rejectNonStandardBodyWrites;
+  if (!responseOptions ||
+      responseOptions.highWaterMark !== hwm ||
+      responseOptions.rejectNonStandardBodyWrites !== rejectNonStd) {
+    responseOptions = {
+      highWaterMark: hwm,
+      rejectNonStandardBodyWrites: rejectNonStd,
+    };
+    state.responseOptions = responseOptions;
+  }
+
+  const res = new server[kServerResponse](req, responseOptions);
   res._keepAliveTimeout = server.keepAliveTimeout;
   res._maxRequestsPerSocket = server.maxRequestsPerSocket;
-  res._onPendingData = updateOutgoingData.bind(undefined,
-                                               socket, state);
+  res._onPendingData = (state.onPendingData ||= updateOutgoingData.bind(undefined, socket, state));
 
   res.shouldKeepAlive = keepAlive;
   res[kUniqueHeaders] = server[kUniqueHeaders];
@@ -1164,7 +1173,9 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
   }
 
   // Check if we should optimize empty requests (those without Content-Length or Transfer-Encoding headers)
-  const shouldOptimize = server[kOptimizeEmptyRequests] === true && !hasBodyHeaders(req.headers);
+  const shouldOptimize = server[kOptimizeEmptyRequests] === true &&
+    !hasRawHeader(req, 'content-length') &&
+    !hasRawHeader(req, 'transfer-encoding');
 
   if (shouldOptimize) {
     // Fast processing where emitting 'data', 'end' and 'close' events is
@@ -1202,7 +1213,7 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
     // From RFC 7230 5.4 https://datatracker.ietf.org/doc/html/rfc7230#section-5.4
     // A server MUST respond with a 400 (Bad Request) status code to any
     // HTTP/1.1 request message that lacks a Host header field
-    if (server.requireHostHeader && req.headers.host === undefined) {
+    if (server.requireHostHeader && !hasRawHeader(req, 'host')) {
       res.writeHead(400, ['Connection', 'close']);
       res.end();
       return 0;
@@ -1225,7 +1236,7 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
       server.emit('dropRequest', req, socket);
       res.writeHead(503);
       res.end();
-    } else if (req.headers.expect !== undefined) {
+    } else if (hasRawHeader(req, 'expect')) {
       handled = true;
 
       if (continueExpression.test(req.headers.expect)) {

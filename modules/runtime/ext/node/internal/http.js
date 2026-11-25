@@ -2,6 +2,7 @@
 // Adapted from Node.js v24.22.1 lib/internal/http.js (primordials replaced by plain calls).
 'use strict';
 
+const { setUnrefTimeout } = require('internal/timers');
 const httpNative = require('internal/host').httpParserNative;
 const traceEvents = require('internal/trace_events');
 
@@ -9,8 +10,20 @@ const { URL } = require('internal/url');
 const { Buffer } = require('buffer');
 const { ERR_PROXY_INVALID_CONFIG } = require('internal/errors').codes;
 
+let utcCache;
+
 function utcDate() {
-  return httpNative(23, false);
+  if (!utcCache) cache();
+  return utcCache;
+}
+
+function cache() {
+  utcCache = httpNative(23, false);
+  setUnrefTimeout(resetCache, 1000 - (Date.now() % 1000));
+}
+
+function resetCache() {
+  utcCache = undefined;
 }
 
 let traceEventId = 0;

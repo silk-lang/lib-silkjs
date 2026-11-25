@@ -229,8 +229,8 @@ function checkIsHttpToken(val) {
  * @param {boolean} [lenient] - Use lenient validation (Fetch spec rules)
  * @returns {boolean}
  */
-function checkInvalidHeaderChar(val, lenient = false) {
-  return httpNative(21, val, Boolean(lenient));
+function checkInvalidHeaderChar(val, lenient) {
+  return httpNative(21, val, lenient);
 }
 
 function cleanParser(parser) {
