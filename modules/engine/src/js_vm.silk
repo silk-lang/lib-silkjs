@@ -726,9 +726,9 @@ unsafe effect fn baselineLoop<H: HeapHooks>(hooks: &mut H, machine: &mut Machine
   if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), cells * Layout.of<ValueBits>().bytes + baseline.recordBytes() + 4096, true) { return false }
   let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut StackFrame, *const StackFrame>(machine.frame))
   let function = frame.currentFunction
-  let arguments = frame.arguments
   let outer = frame.previous
   drop frame
+  let arguments = unsafe activation.frameArguments(unsafe Intrinsic.pointerRequalify<*mut StackFrame, *const StackFrame>(machine.frame))
   let mut from = baseline.Resume { arguments: arguments.data, count: arguments.count, locals: machine.locals, stack: machine.stack, sp: machine.sp(), pc: machine.pc(),
     returnPc: 0, returnsValue: false, taken: false }
   // A known local function's frame names its bytecode and runs in the scope its caller passed.
@@ -4490,6 +4490,26 @@ unsafe fn releaseOperand<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, 
 /// quickInline for any other native builtin (regexp exec, string methods and
 /// the like): the native call itself, without callFromBytecode's and callClass's
 /// layers. The poll is charged as theirs would be; false when it is due.
+/// Pushes a frameless boolean answer, or fuses a following forward
+/// OP_if_false8 / OP_if_true8 when instructions are not being observed.
+@inlineAlways
+unsafe fn pushOrBranchAnswer(machine: &mut Machine, answer: ValueBits) -> () {
+  if let ValueBits.Bool { value: flag } = answer {
+    let anchor = ()
+    if !(unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).observeInstructions {
+      let next = unsafe machine.peekU8(0)
+      if next == op.OP_if_false8 || next == op.OP_if_true8 {
+        let displacement = unsafe machine.peekI8At(1)
+        if displacement > 0 {
+          unsafe machine.skip(2)
+          if flag == (next == op.OP_if_true8) { unsafe machine.jump(displacement, 1) }
+          return ()
+        }
+      }
+    }
+  }
+  unsafe machine.push(answer)
+}
 @inlineAlways
 unsafe effect fn nativeInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, opcode: u8, count: usize, function: ValueBits) -> bool ! JsException ? &mut Allocator {
@@ -4502,7 +4522,6 @@ unsafe effect fn nativeInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let argv = FrameSlots { data: data, count: count }
   let context = machine.context
   if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
-  unsafe machine.publishPc()
   unsafe Pointer.write<i32>(counter, left - 1)
   // native.call(thisArg, ...args), as in hasOwnProperty.call(object, key): the
   // target is called itself, without Function.prototype.call's frame around it.
@@ -4515,16 +4534,18 @@ unsafe effect fn nativeInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
         ValueBits.Uninitialized => ()
         _ => {
           unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
-          unsafe machine.push(quick)
+          unsafe pushOrBranchAnswer(&mut machine, quick)
           return true
         }
       }
     }
+    unsafe machine.publishPc()
     let answer = run unsafe callNativePlain(&mut hooks, memory, context, receiver, unsafe argv.get(0), &rest)
     unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
     unsafe machine.push(answer)
     return true
   }
+  unsafe machine.publishPc()
   let result = run unsafe callNativePlain(&mut hooks, memory, context, function, receiver, &argv)
   unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
   unsafe machine.push(result)
@@ -4562,23 +4583,23 @@ unsafe effect fn framelessCall<H: HeapHooks + CoercionHooks + NativeFunctionHook
 unsafe effect fn leanMethod<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, count: usize) -> bool ! JsException ? &mut Allocator {
   let function = unsafe machine.top(count + 1)
-  return run unsafe leanInline(&mut hooks, memory, &mut machine, op.OP_call_method, count, function)
+  let kind = unsafe nativeFunctions.callKind(function)
+  return run unsafe leanInline(&mut hooks, memory, &mut machine, op.OP_call_method, count, function, kind)
 }
 /// The native call for a function whose callKind is not SLOW: a
 /// CALL_KIND_ANSWER builtin's frameless answer first (answerInline), else
 /// leanCall.
 @inlineAlways
 unsafe effect fn leanInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, machine: &mut Machine, opcode: u8, count: usize, function: ValueBits) -> bool ! JsException ? &mut Allocator {
-  let kind = unsafe nativeFunctions.callKind(function)
-  if kind == nativeFunctions.CALL_KIND_FRAMELESS { return run unsafe framelessCall(&mut hooks, &mut machine, opcode, count, function) }
-  if kind == nativeFunctions.CALL_KIND_ASYNC_CONTEXT && unsafe asyncContextCall(&mut hooks, &mut machine, opcode, count, function) { return true }
+  memory: &AllocationObserver, machine: &mut Machine, opcode: u8, count: usize, function: ValueBits, kind: u8) -> bool ! JsException ? &mut Allocator {
   if kind == nativeFunctions.CALL_KIND_ANSWER && unsafe answerInline(&mut hooks, &mut machine, opcode, count, function) { return true }
+  if kind == nativeFunctions.CALL_KIND_OBJECT_KEYS && count == 1 && run unsafe objectKeysInline(&mut hooks, memory, &mut machine, opcode, function) { return true }
   if kind == nativeFunctions.CALL_KIND_STRING && opcode == op.OP_call_method && run unsafe stringInline(&mut hooks, &mut machine, count, function) { return true }
   if kind == nativeFunctions.CALL_KIND_REGEXP_EXEC && opcode == op.OP_call_method && count != 0 && run unsafe regexpMethodInline(&mut hooks, memory, &mut machine, count, function, false) { return true }
   if kind == nativeFunctions.CALL_KIND_REGEXP_TEST && opcode == op.OP_call_method && count != 0 && run unsafe regexpMethodInline(&mut hooks, memory, &mut machine, count, function, true) { return true }
   if kind == nativeFunctions.CALL_KIND_STRING_REPLACE && opcode == op.OP_call_method && count == 2 && run unsafe stringReplaceInline(&mut hooks, memory, &mut machine, function) { return true }
-  if kind == nativeFunctions.CALL_KIND_OBJECT_KEYS && count == 1 && run unsafe objectKeysInline(&mut hooks, memory, &mut machine, opcode, function) { return true }
+  if kind == nativeFunctions.CALL_KIND_FRAMELESS { return run unsafe framelessCall(&mut hooks, &mut machine, opcode, count, function) }
+  if kind == nativeFunctions.CALL_KIND_ASYNC_CONTEXT && unsafe asyncContextCall(&mut hooks, &mut machine, opcode, count, function) { return true }
   return run unsafe leanCall(&mut hooks, memory, &mut machine, opcode, count, function)
 }
 /// A CALL_KIND_OBJECT_KEYS call (`Object.keys(obj)`): runs objectIntrinsics.quickKeys
@@ -4718,7 +4739,7 @@ unsafe fn answerInline<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcod
   if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
   unsafe Pointer.write<i32>(counter, left - 1)
   unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
-  unsafe machine.push(answer)
+  unsafe pushOrBranchAnswer(&mut machine, answer)
   return true
 }
 /// quickInline for a native function classified CALL_KIND_LEAN: no frameless
@@ -5085,7 +5106,8 @@ unsafe effect fn quickInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + P
   let count = unsafe callCount(&machine, opcode)
   let function = unsafe machine.top(count + 1)
   if !function.isObject() || unsafe classId(function) != classes.JS_CLASS_C_FUNCTION { return false }
-  if unsafe nativeFunctions.callKind(function) >= nativeFunctions.CALL_KIND_LEAN { return run unsafe leanInline(&mut hooks, memory, &mut machine, opcode, count, function) }
+  let kind = unsafe nativeFunctions.callKind(function)
+  if kind >= nativeFunctions.CALL_KIND_LEAN { return run unsafe leanInline(&mut hooks, memory, &mut machine, opcode, count, function, kind) }
   let target = match unsafe nativeFunctions.quickTarget(function) {
     Option<nativeFunctions.QuickTarget>.Some { value } => value
     Option<nativeFunctions.QuickTarget>.None => { return run unsafe nativeInline(&mut hooks, memory, &mut machine, opcode, count, function) }
@@ -6065,15 +6087,20 @@ unsafe effect fn constructRecipeFast<H: HeapHooks>(hooks: &mut H, memory: &Alloc
   let data = unsafe operandCell(machine.stackTop, count)
   let argv = FrameSlots { data: data, count: count }
   let first = unsafe operandCell(data, 2)
-  let planned = run unsafe evaluation.plannedFast(&mut hooks, memory, machine.runtime, final, empty, targetBytecode, plan.stores, plan.tail, plan.recipeSlot, plan.cacheSlot, &argv)
+  let mut moved: u32 = 0
+  let planned = run unsafe evaluation.plannedFast(&mut hooks, memory, machine.runtime, final, empty, targetBytecode, plan.stores, plan.tail, plan.recipeSlot, plan.cacheSlot, &argv, &mut moved)
   if !planned.isObject() { return 0 }
   unsafe machine.skip(2)
-  let operands = unsafe Pointer.assumeManyMut<ValueBits>(data)
-  let mut index: usize = 0
-  while index < count {
-    let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, index))
-    if value.tag() < 0 { unsafe gc.release(&mut hooks, machine.runtime, value) }
-    index = usize.wrappingAdd(index, 1)
+  if count != 0 && (count > 4 || moved != u32.wrappingSubtract(u32.shiftLeft(1, usize.toU32(count)), 1)) {
+    let operands = unsafe Pointer.assumeManyMut<ValueBits>(data)
+    let mut index: usize = 0
+    while index < count {
+      if index >= 4 || (moved & u32.shiftLeft(1, usize.toU32(index))) == 0 {
+        let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, index))
+        if value.tag() < 0 { unsafe gc.release(&mut hooks, machine.runtime, value) }
+      }
+      index = usize.wrappingAdd(index, 1)
+    }
   }
   let mut fnAnchor = ()
   let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut fnAnchor, owner)
