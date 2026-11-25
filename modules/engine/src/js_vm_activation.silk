@@ -396,11 +396,7 @@ pub unsafe fn calleeOf(function: ValueBits) -> Callee {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   return match &data.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
-      let mut refs: ?*const ?*mut HeapHeader = Pointer.null<?*mut HeapHeader>()
-      if closure.varRefs.length() != 0 {
-        refs = unsafe Intrinsic.pointerRequalify<*const ?*mut HeapHeader, ?*const ?*mut HeapHeader>(unsafe closure.varRefs.first())
-      }
-      Callee { bytecode: closure.bytecode, closureReferences: refs, scope: closure.scope }
+      Callee { bytecode: closure.bytecode, closureReferences: unsafe closure.varRefs.firstOrNull(), scope: closure.scope }
     }
     _ => trap()
   }
@@ -415,8 +411,7 @@ impl Copy for KnownContext {}
 pub unsafe fn knownContext(bytecode: *mut HeapHeader, caller: *const Machine, empty: *const ?*mut HeapHeader) -> KnownContext {
   let anchor = ()
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
-  let mut references = empty
-  if code.known.refs.length() != 0 { references = unsafe code.known.refs.first() }
+  let references = unsafe code.known.refs.firstOr(empty)
   let level = code.known.envLevel
   drop code
   if level == 0 { return KnownContext { references: references, scope: Pointer.null<HeapHeader>() } }
@@ -535,13 +530,20 @@ unsafe fn copyInlineArguments(storage: *mut ValueBits, argumentData: *mut ValueB
   while index < copied { unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, index), ValueBits.Undefined) index = index + 1 }
 }
 @inlineNever
-unsafe fn enterFrameObserved(runtime: *mut HeapHeader, machine: *mut Machine, tail: *mut InlineTail,
-  caller: *mut Machine, original: FrameSlots, first: *mut ValueBits) -> () {
+unsafe fn enterFrameObserved(machine: *mut Machine) -> () {
   let anchor = ()
+  let calleeView = unsafe Pointer.borrow<(), Machine>(&anchor, machine)
+  let runtime = calleeView.runtime
+  let tail = unsafe tailOf(&calleeView)
+  let tailAnchor = ()
+  let tailView = unsafe Pointer.borrow<(), InlineTail>(&tailAnchor, tail)
+  let caller = tailView.caller
+  let original = tailView.arguments
+  let first = tailView.first
+  drop tailView
   let callerView = unsafe Pointer.borrow<(), Machine>(&anchor, caller)
   unsafe callerView.publishDebugPc()
   drop callerView
-  let calleeView = unsafe Pointer.borrow<(), Machine>(&anchor, machine)
   let observation = unsafe debugger.enter(&calleeView)
   drop calleeView
   unsafe Pointer.put<InlineTail>(tail, InlineTail { caller: caller, arguments: original, first: first, observation: move observation })
@@ -561,15 +563,9 @@ unsafe fn enterFrame(runtime: *mut HeapHeader, function: ValueBits, bytecode: *m
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let count = arguments.length()
   let declared = u16.toUsize(code.argumentCount)
-  let localCount = u16.toUsize(code.variableCount)
-  let stackCount = u16.toUsize(code.stackSize)
-  let referenceCount = u16.toUsize(code.varRefCount)
   let mut copied: usize = 0
   if count < declared { copied = declared } else if copy { copied = count }
   let slot = Layout.of<ValueBits>().bytes
-  // A scope function's scope lives at the end of its record until a closure
-  // captures it (js_scopes.promote).
-  let scopeSlots = u16.toUsize(code.scopeSlots)
   // A stub, or a function linked to machine code (js_runtime.linkCompiled), has frameCells
   // STUB_FRAME_CELLS: it never fits, and the call takes the native-stack entry.
   // A function linked to machine code is entered only to continue a deoptimized run
@@ -586,7 +582,6 @@ unsafe fn enterFrame(runtime: *mut HeapHeader, function: ValueBits, bytecode: *m
   let previous = state.currentStackFrame
   let frame = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(top)
   state.currentStackFrame = frame
-  let observed = state.observeInstructions
   drop state
   let machine = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut Machine>(unsafe slotAt(top, frameSlots()))
   let tail = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(top, frameSlots() + machineSlots()))
@@ -608,7 +603,15 @@ unsafe fn enterFrame(runtime: *mut HeapHeader, function: ValueBits, bytecode: *m
   callee.frame = frame callee.closureReferences = closureReferences callee.scope = scope callee.thisValue = receiver
   callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut InlineTail, *mut u8>(tail)), boolToUsize(construct))
   drop callee
+  // Write InlineTail before any out-of-line calls so caller, first, tail, and
+  // arguments need not spill across copyInlineArguments, memset, or beginFrameScope.
   let storage = unsafe slotAt(top, recordSlots())
+  let mut original = arguments
+  if copy { original = FrameSlots { data: storage, count: count } }
+  let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
+  debugTail.caller = caller debugTail.arguments = original debugTail.first = first
+  debugTail.observation.tracked = false
+  drop debugTail
   let mut argumentData = empty
   if count != 0 { argumentData = arguments.data }
   let mut argumentCount = count
@@ -617,6 +620,9 @@ unsafe fn enterFrame(runtime: *mut HeapHeader, function: ValueBits, bytecode: *m
     unsafe copyInlineArguments(storage, argumentData, count, copied)
     argumentData = storage argumentCount = copied
   }
+  let localCount = u16.toUsize(code.variableCount)
+  let stackCount = u16.toUsize(code.stackSize)
+  let referenceCount = u16.toUsize(code.varRefCount)
   let locals = unsafe slotAt(storage, copied)
   let stack = unsafe slotAt(locals, localCount)
   let references = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe slotAt(stack, stackCount))
@@ -644,13 +650,13 @@ unsafe fn enterFrame(runtime: *mut HeapHeader, function: ValueBits, bytecode: *m
     unsafe ValueBits.storeLanesAt(unsafe slotAt(locals, index), undefined)
     index = usize.wrappingAdd(index, 1)
   }
-  index = 0
-  while index < referenceCount {
-    unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references), index), Pointer.null<HeapHeader>())
-    index = index + 1
+  if referenceCount != 0 {
+    index = 0
+    while index < referenceCount {
+      unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references), index), Pointer.null<HeapHeader>())
+      index = index + 1
+    }
   }
-  let mut original = arguments
-  if copy { original = FrameSlots { data: storage, count: count } }
   let start = unsafe code.code.start()
   let mut ip = start
   // A method's `push_this put_locK` prologue runs here for an object receiver
@@ -664,36 +670,40 @@ unsafe fn enterFrame(runtime: *mut HeapHeader, function: ValueBits, bytecode: *m
       ip = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 2)
     }
   }
-  let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(empty)
-  if code.constants.length() != 0 { constants = unsafe code.constants.first() }
+  let constants = unsafe code.constants.firstOr(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(empty))
   let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), Machine>(&mut entryAnchor, machine)
   entry.code = start entry.constants = constants entry.ip = ip
   drop entry
-  if scopeSlots != 0 { unsafe beginFrameScope(machine, unsafe slotAt(top, slots - scopes.frameCells(scopeSlots)), scopeSlots, bytecode, &arguments) }
+  // A scope function's scope lives at the end of its record until a closure
+  // captures it (js_scopes.promote).
+  let scopeSlots = u16.toUsize(code.scopeSlots)
   drop code
+  if scopeSlots != 0 { unsafe beginFrameScope(machine, scopeSlots, bytecode) }
   if counted { unsafe hotness.enter(bytecode) }
   // Debugger activations are kept only while instructions are observed: an
-  // unobserved frame stores just tracked = false, and adoptFrames links it in
-  // when observation turns on.
-  if observed {
-    unsafe enterFrameObserved(runtime, machine, tail, caller, original, first)
-  } else {
-    let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
-    debugTail.caller = caller debugTail.arguments = original debugTail.first = first
-    debugTail.observation.tracked = false
+  // unobserved frame already stored tracked = false above, and adoptFrames links
+  // it in when observation turns on.
+  if (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).observeInstructions {
+    unsafe enterFrameObserved(machine)
   }
   return Option<*mut Machine>.some(machine)
 }
 /// enterInline's scope-function tail, out of line so a plain call has no
-/// scope-dependent stores: places the frame-resident scope at storage, begins it
-/// under the closure's scope (callee.scope so far, borrowed), makes it the
-/// callee's scope and marks the record as owning it.
+/// scope-dependent stores: places the frame-resident scope at the end of the
+/// record, begins it under the closure's scope (callee.scope so far, borrowed),
+/// makes it the callee's scope and marks the record as owning it.
 @inlineNever
-unsafe fn beginFrameScope(callee: *mut Machine, storage: *mut ValueBits, slots: usize, bytecode: *mut HeapHeader,
-  arguments: &FrameSlots) -> () {
+unsafe fn beginFrameScope(callee: *mut Machine, slots: usize, bytecode: *mut HeapHeader) -> () {
   let mut anchor = () let machine = unsafe Pointer.borrowMut<(), Machine>(&mut anchor, callee)
+  let stateAnchor = ()
+  let base = unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(machine.frame)
+  let top = unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>((unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, machine.runtime)).callFramesTop)
+  let totalSlots = usize.wrappingSubtract(Pointer.address<ValueBits>(top), Pointer.address<ValueBits>(base)) / Layout.of<ValueBits>().bytes
+  let storage = unsafe slotAt(base, usize.wrappingSubtract(totalSlots, scopes.frameCells(slots)))
+  let tailAnchor = ()
+  let arguments = (unsafe Pointer.borrow<(), InlineTail>(&tailAnchor, unsafe tailOf(&machine))).arguments
   let own = unsafe scopes.placeFrameScope(storage, slots)
-  unsafe scopes.beginScope(own, machine.scope, bytecode, arguments)
+  unsafe scopes.beginScope(own, machine.scope, bytecode, &arguments)
   machine.scope = own
   machine.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(machine.record)), 4)
 }
