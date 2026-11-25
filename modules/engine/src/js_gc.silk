@@ -37,7 +37,7 @@ import js_compiler_types { PendingFunction, LazyStub }
 import js_compiler_state as compilerState
 import js_core_types { HostEdges, hostImportView, hostModuleView, hostScriptMetadataView }
 import js_core_types { USER_VALUE_COUNT, ClosureKind }
-import js_core_types { blankConstructEntry, NO_SP, ScopeData, scopeSlot, LiteralCacheEntry, literalCacheIndex, FieldCacheEntry, fieldCacheIndex, fieldSpareIndex, ConstructPin, blankReceiverEntry, ForwardEntry, blankForwardEntry, EmptyShapeEntry,
+import js_core_types { blankConstructEntry, constructCacheSlot, NO_SP, ScopeData, scopeSlot, LiteralCacheEntry, literalCacheIndex, fieldCacheIndex, fieldSpareIndex, ConstructPin, blankReceiverEntry, ForwardEntry, blankForwardEntry, EmptyShapeEntry,
   RuntimeState, ContextState, GcPhase, HeapList, ObjectData, ObjectPayload,
   PropertySlot, ShapeData, ShapeProperty, JS_PROP_TMASK, JS_PROP_AUTOINIT, FunctionBytecode, VarRef, VarRefState, 
   StackFrame, AsyncFrame, ModuleDef, ExportBinding, NativeFunctionId, BuiltinFamily,
@@ -46,7 +46,7 @@ import js_core_types { blankConstructEntry, NO_SP, ScopeData, scopeSlot, Literal
   linkedModule, NativeCapturedValues
 }
 import js_class_data { JS_CLASS_OBJECT, JS_CLASS_ARRAY, JS_CLASS_BYTECODE_FUNCTION }
-import js_runtime_classes { NATIVE_JS_ARRAY_FINALIZER }
+import js_runtime_classes { NATIVE_JS_ARRAY_FINALIZER, NATIVE_JS_REGEXP_FINALIZER }
 import js_shapes
 import js_allocation_realms as allocationRealms
 import js_atom_data as atomIds
@@ -810,7 +810,7 @@ pub unsafe fn pinConstructed<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   let final = data.shape
   drop data
   let address = Pointer.address<HeapHeader>(final)
-  let slot = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 58)) & 62
+  let slot = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 56)) & 254
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   if state.constructPins[slot].final == address || state.constructPins[slot + 1].final == address { return () }
   drop state
@@ -818,7 +818,7 @@ pub unsafe fn pinConstructed<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
 }
 @inlineNever
 unsafe fn repin<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, slot: usize, final: *mut HeapHeader) -> () {
-  let mut chain: [?*mut HeapHeader; 8] = [Pointer.null<HeapHeader>(); 8]
+  let mut chain: [?*mut HeapHeader; 16] = [Pointer.null<HeapHeader>(); 16]
   let count = unsafe js_shapes.constructChain(runtime, final, &mut chain)
   let mut i: usize = 0
   while i < count { unsafe js_shapes.take(runtime, unsafe nonnull(chain[i])) i = i + 1 }
@@ -1060,6 +1060,45 @@ pub unsafe fn plannedShape(runtime: *mut HeapHeader, function: *mut HeapHeader, 
   header.referenceCount = i32.wrappingAdd(count, 1)
   return PlannedShape { final: entry.final, empty: entry.empty, sources: entry.sources, stores: u8.toUsize(entry.stores) }
 }
+/// plannedShape without retaining final yet, for the spare-cell fast path in
+/// plannedConstructFast (which retains final only once the spare cell is taken).
+@inlineAlways
+pub unsafe fn plannedShapeUnretained(runtime: *mut HeapHeader, function: *mut HeapHeader, bytecode: usize) -> PlannedShape {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let address = Pointer.address<HeapHeader>(function)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let epoch = state.shapeEpoch
+  let missed = PlannedShape { final: Pointer.null<HeapHeader>(), empty: Pointer.null<HeapHeader>(), sources: [0; 8], stores: 0 }
+  let slot = receiverWay(&mut state.*, address)
+  if slot >= RECEIVER_MISS { return missed }
+  let entry = &mut state.receiverCache[slot]
+  if entry.version != version || entry.stores == 0 || entry.bytecode != bytecode || data.isExotic() { return missed }
+  let final = unsafe nonnull(entry.final)
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  match (unsafe data.slotUnchecked(entry.index)).valueBits() {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(unsafe nonnull(finalShape.prototype)) { return missed }
+    }
+    _ => { return missed }
+  }
+  if entry.epoch != epoch {
+    let mut current = finalShape.prototype
+    let depth = u8.toUsize(entry.depth)
+    let mut level: usize = 0
+    while level < depth {
+      let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(current))
+      let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+      if linkShape.version != entry.chain[level] { return missed }
+      current = linkShape.prototype
+      level = usize.wrappingAdd(level, 1)
+    }
+    entry.epoch = epoch
+  }
+  return PlannedShape { final: entry.final, empty: entry.empty, sources: entry.sources, stores: u8.toUsize(entry.stores) }
+}
 /// The prototype of the final shape function's construct plan reaches, when its
 /// receiver cache entry holds a plan; null otherwise. Not checked against
 /// function.prototype (plannedShape does that).
@@ -1074,6 +1113,88 @@ pub unsafe fn planPrototype(runtime: *mut HeapHeader, function: *mut HeapHeader)
   let final = unsafe nonnull(entry.final)
   drop entry drop state
   return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)).prototype
+}
+/// Result of plannedRecipeTarget: unretained final/empty shapes, target
+/// FunctionBytecode, apply method (for CONSTRUCT_FORWARD), and store count.
+pub struct RecipePlan {
+  pub final: ?*mut HeapHeader,
+  pub empty: ?*mut HeapHeader,
+  pub bytecode: ?*mut HeapHeader,
+  pub method: ValueBits,
+  pub stores: usize
+}
+impl Copy for RecipePlan {}
+/// Single-probe receiverCache lookup for constructRecipeFast: validates owner's
+/// shape, prototype slot, prototype-chain epoch, and (for CONSTRUCT_FORWARD)
+/// entry.forward's holder/target/apply versions in one receiverCache probe.
+@inlineAlways
+pub unsafe fn plannedRecipeTarget(runtime: *mut HeapHeader, owner: *mut HeapHeader, ownerBytecode: *mut HeapHeader,
+  isForward: bool, atom: u32) -> RecipePlan {
+  let missed = RecipePlan { final: Pointer.null<HeapHeader>(), empty: Pointer.null<HeapHeader>(), bytecode: Pointer.null<HeapHeader>(), method: ValueBits.Undefined, stores: 0 }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, owner)
+  if data.isExotic() { return missed }
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let address = Pointer.address<HeapHeader>(owner)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let epoch = state.shapeEpoch
+  let slot = receiverWay(&mut state.*, address)
+  if slot >= RECEIVER_MISS { return missed }
+  let entry = &mut state.receiverCache[slot]
+  if entry.version != version || entry.stores == 0 { return missed }
+  let final = unsafe nonnull(entry.final)
+  let finalProtoOpt = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)).prototype
+  let finalProto = match Pointer.nonNullMut<HeapHeader>(finalProtoOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return missed }
+  }
+  match (unsafe data.slotUnchecked(entry.index)).valueBits() {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(finalProto) { return missed }
+    }
+    _ => { return missed }
+  }
+  if entry.epoch != epoch {
+    let mut current = finalProtoOpt
+    let depth = u8.toUsize(entry.depth)
+    let mut level: usize = 0
+    while level < depth {
+      let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(current))
+      let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+      if linkShape.version != entry.chain[level] { return missed }
+      current = linkShape.prototype
+      level = usize.wrappingAdd(level, 1)
+    }
+    entry.epoch = epoch
+  }
+  if isForward {
+    if entry.forward.atom != atom { return missed }
+    let holderData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, finalProto)
+    if (unsafe HeapCell.payload<ShapeData, ()>(&anchor, holderData.shape)).version != entry.forward.holderVersion { return missed }
+    let targetVal = (unsafe holderData.slotUnchecked(u32.toUsize(entry.forward.holderIndex))).valueBits()
+    let targetNode = match targetVal { ValueBits.Object { reference } => reference _ => { return missed } }
+    let targetData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, targetNode)
+    if targetData.classId() != JS_CLASS_BYTECODE_FUNCTION { return missed }
+    let targetShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, targetData.shape)
+    if targetShape.version != entry.forward.targetVersion { return missed }
+    let methodsOpt = targetShape.prototype
+    let targetBytecode = match &targetData.payload {
+      ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode
+      _ => { return missed }
+    }
+    if entry.bytecode != Pointer.address<HeapHeader>(targetBytecode) { return missed }
+    let methods = match Pointer.nonNullMut<HeapHeader>(methodsOpt) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return missed }
+    }
+    let methodsData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, methods)
+    if (unsafe HeapCell.payload<ShapeData, ()>(&anchor, methodsData.shape)).version != entry.forward.applyVersion { return missed }
+    let method = (unsafe methodsData.slotUnchecked(u32.toUsize(entry.forward.applyIndex))).valueBits()
+    return RecipePlan { final: entry.final, empty: entry.empty, bytecode: targetBytecode, method: method, stores: u8.toUsize(entry.stores) }
+  }
+  if entry.bytecode != Pointer.address<HeapHeader>(ownerBytecode) { return missed }
+  return RecipePlan { final: entry.final, empty: entry.empty, bytecode: ownerBytecode, method: ValueBits.Undefined, stores: u8.toUsize(entry.stores) }
 }
 /// No padding and no byte field ahead of a wider one: a copy of a record with an
 /// odd-offset tail is reassembled from overlapping pieces, which stalls store
@@ -1152,10 +1273,18 @@ unsafe effect fn refillEmpty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
 pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   let mut anchor = ()
   let mut slot: usize = 0
-  while slot < 64 {
+  while slot < 256 {
     let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
     let old = state.constructPins[slot]
-    state.constructPins[slot] = ConstructPin { final: 0, count: 0, shapes: [Pointer.null<HeapHeader>(); 8] }
+    state.constructPins[slot] = ConstructPin { final: 0, count: 0, shapes: [Pointer.null<HeapHeader>(); 16] }
+    drop state
+    let mut i: usize = 0
+    while i < old.count { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(old.shapes[i])) i = i + 1 }
+    slot = slot + 1
+  }
+  slot = 0
+  while slot < 64 {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
     let receiver = state.receiverCache[slot]
     state.receiverCache[slot] = blankReceiverEntry()
     state.receiverFunctions[slot] = 0
@@ -1163,8 +1292,6 @@ pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader)
     drop state
     unsafe releaseOptional(&mut hooks, runtime, receiver.empty)
     unsafe releaseOptional(&mut hooks, runtime, receiver.final)
-    let mut i: usize = 0
-    while i < old.count { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(old.shapes[i])) i = i + 1 }
     slot = slot + 1
   }
   slot = 0
@@ -1259,17 +1386,16 @@ pub unsafe fn noteLiteral<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
 unsafe fn forgetConstructCode<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, code: usize) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  let mut slot: usize = 0
-  while slot < 64 {
-    if state.constructCache[slot].code == code {
-      let old = state.constructCache[slot].final
-      state.constructCache[slot] = blankConstructEntry()
-      drop state
-      unsafe releaseOptional(&mut hooks, runtime, old)
-      return ()
-    }
-    slot = slot + 1
+  let first = constructCacheSlot(code)
+  let mut slot = first
+  if state.constructCache[first].code != code {
+    slot = first + 1
+    if state.constructCache[slot].code != code { return () }
   }
+  let old = state.constructCache[slot].final
+  state.constructCache[slot] = blankConstructEntry()
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, old)
 }
 /// Empties the literal cache entry filled for the site at address site, if any.
 unsafe fn forgetLiteralSite<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, site: usize) -> () {
@@ -1468,10 +1594,10 @@ unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, f
         if unsafe kind(value) == HeapKind.Object {
           if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) {
             unsafe destroyObject(&mut hooks, runtime, value, true, false, Pointer.null<ReleaseRing>())
-            drained = drained + 1
+            drained = usize.wrappingAdd(drained, 1)
             if drained == deferAt {
               if credit != 0 {
-                unsafe setColdDrains(runtime, credit - 1)
+                unsafe setColdDrains(runtime, u8.wrappingSubtract(credit, 1))
                 unsafe drainDeferred(&mut hooks, runtime)
               } else {
                 let elapsed = usize.wrappingSubtract(unsafe memory.ticks(), probeStart)
@@ -1516,7 +1642,7 @@ unsafe fn setColdDrains(runtime: *mut HeapHeader, drains: u8) -> () {
 /// only costs; drainZeroFrom then goes on undeferred.
 @inlineNever
 unsafe fn drainDeferred<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
-  let mut ring = ReleaseRing { cells: [ValueBits.Undefined; RELEASE_RING], at: 0 }
+  let mut ring = ReleaseRing { cells: [ValueBits.Undefined; RELEASE_RING], at: 0, mask: 0 }
   while true {
     match Pointer.nonNullMut<HeapHeader>(unsafe popZeroStack(runtime)) {
       Option<*mut HeapHeader>.Some { value } => {
@@ -1857,13 +1983,13 @@ unsafe fn decrementPass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, t
       let mut bits = unsafe passWord(arena, word, young)
       while bits != 0 {
         let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
-        bits = u64.bitAnd(bits, bits - 1)
+        bits = u64.bitAnd(bits, u64.wrappingSubtract(bits, 1))
         if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
         unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.Decrement)
         unsafe markMember(node, young)
-        traced = traced + 1
+        traced = usize.wrappingAdd(traced, 1)
       }
-      word = word + 1
+      word = usize.wrappingAdd(word, 1)
     }
     cursor = unsafe passNext(arena, young)
   }
@@ -1874,7 +2000,7 @@ unsafe fn decrementPass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, t
     if unsafe inPass(node, young) {
       unsafe traceDecrement(&mut hooks, node, &mut tracer)
       unsafe markMember(node, young)
-      traced = traced + 1
+      traced = usize.wrappingAdd(traced, 1)
     }
   }
   unsafe census.censusBump(runtime, census.CENSUS_GC_TRACED, traced)
@@ -1892,9 +2018,10 @@ unsafe fn drainRestore<H: HeapHooks>(hooks: &mut H, tracer: &mut Tracer) -> () {
     let mut anchor = ()
     let stack = unsafe Pointer.borrowMut<(), RestoreStack>(&mut anchor, tracer.stack)
     if stack.depth == 0 { return () }
-    stack.depth = stack.depth - 1
-    let next = unsafe nonnull(stack.cells[stack.depth])
-    if stack.depth != 0 { unsafe prefetchCell(unsafe nonnull(stack.cells[stack.depth - 1])) }
+    let nextDepth = usize.wrappingSubtract(stack.depth, 1)
+    stack.depth = nextDepth
+    let next = unsafe nonnull(stack.cells[nextDepth])
+    if nextDepth != 0 { unsafe prefetchCell(unsafe nonnull(stack.cells[usize.wrappingSubtract(nextDepth, 1)])) }
     drop stack
     unsafe traceAs(&mut hooks, next, &mut tracer, MarkOperation.RestoreReachable)
   }
@@ -1915,7 +2042,7 @@ unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tra
       while bits != 0 {
         let bit = u64.trailingZeros(bits)
         let node = unsafe cellIn(arena, word, bit)
-        bits = u64.bitAnd(bits, bits - 1)
+        bits = u64.bitAnd(bits, u64.wrappingSubtract(bits, 1))
         if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
         if unsafe markOf(node) == 1 {
           if unsafe count(node) > 0 { unsafe mark(node, 0) unsafe restoreFrom(&mut hooks, node, &mut tracer) }
@@ -1926,7 +2053,7 @@ unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tra
         unsafe memory.setPendingWord(arena, word, u64.bitOr(unsafe memory.pendingWord(arena, word), uncounted))
         unsafe listPending(runtime, arena)
       }
-      word = word + 1
+      word = usize.wrappingAdd(word, 1)
     }
     cursor = unsafe passNext(arena, young)
   }
@@ -2014,14 +2141,14 @@ unsafe fn rescanRestore<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, t
       let mut bits = unsafe memory.cellWord(arena, word)
       while bits != 0 {
         let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
-        bits = u64.bitAnd(bits, bits - 1)
+        bits = u64.bitAnd(bits, u64.wrappingSubtract(bits, 1))
         if unsafe markOf(node) == MARK_RESTORE {
           unsafe mark(node, 0)
           unsafe memory.clearPending(unsafe blockAt(node))
           unsafe restoreFrom(&mut hooks, node, &mut tracer)
         }
       }
-      word = word + 1
+      word = usize.wrappingAdd(word, 1)
     }
     cursor = unsafe memory.nextCellArena(arena)
   }
@@ -2044,11 +2171,11 @@ unsafe fn unreachablePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
       let mut bits = unsafe memory.pendingWord(arena, word)
       while bits != 0 {
         let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
-        bits = u64.bitAnd(bits, bits - 1)
+        bits = u64.bitAnd(bits, u64.wrappingSubtract(bits, 1))
         if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
         if unsafe markOf(node) == 1 { unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreUnreachable) }
       }
-      word = word + 1
+      word = usize.wrappingAdd(word, 1)
     }
     cursor = unsafe memory.nextPendingArena(arena)
   }
@@ -2082,13 +2209,13 @@ unsafe fn removeCycles<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) ->
       let mut bits = unsafe memory.pendingWord(arena, word)
       while bits != 0 {
         let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
-        bits = u64.bitAnd(bits, bits - 1)
+        bits = u64.bitAnd(bits, u64.wrappingSubtract(bits, 1))
         // Destroying garbage frees other cells: only a cell still published counts.
         if unsafe memory.isCell(unsafe blockAt(node)) && unsafe markOf(node) == 1 && valueKind(unsafe kind(node)) {
           unsafe destroyGc(&mut hooks, runtime, node)
         }
       }
-      word = word + 1
+      word = usize.wrappingAdd(word, 1)
     }
     cursor = unsafe memory.nextPendingArena(arena)
   }
@@ -2257,31 +2384,111 @@ unsafe fn traceAs<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &m
   unsafe tracer.edgeAs(object.shape, operation)
   if object.hasRecordedRealm() { unsafe traceRecordedRealm(node, &mut tracer) }
   let metadata = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let plain = metadata.plainVersion == metadata.version
   // Counts are read once: the edge updates store to headers, which the
   // compiler cannot tell apart from these lists. An object has a slot for each
   // record of its shape.
   let propertyCount = metadata.properties.length()
-  let mut index: usize = 0
-  while index < propertyCount {
-    let entry = unsafe js_shapes.unchecked<ShapeProperty>(&metadata.properties, index)
-    if entry.atom != 0 {
-      let slot = unsafe object.slotUnchecked(index)
-      if (u8.toU32(entry.flags) & JS_PROP_TMASK) == 0 { unsafe tracer.valueAs(slot.valueBits(), operation) }
-      else { unsafe traceProperty(slot.view(entry.flags), &mut tracer) }
-    }
-    index = index + 1
-  }
   drop metadata
+  if plain || unsafe js_shapes.plainRecords(object.shape) {
+    let values = unsafe js_shapes.objectSlotValues(&object)
+    let count = values.length
+    if count != 0 {
+      if count < 8 {
+        let ptr = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(values))
+        let mut index: usize = 0
+        while index < count {
+          unsafe tracer.valueAs(unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, index)), operation)
+          index = usize.wrappingAdd(index, 1)
+        }
+      } else if ValueBits.anyHeapEarly(values) {
+        let ptr = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(values))
+        let mut ahead: usize = 0
+        while ahead < 8 {
+          match unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, ahead)) {
+            ValueBits.Object { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+            ValueBits.FunctionBytecode { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+            ValueBits.Module { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+            _ => ()
+          }
+          ahead = usize.wrappingAdd(ahead, 1)
+        }
+        let limit = usize.wrappingSubtract(count, 8)
+        let mut index: usize = 0
+        while index < limit {
+          match unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, usize.wrappingAdd(index, 8))) {
+            ValueBits.Object { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+            ValueBits.FunctionBytecode { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+            ValueBits.Module { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+            _ => ()
+          }
+          unsafe tracer.valueAs(unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, index)), operation)
+          index = usize.wrappingAdd(index, 1)
+        }
+        while index < count {
+          unsafe tracer.valueAs(unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, index)), operation)
+          index = usize.wrappingAdd(index, 1)
+        }
+      }
+    }
+  } else {
+    let metadata2 = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+    let mut index: usize = 0
+    while index < propertyCount {
+      let entry = unsafe js_shapes.unchecked<ShapeProperty>(&metadata2.properties, index)
+      if entry.atom != 0 {
+        let slot = unsafe object.slotUnchecked(index)
+        if (u8.toU32(entry.flags) & JS_PROP_TMASK) == 0 { unsafe tracer.valueAs(slot.valueBits(), operation) }
+        else { unsafe traceProperty(slot.view(entry.flags), &mut tracer) }
+      }
+      index = usize.wrappingAdd(index, 1)
+    }
+  }
   if classId == JS_CLASS_OBJECT { return () }
   // An Array's mark callback traces exactly its fast element list.
   if classId == JS_CLASS_ARRAY {
     match &object.payload {
       ObjectPayload.FastArray { array } => {
-        let elementCount = array.values().length()
-        let mut element: usize = 0
-        while element < elementCount {
-          unsafe tracer.valueAs(unsafe js_shapes.unchecked<ValueBits>(array.values(), element), operation)
-          element = element + 1
+        if array.isPlain() { return () }
+        let elements = array.values().asSlice()
+        let elementCount = elements.length
+        if elementCount != 0 {
+          if elementCount < 8 {
+            let ptr = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(elements))
+            let mut element: usize = 0
+            while element < elementCount {
+              unsafe tracer.valueAs(unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, element)), operation)
+              element = usize.wrappingAdd(element, 1)
+            }
+          } else if (if elementCount >= 64 { ValueBits.anyHeap(elements) } else { ValueBits.anyHeapEarly(elements) }) {
+            let ptr = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(elements))
+            let mut ahead: usize = 0
+            while ahead < 8 {
+              match unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, ahead)) {
+                ValueBits.Object { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+                ValueBits.FunctionBytecode { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+                ValueBits.Module { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+                _ => ()
+              }
+              ahead = usize.wrappingAdd(ahead, 1)
+            }
+            let limit = usize.wrappingSubtract(elementCount, 8)
+            let mut element: usize = 0
+            while element < limit {
+              match unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, usize.wrappingAdd(element, 8))) {
+                ValueBits.Object { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+                ValueBits.FunctionBytecode { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+                ValueBits.Module { reference } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(reference)) }
+                _ => ()
+              }
+              unsafe tracer.valueAs(unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, element)), operation)
+              element = usize.wrappingAdd(element, 1)
+            }
+            while element < elementCount {
+              unsafe tracer.valueAs(unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, element)), operation)
+              element = usize.wrappingAdd(element, 1)
+            }
+          }
         }
         return ()
       }
@@ -2304,7 +2511,7 @@ unsafe fn traceAs<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &m
             Option<*mut HeapHeader>.Some { value } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(value)) }
             Option<*mut HeapHeader>.None => ()
           }
-          ahead = ahead + 1
+          ahead = usize.wrappingAdd(ahead, 1)
         }
         let mut element: usize = 0
         while element < referenceCount {
@@ -2312,7 +2519,7 @@ unsafe fn traceAs<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &m
             Option<*mut HeapHeader>.Some { value } => { unsafe tracer.edgeAs(value, operation) }
             Option<*mut HeapHeader>.None => ()
           }
-          element = element + 1
+          element = usize.wrappingAdd(element, 1)
         }
         match Pointer.nonNullMut<HeapHeader>(function.scope) {
           Option<*mut HeapHeader>.Some { value } => { unsafe tracer.edgeAs(value, operation) }
@@ -2542,12 +2749,17 @@ pub unsafe fn finalizeCorePayload<H: HeapHooks>(hooks: &mut H, runtime: *mut Hea
       unsafe releaseObjectHeader(&mut hooks, runtime, function.bytecode)
     }
     ObjectPayload.NativeFunction { function } => {
+      let mut cacheAnchor = ()
+      let rtState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut cacheAnchor, runtime)
+      rtState.regexpStandard.receiverVersion = 0
+      rtState.stringCharCode.protoVersion = 0
+      drop rtState
       unsafe releaseOptional(&mut hooks, runtime, function.realm())
       let count = unsafe function.capturedCount()
       let mut index: usize = 0
       while index < count {
         unsafe release(&mut hooks, runtime, unsafe function.capturedGet(index))
-        index = index + 1
+        index = usize.wrappingAdd(index, 1)
       }
       match Pointer.nonNullMut<HeapHeader>(function.captured()) {
         Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.destroy<NativeCapturedValues>(value) }
@@ -2557,10 +2769,10 @@ pub unsafe fn finalizeCorePayload<H: HeapHooks>(hooks: &mut H, runtime: *mut Hea
     ObjectPayload.FastArray { array } => {
       let mut index: usize = 0
       // A number-only array has nothing to release.
-      if !ValueBits.anyHeap(array.values().asSlice()) { index = array.values().length() }
+      if array.isPlain() || !ValueBits.anyHeap(array.values().asSlice()) { index = array.values().length() }
       while index < array.values().length() {
         unsafe release(&mut hooks, runtime, array.values().get(index))
-        index = index + 1
+        index = usize.wrappingAdd(index, 1)
       }
       unsafe js_shapes.parkValues(runtime, array.intoValues())
     }
@@ -2706,10 +2918,9 @@ unsafe fn parkFirstCell(runtime: *mut HeapHeader, node: *mut HeapHeader, bin: us
 }
 /// Entries in RuntimeState.spareCells for each spare bin.
 pub const SPARE_CELLS: usize = js_shapes.SPARE_OBJECT_CELLS
-/// Spare bins: INLINE_SLOTS or PAIR_SLOTS tails, each for ordinary cells and for
-/// small ones (plain objects whose slots start over the payload, see
-/// js_object_allocate.inlineNode). Bin b's cells sit at b * SPARE_CELLS.
-pub const SPARE_BINS: usize = 4
+/// Spare bins: INLINE_SLOTS or PAIR_SLOTS tails (ordinary and small), plus
+/// WIDE_SLOTS (12) ordinary cells for wide inline arrays (bin 4).
+pub const SPARE_BINS: usize = 5
 @inlineAlways
 fn spareBin(pair: bool, small: bool) -> usize {
   let mut bin: usize = 0
@@ -2718,39 +2929,46 @@ fn spareBin(pair: bool, small: bool) -> usize {
   return bin
 }
 /// Frees a dead object cell whose payload owns nothing. A cell whose slots were
-/// its own tail of INLINE_SLOTS or PAIR_SLOTS (tail; 0 for any other cell) keeps
-/// its storage in the runtime's spare cells when there is room; small says its
-/// slots started over the payload.
+/// its own tail of INLINE_SLOTS, PAIR_SLOTS, or (ordinary) WIDE_SLOTS (tail; 0
+/// for any other cell) keeps its storage in the runtime's spare cells when
+/// there is room; small says its slots started over the payload.
 unsafe fn recycleObjectCell(runtime: *mut HeapHeader, node: *mut HeapHeader, tail: usize, small: bool) -> () {
   if !unsafe parkCell(runtime, node, tail, small) { unsafe HeapCell.destroyEmptied<ObjectData>(node) }
 }
-/// Parks a dead object cell whose slots were its own tail of INLINE_SLOTS or
-/// PAIR_SLOTS (tail; 0 for any other cell) in the runtime's spare cells when
-/// there is room, and says whether it did.
+/// Parks a dead object cell whose slots were its own tail of INLINE_SLOTS,
+/// PAIR_SLOTS, or (ordinary) WIDE_SLOTS (tail; 0 for any other cell) in the
+/// runtime's spare cells when there is room, and says whether it did.
 @inlineAlways
 unsafe fn parkCell(runtime: *mut HeapHeader, node: *mut HeapHeader, tail: usize, small: bool) -> bool {
+  let bin: usize = if tail == js_shapes.INLINE_SLOTS {
+    if small { 2 } else { 0 }
+  } else if tail == js_shapes.PAIR_SLOTS {
+    if small { 3 } else { 1 }
+  } else if !small && tail == js_shapes.WIDE_SLOTS {
+    4
+  } else {
+    return false
+  }
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  let pair = tail == js_shapes.PAIR_SLOTS
-  let bin = spareBin(pair, small)
   let count = state.spareCellCounts[bin]
   // The cache holds SPARE_CELLS per bin (none in a bare test runtime).
-  if (!pair && tail != js_shapes.INLINE_SLOTS) || count >= SPARE_CELLS { return false }
+  if count >= SPARE_CELLS { return false }
   if state.spareCells.length() < SPARE_CELLS * SPARE_BINS { drop state return unsafe parkFirstCell(runtime, node, bin) }
-  state.spareCellCounts[bin] = count + 1
+  state.spareCellCounts[bin] = usize.wrappingAdd(count, 1)
   // The whole cell parks: its header keeps the owner byte reuse needs.
-  state.spareCells.set(bin * SPARE_CELLS + count, node)
+  unsafe state.spareCells.setUnchecked(usize.wrappingAdd(usize.wrappingMultiply(bin, SPARE_CELLS), count), node)
   return true
 }
-/// A dead object cell with an inline tail of capacity slots (INLINE_SLOTS or
-/// PAIR_SLOTS) from the runtime's spare cells, or null; small picks a cell whose
-/// slots start over the payload. Its storage is the caller's: revive it with
-/// HeapCell.reviveUninit.
+/// A dead object cell with an inline tail of capacity slots (INLINE_SLOTS,
+/// PAIR_SLOTS, or ordinary WIDE_SLOTS) from the runtime's spare cells, or null;
+/// small picks a cell whose slots start over the payload. Its storage is the
+/// caller's: revive it with HeapCell.reviveUninit.
 @inlineAlways
 pub unsafe fn takeSpareCell(runtime: *mut HeapHeader, capacity: usize, small: bool) -> ?*mut HeapHeader {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  let bin = spareBin(capacity != js_shapes.INLINE_SLOTS, small)
+  let bin = if !small && capacity == js_shapes.WIDE_SLOTS { 4 } else { spareBin(capacity != js_shapes.INLINE_SLOTS, small) }
   let count = state.spareCellCounts[bin]
   if count == 0 { return Pointer.null<HeapHeader>() }
   let left = usize.wrappingSubtract(count, 1)
@@ -2758,20 +2976,15 @@ pub unsafe fn takeSpareCell(runtime: *mut HeapHeader, capacity: usize, small: bo
   // Unchecked: parkCell only parks while spareCells holds SPARE_CELLS per bin, so
   // count <= SPARE_CELLS and the index is in bounds; the checked index math and
   // slice read cost ~6 Ir on every inline object allocation.
-  let parked = unsafe Pointer.assumeMany<?*mut HeapHeader>(Pointer.fromRef<?*mut HeapHeader>(&state.spareCells.asSlice()[0]))
-  return unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(parked, usize.wrappingAdd(bin * SPARE_CELLS, left)))
-}
-unsafe fn valuesInTail(node: *mut HeapHeader) -> bool {
-  let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-  return match &object.payload { ObjectPayload.FastArray { array } => array.values().borrowsStorage() _ => false }
+  let parked = unsafe Intrinsic.pointerRequalify<?[*]const ?*mut HeapHeader, [*]const ?*mut HeapHeader>(Pointer.fromSlice<?*mut HeapHeader>(state.spareCells.asSlice()))
+  return unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(parked, usize.wrappingAdd(usize.wrappingMultiply(bin, SPARE_CELLS), left)))
 }
 /// destroyObject's class finalizer call, for classes other than JS_CLASS_OBJECT.
 // Out of line: plain objects, the bulk of what dies, never come here, and the
 // class dispatch would otherwise fill destroyObject's hot lines.
 @inlineNever
 unsafe fn finalizeObjectClass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, classId: u32) -> () {
-  let anchor = ()
+  let mut anchor = ()
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let callback = match &state.classes.asSlice()[u32.toUsize(classId)].finalizer {
     Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
@@ -2779,6 +2992,22 @@ unsafe fn finalizeObjectClass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   }
   drop state
   match move callback {
+    Option<NativeFunctionId>.Some { value: NativeFunctionId.Builtin { family: BuiltinFamily.Runtime, method } } => {
+      if method == NATIVE_JS_REGEXP_FINALIZER {
+        let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+        let payload = Intrinsic.replace(data.payload, ObjectPayload.Empty)
+        drop data
+        match move payload {
+          ObjectPayload.RegExp { regexp } => {
+            unsafe release(&mut hooks, runtime, regexp.pattern())
+            unsafe release(&mut hooks, runtime, regexp.bytecode())
+          }
+          _ => ()
+        }
+        return ()
+      }
+      unsafe HeapHooks.finalizeClass(&mut hooks, runtime, node, NativeFunctionId.Builtin { family: BuiltinFamily.Runtime, method: method })
+    }
     Option<NativeFunctionId>.Some { value } => { unsafe HeapHooks.finalizeClass(&mut hooks, runtime, node, value) }
     Option<NativeFunctionId>.None => ()
   }
@@ -2787,14 +3016,21 @@ unsafe fn finalizeObjectClass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
 /// builtin Array finalizer (which does just that arm): true once its values
 /// are released (through releaseDraining when linked) and their list parked;
 /// false, with nothing changed, for any other payload or finalizer.
+/// When the array's values lived in the cell's own tail and tailOut is non-zero
+/// (slots also in the tail), adds their capacity to tailOut so INLINE_SLOTS
+/// array cells recycle through Bin 0.
 @inlineAlways
-unsafe fn finishFastArray<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool) -> bool {
+unsafe fn finishFastArray<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool, tailOut: &mut usize) -> bool {
   let mut anchor = ()
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let builtin = match &state.classes.asSlice()[u32.toUsize(JS_CLASS_ARRAY)].finalizer {
-    Option<NativeFunctionId>.Some { value: NativeFunctionId.Builtin { family: BuiltinFamily.Runtime, method } } => method == NATIVE_JS_ARRAY_FINALIZER
-    _ => false
-  }
+  let classes = state.classes.asSlice()
+  let arrayIdx = u32.toUsize(JS_CLASS_ARRAY)
+  let builtin = if arrayIdx < classes.length {
+    match &classes[arrayIdx].finalizer {
+      Option<NativeFunctionId>.Some { value: NativeFunctionId.Builtin { family: BuiltinFamily.Runtime, method } } => method == NATIVE_JS_ARRAY_FINALIZER
+      _ => false
+    }
+  } else { false }
   drop state
   if !builtin { return false }
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
@@ -2803,20 +3039,27 @@ unsafe fn finishFastArray<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   drop data
   match move payload {
     ObjectPayload.FastArray { array } => {
-      let mut count = array.values().length()
+      if array.values().borrowsStorage() {
+        if tailOut.* != 0 { tailOut.* = usize.wrappingAdd(tailOut.*, array.values().capacity()) }
+      }
+      let slice = array.values().asSlice()
+      let mut count = slice.length
       // Number-only arrays (a literal of numbers) have nothing to release.
       // Long ones scan without the per-block exit, about half the cost per value.
       // A plain array is known to hold none, without a scan.
       if array.isPlain() { count = 0 }
-      else if count >= 64 { if !ValueBits.anyHeap(array.values().asSlice()) { count = 0 } }
-      else if count > 2 && !ValueBits.anyHeapEarly(array.values().asSlice()) { count = 0 }
-      let mut index: usize = 0
-      while index < count {
-        let value = array.values().get(index)
-        if linked { unsafe releaseDraining(&mut hooks, runtime, value) } else { unsafe release(&mut hooks, runtime, value) }
-        index = index + 1
+      else if count >= 64 { if !ValueBits.anyHeap(slice) { count = 0 } }
+      else if count >= 8 && !ValueBits.anyHeapEarly(slice) { count = 0 }
+      if count != 0 {
+        let ptr = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(slice))
+        let mut index: usize = 0
+        while index < count {
+          let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, index))
+          if linked { unsafe releaseDraining(&mut hooks, runtime, value) } else { unsafe release(&mut hooks, runtime, value) }
+          index = usize.wrappingAdd(index, 1)
+        }
       }
-      unsafe js_shapes.parkValues(runtime, array.intoValues())
+      if array.values().ownsStorage() { unsafe js_shapes.parkValues(runtime, array.intoValues()) } else { drop array }
     }
     _ => invariantFailure()
   }
@@ -2847,7 +3090,8 @@ const RELEASE_WIDE: usize = 3
 /// at once and its count is read RELEASE_RING releases later, so the misses of
 /// that many children overlap. Each heap value in cells owns the reference it
 /// will release; the other entries are Undefined. at is the oldest entry.
-struct ReleaseRing { cells: [ValueBits; RELEASE_RING], at: usize }
+/// mask has bit i set iff cells[i] holds a waiting heap value.
+struct ReleaseRing { cells: [ValueBits; RELEASE_RING], at: usize, mask: u16 }
 /// releaseDraining through the ring: value's cell lines start loading now, and
 /// the oldest waiting value is released in its place.
 @inlineAlways
@@ -2859,9 +3103,9 @@ unsafe fn deferRelease<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, wa
       // An array literal's values follow its slots, in the cell's later lines.
       if value.isObject() {
         let address = Pointer.address<HeapHeader>(reference)
-        unsafe memory.prefetch(address + 128)
-        unsafe memory.prefetch(address + 192)
-        unsafe memory.prefetch(address + 256)
+        unsafe memory.prefetch(usize.wrappingAdd(address, 128))
+        unsafe memory.prefetch(usize.wrappingAdd(address, 192))
+        unsafe memory.prefetch(usize.wrappingAdd(address, 256))
       }
     }
     Option<*mut HeapHeader>.None => ()
@@ -2869,29 +3113,40 @@ unsafe fn deferRelease<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, wa
   let mut ringAnchor = ()
   let ring = unsafe Pointer.borrowMut<(), ReleaseRing>(&mut ringAnchor, unsafe Intrinsic.pointerRequalify<?*mut ReleaseRing, *mut ReleaseRing>(waiting))
   let at = ring.at
-  let due = ring.cells[at]
-  ring.cells[at] = value
-  ring.at = (at + 1) & (RELEASE_RING - 1)
+  let bit = u16.shiftLeft(1, usize.wrappingToU16(at))
+  let had = (ring.mask & bit) != 0
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(Pointer.fromMutRef<ValueBits>(&mut ring.cells[0]))
+  let slot = unsafe Pointer.atMut<ValueBits>(cells, at)
+  let due = unsafe Pointer.read<ValueBits>(slot)
+  unsafe Pointer.write<ValueBits>(slot, value)
+  ring.mask = ring.mask | bit
+  ring.at = usize.wrappingAdd(at, 1) & (RELEASE_RING - 1)
   drop ring
-  unsafe releaseDraining(&mut hooks, runtime, due)
+  if had { unsafe releaseDraining(&mut hooks, runtime, due) }
 }
 /// Releases every waiting value of ring, oldest first, leaving it empty, and
 /// returns how many there were. The releases may stack more dead objects,
 /// whose children may use ring again.
 @inlineNever
 unsafe fn flushRing<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, ring: &mut ReleaseRing) -> usize {
-  let mut left = RELEASE_RING
-  let mut at = ring.at
+  let mask = ring.mask
+  if mask == 0 { return 0 }
+  let at = ring.at
+  let shift = usize.wrappingToU32(at)
+  let wide = u16.toU32(mask)
+  let mut rot = (u32.shiftRight(wide, shift) | u32.shiftLeft(wide, u32.wrappingSubtract(16, shift))) & 0xFFFF
+  ring.mask = 0
+  let cells = unsafe Pointer.assumeManyMut<ValueBits>(Pointer.fromMutRef<ValueBits>(&mut ring.cells[0]))
   let mut found: usize = 0
-  while left != 0 {
-    let due = ring.cells[at]
-    if due.tag() < 0 {
-      ring.cells[at] = ValueBits.Undefined
-      found = found + 1
-      unsafe releaseDraining(&mut hooks, runtime, due)
-    }
-    at = (at + 1) & (RELEASE_RING - 1)
-    left = left - 1
+  while rot != 0 {
+    let tz = u32.toUsize(u32.trailingZeros(rot))
+    rot = rot & u32.wrappingSubtract(rot, 1)
+    let idx = usize.wrappingAdd(at, tz) & (RELEASE_RING - 1)
+    let slot = unsafe Pointer.atMut<ValueBits>(cells, idx)
+    let due = unsafe Pointer.read<ValueBits>(slot)
+    unsafe Pointer.write<ValueBits>(slot, ValueBits.Undefined)
+    found = usize.wrappingAdd(found, 1)
+    unsafe releaseDraining(&mut hooks, runtime, due)
   }
   return found
 }
@@ -2905,19 +3160,20 @@ unsafe fn releaseDraining<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
       let mut anchor = ()
       let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, reference)
       let count = header.referenceCount
-      if count > 1 { header.referenceCount = count - 1 return () }
+      if count > 1 { header.referenceCount = i32.wrappingSubtract(count, 1) return () }
       if count == 1 && header.mark == 0 && header.kind == HeapKind.Object {
         let mut stateAnchor = ()
         let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
         let depth = u16.toUsize(state.zeroStackCount)
         if depth < ZERO_STACK {
-          state.zeroStack[depth] = reference
-          state.zeroStackCount = usize.toU16(depth + 1)
+          let stack = unsafe Pointer.assumeManyMut<?*mut HeapHeader>(Pointer.fromMutRef<?*mut HeapHeader>(&mut state.zeroStack[0]))
+          unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(stack, depth), reference)
+          state.zeroStackCount = usize.wrappingToU16(usize.wrappingAdd(depth, 1))
           header.referenceCount = 0
           header.mark = 1
           // Its slots start in the cell's second line: begin that load while
           // the parent finishes, before destroyObject reads them.
-          unsafe memory.prefetch(Pointer.address<HeapHeader>(reference) + 64)
+          unsafe memory.prefetch(usize.wrappingAdd(Pointer.address<HeapHeader>(reference), 64))
           return ()
         }
       }
@@ -2964,16 +3220,15 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   let mut index: usize = 0
   require(slotCount <= unsafe js_shapes.recordCount(shape))
   // Plain data records holding only numbers and other immediates own nothing
-  // (one or two slots are cheaper to walk than to scan first: cons cells).
+  // (small objects are cheaper to walk directly than to scan out of line).
   let plain = unsafe js_shapes.plainRecords(shape)
-  if slotCount > 2 && plain && !ValueBits.anyHeapEarly(unsafe js_shapes.slotValues(&properties)) { index = slotCount }
+  if slotCount >= 8 && plain && !ValueBits.anyHeapEarly(unsafe js_shapes.slotValues(&properties)) { index = slotCount }
   // All data records: no per-slot flags to read.
   if plain && slotCount == 2 {
     // A cons cell, unrolled: both children's header loads start first, so a
     // dying pair's car and cdr miss in parallel.
-    let values = unsafe js_shapes.slotValues(&properties)
-    let car = values[0] let cdr = values[1]
-    drop values
+    let car = (unsafe properties.getUnchecked(0)).valueBits()
+    let cdr = (unsafe properties.getUnchecked(1)).valueBits()
     match ValueBits.heapReference(&car) {
       Option<*mut HeapHeader>.Some { value } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(value)) }
       Option<*mut HeapHeader>.None => ()
@@ -2986,25 +3241,44 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     else if linked { unsafe releaseDraining(&mut hooks, runtime, car) unsafe releaseDraining(&mut hooks, runtime, cdr) }
     else { unsafe release(&mut hooks, runtime, car) unsafe release(&mut hooks, runtime, cdr) }
     index = 2
+  } else if plain && !deferred {
+    // In-cache short drains (drainZeroFrom): read each slot once without a
+    // separate prefetch pass, saving half the slot reads on small temporaries.
+    while index < slotCount {
+      let value = (unsafe properties.getUnchecked(index)).valueBits()
+      if value.tag() < 0 {
+        if linked { unsafe releaseDraining(&mut hooks, runtime, value) }
+        else { unsafe release(&mut hooks, runtime, value) }
+      }
+      index = usize.wrappingAdd(index, 1)
+    }
   } else if plain {
     // Start every child's header load first: a dying pair's car and cdr then
     // miss in parallel instead of one release after the other.
-    let values = unsafe js_shapes.slotValues(&properties)
+    let pre = if slotCount < 8 { slotCount } else { 8 }
     let mut ahead = index
-    while ahead < slotCount && ahead < 8 {
-      match ValueBits.heapReference(&values[ahead]) {
+    while ahead < pre {
+      let nextVal = (unsafe properties.getUnchecked(ahead)).valueBits()
+      match ValueBits.heapReference(&nextVal) {
         Option<*mut HeapHeader>.Some { value } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(value)) }
         Option<*mut HeapHeader>.None => ()
       }
-      ahead = ahead + 1
+      ahead = usize.wrappingAdd(ahead, 1)
     }
-    drop values
+    while usize.wrappingAdd(index, 8) < slotCount {
+      let nextVal = (unsafe properties.getUnchecked(usize.wrappingAdd(index, 8))).valueBits()
+      match ValueBits.heapReference(&nextVal) {
+        Option<*mut HeapHeader>.Some { value } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(value)) }
+        Option<*mut HeapHeader>.None => ()
+      }
+      let slot = unsafe properties.getUnchecked(index)
+      unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits())
+      index = usize.wrappingAdd(index, 1)
+    }
     while index < slotCount {
       let slot = unsafe properties.getUnchecked(index)
-      if deferred { unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits()) }
-      else if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
-      else { unsafe release(&mut hooks, runtime, slot.valueBits()) }
-      index = index + 1
+      unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits())
+      index = usize.wrappingAdd(index, 1)
     }
   }
   while index < slotCount {
@@ -3024,21 +3298,26 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     // except an initializer or captured stack, which also owns its cell.
     else if kind == JS_PROP_AUTOINIT && !slot.lazyOwnsCell() { unsafe releaseOptional(&mut hooks, runtime, slot.lazyRealmUnchecked()) }
     else { unsafe releaseProperty(&mut hooks, runtime, unsafe slot.retire(flags)) }
-    index = index + 1
+    index = usize.wrappingAdd(index, 1)
   }
   // Slots kept in the object's own cell (most objects) have no storage to park,
   // so they skip the call; that tail's size picks the cell's spare bin.
   let mut tail: usize = 0
   if properties.borrowsStorage() { tail = properties.capacity() }
-  // An array literal's values may follow the slots in the tail: no spare bin fits.
-  if classId == JS_CLASS_ARRAY && tail != 0 && unsafe valuesInTail(node) { tail = 0 }
   if properties.ownsStorage() { unsafe js_shapes.parkSlots(runtime, move properties) } else { drop properties }
   unsafe releaseObjectHeader(&mut hooks, runtime, shape)
   // Plain objects (the bulk of what dies) have no class finalizer.
   if classId != JS_CLASS_OBJECT {
     // A fast array (exec results, short-lived literals) frees its values here,
     // its dying elements straight onto the zero stack, without the class hook.
-    if classId != JS_CLASS_ARRAY || !unsafe finishFastArray(&mut hooks, runtime, node, linked) { unsafe finalizeObjectClass(&mut hooks, runtime, node, classId) }
+    if classId == JS_CLASS_ARRAY {
+      if !unsafe finishFastArray(&mut hooks, runtime, node, linked, &mut tail) {
+        tail = 0
+        unsafe finalizeObjectClass(&mut hooks, runtime, node, classId)
+      }
+    } else {
+      unsafe finalizeObjectClass(&mut hooks, runtime, node, classId)
+    }
   }
   let mut finalizedObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   // Read here, not kept live across the releases above.
@@ -3052,6 +3331,12 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   if small { unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut finalizedObject.payload), ObjectPayload.Empty) }
   else { match &finalizedObject.payload { ObjectPayload.Empty => () _ => { finalizedObject.payload = ObjectPayload.Empty } } }
   let weak = finalizedObject.weakRefCount
+  // A tailless cell (separateNode or an outgrown small PAIR_SLOTS cell) shares
+  // spare Bin 3 once its payload is reset to Empty. Read here so no live flag
+  // crosses the slot releases above.
+  let mut parkTail = tail
+  let mut parkSmall = small
+  if tail == 0 && finalizedObject.hasNoTail() { parkTail = js_shapes.PAIR_SLOTS parkSmall = true }
   drop finalizedObject
   // The properties were moved out and the payload reset to Empty above.
   // A parked cell has mark 0, as reviveUninit keeps it.
@@ -3062,13 +3347,13 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     if unsafe count(node) != 0 || weak != 0 { unsafe mark(node, MARK_ZOMBIE) return () }
     unsafe leave(runtime, node)
     unsafe mark(node, 0)
-    unsafe recycleObjectCell(runtime, node, tail, small)
+    unsafe recycleObjectCell(runtime, node, parkTail, parkSmall)
     return ()
   }
   unsafe leave(runtime, node)
   unsafe mark(node, 0)
   // A zombie kept for its weak references is detached with mark 0 (see releaseWeak).
-  if weak == 0 { unsafe recycleObjectCell(runtime, node, tail, small) } else { unsafe noteWeakTargetDied(runtime) }
+  if weak == 0 { unsafe recycleObjectCell(runtime, node, parkTail, parkSmall) } else { unsafe noteWeakTargetDied(runtime) }
 }
 unsafe fn noteWeakTargetDied(runtime: *mut HeapHeader) -> () {
   let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime) state.weakTargetsDied = true
@@ -3591,12 +3876,9 @@ unsafe fn forgetFieldSite(runtime: *mut HeapHeader, site: usize) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   let slot = fieldCacheIndex(site)
-  if state.fieldCache[slot].site == site {
-    state.fieldCache[slot] = FieldCacheEntry { site: 0, key: 0, protoKey: 0, midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
-  }
-  if state.fieldCache[fieldSpareIndex(slot)].site == site {
-    state.fieldCache[fieldSpareIndex(slot)] = FieldCacheEntry { site: 0, key: 0, protoKey: 0, midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
-  }
+  if state.fieldCache[slot].site == site { state.fieldCache[slot].site = 0 }
+  let spare = fieldSpareIndex(slot)
+  if state.fieldCache[spare].site == site { state.fieldCache[spare].site = 0 }
 }
 /// What destroyBytecode needs of a final (short-form) opcode in one load: its
 /// size, including a field key, in the low six bits, FINAL_ATOM when it carries
@@ -3612,22 +3894,78 @@ pub fn finalShape(code: u8) -> u8 {
 unsafe fn destroyBytecode<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
   let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
-  let code = Intrinsic.replace(b.code, ByteStorage.empty())
-  let definitions = Intrinsic.replace(b.varDefs, BoxList<VarDef>.make())
-  let constants = Intrinsic.replace(b.constants, BoxList<ValueBits>.make())
-  let closures = Intrinsic.replace(b.closureVars, BoxList<ClosureVar>.make())
-  let knownRefs = Intrinsic.replace(b.known.refs, BoxList<?*mut HeapHeader>.make())
-  let debug = Intrinsic.replace(b.debug, Option<FunctionDebugInfo>.none())
-  let mut host = Intrinsic.replace(b.host, ThinBox<HostEdges>.none())
-  let mut pending = Intrinsic.replace(b.pending, ThinBox<PendingFunction>.none())
-  // A stub's placeholder code never ran, so no cache knows its address.
-  let placeholder = pending.isSome()
   let realm = b.realm
   let name = b.name
   b.name = 0
+  let filename = match &b.debug {
+    Option<FunctionDebugInfo>.Some { value } => value.filename
+    Option<FunctionDebugInfo>.None => 0
+  }
+  let mut hasTree = false
+  let placeholder = b.pending.isSome()
+  // Release every owned atom in one RuntimeState borrow before dropping b.
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  if name != 0 { state.atoms.release(name) }
+  if filename != 0 { state.atoms.release(filename) }
+  let defCount = b.varDefs.length()
+  if defCount != 0 {
+    let defs = unsafe Pointer.assumeMany<VarDef>(unsafe b.varDefs.first())
+    let mut i: usize = 0
+    while i < defCount {
+      state.atoms.release((unsafe Pointer.read<VarDef>(unsafe Pointer.at<VarDef>(defs, i))).name)
+      i = usize.wrappingAdd(i, 1)
+    }
+  }
+  let varCount = b.closureVars.length()
+  if varCount != 0 {
+    let vars = unsafe Pointer.assumeMany<ClosureVar>(unsafe b.closureVars.first())
+    let mut i: usize = 0
+    while i < varCount {
+      state.atoms.release((unsafe Pointer.read<ClosureVar>(unsafe Pointer.at<ClosureVar>(vars, i))).name)
+      i = usize.wrappingAdd(i, 1)
+    }
+  }
+  if placeholder {
+    let p = b.pending.getMut()
+    match &mut p.lazy {
+      Option<LazyStub>.Some { value: stub } => {
+        if stub.filename != 0 { state.atoms.release(stub.filename) stub.filename = 0 }
+        let names = stub.skips.second()
+        let mut j: usize = 0
+        while j < names.length {
+          state.atoms.release(names[j].name)
+          j = usize.wrappingAdd(j, 1)
+        }
+      }
+      Option<LazyStub>.None => { hasTree = p.deferred.isNone() }
+    }
+  }
+  drop state
+  // A stub's placeholder code never ran (shared 1-byte STUB_CODE with no atoms
+  // or caches), and a lazy/deferred stub with no constants, host edges or known
+  // refs finishes without moving any tail storage out before cell destruction.
+  if placeholder && !hasTree && b.known.refs.length() == 0 && b.host.isNone() && b.constants.length() == 0 {
+    drop b
+    unsafe releaseHeader(&mut hooks, runtime, realm)
+    if unsafe finishTyped(runtime, node) { unsafe HeapCell.destroy<FunctionBytecode>(node) }
+    return ()
+  }
+  let code = if placeholder { ByteStorage.empty() } else { Intrinsic.replace(b.code, ByteStorage.empty()) }
+  let constants = if b.constants.length() != 0 { Intrinsic.replace(b.constants, BoxList<ValueBits>.make()) } else { BoxList<ValueBits>.make() }
+  let knownRefs = if b.known.refs.length() != 0 { Intrinsic.replace(b.known.refs, BoxList<?*mut HeapHeader>.make()) } else { BoxList<?*mut HeapHeader>.make() }
+  let mut host = if b.host.isSome() { Intrinsic.replace(b.host, ThinBox<HostEdges>.none()) } else { ThinBox<HostEdges>.none() }
+  let mut pending = if hasTree { Intrinsic.replace(b.pending, ThinBox<PendingFunction>.none()) } else { ThinBox<PendingFunction>.none() }
   drop b
-  let mut knownIndex: usize = 0
-  while knownIndex < knownRefs.length() { unsafe releaseOptional(&mut hooks, runtime, knownRefs.get(knownIndex)) knownIndex = knownIndex + 1 }
+  let knownCount = knownRefs.length()
+  if knownCount != 0 {
+    let refs = unsafe Pointer.assumeMany<?*mut HeapHeader>(unsafe knownRefs.first())
+    let mut knownIndex: usize = 0
+    while knownIndex < knownCount {
+      unsafe releaseOptional(&mut hooks, runtime, unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(refs, knownIndex)))
+      knownIndex = usize.wrappingAdd(knownIndex, 1)
+    }
+  }
   drop knownRefs
   if let Option<HostEdges>.Some { value } = host.take() {
     let mut edges = move value
@@ -3636,69 +3974,62 @@ unsafe fn destroyBytecode<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
     unsafe release(&mut hooks, runtime, edges.scriptMetadata.take().intoBits())
     drop edges
   }
-  // A stub that never ran still holds its definition's atoms and source.
-  match pending.take() {
-    Option<PendingFunction>.Some { value } => {
-      let mut kept = move value
-      match &mut kept.lazy {
-        Option<LazyStub>.Some { value: stub } => { unsafe stub.release(runtime) }
-        // A deferred body owns nothing: its bytes and atoms are the runtime's.
-        _ => { if kept.deferred.isNone() { let cell = kept.cell compilerState.destroyFunction(&mut hooks, &mut kept.tree.getMut(), cell) } }
+  // A deferred-parse tree stub still owns its unlinked FunctionDef.
+  if hasTree {
+    match pending.take() {
+      Option<PendingFunction>.Some { value } => {
+        let mut kept = move value
+        let cell = kept.cell
+        compilerState.destroyFunction(&mut hooks, &mut kept.tree.getMut(), cell)
       }
+      Option<PendingFunction>.None => ()
     }
-    Option<PendingFunction>.None => ()
   }
   drop host drop pending
   // One base pointer for the walk: code neither moves nor changes until it drops.
   let length = code.length()
-  let mut position: usize = 0
   if length != 0 {
+    let mut position: usize = 0
     let base = unsafe Pointer.assumeMany<u8>(unsafe code.start())
     while position < length {
       let shape = finalShape(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, position)))
       let size = u8.toUsize(shape & FINAL_SIZE)
       if (shape & FINAL_ATOM) != 0 {
         // Incomplete final operands occur on compiler allocation failure.
-        if length - position >= 5 {
-          let atom = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, position + 1)))
-            | u32.shiftLeft(u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, position + 2))), 8)
-            | u32.shiftLeft(u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, position + 3))), 16)
-            | u32.shiftLeft(u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, position + 4))), 24)
-          unsafe releaseAtom(runtime, atom)
+        if usize.wrappingSubtract(length, position) >= 5 {
+          let at = unsafe Pointer.at<u8>(base, usize.wrappingAdd(position, 1))
+          let atom = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(at))
+          let mut stateAnchor = ()
+          let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+          state.atoms.release(atom)
           // The site's address may be reused by later bytecode with another atom,
           // which the field cache's site and shape version checks would not tell apart.
-          unsafe forgetFieldSite(runtime, Pointer.address<u8>(unsafe Pointer.at<u8>(base, position + 1)))
+          let site = Pointer.address<u8>(at)
+          let slot = fieldCacheIndex(site)
+          if state.fieldCache[slot].site == site { state.fieldCache[slot].site = 0 }
+          let spare = fieldSpareIndex(slot)
+          if state.fieldCache[spare].site == site { state.fieldCache[spare].site = 0 }
+          drop state
         }
       }
       if (shape & FINAL_OBJECT) != 0 {
-        unsafe forgetLiteralSite(&mut hooks, runtime, Pointer.address<u8>(unsafe Pointer.at<u8>(base, position)) + 1)
+        unsafe forgetLiteralSite(&mut hooks, runtime, usize.wrappingAdd(Pointer.address<u8>(unsafe Pointer.at<u8>(base, position)), 1))
       }
       require(size != 0)
-      position = position + size
+      position = usize.wrappingAdd(position, size)
+    }
+    unsafe forgetConstructCode(&mut hooks, runtime, Pointer.address<u8>(unsafe code.pointerAt(0)))
+  }
+  let constCount = constants.length()
+  if constCount != 0 {
+    let consts = unsafe Pointer.assumeMany<ValueBits>(unsafe constants.first())
+    let mut index: usize = 0
+    while index < constCount {
+      unsafe release(&mut hooks, runtime, unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(consts, index)))
+      index = usize.wrappingAdd(index, 1)
     }
   }
-  if code.length() != 0 && !placeholder { unsafe forgetConstructCode(&mut hooks, runtime, Pointer.address<u8>(unsafe code.pointerAt(0))) }
-  let mut index: usize = 0
-  while index < definitions.length() {
-    unsafe releaseAtom(runtime, definitions.get(index).name)
-    index = index + 1
-  }
-  index = 0
-  while index < constants.length() {
-    unsafe release(&mut hooks, runtime, constants.get(index))
-    index = index + 1
-  }
-  index = 0
-  while index < closures.length() {
-    unsafe releaseAtom(runtime, closures.get(index).name)
-    index = index + 1
-  }
   unsafe releaseHeader(&mut hooks, runtime, realm)
-  unsafe releaseAtom(runtime, name)
-  match &debug {
-    Option<FunctionDebugInfo>.Some { value } => { unsafe releaseAtom(runtime, value.filename) }
-    Option<FunctionDebugInfo>.None => ()
-  }
   // These local native owners may outlive the header but contain no remaining JS
   // ownership. Borrowed ROM is never freed; embedded atom references still are.
   if unsafe finishTyped(runtime, node) { unsafe HeapCell.destroy<FunctionBytecode>(node) }
@@ -3871,6 +4202,9 @@ unsafe fn destroyModule<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
 @inlineNever
 unsafe fn destroyContext<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
+  let rtState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  rtState.stringCharCode.protoVersion = 0
+  drop rtState
   while true {
     let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, node)
     let first = ctx.loadedModules.first
@@ -4001,7 +4335,7 @@ pub unsafe fn releaseWeak(value: ValueBits) -> () {
       let h = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
       let reclaim = last && h.referenceCount == 0 && h.mark == 0
       drop h
-      if reclaim { unsafe HeapCell.destroy<ObjectData>(reference) }
+      if reclaim { unsafe HeapCell.destroyEmptied<ObjectData>(reference) }
     }
     ValueBits.Symbol { reference } => {
       let symbol = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut anchor, reference)
@@ -4138,7 +4472,7 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   unsafe release(&mut hooks, runtime, tracedValue)
   unsafe release(&mut hooks, runtime, tracedStack)
   let mut unit: usize = 0
-  while unit < 769 {
+  while unit < 1537 {
     let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
     let cached = cache.unitStrings[unit]
     cache.unitStrings[unit] = ValueBits.Undefined

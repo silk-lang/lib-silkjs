@@ -50,6 +50,7 @@ import js_shapes as shapes
 import js_property_mutations as properties
 import js_proxy_core as core
 import js_atom_data as atoms
+import js_class_data as classes
 import js_regexp_intrinsics_support as support
 import regexp_exec { RegExpExecutor, LITERAL_NONE, LITERAL_HIT }
 import regexp_types {
@@ -59,7 +60,8 @@ import regexp_types {
   FLAG_GLOBAL,
   FLAG_STICKY,
   FLAG_INDICES,
-  FLAG_NAMED_GROUPS
+  FLAG_NAMED_GROUPS,
+  FLAG_HINT
 }
 import regexp_validate { RegExpValidationError, validateMatch, validateCaptures }
 import byte_buffer { readU16, readU32 }
@@ -447,10 +449,10 @@ effect fn resultArray<'a, 'b, H: HeapHooks>(
   let array = run unsafe allocate.shapedArray(&mut hooks, memory, realm, shape, count)
   let mut arrayAnchor = ()
   let made = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(array))
-  made.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
-  made.setSlot(1, SlotBits.value(ValueBits.Int { value: index }))
-  made.setSlot(2, SlotBits.value(string.dup().intoBits()))
-  made.setSlot(3, SlotBits.value(groups.dup().intoBits()))
+  unsafe made.setSlotUnchecked(0, SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
+  unsafe made.setSlotUnchecked(1, SlotBits.value(ValueBits.Int { value: index }))
+  unsafe made.setSlotUnchecked(2, SlotBits.value(string.dup().intoBits()))
+  unsafe made.setSlotUnchecked(3, SlotBits.value(groups.dup().intoBits()))
   return array
 }
 
@@ -528,10 +530,19 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
         bytes = unsafe latin1Bytes(&inputAnchor, stringReference(string.view()))
       }
       let length = Strings.length(string.view())
+      let capSlice = captures.asSlice()
+      if capSlice.length < usize.wrappingMultiply(count, 2) { Intrinsic.trap("Captures.get: index out of range") }
+      let capPtr = unsafe Intrinsic.pointerRequalify<?[*]const i32, [*]const i32>(Pointer.fromSlice<i32>(capSlice))
       let mut i: usize = 0
       while i < count {
-        let start = captures.get(i * 2)
-        let end = captures.get(i * 2 + 1)
+        let pair = usize.wrappingMultiply(i, 2)
+        let start = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(capPtr, pair))
+        let end = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(capPtr, usize.wrappingAdd(pair, 1)))
+        if start < 0 || end < 0 {
+          unsafe Pointer.put<ValueBits>(unsafe Pointer.atMut<ValueBits>(output, i), ValueBits.Undefined)
+          i = usize.wrappingAdd(i, 1)
+          continue
+        }
         let captured = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(
           capturePiece(realm, string, bytes, narrow, length, start, end),
           failedCapture,
@@ -545,7 +556,7 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
             fail move error
           }
         }
-        i = i + 1
+        i = usize.wrappingAdd(i, 1)
       }
       unsafe array.valuesMut().extendFilled(count)
     }
@@ -585,22 +596,25 @@ effect fn capturePiece<'a, 'b>(
   if start < 0 || end < 0 {
     return ValueBits.Undefined
   }
-  if start == 0 && i32.toUsize(end) == length {
+  let startPos = i32.wrappingToUsize(start)
+  let endPos = i32.wrappingToUsize(end)
+  if startPos == 0 && endPos == length {
     return Strings.duplicate(string.view())
   }
+  let span = usize.wrappingSubtract(endPos, startPos)
   if narrow {
     return run unitStrings.latin1Substring(
       realm,
-      Slice.view(bytes, i32.toUsize(start), i32.toUsize(end - start)),
+      Slice.view(bytes, startPos, span),
     )
   }
-  if end - start == 1 {
+  if span == 1 {
     return run unsafe unitStrings.unit(
       realm.runtime(),
-      u16.toU32(Strings.codeUnit(string.view(), i32.toUsize(start))),
+      u16.toU32(Strings.codeUnit(string.view(), startPos)),
     )
   }
-  return run unitStrings.substring(realm, string, i32.toUsize(start), i32.toUsize(end))
+  return run unitStrings.substring(realm, string, startPos, endPos)
 }
 
 @cold
@@ -950,7 +964,7 @@ pub effect fn exec<
 /// allocation and a regexp timeout; then it declines (none) having changed
 /// nothing, and the full call reruns it and reports the failure. lastIndex is
 /// written after the result is built, which no script can observe.
-@inlineAlways
+@inlineNever
 pub effect fn quickExec<
   'a,
   H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks
@@ -963,26 +977,27 @@ pub effect fn quickExec<
   test: bool,
 ) -> Option<ValueBits>
   ? &mut Allocator {
-  if !support.regexp(unsafe lendBits(&receiver, receiver)) || input.tag() != -7 {
+  if !receiver.isObject() || input.tag() != -7 {
     return Option<ValueBits>.none()
   }
   let anchor = ()
   let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
+  if object.classId() != classes.JS_CLASS_REGEXP {
+    return Option<ValueBits>.none()
+  }
   let stored = match object.slot(0).valueBits() {
     ValueBits.Int { value } => value
     _ => {
       return Option<ValueBits>.none()
     }
   }
-  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
-  let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
-  drop shape
   let code = match &object.payload {
     ObjectPayload.RegExp { regexp } => regexp.bytecode()
     _ => {
       return Option<ValueBits>.none()
     }
   }
+  let shapePtr = object.shape
   drop object
   let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
   let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
@@ -991,19 +1006,24 @@ pub effect fn quickExec<
     return Option<ValueBits>.none()
   }
   let updatesIndex = (flags & (FLAG_GLOBAL | FLAG_STICKY)) != 0
-  if updatesIndex && !writable {
-    return Option<ValueBits>.none()
-  }
   let mut lastIndex: usize = 0
-  if updatesIndex && stored > 0 {
-    lastIndex = i32.toUsize(stored)
-  }
-  if lastIndex > Strings.length(input) {
-    unsafe quickLastIndex(receiver, 0)
-    if test {
-      return Option<ValueBits>.some(ValueBits.Bool { value: false })
+  if updatesIndex {
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapePtr)
+    let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
+    drop shape
+    if !writable {
+      return Option<ValueBits>.none()
     }
-    return Option<ValueBits>.some(ValueBits.Null)
+    if stored > 0 {
+      lastIndex = i32.wrappingToUsize(stored)
+    }
+    if lastIndex > Strings.length(input) {
+      unsafe quickLastIndex(receiver, 0)
+      if test {
+        return Option<ValueBits>.some(ValueBits.Bool { value: false })
+      }
+      return Option<ValueBits>.some(ValueBits.Null)
+    }
   }
 
   // The receiver keeps code alive: nothing below can replace its bytecode.
@@ -1015,6 +1035,7 @@ pub effect fn quickExec<
     memory,
     realm,
     code,
+    flags,
     input,
     lastIndex,
     test,
@@ -1070,7 +1091,7 @@ pub effect fn literalExec<
   // The match goes straight into the realm's last match.
   let mut place = ()
   let captures = unsafe lastCaptures(realm, &mut place)
-  return run answer(&mut hooks, memory, realm, code, input, 0, test, previous, &mut captures)
+  return run answer(&mut hooks, memory, realm, code, flags, input, 0, test, previous, &mut captures)
 }
 
 /// The match and its answer for quickExec and literalExec: Null (false for test)
@@ -1084,6 +1105,7 @@ effect fn answer<
   memory: &AllocationObserver,
   realm: Realm<'a>,
   code: ValueBits,
+  flags: u32,
   input: ValueBits,
   lastIndex: usize,
   test: bool,
@@ -1101,20 +1123,22 @@ effect fn answer<
 
   // A pattern that is one literal is a substring search: no matcher entry.
   let mut literal = LITERAL_NONE
-  if text.wide {
-    literal = RegExpExecutor.literalInto16(
-      codeFlat.latin1.asSlice(),
-      Slice.view(text.wideUnits(), 0, text.length()),
-      lastIndex,
-      &mut captures,
-    )
-  } else {
-    literal = RegExpExecutor.literalInto8(
-      codeFlat.latin1.asSlice(),
-      Slice.view(inputBytes, 0, text.length()),
-      lastIndex,
-      &mut captures,
-    )
+  if (flags & FLAG_HINT) != 0 {
+    if text.wide {
+      literal = RegExpExecutor.literalInto16(
+        codeFlat.latin1.asSlice(),
+        Slice.view(text.wideUnits(), 0, text.length()),
+        lastIndex,
+        &mut captures,
+      )
+    } else {
+      literal = RegExpExecutor.literalInto8(
+        codeFlat.latin1.asSlice(),
+        Slice.view(inputBytes, 0, text.length()),
+        lastIndex,
+        &mut captures,
+      )
+    }
   }
   let mut matched = literal == LITERAL_HIT
   if literal == LITERAL_NONE {

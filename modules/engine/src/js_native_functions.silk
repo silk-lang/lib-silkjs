@@ -47,6 +47,7 @@ import js_string_types { FlatString, StringLengthError }
 import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import js_atom_data as atoms
+import js_atoms { UNKNOWN_STRING_ATOM }
 import js_class_data as classes
 import js_collection_intrinsics as collections
 import js_number_intrinsics as numberIntrinsics
@@ -651,6 +652,11 @@ pub const CALL_KIND_STRING: u8 = 10
 /// The runtime's async context getter or setter (runtimeIds.NATIVE_ASYNC_CONTEXT_GET
 /// and _SET): the VM reads or replaces RuntimeState.asyncContext itself.
 pub const CALL_KIND_ASYNC_CONTEXT: u8 = 11
+/// RegExp.prototype.exec / .test and String.prototype.replace: dispatched from
+/// leanInline straight to their small dedicated inline helpers, bypassing quickInline.
+pub const CALL_KIND_REGEXP_EXEC: u8 = 12
+pub const CALL_KIND_REGEXP_TEST: u8 = 13
+pub const CALL_KIND_STRING_REPLACE: u8 = 14
 /// The callKind of a native function made with id and protocol (each SLOW
 /// case below names the VM path that may answer it).
 pub fn callKindOf(id: NativeFunctionId, protocol: NativeCallProtocol) -> u8 {
@@ -683,15 +689,17 @@ pub fn callKindOf(id: NativeFunctionId, protocol: NativeCallProtocol) -> u8 {
       BuiltinFamily.Math => CALL_KIND_SLOW
       // numberInline, quickParseInt, quickWrite's toString
       BuiltinFamily.Number => CALL_KIND_SLOW
-      // unitInline, quickString, quickReplace, stringBasic.quick
-      BuiltinFamily.String => if method == stringIds.FROM_CHAR_CODE || method == STRING_REPLACE || method == stringIds.CHAR_CODE_AT || method == stringIds.CHAR_AT { CALL_KIND_SLOW }
+      // unitInline, quickString, stringReplaceInline, stringBasic.quick
+      BuiltinFamily.String => if method == stringIds.FROM_CHAR_CODE || method == stringIds.CHAR_CODE_AT || method == stringIds.CHAR_AT { CALL_KIND_SLOW }
+        else if method == STRING_REPLACE { CALL_KIND_STRING_REPLACE }
         else if stringBasic.hasPrimitiveEntry(method) { CALL_KIND_STRING } else { CALL_KIND_LEAN }
       // pushInline, popInline, quickSplice
       BuiltinFamily.Array => if method == ARRAY_PUSH || method == ARRAY_POP || method == ARRAY_SPLICE { CALL_KIND_SLOW } else { CALL_KIND_LEAN }
       // clockInline
       BuiltinFamily.Date => if method == DATE_NOW { CALL_KIND_SLOW } else { CALL_KIND_LEAN }
-      // nativeInline's quickExec
-      BuiltinFamily.RegExp => if method == REGEXP_EXEC || method == REGEXP_TEST { CALL_KIND_SLOW } else { CALL_KIND_LEAN }
+      // regexpExecInline / regexpTestInline
+      BuiltinFamily.RegExp => if method == REGEXP_EXEC { CALL_KIND_REGEXP_EXEC }
+        else if method == REGEXP_TEST { CALL_KIND_REGEXP_TEST } else { CALL_KIND_LEAN }
       // appliesInline and callInline (f.call, f.apply, Reflect.apply)
       BuiltinFamily.Function => CALL_KIND_SLOW
       BuiltinFamily.Reflect => CALL_KIND_SLOW
@@ -705,24 +713,27 @@ const ARRAY_BUFFER_IS_VIEW: u32 = 1
 const NUMBER_IS_NAN: u32 = 1
 const NUMBER_IS_SAFE_INTEGER: u32 = 4
 const OBJECT_IS: u32 = 16
+const OBJECT_HAS_OWN: u32 = 23
+const OBJECT_HAS_OWN_PROPERTY: u32 = 27
 fn answers(id: NativeFunctionId) -> bool {
   return match id {
     NativeFunctionId.Builtin { family, method } => match family {
       BuiltinFamily.Array => method == ARRAY_IS_ARRAY
       BuiltinFamily.ArrayBuffer => method == ARRAY_BUFFER_IS_VIEW
       BuiltinFamily.Number => method >= NUMBER_IS_NAN && method <= NUMBER_IS_SAFE_INTEGER
-      BuiltinFamily.Object => method == OBJECT_IS
+      BuiltinFamily.Object => method == OBJECT_IS || method == OBJECT_HAS_OWN || method == OBJECT_HAS_OWN_PROPERTY
       _ => false
     }
     _ => false
   }
 }
 /// The answer of a CALL_KIND_ANSWER builtin when it needs no native frame: the
-/// predicates below read their arguments' tags and classes only, so nothing
-/// throws, allocates or runs JavaScript. Uninitialized declines (a Proxy for
-/// Array.isArray), leaving the full call.
+/// predicates below read their arguments' tags, classes and shapes only, so
+/// nothing throws, allocates or runs JavaScript. Uninitialized declines (a Proxy
+/// for Array.isArray, or non-ordinary object / non-flat-string key for hasOwn),
+/// leaving the full call.
 @inlineAlways
-pub unsafe fn leanAnswer(function: ValueBits, argv: &FrameSlots) -> ValueBits {
+pub unsafe fn leanAnswer(runtime: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots) -> ValueBits {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
   let id = match &object.payload { ObjectPayload.NativeFunction { function: native } => native.function _ => { return ValueBits.Uninitialized } }
   drop object
@@ -742,9 +753,29 @@ pub unsafe fn leanAnswer(function: ValueBits, argv: &FrameSlots) -> ValueBits {
     return ValueBits.Bool { value: primitives.numberIsSafeInteger(number) }
   }
   if family == BuiltinFamily.Object {
-    let mut second = ValueBits.Undefined
-    if argv.length() > 1 { second = unsafe argv.get(1) }
-    return ValueBits.Bool { value: unsafe primitives.equal(first, second, EqualityMode.SameValue) }
+    if method == OBJECT_IS {
+      let mut second = ValueBits.Undefined
+      if argv.length() > 1 { second = unsafe argv.get(1) }
+      return ValueBits.Bool { value: unsafe primitives.equal(first, second, EqualityMode.SameValue) }
+    }
+    let mut target = receiver
+    let mut key = first
+    if method == OBJECT_HAS_OWN {
+      target = first
+      key = if argv.length() > 1 { unsafe argv.get(1) } else { ValueBits.Undefined }
+    }
+    let node = match target { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+    match key { ValueBits.String { .. } => () _ => { return ValueBits.Uninitialized } }
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || data.fastArray() { return ValueBits.Uninitialized }
+    let shape = data.shape
+    drop data
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    let atom = state.atoms.findString(key)
+    drop state
+    if atom == UNKNOWN_STRING_ATOM { return ValueBits.Uninitialized }
+    if atom == 0 { return ValueBits.Bool { value: false } }
+    return ValueBits.Bool { value: (unsafe shapes.lookup(shape, atom)).isSome() }
   }
   let node = match first { ValueBits.Object { reference } => reference _ => { return ValueBits.Bool { value: false } } }
   let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
@@ -844,6 +875,24 @@ pub fn quick<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, target: &Qui
 // RegExp.prototype.exec's and test's method ids in js_regexp_intrinsics.
 const REGEXP_EXEC: u32 = 7
 const REGEXP_TEST: u32 = 8
+/// The realm of a native function object whose kind is already known.
+@inlineAlways
+pub unsafe fn nativeRealm(function: ValueBits) -> ?*mut HeapHeader {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => native.realm()
+    _ => Pointer.null<HeapHeader>()
+  }
+}
+/// Whether target is the intrinsic String constructor called as a function.
+@inlineAlways
+pub fn isStringConstructor(target: &QuickTarget) -> bool {
+  if target.protocol != NativeCallProtocol.ConstructorOrFunction { return false }
+  return match target.id {
+    NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.String && method == stringIds.CONSTRUCTOR
+    _ => false
+  }
+}
 /// The realm of function when it is the intrinsic RegExp.prototype.exec or test
 /// (test.* says which), else null: the VM answers that call with
 /// js_regexp_intrinsics_exec.quickExec.
@@ -988,7 +1037,8 @@ pub unsafe fn unitStringOf(runtime: *mut HeapHeader, value: ValueBits) -> ValueB
   let code = match value { ValueBits.Int { value: integer } => i32.toU32(i32.bitAnd(integer, 65535)) _ => { return ValueBits.Uninitialized } }
   if code > 255 { return ValueBits.Uninitialized }
   let anchor = () let registry = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let entry = registry.unitStrings[u32.toUsize(code)]
+  let table = unsafe Pointer.assumeMany<ValueBits>(Pointer.fromRef<ValueBits>(&registry.unitStrings[0]))
+  let entry = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(table, u32.toUsize(code)))
   drop registry
   if entry.isString() { return Strings.duplicate(entry) }
   return ValueBits.Uninitialized
@@ -1013,7 +1063,8 @@ pub unsafe fn isCharCodeAt(function: ValueBits) -> bool {
 pub const UNIT_METHOD_NONE: u8 = 0
 pub const UNIT_METHOD_CHAR_CODE_AT: u8 = 1
 pub const UNIT_METHOD_FROM_CHAR_CODE: u8 = 2
-/// Which of the two per-character String intrinsics function is, in one pass
+pub const UNIT_METHOD_CHAR_AT: u8 = 3
+/// Which of the per-character String intrinsics function is, in one pass
 /// over its payload (isCharCodeAt and objectMethod each walk it again).
 @inlineAlways
 pub unsafe fn unitMethod(function: ValueBits) -> u8 {
@@ -1026,6 +1077,7 @@ pub unsafe fn unitMethod(function: ValueBits) -> u8 {
         if family != BuiltinFamily.String || native.protocol == NativeCallProtocol.Data { UNIT_METHOD_NONE }
         else if method == stringIds.CHAR_CODE_AT { UNIT_METHOD_CHAR_CODE_AT }
         else if method == stringIds.FROM_CHAR_CODE { UNIT_METHOD_FROM_CHAR_CODE }
+        else if method == stringIds.CHAR_AT { UNIT_METHOD_CHAR_AT }
         else { UNIT_METHOD_NONE }
       }
       _ => UNIT_METHOD_NONE
@@ -1084,31 +1136,58 @@ pub unsafe fn charCodeOf(receiver: ValueBits, value: ValueBits) -> i32 {
   let index = match value { ValueBits.Int { value: integer } => integer _ => { return -1 } }
   if index < 0 { return -1 }
   // A flat string reads its unit in place: one length check and one load for
-  // the common compact Latin-1 text (a scanner's charCodeAt loop).
+  // both compact and out-of-line Latin-1 text (a scanner's charCodeAt loop).
   if let ValueBits.String { reference } = receiver {
     let anchor = ()
     let data = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, reference)
     let at = i32.toUsize(index)
     if at >= data.length() { return -1 }
-    if data.compact && !data.wide { return u8.toI32(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(data.textAddress()), at))) }
+    if !data.wide {
+      if data.compact {
+        return u8.toI32(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(data.textAddress()), at)))
+      }
+      let bytes = data.latin1.asSlice()
+      let pos = usize.wrappingAdd(data.frontGap(), at)
+      if pos < bytes.length {
+        let ptr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+        return u8.toI32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos)))
+      }
+      return -1
+    }
     return u16.toI32(data.unit(at))
   }
   let text = Strings.flatView((unsafe lendBits(&receiver, receiver)).view())
   if text.tag() != -7 || i32.toUsize(index) >= Strings.length(text) { return -1 }
   return u16.toI32(Strings.codeUnit(text, i32.toUsize(index)))
 }
+/// Zero-call flat Latin-1 charCodeAt for leaf charCode accessors: handles both
+/// compact and out-of-line Latin-1 flat strings without bounds-check fatals;
+/// returns -1 on wide strings, ropes, non-strings, or out-of-range indices.
+@inlineAlways
+pub unsafe fn flatCharCodeOf(receiver: ValueBits, index: i32) -> i32 {
+  if index < 0 { return -1 }
+  if let ValueBits.String { reference } = receiver {
+    let anchor = ()
+    let data = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, reference)
+    let at = i32.toUsize(index)
+    if at >= data.length() || data.wide { return -1 }
+    if data.compact {
+      return u8.toI32(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(data.textAddress()), at)))
+    }
+    let bytes = data.latin1.asSlice()
+    let pos = data.frontGap() + at
+    if pos < bytes.length {
+      let ptr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+      return u8.toI32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos)))
+    }
+  }
+  return -1
+}
 /// Array.prototype.pop on a fast Array whose writable length matches its dense
 /// count: remove the last value and publish the new length, with no frame.
+@inlineAlways
 pub unsafe fn quickPop(receiver: ValueBits) -> Option<ValueBits> {
-  let held = unsafe lendBits(&receiver, receiver)
-  let count = arraySupport.fastCount(held)
-  if count < 0 || arraySupport.intLength(held) != count || !arraySupport.writableLength(held) {
-    return Option<ValueBits>.none()
-  }
-  if count == 0 { return Option<ValueBits>.some(ValueBits.Undefined) }
-  let removed = arraySupport.popFast(held, false).intoBits()
-  arraySupport.publishLength(held, count - 1)
-  return Option<ValueBits>.some(removed)
+  return unsafe arraySupport.popOne(receiver)
 }
 /// The decimal text of an Int for Number.prototype.toString: the realm's cached
 /// text below 256, else a new string. None only on allocation failure, which the

@@ -27,6 +27,8 @@ import js_owned_value { Value, lendBits, ValueRef }
 import js_string_intrinsics_metadata as ids
 import unicode_case { UnicodeCase }
 import js_unit_strings as unitStrings
+import js_primitives as primitive
+import js_caught { FailedOomLength, failedOomLength }
 import js_invariant { require }
 import js_parser_diagnostics { DiagnosticMessage }
 import dtoa { Dtoa }
@@ -40,23 +42,89 @@ pub fn hasPrimitiveEntry(method: u32) -> bool {
     || method == ids.AT || method == ids.CHAR_CODE_AT || method == ids.CHAR_AT || method == ids.CODE_POINT_AT
 }
 
-/// Borrowed primitive calls can use the string implementation without a native
-/// frame. Any receiver or argument that could invoke user code declines before
-/// conversion; the ordinary native entry then supplies its frame and errors.
+/// Borrowed primitive calls run directly on the borrowed string operands with no
+/// retain/release or native frame. Any receiver or argument that could invoke
+/// user code declines before conversion; the ordinary native entry then supplies
+/// its frame and errors.
 @inlineNever
 pub effect fn quick<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, receiver: ValueBits,
   argv: &FrameSlots, method: u32) -> Option<ValueBits> ! JsException ? &mut Allocator {
-  if !receiver.isString() { return Option<ValueBits>.none() }
+  let text = Strings.flatView(receiver)
+  if text.tag() != -7 { return Option<ValueBits>.none() }
   let args = unsafe lendArguments(argv)
   let first = args.get(0).view() let second = args.get(1).view()
+  let length = usize.toI32(Strings.length(text))
   if method >= ids.INDEX_OF && method <= ids.STARTS_WITH {
-    if !first.isString() || !plainIndex(second) { return Option<ValueBits>.none() }
-  } else if method >= ids.SUBSTRING && method <= ids.SLICE {
+    let search = Strings.flatView(first)
+    if search.tag() != -7 || !plainIndex(second) { return Option<ValueBits>.none() }
+    let searchLength = usize.toI32(Strings.length(search))
+    if method == ids.LAST_INDEX_OF {
+      if searchLength > length { return Option<ValueBits>.some(ValueBits.Int { value: -1 }) }
+      let mut position = length - searchLength
+      if let ValueBits.Int { value } = second {
+        if value <= 0 { position = 0 } else if value < position { position = value }
+      }
+      while position >= 0 {
+        if Strings.compareRange(text, i32.toUsize(position), search, 0, i32.toUsize(searchLength)) == 0 {
+          return Option<ValueBits>.some(ValueBits.Int { value: position })
+        }
+        position = position - 1
+      }
+      return Option<ValueBits>.some(ValueBits.Int { value: -1 })
+    }
+    let mut position: i32 = 0
+    if method == ids.ENDS_WITH { position = length }
+    if let ValueBits.Int { value } = second { position = primitive.int32Clamped(value, 0, length, 0) }
+    if method == ids.INDEX_OF || method == ids.INCLUDES {
+      let index = support.find(text, search, i32.toUsize(position))
+      if method == ids.INDEX_OF { return Option<ValueBits>.some(ValueBits.Int { value: index }) }
+      return Option<ValueBits>.some(ValueBits.Bool { value: index >= 0 })
+    }
+    if method == ids.ENDS_WITH { position = position - searchLength }
+    if position < 0 || position > length - searchLength { return Option<ValueBits>.some(ValueBits.Bool { value: false }) }
+    return Option<ValueBits>.some(ValueBits.Bool { value: Strings.compareRange(text, i32.toUsize(position), search, 0, i32.toUsize(searchLength)) == 0 })
+  }
+  if method >= ids.SUBSTRING && method <= ids.SLICE {
     if !plainIndex(first) || !plainIndex(second) { return Option<ValueBits>.none() }
-  } else if method == ids.AT || method == ids.CHAR_CODE_AT || method == ids.CHAR_AT || method == ids.CODE_POINT_AT {
+    let mut offset: i32 = 0 if method != ids.SUBSTRING { offset = length }
+    let mut start: i32 = 0
+    if let ValueBits.Int { value } = first { start = primitive.int32Clamped(value, 0, length, offset) }
+    let mut end = length
+    if method == ids.SUBSTR {
+      let mut count = length - start
+      if let ValueBits.Int { value } = second { count = primitive.int32Clamped(value, 0, count, 0) }
+      end = start + count
+    } else {
+      if let ValueBits.Int { value } = second { end = primitive.int32Clamped(value, 0, length, offset) }
+      if end < start {
+        if method == ids.SUBSTRING { let old = start start = end end = old } else { end = start }
+      }
+    }
+    return Option<ValueBits>.some(run support.slice(&mut hooks, realm, unsafe lendBits(&text, text), i32.toUsize(start), i32.toUsize(end)))
+  }
+  if method == ids.AT || method == ids.CHAR_CODE_AT || method == ids.CHAR_AT || method == ids.CODE_POINT_AT {
     if !plainIndex(first) { return Option<ValueBits>.none() }
-  } else { return Option<ValueBits>.none() }
-  return Option<ValueBits>.some(run call(&mut hooks, realm, unsafe lendBits(&receiver, receiver), args, method))
+    let mut index: i32 = 0
+    if let ValueBits.Int { value } = first { index = value }
+    if method == ids.AT && index < 0 {
+      if index < -length { return Option<ValueBits>.some(ValueBits.Undefined) }
+      index = index + length
+    }
+    if index < 0 || index >= length {
+      if method == ids.CHAR_CODE_AT { return Option<ValueBits>.some(ValueBits.Float64 { value: f64.fromBits(0x7ff8000000000000) }) }
+      if method == ids.CHAR_AT { return Option<ValueBits>.some(run support.slice(&mut hooks, realm, unsafe lendBits(&text, text), 0, 0)) }
+      return Option<ValueBits>.some(ValueBits.Undefined)
+    }
+    let mut cursor = i32.toUsize(index)
+    if method == ids.CHAR_CODE_AT { return Option<ValueBits>.some(ValueBits.Int { value: u16.toI32(Strings.codeUnit(text, cursor)) }) }
+    if method == ids.CODE_POINT_AT { return Option<ValueBits>.some(ValueBits.Int { value: u32.toI32(Strings.codePoint(text, &mut cursor)) }) }
+    let made = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(unitStrings.forContext(realm, u16.toU32(Strings.codeUnit(text, cursor))), failedOomLength)
+    return match move made {
+      ValueBits output => Option<ValueBits>.some(output)
+      FailedOomLength { error } => Option<ValueBits>.some(run support.materializeValue(&mut hooks, realm, move error))
+    }
+  }
+  return Option<ValueBits>.none()
 }
 @inlineAlways
 fn plainIndex(value: ValueBits) -> bool {

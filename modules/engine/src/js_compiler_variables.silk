@@ -8,6 +8,7 @@ import js_value { ValueBits }
 import js_debugger_metadata { Metadata as DebuggerMetadata }
 import thin_list { ThinList, BoxList }
 import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -353,34 +354,86 @@ pub effect fn captureFreeName(fd: &mut FunctionDef, table: &mut AtomTable, name:
 /// closure entries, the arguments and function-name vars) are idempotent, so a
 /// second lookup would return the same binding. Open addressing, at most half
 /// full; inserting stops there.
-struct BindingMemo { keys: List<u64>, bindings: List<Binding>, count: usize }
+const BLANK_BINDING: Binding = Binding { index: 0, storage: 0, constant: false, lexical: false, kind: VariableKind.Normal }
+struct BindingMemo {
+  smallKeys: [u64; 16],
+  smallBindings: [Binding; 16],
+  keys: List<u64>,
+  bindings: List<Binding>,
+  count: usize
+}
+const MEMO_SMALL: usize = 16
 const MEMO_SLOTS: usize = 128
+fn makeBindingMemo() -> BindingMemo {
+  return BindingMemo {
+    smallKeys: [0; 16],
+    smallBindings: [BLANK_BINDING; 16],
+    keys: List<u64>.make(),
+    bindings: List<Binding>.make(),
+    count: 0
+  }
+}
 fn memoKey(name: u32, scope: i32, store: bool) -> u64 {
   let mut key = u64.shiftLeft(i32.toU64(scope + 1), 32) | u32.toU64(name)
   if store { key = key | 0x8000000000000000 }
   return key
 }
+fn memoSlotSmall(key: u64) -> usize {
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(key, 0x9e3779b97f4a7c15), 60))
+}
 fn memoSlot(key: u64) -> usize {
   return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(key, 0x9e3779b97f4a7c15), 57))
+}
+@inlineNever
+effect fn promoteBindingMemo(memo: &mut BindingMemo, binding: Binding) -> () ! OutOfMemoryError ? &mut Allocator {
+  run memo.keys.appendRepeated(0, MEMO_SLOTS)
+  run memo.bindings.appendRepeated(binding, MEMO_SLOTS)
+  let mut i: usize = 0
+  while i < MEMO_SMALL {
+    let k = memo.smallKeys[i]
+    if k != 0 {
+      let mut s = memoSlot(k)
+      while memo.keys.get(s) != 0 { s = (s + 1) & (MEMO_SLOTS - 1) }
+      memo.keys.set(s, k)
+      memo.bindings.set(s, memo.smallBindings[i])
+    }
+    i = i + 1
+  }
 }
 effect fn memoLookup(tree: &mut FunctionTree, cell: FunctionId, memo: &mut BindingMemo, name: u32, scope: i32, code: u8, label: &mut i32) -> Binding
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let key = memoKey(name, scope, code == op.OP_scope_put_var || code == op.OP_scope_make_ref)
-  let mut at = memoSlot(key)
-  if memo.keys.length() != 0 {
-    while memo.keys.get(at) != 0 {
-      if memo.keys.get(at) == key { return memo.bindings.get(at) }
-      at = (at + 1) & (MEMO_SLOTS - 1)
+  if memo.keys.length() == 0 {
+    let mut at = memoSlotSmall(key)
+    while memo.smallKeys[at] != 0 {
+      if memo.smallKeys[at] == key { return memo.smallBindings[at] }
+      at = (at + 1) & (MEMO_SMALL - 1)
     }
+    let binding = run lookup(&mut tree, cell, name, scope, code, &mut label)
+    if binding.storage >= 2 && binding.index >= u16.toI32(SCOPE_OPERAND) { run tooManyClosures(&tree.*, cell, binding.index) }
+    if label.* < 0 {
+      if memo.count < MEMO_SMALL / 2 {
+        memo.smallKeys[at] = key
+        memo.smallBindings[at] = binding
+        memo.count = memo.count + 1
+      } else {
+        run promoteBindingMemo(&mut memo, binding)
+        let mut s = memoSlot(key)
+        while memo.keys.get(s) != 0 { s = (s + 1) & (MEMO_SLOTS - 1) }
+        memo.keys.set(s, key) memo.bindings.set(s, binding) memo.count = memo.count + 1
+      }
+    }
+    return binding
+  }
+  let mut at = memoSlot(key)
+  while memo.keys.get(at) != 0 {
+    if memo.keys.get(at) == key { return memo.bindings.get(at) }
+    at = (at + 1) & (MEMO_SLOTS - 1)
   }
   let binding = run lookup(&mut tree, cell, name, scope, code, &mut label)
   // Var-ref and get_var operands at SCOPE_OPERAND and above name scope slots.
   if binding.storage >= 2 && binding.index >= u16.toI32(SCOPE_OPERAND) { run tooManyClosures(&tree.*, cell, binding.index) }
   if label.* < 0 && memo.count < MEMO_SLOTS / 2 {
-    if memo.keys.length() == 0 {
-      run memo.keys.appendRepeated(0, MEMO_SLOTS)
-      run memo.bindings.appendRepeated(binding, MEMO_SLOTS)
-    }
     memo.keys.set(at, key) memo.bindings.set(at, binding) memo.count = memo.count + 1
   }
   return binding
@@ -648,6 +701,7 @@ effect fn privateGet(fd: &mut FunctionDef, binding: &Binding) -> () ? &mut Alloc
   let mut get = op.OP_get_loc if binding.storage == 2 { get = op.OP_get_var_ref }
   run pair(&mut fd, get, binding.index)
 }
+@inlineNever
 effect fn resolvePrivate(tree: &mut FunctionTree, cell: FunctionId, name: u32, scope: i32, code: u8) -> ()
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let binding = run privateLookup(&mut tree, cell, name, scope)
@@ -899,6 +953,7 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   let mut callIndex: usize = 0
   // Kept call entries, plus global reads, which throw a ReferenceError at the identifier.
   let mut kept = List<PcSourcePosition>.make()
+  if calls.length() != 0 { run kept.reserveExact(calls.length()) }
   let debug = initial.debuggerMetadata.enabled
   let locations = Intrinsic.replace(initial.debuggerMetadata.locations, BoxList<Location>.make())
   let mut locationIndex: usize = 0
@@ -922,54 +977,83 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   }
   drop runtime drop initial
   let mut line: i32 = 0 let mut cc = CodeContext.make()
-  let mut memo = BindingMemo { keys: List<u64>.make(), bindings: List<Binding>.make(), count: 0 }
+  let mut memo = makeBindingMemo()
   // js_compiler_known: where the last `fclosure [set_name] [dup]` ends, so a
   // store right there writes that function expression; and the next callee read.
   let mut closureChild: i32 = -1 let mut closureEnd: usize = usize.MAX let mut closureDup = false
   let mut calleeIndex: usize = 0
-  while position.* < input.length() {
-    let p = position.* let code = input.get(p)
+  let inputLen = input.length()
+  let mut nextCall = inputLen
+  if callIndex < calls.length() { nextCall = u32.toUsize(calls.get(callIndex).pc) }
+  while position.* < inputLen {
+    let p = position.*
+    let bytes = input.asSlice()
+    let ptr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, p))
     // Calls with recorded source positions and debugger locations are mapped
-    // instruction by instruction below, so a run stops before the next call.
-    while callIndex < calls.length() && calls.get(callIndex).pc < usize.toU32(p) { callIndex = callIndex + 1 }
-    let mut stop = input.length()
-    if callIndex < calls.length() { stop = u32.toUsize(calls.get(callIndex).pc) }
-    if !debug && stop > p && (emit.passClass(code) & emit.PASS_SPECIAL) == 0 {
-      // A run of verbatim instructions: one claim and one append for all of them.
+    // instruction by instruction below; in non-debug mode verbatim runs span
+    // across call sites by tracking nextCall inside the run.
+    while nextCall < p {
+      callIndex = callIndex + 1
+      nextCall = if callIndex < calls.length() { u32.toUsize(calls.get(callIndex).pc) } else { inputLen }
+    }
+    let cls0 = emit.passClass(code)
+    if !debug && (cls0 & emit.PASS_SPECIAL) == 0 {
       let fd = tree.getMut(cell)
-      let mut q = p let mut atomsSeen = false
-      let bytes = input.asSlice()
-      while q < stop {
-        let c = bytes[q] let cls = emit.passClass(c)
-        if (cls & emit.PASS_SPECIAL) != 0 { break }
-        if c == op.OP_fclosure { closureChild = u32.toI32(readU32(bytes, q + 1)) closureEnd = q + 5 closureDup = false }
-        else if c == op.OP_set_name && q == closureEnd { closureEnd = q + 5 }
-        else if c == op.OP_dup && q == closureEnd && !closureDup { closureEnd = q + 1 closureDup = true }
-        else if c == op.OP_line_num && q == closureEnd { closureEnd = q + 5 }
-        if (cls & emit.PASS_ATOM) != 0 { atomsSeen = true }
-        else if c == op.OP_line_num {
-          line = signedWord(readU32(bytes, q + 1)) fd.lineNumberCapacity = fd.lineNumberCapacity + 1
+      let baseOutPc = usize.wrappingToU32(fd.bytecode.length())
+      let mut q = p
+      let mut atomsSeen = false
+      let mut lineDelta: usize = 0
+      while q < inputLen {
+        let c = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, q))
+        let cls = emit.passClass(c)
+        if cls >= emit.PASS_WATCH {
+          if (cls & emit.PASS_SPECIAL) != 0 { break }
+          if (cls & emit.PASS_ATOM) != 0 { atomsSeen = true }
+          else if c == op.OP_line_num {
+            line = signedWord(readU32(bytes, usize.wrappingAdd(q, 1)))
+            lineDelta = usize.wrappingAdd(lineDelta, 1)
+            if q == closureEnd { closureEnd = usize.wrappingAdd(q, 5) }
+          } else {
+            closureChild = u32.toI32(readU32(bytes, usize.wrappingAdd(q, 1)))
+            closureEnd = usize.wrappingAdd(q, 5)
+            closureDup = false
+          }
         }
-        q = q + u8.toUsize(cls & 0x3f)
+        q = usize.wrappingAdd(q, u8.toUsize(cls & 0x0f))
       }
-      if q > input.length() { Intrinsic.trap("QuickJS invariant violated") }
+      if q > inputLen { Intrinsic.trap("QuickJS invariant violated") }
+      if nextCall < q {
+        let callCount = calls.length()
+        while nextCall < q {
+          let c = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, nextCall))
+          if (emit.passClass(c) & emit.PASS_KEEP_CALL) != 0 {
+            let sourcePosition = calls.get(callIndex).sourcePosition
+            run kept.append(PcSourcePosition { pc: u32.wrappingAdd(baseOutPc, usize.wrappingToU32(nextCall - p)), sourcePosition: sourcePosition })
+          }
+          callIndex = callIndex + 1
+          nextCall = if callIndex < callCount { u32.toUsize(calls.get(callIndex).pc) } else { inputLen }
+        }
+      }
+      if lineDelta != 0 { fd.lineNumberCapacity = fd.lineNumberCapacity + lineDelta }
       // Copied atom operands move to the output as they are: nothing reads
       // input's operands behind position again. A run that is not copied
       // releases its own.
       let mut copied = false
       if run emit.claimBytecode(&mut fd, q - p) {
-        copied = fd.bytecode.appendSliceWithin(Slice.view<u8>(input.asSlice(), p, q - p))
+        copied = fd.bytecode.appendSliceWithin(Slice.view<u8>(bytes, p, q - p))
         if !copied { fd.bytecodeError = true }
       }
       if !copied && atomsSeen {
         let mut ra2 = ()
         let rt = fd.runtimeStateMut(&mut ra2)
-        emit.freeBytecodeAtoms(&mut rt.atoms, Slice.view<u8>(input.asSlice(), p, q - p), false)
+        emit.freeBytecodeAtoms(&mut rt.atoms, Slice.view<u8>(bytes, p, q - p), false)
       }
       position.* = q
       continue
     }
-    let size = u8.toUsize(op.opcodeInfo(code, false).size) let mut next = p + size
+    let cls1 = cls0
+    let size = u8.toUsize(cls1 & 0x0f) let mut next = p + size
     let mut outputStart: usize = 0
     if debug {
       while locationIndex < locations.length() && locations.get(locationIndex).pc <= usize.toU32(p) {
@@ -979,25 +1063,14 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
       let fd = tree.get(cell)
       outputStart = fd.bytecode.length()
     }
-    while callIndex < calls.length() && calls.get(callIndex).pc < usize.toU32(p) {
-      callIndex = callIndex + 1
-    }
-    if callIndex < calls.length() && calls.get(callIndex).pc == usize.toU32(p) {
-      let fd = tree.get(cell)
-      // Calls, and property reads, which throw on undefined.
-      if code == op.OP_call || code == op.OP_call_method || code == op.OP_call_constructor
-        || code == op.OP_apply || code == op.OP_eval || code == op.OP_apply_eval
-        || code == op.OP_get_field || code == op.OP_get_field2 || code == op.OP_get_array_el
-        || code == op.OP_get_array_el3 || code == op.OP_get_super_value
-        || code == op.OP_put_field || code == op.OP_put_array_el
-        || code == op.OP_get_field_opt_chain || code == op.OP_get_array_el_opt_chain
-        // An await: where a suspended function's async stack trace frame points.
-        || code == op.OP_await {
+    if nextCall == p {
+      // Calls, property reads/writes, and await keep source positions.
+      if (cls1 & emit.PASS_KEEP_CALL) != 0 {
         let sourcePosition = calls.get(callIndex).sourcePosition
-        drop fd
         run kept.append(PcSourcePosition { pc: usize.toU32(tree.get(cell).bytecode.length()), sourcePosition: sourcePosition })
       }
       callIndex = callIndex + 1
+      nextCall = if callIndex < calls.length() { u32.toUsize(calls.get(callIndex).pc) } else { input.length() }
     }
     if code == op.OP_fclosure { closureChild = u32.toI32(readU32(input.asSlice(), p + 1)) closureEnd = p + 5 closureDup = false }
     else if code == op.OP_set_name && p == closureEnd { closureEnd = p + 5 }
@@ -1065,9 +1138,11 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
       } else if code == op.OP_insert3 {
         if !debug && matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_put_array_el, op.OP_put_ref_value), opcode(op.OP_drop), -1]) {
           // The store keeps its call site, which names the folded instruction.
-          if callIndex < calls.length() && u32.toUsize(calls.get(callIndex).pc) < i32.toUsize(cc.position) {
+          if nextCall < i32.toUsize(cc.position) {
             let site = PcSourcePosition { pc: usize.toU32(fd.bytecode.length()), sourcePosition: calls.get(callIndex).sourcePosition }
-            run kept.append(site) callIndex = callIndex + 1
+            run kept.append(site)
+            callIndex = callIndex + 1
+            nextCall = if callIndex < calls.length() { u32.toUsize(calls.get(callIndex).pc) } else { input.length() }
           }
           run emit.emitU8(&mut fd, i32.toU8(cc.opcode)) next = i32.toUsize(cc.position)
           if cc.lineNumber != -1 && cc.lineNumber != line { line = cc.lineNumber run lineOut(&mut fd, line) } copy = false
@@ -1282,9 +1357,11 @@ effect fn resolveStub(tree: &mut FunctionTree, cell: FunctionId) -> ()
   let fd = tree.getMut(cell)
   let rt = fd.runtimeStateMut(&mut ra)
   releaseLazyFree(&mut fd, &mut rt.atoms)
-  emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false)
-  emit.freeBytecodeAtoms(&mut rt.atoms, fd.bytecode.asSlice(), false)
-  fd.bytecode = ByteBuffer.make()
+  if input.length() != 0 { emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false) }
+  if fd.bytecode.length() != 0 {
+    emit.freeBytecodeAtoms(&mut rt.atoms, fd.bytecode.asSlice(), false)
+    fd.bytecode = ByteBuffer.make()
+  }
   match move failure {
     Option<OutOfMemoryError | StringLengthError | CompilerError>.Some { value } => { fail move value }
     _ => ()

@@ -17,6 +17,7 @@ import js_vm_state { Machine }
 import js_vm_property_ops as shared
 import js_heap { HeapCell, HeapHeader }
 import js_atom_data as atomIds
+import js_atoms { AtomTable }
 import js_value { ValueBits }
 import js_core_types { FieldCacheEntry, fieldCacheIndex, storeFieldEntry, ContextState, FunctionBytecode, ShapeProperty, InstanceCacheEntry, INSTANCE_CACHE_EMPTY, JS_PROP_TMASK, RuntimeState, ObjectData, ObjectPayload, SlotBits, NativeErrorKind, ShapeData,
   JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_ENUMERABLE, JS_PROP_C_W_E,
@@ -554,7 +555,41 @@ unsafe effect fn defineFieldFast<H: HeapHooks>(hooks: &mut H, runtime: *mut Heap
   object: ValueBits, atom: u32, value: ValueBits, site: usize) -> bool ? &mut Allocator {
   let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
-  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
+  if data.classId() != classes.JS_CLASS_OBJECT {
+    // Large array literals emit OP_define_field with sequential integer atoms.
+    if data.classId() == classes.JS_CLASS_ARRAY && data.fastArray() && data.extensible() && AtomTable.isInteger(atom) {
+      let raw = AtomTable.integer(atom)
+      if raw < 2147483647 {
+        let index = u32.toI32(raw)
+        let lenMatch = match (unsafe data.slotUnchecked(0)).valueBits() { ValueBits.Int { value: length } => length == index _ => false }
+        if lenMatch {
+          let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
+          let writable = (u8.toU32((unsafe shape.properties.getUnchecked(0)).flags) & JS_PROP_WRITABLE) != 0
+          drop shape
+          if writable {
+            let appended = match &mut data.payload {
+              ObjectPayload.FastArray { array } => {
+                if array.values().length() != u32.toUsize(raw) { false }
+                else {
+                  match run Effect.result(array.valuesMut().append(value)) {
+                    Result<(), OutOfMemoryError>.Success { .. } => true
+                    Result<(), OutOfMemoryError>.Failure { error } => { drop error false }
+                  }
+                }
+              }
+              _ => false
+            }
+            if appended {
+              unsafe data.setSlotUnchecked(0, SlotBits.value(ValueBits.Int { value: i32.wrappingAdd(index, 1) }))
+              return true
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
+  if data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
   // A define adds an own property whatever the prototypes hold, so a memoized
   // transition between live shapes is just a swap. A memo entry exists only for
   // an atom its base shape lacks, so a hit needs no lookup.
@@ -568,17 +603,17 @@ unsafe effect fn defineFieldFast<H: HeapHooks>(hooks: &mut H, runtime: *mut Heap
       let shapeAnchor = ()
       let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
       let flags = (unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags
+      let version = shape.version
       drop shape
       if u8.toU32(flags) != JS_PROP_C_W_E { return false }
       if site != 0 && index < 0x10000 {
-        let version = (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)).version
         let mut stateAnchor = ()
         let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
         let slot = fieldCacheIndex(site)
         storeFieldEntry(&mut state, slot, FieldCacheEntry { site: site, key: u64.shiftLeft(version, 16) | usize.toU64(index), protoKey: 0, midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 })
       }
       let old = (unsafe data.slotUnchecked(index)).valueBits()
-      data.setSlot(index, SlotBits.value(value)) drop data
+      unsafe data.setSlotUnchecked(index, SlotBits.value(value)) drop data
       unsafe gc.release(&mut hooks, runtime, old)
       return true
     }
@@ -588,7 +623,7 @@ unsafe effect fn defineFieldFast<H: HeapHooks>(hooks: &mut H, runtime: *mut Heap
     AddResult result => move result
     AddFailed { .. } => { return false }
   }
-  data.setSlot(added.index, SlotBits.value(value)) drop data
+  unsafe data.setSlotUnchecked(added.index, SlotBits.value(value)) drop data
   unsafe gc.retireShape(&mut hooks, runtime, added.retiredShape)
   return true
 }
@@ -609,6 +644,9 @@ fn literalValueOp(opcode: u8) -> bool {
   if (opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3) || opcode == op.OP_get_scope0 || opcode == op.OP_get_scope0_check { return true }
   if opcode == op.OP_get_length || (opcode >= op.OP_call0 && opcode <= op.OP_call3) || (opcode >= op.OP_is_undefined && opcode <= op.OP_typeof_is_function) { return true }
   if opcode == op.OP_typeof_is || opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8 || opcode == op.OP_get_scope0_el { return true }
+  if opcode >= op.OP_get_loc_field8 && opcode <= op.OP_get_arg_el8 { return true }
+  if opcode == op.OP_shl_imm || opcode == op.OP_get_loc_el_arg8 { return true }
+  if opcode >= op.OP_add_top_arg8 && opcode <= op.OP_get_arg_el_arg8 { return true }
   return false
 }
 unsafe fn codeByte(code: *const u8, pos: usize) -> u8 {
@@ -726,7 +764,8 @@ unsafe effect fn cloneSpread<H: HeapHooks>(hooks: &mut H, memory: &AllocationObs
   }
   if !same { return false }
   let count = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).properties.length()
-  unsafe shapes.take(machine.runtime, shape)
+  // source holds a live reference to shape, so it cannot be parked (rc >= 1).
+  unsafe HeapCell.retain(shape)
   let realm = unsafe lendRealm(&machine.context, machine.context)
   // Every slot is stored from the source's before anything reads the object.
   let created = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe allocation.ordinaryFromShapeWritten(&mut hooks, memory, realm, shape, count), addFailed)
@@ -734,7 +773,11 @@ unsafe effect fn cloneSpread<H: HeapHooks>(hooks: &mut H, memory: &AllocationObs
     ValueBits value => value
     AddFailed { .. } => { return false }
   }
-  if let ValueBits.Object { reference } = value { unsafe copying.fillClone(reference, source) }
+  if let ValueBits.Object { reference } = value {
+    if let ValueBits.Object { reference: from } = source {
+      unsafe copying.fillCloneWritten(reference, from, count)
+    }
+  }
   unsafe machine.push(value)
   unsafe machine.skip(width + 5)
   return true

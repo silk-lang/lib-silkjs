@@ -16,11 +16,13 @@ import silk.mem.pointer { Pointer }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.i32
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_core_types { FunctionBytecode, FrameSlots, RuntimeState, ObjectData, ObjectPayload, StackFrame, SCOPE_OPERAND, scopeSlot }
+import js_core_types { FunctionBytecode, FrameSlots, RuntimeState, CompiledEntry, OSR_ONLY_CALL_WORDS, ObjectData, ObjectPayload, ShapeData, StackFrame, SCOPE_OPERAND, scopeSlot }
+import js_compiler_finish { STUB_FRAME_CELLS }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_private_fields as privateFields
@@ -32,6 +34,7 @@ import js_scopes as scopes
 import js_primitives as primitives
 import js_class_data as classes
 import js_opcode_data as op
+import js_native_functions as nativeFunctions
 import js_bytecode { LEAF_PREFILL, LEAF_CELLS, LEAF_CREDIT_MASK, LEAF_ACCESSOR }
 
 /// Runs live at once: the outermost and one leaf it calls (Nesting).
@@ -59,10 +62,28 @@ pub unsafe fn runsLeaf(bytecode: *mut HeapHeader, count: usize) -> bool {
 }
 
 /// Charges a declined run to code, a leaf's FunctionBytecode: a leaf that keeps
-/// needing slow paths stops being tried.
+/// needing slow paths stops being tried. If code is already linked to baseline
+/// or full compiled code, retire the leaf path immediately so this call enters it.
 @inlineNever
-pub unsafe fn miss(code: *mut HeapHeader) -> () {
+pub unsafe fn miss(runtime: *mut HeapHeader, code: *mut HeapHeader) -> () {
   let mut anchor = () let bytecode = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, code)
+  if bytecode.baseline != 0 {
+    bytecode.leaf = 0
+    bytecode.frameCells = STUB_FRAME_CELLS
+    return ()
+  }
+  let compiled = bytecode.compiled
+  if compiled != 0 {
+    let stateAnchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
+    let entries = unsafe Pointer.assumeMany<CompiledEntry>(unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *const CompiledEntry>(state.compiled.entries))
+    let entry = unsafe Pointer.borrow<(), CompiledEntry>(&stateAnchor, unsafe Pointer.at<CompiledEntry>(entries, u32.toUsize(compiled - 1)))
+    if entry.callWords != OSR_ONLY_CALL_WORDS {
+      bytecode.leaf = 0
+      bytecode.frameCells = STUB_FRAME_CELLS
+      return ()
+    }
+  }
   bytecode.leaf = bytecode.leaf - 1
 }
 /// Runs the leaf code (a bytecode function's FunctionBytecode, rooted by the
@@ -126,7 +147,7 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
   let prefill = bytecode.leaf >= LEAF_PREFILL
   let ip = unsafe bytecode.code.start()
   let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(top)
-  if bytecode.constants.length() != 0 { constants = Pointer.fromRef<ValueBits>(&bytecode.constants.asSlice()[0]) }
+  if bytecode.constants.length() != 0 { constants = unsafe bytecode.constants.first() }
   let realm = bytecode.realm
   drop bytecode
   let stack = unsafe cellAt(top, localCount)
@@ -138,7 +159,7 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
     record: Pointer.null<u8>() }
   if prefill { // set only when some local is read before written, so localCount > 0
     let mut index: usize = 0
-    while true { unsafe Pointer.write<ValueBits>(unsafe cellAt(top, index), ValueBits.Undefined) index = index + 1 if index >= localCount { break } }
+    while true { unsafe Pointer.write<ValueBits>(unsafe cellAt(top, index), ValueBits.Undefined) index = usize.wrappingAdd(index, 1) if index >= localCount { break } }
   }
   // Nearly every method starts `push_this put_loc0` (this into its local): done
   // here in one copy, without two dispatches or the stack round trip.
@@ -202,6 +223,11 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
       14 => { unsafe s.discard(1) } // OP_drop
       15 => { let value = unsafe s.top(1) unsafe s.set(2, value) unsafe s.discard(1) } // OP_nip
       17 => { let value = unsafe s.top(1) unsafe s.push(value) } // OP_dup
+      18 => { let top = unsafe s.top(1) let below = unsafe s.top(2) unsafe s.set(1, below) unsafe s.push(top) } // OP_dup1
+      19 => { let below = unsafe s.top(2) let top = unsafe s.top(1) unsafe s.push(below) unsafe s.push(top) } // OP_dup2
+      21 => { let top = unsafe s.top(1) let below = unsafe s.top(2) unsafe s.set(2, top) unsafe s.set(1, below) unsafe s.push(top) } // OP_insert2
+      24 => { let mid = unsafe s.top(2) unsafe s.set(2, unsafe s.top(3)) unsafe s.set(3, mid) } // OP_perm3
+      27 => { let top = unsafe s.top(1) unsafe s.set(1, unsafe s.top(2)) unsafe s.set(2, top) } // OP_swap
       // Locals live in scratch; arguments are the caller's operand cells, read only.
       198 => { let index = u8.toUsize(unsafe s.readU8()) let value = unsafe s.local(index) unsafe s.push(value) } // OP_get_loc8
       199 => { let index = u8.toUsize(unsafe s.readU8()) let value = unsafe s.pop() drop unsafe s.setLocal(index, value) } // OP_put_loc8
@@ -261,17 +287,19 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
       91 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var_ref
       225 => { let slot = u16.toUsize(unsafe s.readU16()) if !unsafe pushScoped(&mut s, slot) { return false } } // OP_get_scope0
       228 => { let slot = u16.toUsize(unsafe s.readU16()) if !unsafe pushScoped(&mut s, slot) { return false } } // OP_get_scope0_check
-      226 => { // OP_put_scope0: the run's last step (leafCode), so it completes the call
+      226 => { // OP_put_scope0: only when immediately followed by return_undef
         let slot = u16.toUsize(unsafe s.readU16())
-        if !nesting.outermost() { return false }
+        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
         let at = unsafe scopeSlot(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(s.scope), slot)
         let previous = unsafe Pointer.read<ValueBits>(at)
         unsafe Pointer.write<ValueBits>(at, unsafe (unsafe s.top(1)).retained())
         unsafe nesting.releaseStored(runtime, previous)
         unsafe nesting.complete(ValueBits.Undefined) return true
       }
+      140 => { if !unsafe operators.stepTop(&mut s, -1, false) { return false } } // OP_dec
       141 => { if !unsafe operators.stepTop(&mut s, 1, false) { return false } } // OP_inc
-      142 => { if !unsafe operators.stepTop(&mut s, -1, false) { return false } } // OP_dec
+      142 => { if !unsafe operators.stepTop(&mut s, -1, true) { return false } } // OP_post_dec
+      143 => { if !unsafe operators.stepTop(&mut s, 1, true) { return false } } // OP_post_inc
       100 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var_ref_check
       55 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var_undef
       56 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var
@@ -322,90 +350,99 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
         let slot6 = u8.toUsize(unsafe s.readU8()) unsafe copyCell(unsafe s.localCell(slot6), s.stackTop) unsafe s.advance(1)
         if !unsafe arrayElement(&mut s) { return false }
       }
-      63 => { // OP_put_field: leafCode puts return_undef (or a goto to it) right after, so the store is the run's last step
-        let site = s.ip
-        let atom = unsafe s.readU32()
-        if !nesting.outermost() { return false }
-        if !unsafe store(site, unsafe s.top(2), atom, unsafe s.top(1)) { return false }
+      63 => { // OP_put_field: only when immediately followed by return_undef
+        let site = s.ip let atom = unsafe s.readU32() unsafe s.skip(u8.toUsize(op.FIELD_KEY_BYTES))
+        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
+        if !unsafe storeKeyed(site, unsafe s.top(2), atom, unsafe s.top(1)) { return false }
         unsafe nesting.complete(ValueBits.Undefined) return true
       }
       235 => { // OP_put_loc_field_loc8: the object's local, then the value's
-        let site = s.ip
-        let atom = unsafe s.readU32() unsafe s.advance(u8.toUsize(op.FIELD_KEY_BYTES))
+        let site = s.ip let atom = unsafe s.readU32() unsafe s.skip(u8.toUsize(op.FIELD_KEY_BYTES))
         let objectSlot = u8.toUsize(unsafe s.readU8()) let valueSlot = u8.toUsize(unsafe s.readU8())
-        if !nesting.outermost() { return false }
-        if !unsafe store(site, unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)), atom, unsafe Pointer.read<ValueBits>(unsafe s.localCell(valueSlot))) { return false }
+        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
+        if !unsafe storeKeyed(site, unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)), atom, unsafe Pointer.read<ValueBits>(unsafe s.localCell(valueSlot))) { return false }
         unsafe nesting.complete(ValueBits.Undefined) return true
       }
       236 => { // OP_put_loc_field_arg8: the object's local, then the value's argument
-        let site = s.ip
-        let atom = unsafe s.readU32() unsafe s.advance(u8.toUsize(op.FIELD_KEY_BYTES))
+        let site = s.ip let atom = unsafe s.readU32() unsafe s.skip(u8.toUsize(op.FIELD_KEY_BYTES))
         let objectSlot = u8.toUsize(unsafe s.readU8()) let valueSlot = u8.toUsize(unsafe s.readU8())
-        if !nesting.outermost() { return false }
-        if !unsafe store(site, unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)), atom, unsafe Pointer.read<ValueBits>(unsafe s.argumentCell(valueSlot))) { return false }
+        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
+        if !unsafe storeKeyed(site, unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)), atom, unsafe Pointer.read<ValueBits>(unsafe s.argumentCell(valueSlot))) { return false }
         unsafe nesting.complete(ValueBits.Undefined) return true
       }
-      62 => { // OP_get_field2: the method above its receiver, as get_field
-        if !unsafe properties.peekField2Operand(&mut s) { return false }
+      62 => { // OP_get_field2: the method above its receiver, as get_field (or String.prototype method)
+        if !unsafe properties.peekField2Operand(&mut s) {
+          let skip = unsafe stringMethodLeaf(runtime, s.context, s.ip, s.locals, s.arguments, s.stackTop)
+          if skip == 0 { return false }
+          unsafe s.skip(skip)
+          if skip == 4 { unsafe s.advance(1) }
+        }
       }
-      36 => { // OP_call_method: a leaf callee runs on the cells above this run's, as a leaf of its own
+      36 => { // OP_call_method: String.prototype.charCodeAt(i), or a leaf callee on cells above this run's
         let argc = u16.toUsize(unsafe s.readU16())
         let callee = unsafe s.top(argc + 1)
-        if !nesting.outermost() || !unsafe isBytecodeFunction(callee) { return false }
-        let inner = match Pointer.nonNullMut<HeapHeader>(unsafe leafBytecode(callee, argc)) {
-          Option<*mut HeapHeader>.Some { value } => value
-          Option<*mut HeapHeader>.None => { return false }
+        if argc == 1 && (unsafe s.top(3)).isString() && unsafe nativeFunctions.unitMethod(callee) == nativeFunctions.UNIT_METHOD_CHAR_CODE_AT {
+          let unit = unsafe nativeFunctions.charCodeOf(unsafe s.top(3), unsafe s.top(1))
+          if unit < 0 { return false }
+          unsafe s.set(3, ValueBits.Int { value: unit })
+          unsafe s.discard(2)
+        } else {
+          if !nesting.outermost() || !unsafe isBytecodeFunction(callee) { return false }
+          let inner = match Pointer.nonNullMut<HeapHeader>(unsafe leafBytecode(callee, argc)) {
+            Option<*mut HeapHeader>.Some { value } => value
+            Option<*mut HeapHeader>.None => { return false }
+          }
+          let operands = unsafe cellAt(s.stackTop, usize.wrappingSubtract(0, argc))
+          // The callee reads its receiver from that cell and writes its result over
+          // it when done, so neither crosses a 16-byte reload of 8-byte stores.
+          let destination = unsafe cellAt(s.stackTop, usize.wrappingSubtract(0, argc + 2))
+          if !unsafe isAccessor(inner) || !unsafe accessor(runtime, callee, inner, operands, destination, destination) {
+            if !unsafe nesting.call(runtime, frame, unsafe captures(callee, s.stackTop), inner, operands, argc, destination, s.stackTop, destination) { return false }
+          }
+          s.stackTop = unsafe cellAt(destination, 1)
         }
-        let operands = unsafe cellAt(s.stackTop, usize.wrappingSubtract(0, argc))
-        // The callee reads its receiver from that cell and writes its result over
-        // it when done, so neither crosses a 16-byte reload of 8-byte stores.
-        let destination = unsafe cellAt(s.stackTop, usize.wrappingSubtract(0, argc + 2))
-        if !unsafe isAccessor(inner) || !unsafe accessor(runtime, callee, inner, operands, destination, destination) {
-          if !unsafe nesting.call(runtime, frame, unsafe captures(callee, s.stackTop), inner, operands, argc, destination, s.stackTop, destination) { return false }
-        }
-        s.stackTop = unsafe cellAt(destination, 1)
       }
-      // Branches go forward only (leafCode), so a run needs no interrupt poll.
-      104 => { let displacement = unsafe s.readI32() if !unsafe condition(&mut s) { unsafe s.jump(displacement, 4) } } // OP_if_false
-      105 => { let displacement = unsafe s.readI32() if unsafe condition(&mut s) { unsafe s.jump(displacement, 4) } } // OP_if_true
-      238 => { let displacement = unsafe s.readI8() if !unsafe condition(&mut s) { unsafe s.jump(displacement, 1) } } // OP_if_false8
-      239 => { let displacement = unsafe s.readI8() if unsafe condition(&mut s) { unsafe s.jump(displacement, 1) } } // OP_if_true8
+      // Branches go forward only (backward edges decline so a run never loops without polling).
+      104 => { let displacement = unsafe s.readI32() if !unsafe condition(&mut s) { if displacement <= 0 { return false } unsafe s.jump(displacement, 4) } } // OP_if_false
+      105 => { let displacement = unsafe s.readI32() if unsafe condition(&mut s) { if displacement <= 0 { return false } unsafe s.jump(displacement, 4) } } // OP_if_true
+      238 => { let displacement = unsafe s.readI8() if !unsafe condition(&mut s) { if displacement <= 0 { return false } unsafe s.jump(displacement, 1) } } // OP_if_false8
+      239 => { let displacement = unsafe s.readI8() if unsafe condition(&mut s) { if displacement <= 0 { return false } unsafe s.jump(displacement, 1) } } // OP_if_true8
       26 => { // OP_if_true_keep8: dup, if_true8, drop; taken, the value stays
         // One ip move at the end, as in js_vm (a constant skip feeding the jump splits the ip).
         let displacement = unsafe s.peekI8At(1) let mut advance: i32 = 3
-        if unsafe truth(unsafe s.top(1)) { advance = displacement + 1 } else { unsafe s.discard(1) }
+        if unsafe truth(unsafe s.top(1)) { if displacement <= 0 { return false } advance = displacement + 1 } else { unsafe s.discard(1) }
         unsafe s.jump(advance, 0)
       }
       28 => { // OP_if_false_keep8: dup, if_false8, drop
         let displacement = unsafe s.peekI8At(1) let mut advance: i32 = 3
-        if !unsafe truth(unsafe s.top(1)) { advance = displacement + 1 } else { unsafe s.discard(1) }
+        if !unsafe truth(unsafe s.top(1)) { if displacement <= 0 { return false } advance = displacement + 1 } else { unsafe s.discard(1) }
         unsafe s.jump(advance, 0)
       }
       31 => { // OP_if_not_nullish_keep8: dup, if_not_nullish8, drop
         let displacement = unsafe s.peekI8At(2) let mut advance: i32 = 4
-        if match unsafe s.top(1) { ValueBits.Null => false ValueBits.Undefined => false _ => true } { advance = displacement + 2 }
+        if match unsafe s.top(1) { ValueBits.Null => false ValueBits.Undefined => false _ => true } { if displacement <= 0 { return false } advance = displacement + 2 }
         else { unsafe s.discard(1) }
         unsafe s.jump(advance, 0)
       }
       221 => { // OP_if_nullish8: is_undefined_or_null, padding, then if_true8
         unsafe s.skip(1) let displacement = unsafe s.readI8()
-        if match unsafe s.pop() { ValueBits.Null => true ValueBits.Undefined => true _ => false } { unsafe s.jump(displacement, 1) }
+        if match unsafe s.pop() { ValueBits.Null => true ValueBits.Undefined => true _ => false } { if displacement <= 0 { return false } unsafe s.jump(displacement, 1) }
       }
       222 => { // OP_if_not_nullish8: is_undefined_or_null, padding, then if_false8
         unsafe s.skip(1) let displacement = unsafe s.readI8()
-        if match unsafe s.pop() { ValueBits.Null => false ValueBits.Undefined => false _ => true } { unsafe s.jump(displacement, 1) }
+        if match unsafe s.pop() { ValueBits.Null => false ValueBits.Undefined => false _ => true } { if displacement <= 0 { return false } unsafe s.jump(displacement, 1) }
       }
       223 => { // OP_if_null8: is_null, padding, then if_true8
         unsafe s.skip(1) let displacement = unsafe s.readI8()
-        if match unsafe s.pop() { ValueBits.Null => true _ => false } { unsafe s.jump(displacement, 1) }
+        if match unsafe s.pop() { ValueBits.Null => true _ => false } { if displacement <= 0 { return false } unsafe s.jump(displacement, 1) }
       }
       224 => { // OP_if_not_null8: is_null, padding, then if_false8
         unsafe s.skip(1) let displacement = unsafe s.readI8()
-        if match unsafe s.pop() { ValueBits.Null => false _ => true } { unsafe s.jump(displacement, 1) }
+        if match unsafe s.pop() { ValueBits.Null => false _ => true } { if displacement <= 0 { return false } unsafe s.jump(displacement, 1) }
       }
-      106 => { let displacement = unsafe s.readI32() unsafe s.jump(displacement, 4) } // OP_goto
-      240 => { let displacement = unsafe s.readI8() unsafe s.jump(displacement, 1) } // OP_goto8
-      241 => { let displacement = unsafe s.readI16() unsafe s.jump(displacement, 2) } // OP_goto16
+      106 => { let displacement = unsafe s.readI32() if displacement <= 0 { return false } unsafe s.jump(displacement, 4) } // OP_goto
+      240 => { let displacement = unsafe s.readI8() if displacement <= 0 { return false } unsafe s.jump(displacement, 1) } // OP_goto8
+      241 => { let displacement = unsafe s.readI16() if displacement <= 0 { return false } unsafe s.jump(displacement, 2) } // OP_goto16
       // Operators: numbers and identities, as the dispatch loop's fast paths.
       152 => { // OP_mul
         let mut x: i32 = 0 let mut y: i32 = 0
@@ -505,8 +542,8 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
       }
       167 => { if !unsafe equality(&mut s, op.OP_eq, false, true) { return false } } // OP_eq
       168 => { if !unsafe equality(&mut s, op.OP_neq, false, false) { return false } } // OP_neq
-      71 => { let k = unsafe s.readI8() let same = operators.equalsSmallInt(unsafe s.top(1), k) unsafe s.set(1, ValueBits.Bool { value: same }) } // OP_strict_eq_imm8
-      72 => { let k = unsafe s.readI8() let same = operators.equalsSmallInt(unsafe s.top(1), k) unsafe s.set(1, ValueBits.Bool { value: !same }) } // OP_strict_neq_imm8
+      71 => { let k = unsafe s.readI8() let same = operators.equalsSmallInt(unsafe s.top(1), k) if !unsafe operators.fusedTestBranch(&mut s, same) { unsafe s.set(1, ValueBits.Bool { value: same }) } } // OP_strict_eq_imm8
+      72 => { let k = unsafe s.readI8() let same = !operators.equalsSmallInt(unsafe s.top(1), k) if !unsafe operators.fusedTestBranch(&mut s, same) { unsafe s.set(1, ValueBits.Bool { value: same }) } } // OP_strict_neq_imm8
       169 => { if !unsafe equality(&mut s, op.OP_eq, true, true) { return false } } // OP_strict_eq
       170 => { if !unsafe equality(&mut s, op.OP_neq, true, false) { return false } } // OP_strict_neq
       138 => { if !unsafe operators.negateTop(&mut s) { return false } } // OP_neg
@@ -550,12 +587,24 @@ unsafe fn accessor(runtime: *mut HeapHeader, function: ValueBits, code: *mut Hea
   drop bytecode
   let object = match unsafe Pointer.read<ValueBits>(receiver) { ValueBits.Object { reference } => reference _ => { return false } }
   let fused = unsafe codeByte(ip, 2) == op.OP_get_loc_field8
-  if fused && unsafe codeByte(ip, ACCESSOR_TAIL) != op.OP_get_field2 {
-    if unsafe codeByte(ip, ACCESSOR_TAIL) == op.OP_get_var { return unsafe selectAccessor(runtime, function, ip, object, result) }
-    return unsafe plainAccessor(runtime, ip, object, arguments, result)
+  if fused {
+    let tail = unsafe codeByte(ip, ACCESSOR_TAIL)
+    if tail == op.OP_get_var { return unsafe selectAccessor(runtime, function, ip, object, result) }
+    if tail != op.OP_get_field2 {
+      if tail == op.OP_get_loc_field8 { return unsafe charCodeFieldAccessor(runtime, code, ip, object, result) }
+      return unsafe plainAccessorLeaf(runtime, ip, object, tail, arguments, result)
+    }
+    return unsafe forwardingAccessor(runtime, ip, object, true, arguments, result)
   }
-  // Forwarding (js_bytecode.forwardingAccessor): this.f, then its method g, run
-  // in place when g is a plain accessor taking the arguments this one got.
+  if unsafe codeByte(ip, 2) == op.OP_get_arg0 {
+    return unsafe charCodeArgAccessor(runtime, code, ip, object, arguments, result)
+  }
+  return unsafe forwardingAccessor(runtime, ip, object, false, arguments, result)
+}
+/// Forwarding (js_bytecode.forwardingAccessor): this.f, then its method g, run
+/// in place when g is a plain accessor taking the arguments this one got.
+@inlineNever
+unsafe fn forwardingAccessor(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, fused: bool, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
   let mut holder = ValueBits.Undefined
   let mut fieldSite: usize = 4
   if fused { fieldSite = 3 }
@@ -575,16 +624,75 @@ unsafe fn accessor(runtime: *mut HeapHeader, function: ValueBits, code: *mut Hea
   let innerIp = unsafe innerBytecode.code.start()
   drop innerBytecode
   let innerTail = unsafe codeByte(innerIp, ACCESSOR_TAIL)
-  if unsafe codeByte(innerIp, 2) != op.OP_get_loc_field8 || innerTail == op.OP_get_var || innerTail == op.OP_get_field2 { return false }
-  return unsafe plainAccessor(runtime, innerIp, target, arguments, result)
+  if unsafe codeByte(innerIp, 2) != op.OP_get_loc_field8
+    || (innerTail != op.OP_return && innerTail != op.OP_get_length && innerTail != op.OP_get_arg0) { return false }
+  return unsafe plainAccessorLeaf(runtime, innerIp, target, innerTail, arguments, result)
+}
+/// js_bytecode.charCodeAccessor (`if (this.i < this.len) return this.s.charCodeAt(this.i)`).
+/// Zero-call leaf: checks shape.version once against all three inline keys,
+/// verifies String.prototype.charCodeAt via RuntimeState's cached slot/cell, and
+/// reads compact flat Latin-1 units inline; on any cold miss returns false so
+/// evaluate warms the keys/cache once.
+@inlineNever
+unsafe fn charCodeFieldAccessor(runtime: *mut HeapHeader, code: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, result: *mut ValueBits) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let kPos = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 3))
+  let kLen = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 17))
+  let kSrc = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 34))
+  if ((u64.shiftRight(kPos, 16) ^ version) | (u64.shiftRight(kLen, 16) ^ version) | (u64.shiftRight(kSrc, 16) ^ version)) != 0 { return false }
+  let posVal = (unsafe data.slotUnchecked(u64.toUsize(kPos & 0xffff))).valueBits()
+  let lenVal = (unsafe data.slotUnchecked(u64.toUsize(kLen & 0xffff))).valueBits()
+  let pos = match posVal { ValueBits.Int { value } => value _ => { return false } }
+  let len = match lenVal { ValueBits.Int { value } => value _ => { return false } }
+  if pos >= len { return false }
+  let src = (unsafe data.slotUnchecked(u64.toUsize(kSrc & 0xffff))).valueBits()
+  drop data
+  let unit = unsafe nativeFunctions.flatCharCodeOf(src, pos)
+  if unit < 0 { return false }
+  let realm = (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)).realm
+  if !unsafe properties.isVerifiedCharCodeAt(runtime, realm, unsafe codeAt(ip, 48)) { return false }
+  unsafe Pointer.write<ValueBits>(result, ValueBits.Int { value: unit })
+  return true
+}
+/// js_bytecode.charCodeAccessor (`if (arg0 < this.len) return this.s.charCodeAt(arg0)`).
+/// Zero-call leaf.
+@inlineNever
+unsafe fn charCodeArgAccessor(runtime: *mut HeapHeader, code: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
+  let posVal = unsafe Pointer.read<ValueBits>(arguments)
+  let pos = match posVal { ValueBits.Int { value } => value _ => { return false } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let kLen = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 4))
+  let kSrc = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 21))
+  if ((u64.shiftRight(kLen, 16) ^ version) | (u64.shiftRight(kSrc, 16) ^ version)) != 0 { return false }
+  let lenVal = (unsafe data.slotUnchecked(u64.toUsize(kLen & 0xffff))).valueBits()
+  let len = match lenVal { ValueBits.Int { value } => value _ => { return false } }
+  if pos >= len { return false }
+  let src = (unsafe data.slotUnchecked(u64.toUsize(kSrc & 0xffff))).valueBits()
+  drop data
+  let unit = unsafe nativeFunctions.flatCharCodeOf(src, pos)
+  if unit < 0 { return false }
+  let realm = (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)).realm
+  if !unsafe properties.isVerifiedCharCodeAt(runtime, realm, unsafe codeAt(ip, 35)) { return false }
+  unsafe Pointer.write<ValueBits>(result, ValueBits.Int { value: unit })
+  return true
 }
 /// js_bytecode.selectAccessor at ip for this object: compares this.a with the
 /// variable (or its field) and returns this.b or this.c, borrowed; false when a
 /// read misses the site cache or the comparison needs more than identity.
-@inlineAlways
+@inlineNever
 unsafe fn selectAccessor(runtime: *mut HeapHeader, function: ValueBits, ip: *const u8, object: *mut HeapHeader, result: *mut ValueBits) -> bool {
+  let objAnchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&objAnchor, object)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&objAnchor, data.shape)).version
+  let k1 = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 3))
   let mut left = ValueBits.Undefined
-  if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, 3), object, Pointer.fromMutRef<ValueBits>(&mut left), false) { return false }
+  if u64.shiftRight(k1, 16) == version {
+    left = (unsafe data.slotUnchecked(u64.toUsize(k1 & 0xffff))).valueBits()
+  } else {
+    if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, 3), object, Pointer.fromMutRef<ValueBits>(&mut left), false) { return false }
+  }
   let index = u8.toUsize(unsafe codeByte(ip, ACCESSOR_TAIL + 1)) | usize.shiftLeft(u8.toUsize(unsafe codeByte(ip, ACCESSOR_TAIL + 2)), 8)
   let mut empty = ValueBits.Undefined
   let refs = (unsafe captures(function, Pointer.fromMutRef<ValueBits>(&mut empty))).references
@@ -597,7 +705,14 @@ unsafe fn selectAccessor(runtime: *mut HeapHeader, function: ValueBits, ip: *con
   let mut pos: usize = ACCESSOR_TAIL + 3
   if unsafe codeByte(ip, pos) == op.OP_get_field {
     let holder = match right { ValueBits.Object { reference } => reference _ => { return false } }
-    if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, pos + 1), holder, Pointer.fromMutRef<ValueBits>(&mut right), false) { return false }
+    let hAnchor = ()
+    let hData = unsafe HeapCell.payload<ObjectData, ()>(&hAnchor, holder)
+    let kRight = unsafe properties.fieldKeyAt(unsafe codeAt(ip, pos + 1))
+    if u64.shiftRight(kRight, 16) == (unsafe HeapCell.payload<ShapeData, ()>(&hAnchor, hData.shape)).version {
+      right = (unsafe hData.slotUnchecked(u64.toUsize(kRight & 0xffff))).valueBits()
+    } else if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, pos + 1), holder, Pointer.fromMutRef<ValueBits>(&mut right), false) {
+      return false
+    }
     pos = pos + 1 + properties.FIELD_OPERAND_BYTES
   }
   let compare = unsafe codeByte(ip, pos)
@@ -614,6 +729,12 @@ unsafe fn selectAccessor(runtime: *mut HeapHeader, function: ValueBits, ip: *con
   // compare, if_false8 d, then get_loc_field8(b) return and get_loc_field8(c) return.
   let mut branch = pos + 3
   if (same == 1) != (compare == op.OP_eq || compare == op.OP_strict_eq) { branch = pos + ACCESSOR_TAIL + 2 }
+  let k2 = unsafe properties.fieldKeyAt(unsafe codeAt(ip, branch + 1))
+  if u64.shiftRight(k2, 16) == version {
+    let picked = (unsafe data.slotUnchecked(u64.toUsize(k2 & 0xffff))).valueBits()
+    unsafe Pointer.write<ValueBits>(result, picked)
+    return true
+  }
   // Read into a local: result may be the receiver's cell, which a declined
   // read must leave intact for the runner.
   let mut picked = ValueBits.Undefined
@@ -628,25 +749,40 @@ const ACCESSOR_TAIL: usize = 3 + properties.FIELD_OPERAND_BYTES + 1
 unsafe fn codeAt(ip: *const u8, offset: usize) -> *const u8 { return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), offset) }
 @inlineAlways
 unsafe fn codeByte(ip: *const u8, offset: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe codeAt(ip, offset)) }
-/// The plain accessor at ip (`return this.f`, `this.f.length`, `this.f[a]`)
-/// for this object: true with the borrowed result in result.
+/// Leaf fast path for plainAccessor (`return this.f`, `this.f.length`, `this.f[a]`):
+/// checks the inline key directly with zero function calls on hit so accessor
+/// stays a zero-push leaf, tail-calling plainAccessorSlow on key miss.
 @inlineAlways
-unsafe fn plainAccessor(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
+unsafe fn plainAccessorLeaf(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, tail: u8, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
+  let objAnchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&objAnchor, object)
+  let key = unsafe properties.fieldKeyAt(unsafe codeAt(ip, 3))
+  if u64.shiftRight(key, 16) != (unsafe HeapCell.payload<ShapeData, ()>(&objAnchor, data.shape)).version {
+    return unsafe plainAccessorSlow(runtime, ip, object, tail, arguments, result)
+  }
+  let field = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+  drop data
+  return unsafe finishPlainAccessor(field, tail, arguments, result)
+}
+@inlineNever
+unsafe fn plainAccessorSlow(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, tail: u8, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
   let mut field = ValueBits.Undefined
-  // The site is the field read's atom operand, as the runner's (shared entry).
   if !unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, 3), object, Pointer.fromMutRef<ValueBits>(&mut field), false) { return false }
-  let tail = unsafe codeByte(ip, ACCESSOR_TAIL)
+  return unsafe finishPlainAccessor(field, tail, arguments, result)
+}
+@inlineAlways
+unsafe fn finishPlainAccessor(field: ValueBits, tail: u8, arguments: *mut ValueBits, result: *mut ValueBits) -> bool {
   if tail == op.OP_return { unsafe Pointer.write<ValueBits>(result, field) return true }
   let node = match field { ValueBits.Object { reference } => reference _ => { return false } }
   let objectAnchor = () let array = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, node)
   if array.classId() != classes.JS_CLASS_ARRAY { return false }
-  if tail == op.OP_get_length { unsafe Pointer.write<ValueBits>(result, array.slot(0).valueBits()) return true }
+  if tail == op.OP_get_length { unsafe Pointer.write<ValueBits>(result, (unsafe array.slotUnchecked(0)).valueBits()) return true }
   let at = match unsafe Pointer.read<ValueBits>(arguments) { ValueBits.Int { value } => value _ => { return false } }
   if at < 0 { return false }
   let element = match &array.payload {
     ObjectPayload.FastArray { array: fast } => {
-      if i32.toUsize(at) >= fast.values().length() { return false }
-      fast.values().get(i32.toUsize(at))
+      let idx = i32.toUsize(at)
+      if idx >= fast.values().length() { return false }
+      unsafe fast.values().getUnchecked(idx)
     }
     _ => { return false }
   }
@@ -662,7 +798,7 @@ unsafe fn captures(function: ValueBits, empty: *mut ValueBits) -> Captures {
   return match &data.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
       let mut table = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(empty))
-      if closure.varRefs.length() != 0 { table = Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0]) }
+      if closure.varRefs.length() != 0 { table = unsafe closure.varRefs.first() }
       Captures { references: table, scope: closure.scope }
     }
     _ => invariant()
@@ -711,42 +847,76 @@ unsafe fn arrayLength(s: &mut Machine) -> bool {
   let node = match unsafe s.top(1) { ValueBits.Object { reference } => reference _ => { return false } }
   let objectAnchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, node)
   if object.classId() != classes.JS_CLASS_ARRAY { return false }
-  let length = object.slot(0).valueBits()
+  let length = (unsafe object.slotUnchecked(0)).valueBits()
   drop object
   unsafe s.set(1, length)
   return true
 }
-/// OP_get_array_el's path: an in-bounds Int index into a fast Array.
+/// OP_get_array_el's path: an in-bounds Int index into a fast Array, or a
+/// non-index flat string key on an ordinary object (e.g. StringHashTable.lookup).
 @inlineAlways
 unsafe fn arrayElement(s: &mut Machine) -> bool {
   let node = match unsafe s.top(2) { ValueBits.Object { reference } => reference _ => { return false } }
-  let at = match unsafe s.top(1) { ValueBits.Int { value } => value _ => { return false } }
-  if at < 0 { return false }
-  let objectAnchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, node)
-  if object.classId() != classes.JS_CLASS_ARRAY { return false }
-  let element = match &object.payload {
-    ObjectPayload.FastArray { array } => {
-      if i32.toUsize(at) >= array.values().length() { return false }
-      array.values().get(i32.toUsize(at))
+  let key = unsafe s.top(1)
+  match key {
+    ValueBits.Int { value: at } => {
+      if at < 0 { return false }
+      let objectAnchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&objectAnchor, node)
+      if object.classId() != classes.JS_CLASS_ARRAY { return false }
+      let element = match &object.payload {
+        ObjectPayload.FastArray { array } => {
+          let idx = i32.toUsize(at)
+          if idx >= array.values().length() { return false }
+          unsafe array.values().getUnchecked(idx)
+        }
+        _ => { return false }
+      }
+      drop object
+      unsafe operators.finishBinary(&mut s, element)
+      return true
+    }
+    ValueBits.String { .. } => {
+      if !unsafe properties.peekNamedString(s.runtime, node, key, unsafe s.topCell(2)) { return false }
+      unsafe s.discard(1)
+      return true
     }
     _ => { return false }
   }
-  drop object
-  unsafe operators.finishBinary(&mut s, element)
-  return true
+}
+/// Whether s.ip (right after a store instruction) is return_undef or a forward
+/// goto8 to return_undef, so the store is guaranteed to be the leaf's final step.
+@inlineAlways
+unsafe fn endsWithReturnUndef(s: &Machine) -> bool {
+  let next = unsafe s.peekU8(0)
+  if next == op.OP_return_undef { return true }
+  if next == op.OP_goto8 {
+    let d = unsafe s.peekI8At(1)
+    return d > 0 && unsafe s.peekU8(1 + i32.toUsize(d)) == op.OP_return_undef
+  }
+  return false
 }
 /// The truth of an operand the keep branches leave in place.
 @inlineAlways
 unsafe fn truth(value: ValueBits) -> bool {
-  match value { ValueBits.Bool { value: truth } => { return truth } _ => () }
-  return unsafe primitives.toBoolean(value) != 0
+  return match value {
+    ValueBits.Bool { value: flag } => flag
+    ValueBits.Int { value: n } => n != 0
+    ValueBits.Null => false
+    ValueBits.Undefined => false
+    _ => unsafe primitives.toBoolean(value) != 0
+  }
 }
 /// The truth of the popped operand.
 @inlineAlways
 unsafe fn condition(s: &mut Machine) -> bool {
   let value = unsafe s.pop()
-  match value { ValueBits.Bool { value: truth } => { return truth } _ => () }
-  return unsafe primitives.toBoolean(value) != 0
+  return match value {
+    ValueBits.Bool { value: flag } => flag
+    ValueBits.Int { value: n } => n != 0
+    ValueBits.Null => false
+    ValueBits.Undefined => false
+    _ => unsafe primitives.toBoolean(value) != 0
+  }
 }
 /// Float and mixed number operands for add, sub and mul.
 @inlineAlways
@@ -765,7 +935,11 @@ unsafe fn numbers(s: &mut Machine, opcode: u8) -> bool {
 @inlineAlways
 unsafe fn equality(s: &mut Machine, numeric: u8, strict: bool, equal: bool) -> bool {
   let mut x: i32 = 0 let mut y: i32 = 0
-  if unsafe operators.intOperands(&s.*, &mut x, &mut y) { unsafe operators.finishBinary(&mut s, ValueBits.Bool { value: (x == y) == equal }) return true }
+  if unsafe operators.intOperands(&s.*, &mut x, &mut y) {
+    let ans = (x == y) == equal
+    if !unsafe operators.fusedBranch(&mut s, ans) { unsafe operators.finishBinary(&mut s, ValueBits.Bool { value: ans }) }
+    return true
+  }
   if unsafe operators.binaryFast(&mut s, numeric) { return true }
   let left = unsafe s.top(2) let right = unsafe s.top(1)
   let mut same: i32 = -1
@@ -774,19 +948,85 @@ unsafe fn equality(s: &mut Machine, numeric: u8, strict: bool, equal: bool) -> b
     if same == 2 { same = 0 if unsafe operators.sameText(left, right) { same = 1 } }
   } else { same = unsafe operators.looseIdentity(left, right) }
   if same < 0 { return false }
-  unsafe operators.finishBinary(&mut s, ValueBits.Bool { value: (same == 1) == equal })
+  let ans = (same == 1) == equal
+  if !unsafe operators.fusedBranch(&mut s, ans) { unsafe operators.finishBinary(&mut s, ValueBits.Bool { value: ans }) }
   return true
 }
-/// put_field of value on object, then the leaf's return_undef: true when the
-/// store needs no slow path, else false with nothing changed.
+/// OP_get_field2 on a primitive string receiver in a leaf: resolves a
+/// String.prototype method without retaining it, and fuses
+/// `str.charCodeAt(idx)` directly when followed by a simple index operand and
+/// `call_method 1`. Takes 6 scalar register pointers (no &mut Machine, no stack
+/// args) so evaluate's Machine stays fully SROA'd. Returns 0 on decline, 4 when
+/// the method was written to methodOut (caller skips 4 and advances 1), or >4
+/// when the fused charCodeAt result was written to topCell (caller skips return value).
 @inlineNever
-unsafe fn store(site: *const u8, object: ValueBits, atom: u32, value: ValueBits) -> bool {
+unsafe fn stringMethodLeaf(runtime: *mut HeapHeader, context: *mut HeapHeader, ip: *const u8,
+  locals: *mut ValueBits, arguments: *mut ValueBits, methodOut: *mut ValueBits) -> usize {
+  let topCell = unsafe cellAt(methodOut, usize.wrappingSubtract(0, 1))
+  let receiver = unsafe Pointer.read<ValueBits>(topCell)
+  if !receiver.isString() || !unsafe properties.readStringMethodBorrowedAt(runtime, context, ip, methodOut) { return 0 }
+  let method = unsafe Pointer.read<ValueBits>(methodOut)
+  if unsafe nativeFunctions.unitMethod(method) == nativeFunctions.UNIT_METHOD_CHAR_CODE_AT {
+    unsafe properties.noteStringCharCodeAt(runtime, context, ip, method)
+    let nextOp = unsafe codeByte(ip, 4)
+    let mut width: usize = 0
+    let mut index = ValueBits.Undefined
+    let mut haveIndex = false
+    if nextOp == op.OP_get_loc_field8 {
+      let fieldWidth = 1 + properties.FIELD_OPERAND_BYTES + 1
+      if unsafe codeByte(ip, 4 + fieldWidth) == op.OP_call_method
+        && unsafe codeByte(ip, 5 + fieldWidth) == 1 && unsafe codeByte(ip, 6 + fieldWidth) == 0 {
+        let holder = unsafe Pointer.read<ValueBits>(unsafe cellAt(locals, u8.toUsize(unsafe codeByte(ip, 5 + properties.FIELD_OPERAND_BYTES))))
+        match holder {
+          ValueBits.Object { reference } => {
+            if unsafe properties.readFieldKeyedAt(runtime, unsafe codeAt(ip, 5), reference, Pointer.fromMutRef<ValueBits>(&mut index), false) {
+              let unit = unsafe nativeFunctions.charCodeOf(receiver, index)
+              if unit >= 0 {
+                unsafe Pointer.write<ValueBits>(topCell, ValueBits.Int { value: unit })
+                return 4 + fieldWidth + 3
+              }
+            }
+          }
+          _ => ()
+        }
+      }
+    } else if nextOp >= op.OP_get_loc0 && nextOp <= op.OP_get_loc3 {
+      index = unsafe Pointer.read<ValueBits>(unsafe cellAt(locals, u8.toUsize(nextOp - op.OP_get_loc0))) width = 1 haveIndex = true
+    } else if nextOp == op.OP_get_loc8 {
+      index = unsafe Pointer.read<ValueBits>(unsafe cellAt(locals, u8.toUsize(unsafe codeByte(ip, 5)))) width = 2 haveIndex = true
+    } else if nextOp >= op.OP_get_arg0 && nextOp <= op.OP_get_arg3 {
+      index = unsafe Pointer.read<ValueBits>(unsafe cellAt(arguments, u8.toUsize(nextOp - op.OP_get_arg0))) width = 1 haveIndex = true
+    } else if nextOp == op.OP_get_arg {
+      let argIdx = u8.toUsize(unsafe codeByte(ip, 5)) | usize.shiftLeft(u8.toUsize(unsafe codeByte(ip, 6)), 8)
+      index = unsafe Pointer.read<ValueBits>(unsafe cellAt(arguments, argIdx)) width = 3 haveIndex = true
+    } else if nextOp >= op.OP_push_0 && nextOp <= op.OP_push_1 {
+      index = ValueBits.Int { value: u8.toI32(nextOp - op.OP_push_0) } width = 1 haveIndex = true
+    } else if nextOp == op.OP_push_i8 {
+      let b = unsafe codeByte(ip, 5)
+      index = ValueBits.Int { value: if b >= 128 { u8.toI32(b) - 256 } else { u8.toI32(b) } } width = 2 haveIndex = true
+    }
+    if haveIndex && unsafe codeByte(ip, 4 + width) == op.OP_call_method
+      && unsafe codeByte(ip, 5 + width) == 1 && unsafe codeByte(ip, 6 + width) == 0 {
+      let unit = unsafe nativeFunctions.charCodeOf(receiver, index)
+      if unit >= 0 {
+        unsafe Pointer.write<ValueBits>(topCell, ValueBits.Int { value: unit })
+        return 4 + width + 3
+      }
+    }
+  }
+  return 4
+}
+/// put_field of value on object using its inline field key first, then probing
+/// and caching the key on miss; false leaves everything unchanged.
+@inlineNever
+unsafe fn storeKeyed(site: *const u8, object: ValueBits, atom: u32, value: ValueBits) -> bool {
   let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
   let mut stored = unsafe value.retained()
-  // The key the store instruction (its atom at site) holds first: no probe of the shape,
-  // and a store the key proves needs no watch test (ObjectData.setSlotKeyedUnchecked).
   if unsafe properties.writeOwnField(site, node, Pointer.fromMutRef<ValueBits>(&mut stored)) { return true }
-  if !unsafe properties.writeOwnFieldProbe(node, atom, Pointer.fromMutRef<ValueBits>(&mut stored)) { if !unsafe gc.releaseIfShared(stored) { invariant() } return false }
+  if !unsafe properties.writeOwnFieldProbeKeyed(site, node, atom, Pointer.fromMutRef<ValueBits>(&mut stored)) {
+    if !unsafe gc.releaseIfShared(stored) { invariant() }
+    return false
+  }
   return true
 }
 /// How a run treats the leaf calls it makes and its result: the outermost run

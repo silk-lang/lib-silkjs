@@ -1,10 +1,15 @@
 //! Shared String intrinsic ownership and coercion boundaries. Inputs are borrowed.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.num.i32
 import silk.num.i64
+import silk.num.u32
+import silk.num.u64
 import silk.num.usize
+import silk.simd.u8x16
+import silk.simd.mask16
 import js_value { ValueBits }
 import js_owned_value { Value, ValueRef }
 import js_realm { Realm, Arguments }
@@ -106,22 +111,101 @@ pub fn contains(value: ValueBits, unit: u16) -> bool {
   while i < Strings.length(value) { if Strings.codeUnit(value, i) == unit { return true } i = i + 1 }
   return false
 }
+@inlineAlways
+unsafe fn equalLatin1Bytes(a: [*]const u8, aOff: usize, b: [*]const u8, bOff: usize, count: usize) -> bool {
+  let mut k: usize = 0
+  while usize.wrappingSubtract(count, k) >= 8 {
+    let left = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(a, usize.wrappingAdd(aOff, k))))
+    let right = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(b, usize.wrappingAdd(bOff, k))))
+    if left != right { return false }
+    k = usize.wrappingAdd(k, 8)
+  }
+  if usize.wrappingSubtract(count, k) >= 4 {
+    let left = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(unsafe Pointer.at<u8>(a, usize.wrappingAdd(aOff, k))))
+    let right = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(unsafe Pointer.at<u8>(b, usize.wrappingAdd(bOff, k))))
+    if left != right { return false }
+    k = usize.wrappingAdd(k, 4)
+  }
+  while k < count {
+    if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(a, usize.wrappingAdd(aOff, k))) != unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(b, usize.wrappingAdd(bOff, k))) { return false }
+    k = usize.wrappingAdd(k, 1)
+  }
+  return true
+}
 pub fn find(value: ValueBits, search: ValueBits, from: usize) -> i32 {
   let count = Strings.length(search) let length = Strings.length(value)
   if count > length || from > length - count { return -1 }
   if count == 0 { return usize.toI32(from) }
   if value.tag() == -7 && search.tag() == -7 && !Strings.isWide(value) && !Strings.isWide(search) {
-    // Flat Latin-1 operands: scan the storage bytes instead of decoding each code unit.
+    // Flat Latin-1 operands: SIMD 16-byte scan over storage bytes.
     let haystack = unsafe latin1Bytes(&value, stringReference(value))
     let needle = unsafe latin1Bytes(&search, stringReference(search))
-    let first = needle[0] let last = length - count let mut i = from
-    while i <= last {
-      if haystack[i] == first {
-        let mut j: usize = 1
-        while j < count && haystack[i + j] == needle[j] { j = j + 1 }
-        if j == count { return usize.toI32(i) }
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(haystack))
+    let nbase = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(needle))
+    let first = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(nbase, 0))
+    let last = usize.wrappingSubtract(length, count)
+    if count == 1 {
+      let pat = u8x16.splat(first)
+      let mut at = from
+      if length >= 16 {
+        let limit = usize.wrappingSubtract(length, 16)
+        while at <= limit {
+          let hits = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, at))), pat))
+          if hits != 0 { return usize.wrappingToI32(usize.wrappingAdd(at, u32.toUsize(u64.trailingZeros(hits)))) }
+          at = usize.wrappingAdd(at, 16)
+        }
+        if at < length {
+          let hits = u64.shiftRight(mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, limit))), pat)), usize.toU64(usize.wrappingSubtract(at, limit)))
+          if hits != 0 { return usize.wrappingToI32(usize.wrappingAdd(at, u32.toUsize(u64.trailingZeros(hits)))) }
+        }
+        return -1
       }
-      i = i + 1
+      while at < length {
+        if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, at)) == first { return usize.wrappingToI32(at) }
+        at = usize.wrappingAdd(at, 1)
+      }
+      return -1
+    }
+    let tailOff = usize.wrappingSubtract(count, 1)
+    let tailByte = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(nbase, tailOff))
+    let midCount = usize.wrappingSubtract(count, 2)
+    if usize.wrappingSubtract(last, from) >= 15 {
+      let headVec = u8x16.splat(first)
+      let tailVec = u8x16.splat(tailByte)
+      let limit = usize.wrappingSubtract(last, 15)
+      let mut at = from
+      while at <= limit {
+        let h1 = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, at))), headVec))
+        let h2 = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(at, tailOff)))), tailVec))
+        let mut hits = h1 & h2
+        while hits != 0 {
+          let pos = usize.wrappingAdd(at, u32.toUsize(u64.trailingZeros(hits)))
+          if midCount == 0 || unsafe equalLatin1Bytes(base, usize.wrappingAdd(pos, 1), nbase, 1, midCount) { return usize.wrappingToI32(pos) }
+          hits = hits & u64.wrappingSubtract(hits, 1)
+        }
+        at = usize.wrappingAdd(at, 16)
+      }
+      if at <= last {
+        let shift = usize.toU64(usize.wrappingSubtract(at, limit))
+        let h1 = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, limit))), headVec))
+        let h2 = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(limit, tailOff)))), tailVec))
+        let mut hits = u64.shiftRight(h1 & h2, shift)
+        while hits != 0 {
+          let pos = usize.wrappingAdd(at, u32.toUsize(u64.trailingZeros(hits)))
+          if midCount == 0 || unsafe equalLatin1Bytes(base, usize.wrappingAdd(pos, 1), nbase, 1, midCount) { return usize.wrappingToI32(pos) }
+          hits = hits & u64.wrappingSubtract(hits, 1)
+        }
+      }
+      return -1
+    }
+    let mut i = from
+    while i <= last {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, i)) == first
+        && unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(i, tailOff))) == tailByte
+        && (midCount == 0 || unsafe equalLatin1Bytes(base, usize.wrappingAdd(i, 1), nbase, 1, midCount)) {
+        return usize.wrappingToI32(i)
+      }
+      i = usize.wrappingAdd(i, 1)
     }
     return -1
   }

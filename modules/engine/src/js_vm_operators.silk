@@ -51,6 +51,7 @@ import js_opcode_data as op
 import dtoa { Dtoa }
 import silk.collections.slice { Slice }
 import js_atom_data as atoms
+import js_class_data as classes
 import js_bytecode { typeofIsAtom }
 import runtime_memory { AllocationObserver }
 
@@ -77,13 +78,64 @@ unsafe fn typeofAtom<H: CoercionHooks>(hooks: &mut H, machine: &Machine, value: 
     ValueBits.Symbol { .. } => { return atoms.JS_ATOM_symbol }
     ValueBits.Object { reference } => {
       let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
-      let htmlDda = object.isHtmlDda() drop object
-      if htmlDda { return atoms.JS_ATOM_undefined }
+      if object.isHtmlDda() { return atoms.JS_ATOM_undefined }
+      let classId = object.classId()
+      drop object
+      if classId == classes.JS_CLASS_OBJECT || classId == classes.JS_CLASS_ARRAY { return atoms.JS_ATOM_object }
+      if classId == classes.JS_CLASS_BYTECODE_FUNCTION || classId == classes.JS_CLASS_C_FUNCTION { return atoms.JS_ATOM_function }
       if hooks.isCallable(unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&value, value)) { return atoms.JS_ATOM_function }
       return atoms.JS_ATOM_object
     }
     _ => { return atoms.JS_ATOM_unknown }
   }
+}
+
+/// Inline fast path for OP_typeof_is_undefined (index 6), OP_typeof_is_function
+/// (index 7) and OP_typeof_is (index 0..7): returns 1 (true), 0 (false), or -1
+/// when an exotic/callable object class needs hooks.isCallable.
+@inlineAlways
+pub unsafe fn quickTypeofIs(value: ValueBits, index: u8) -> i32 {
+  if index == 0 { return if value.isString() { 1 } else { 0 } }
+  if index == 1 { return if value.isNumber() { 1 } else { 0 } }
+  if index == 3 { return match value { ValueBits.Bool { .. } => 1 _ => 0 } }
+  if index == 4 { return match value { ValueBits.Symbol { .. } => 1 _ => 0 } }
+  if index == 5 { return if value.isBigInt() { 1 } else { 0 } }
+  if index == 6 {
+    return match value {
+      ValueBits.Undefined => 1
+      ValueBits.Object { reference } => {
+        let anchor = ()
+        if (unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)).isHtmlDda() { 1 } else { 0 }
+      }
+      _ => 0
+    }
+  }
+  if index == 7 {
+    let reference = match value { ValueBits.Object { reference } => reference _ => { return 0 } }
+    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    if object.isHtmlDda() { return 0 }
+    let classId = object.classId()
+    drop object
+    if classId == classes.JS_CLASS_OBJECT || classId == classes.JS_CLASS_ARRAY { return 0 }
+    if classId == classes.JS_CLASS_BYTECODE_FUNCTION || classId == classes.JS_CLASS_C_FUNCTION { return 1 }
+    return -1
+  }
+  if index == 2 {
+    return match value {
+      ValueBits.Null => 1
+      ValueBits.Object { reference } => {
+        let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+        if object.isHtmlDda() { return 0 }
+        let classId = object.classId()
+        drop object
+        if classId == classes.JS_CLASS_OBJECT || classId == classes.JS_CLASS_ARRAY { return 1 }
+        if classId == classes.JS_CLASS_BYTECODE_FUNCTION || classId == classes.JS_CLASS_C_FUNCTION { return 0 }
+        -1
+      }
+      _ => 0
+    }
+  }
+  return -1
 }
 
 /// OP_typeof without step's opcode chain: it cannot fail, and the type names
@@ -101,11 +153,12 @@ pub unsafe effect fn typeofValue<H: HeapHooks + CoercionHooks>(hooks: &mut H, ma
 @inlineNever
 pub unsafe fn typeofTest<H: HeapHooks + CoercionHooks>(hooks: &mut H, machine: &mut Machine, opcode: u8) -> () {
   let input = unsafe machine.top(1)
-  let atom = unsafe typeofAtom(&mut hooks, &machine.*, input)
-  let mut answer = atom == atoms.JS_ATOM_function
-  if opcode == op.OP_typeof_is_undefined { answer = atom == atoms.JS_ATOM_undefined }
-  else if opcode == op.OP_typeof_is { answer = atom == typeofIsAtom(unsafe machine.readU8()) }
-  unsafe gc.release(&mut hooks, machine.runtime, input)
+  let mut index: u8 = 7
+  if opcode == op.OP_typeof_is_undefined { index = 6 }
+  else if opcode == op.OP_typeof_is { index = unsafe machine.readU8() }
+  let quick = unsafe quickTypeofIs(input, index)
+  let answer = if quick >= 0 { quick != 0 } else { unsafe typeofAtom(&mut hooks, &machine.*, input) == typeofIsAtom(index) }
+  if input.tag() < 0 { unsafe gc.release(&mut hooks, machine.runtime, input) }
   unsafe machine.set(1, ValueBits.Bool { value: answer })
 }
 
@@ -386,7 +439,7 @@ pub unsafe fn fusedBranch(machine: &mut Machine, answer: bool) -> bool {
   let next = unsafe machine.peekU8(0)
   if next != op.OP_if_false8 && next != op.OP_if_true8 { return false }
   let displacement = unsafe machine.peekI8At(1)
-  if displacement < 0 { return false }
+  if displacement <= 0 { return false }
   unsafe machine.discard(2)
   unsafe machine.skip(2)
   if answer == (next == op.OP_if_true8) { unsafe machine.jump(displacement, 1) }
@@ -399,7 +452,7 @@ pub unsafe fn fusedTestBranch(machine: &mut Machine, answer: bool) -> bool {
   let next = unsafe machine.peekU8(0)
   if next != op.OP_if_false8 && next != op.OP_if_true8 { return false }
   let displacement = unsafe machine.peekI8At(1)
-  if displacement < 0 { return false }
+  if displacement <= 0 { return false }
   unsafe machine.discard(1)
   unsafe machine.skip(2)
   if answer == (next == op.OP_if_true8) { unsafe machine.jump(displacement, 1) }
@@ -935,14 +988,14 @@ unsafe effect fn addThree(machine: &mut Machine, left: ValueBits, right: ValueBi
     | u32.shiftLeft(u8.toU32(unsafe machine.peekU8(3)), 16) | u32.shiftLeft(u8.toU32(unsafe machine.peekU8(4)), 24)
   if AtomTable.isInteger(atom) { return false }
   let mut anchor = () let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, machine.runtime)
-  let third = rt.atoms.storedAtomValue(atom)
-  if sameString(rt.joinCache[0], left) && sameString(rt.joinCache[1], right) && sameString(rt.joinCache[2], third) {
+  if sameString(rt.joinCache[0], left) && sameString(rt.joinCache[1], right) && rt.atoms.isStoredString(atom, rt.joinCache[2]) {
     let again = Strings.duplicate(rt.joinCache[3]) drop rt
-    releaseString(third) releaseString(left) releaseString(right)
+    Strings.dropHolder(left) Strings.dropHolder(right)
     unsafe machine.set(2, again) unsafe machine.discard(1)
     unsafe machine.skip(6)
     return true
   }
+  let third = rt.atoms.storedAtomValue(atom)
   drop rt
   if !third.isString() { releaseString(third) return false }
   let joined = run Strings.joinThreeLatin1(left, right, third)
@@ -987,6 +1040,14 @@ unsafe fn textNumber(runtime: *mut HeapHeader, text: ValueBits) -> ValueBits {
 /// slot and the operand stack hold, the store included (see addStored): the
 /// append made once per character while a string is built. It never allocates,
 /// so it has none of addTextEntry's frame. False leaves everything untouched.
+/// Fast inline pre-check before calling @inlineNever addStoredShort: only
+/// string additions immediately followed by a local/arg/scope0 store can reuse
+/// the target buffer in place.
+@inlineAlways
+pub unsafe fn hasStoredTarget(ip: *const u8) -> bool {
+  let next = unsafe Pointer.read<u8>(ip)
+  return (next >= op.OP_put_loc0 && next <= op.OP_put_loc3) || next == op.OP_put_loc8 || next == op.OP_put_arg || next == op.OP_put_scope0
+}
 @inlineNever
 pub unsafe fn addStoredShort(machine: &mut Machine) -> bool {
   let right = unsafe machine.top(1)
@@ -997,11 +1058,16 @@ pub unsafe fn addStoredShort(machine: &mut Machine) -> bool {
   let mut slot = ValueBits.Undefined
   if next >= op.OP_put_loc0 && next <= op.OP_put_loc3 { slot = unsafe machine.local(u8.toUsize(next - op.OP_put_loc0)) }
   else if next == op.OP_put_loc8 { slot = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) width = 2 }
+  else if next == op.OP_put_arg { slot = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(1)) + 256 * u8.toUsize(unsafe machine.peekU8(2))) width = 3 }
   else if next == op.OP_put_scope0 { slot = unsafe scopedValue(&machine, 1) width = 3 }
   else { return false }
-  if !sameString(slot, left) { return false }
-  // One unit first (a scanner's `text += String.fromCharCode(code)`), then any short piece.
-  if !Strings.appendUnitLatin1(left, right) && !unsafe appendStoredPiece(left, right) { return false }
+  if !sameString(slot, left) {
+    if sameString(slot, right) { return unsafe prependStoredShort(&mut machine, width) }
+    return false
+  }
+  // One unit first (a scanner's `text += String.fromCharCode(code)`), else tail-call
+  // the multi-unit path so this fast path stays a leaf with no frame or spills.
+  if !Strings.appendUnitLatin1(left, right) { return unsafe addStoredShortSlow(&mut machine, width) }
   // The operand's reference goes with the store; the slot keeps its own.
   Strings.dropHolder(left)
   unsafe machine.discard(2)
@@ -1014,7 +1080,30 @@ pub unsafe fn addStoredShort(machine: &mut Machine) -> bool {
 }
 /// addStoredShort's piece of more than one unit (Strings.appendShortLatin1).
 @inlineNever
-unsafe fn appendStoredPiece(left: ValueBits, right: ValueBits) -> bool { return Strings.appendShortLatin1(left, right, 2) }
+unsafe fn addStoredShortSlow(machine: &mut Machine, width: usize) -> bool {
+  let right = unsafe machine.top(1)
+  let left = unsafe machine.top(2)
+  if !Strings.appendShortLatin1(left, right, 2) { return false }
+  Strings.dropHolder(left)
+  unsafe machine.discard(2)
+  unsafe machine.skip(width)
+  if Strings.heldOnce(right) { return unsafe releasedPiece(right) }
+  Strings.dropHolder(right)
+  return true
+}
+/// addStoredShort's `s = piece + s` into s's front gap (Strings.prependIntoRoom).
+@inlineNever
+unsafe fn prependStoredShort(machine: &mut Machine, width: usize) -> bool {
+  let right = unsafe machine.top(1)
+  let left = unsafe machine.top(2)
+  if !Strings.prependIntoRoom(right, left, 2) { return false }
+  Strings.dropHolder(right)
+  unsafe machine.discard(2)
+  unsafe machine.skip(width)
+  if Strings.heldOnce(left) { return unsafe releasedPiece(left) }
+  Strings.dropHolder(left)
+  return true
+}
 /// Frees addStoredShort's piece, whose last reference the operand stack held.
 @inlineNever
 unsafe fn releasedPiece(piece: ValueBits) -> bool { releaseString(piece) return true }
@@ -1024,8 +1113,26 @@ pub unsafe effect fn addTextEntry(machine: &mut Machine) -> bool ! OutOfMemoryEr
   let right = unsafe machine.top(1)
   if right.tag() == -7 {
     let left = unsafe machine.top(2)
-    // `s = piece + s` or `s = s + piece`, written into s, storing s itself.
-    if left.tag() == -7 { if run unsafe addStored(&mut machine, left, right) { return true } }
+    if left.tag() == -7 {
+      // `left + right + atom` joinCache hit: avoids addStored/addText/addThree,
+      // storedAtomValue retain/release, and full releaseString calls.
+      if unsafe machine.peekU8(0) == op.OP_push_atom_value && unsafe machine.peekU8(5) == op.OP_add {
+        let atom = u8.toU32(unsafe machine.peekU8(1)) | u32.shiftLeft(u8.toU32(unsafe machine.peekU8(2)), 8)
+          | u32.shiftLeft(u8.toU32(unsafe machine.peekU8(3)), 16) | u32.shiftLeft(u8.toU32(unsafe machine.peekU8(4)), 24)
+        if !AtomTable.isInteger(atom) {
+          let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+          if sameString(rt.joinCache[0], left) && sameString(rt.joinCache[1], right) && rt.atoms.isStoredString(atom, rt.joinCache[2]) {
+            let again = Strings.duplicate(rt.joinCache[3]) drop rt
+            Strings.dropHolder(left) Strings.dropHolder(right)
+            unsafe machine.set(2, again) unsafe machine.discard(1)
+            unsafe machine.skip(6)
+            return true
+          }
+        }
+      }
+      // `s = piece + s` or `s = s + piece`, written into s, storing s itself.
+      if run unsafe addStored(&mut machine, left, right) { return true }
+    }
     // `n + ''` with an Int n: the number's text, before addText's string checks.
     match left {
       ValueBits.Int { value } => { if Strings.length(right) == 0 { return run unsafe intPlusEmpty(&mut machine, value, right) } }

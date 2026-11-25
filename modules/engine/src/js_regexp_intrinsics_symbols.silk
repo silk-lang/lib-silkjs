@@ -74,8 +74,23 @@ impl Drop for Results {
 }
 fn number(value: i64) -> ValueBits { return ValueBits.number(i64.toF64(value)) }
 fn contains(value: ValueBits, unit: u16) -> bool {
+  if value.tag() == -7 && !Strings.isWide(value) {
+    if unit > 255 { return false }
+    let bytes = unsafe latin1Bytes(&value, stringReference(value))
+    let len = bytes.length
+    if len == 0 { return false }
+    let ptr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+    let target = u16.toU8(unit)
+    let mut i: usize = 0
+    while i < len {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, i)) == target { return true }
+      i = usize.wrappingAdd(i, 1)
+    }
+    return false
+  }
   let mut i: usize = 0
-  while i < Strings.length(value) { if Strings.codeUnit(value, i) == unit { return true } i = i + 1 }
+  let len = Strings.length(value)
+  while i < len { if Strings.codeUnit(value, i) == unit { return true } i = usize.wrappingAdd(i, 1) }
   return false
 }
 fn unicode(flags: ValueBits) -> bool { return contains(flags, 117) || contains(flags, 118) }
@@ -499,35 +514,89 @@ unsafe fn standardLastIndex(slot: PropertySlot) -> bool {
     _ => false
   }
 }
+@inlineAlways
+unsafe fn slotAddress(slot: SlotBits) -> usize {
+  return match slot.valueBits() {
+    ValueBits.Object { reference } => Pointer.address<HeapHeader>(reference)
+    _ => 0
+  }
+}
+@inlineAlways
+unsafe fn getterAddress(slot: SlotBits) -> usize {
+  return match Pointer.nonNullMut<HeapHeader>(slot.getter()) {
+    Option<*mut HeapHeader>.Some { value } => Pointer.address<HeapHeader>(value)
+    Option<*mut HeapHeader>.None => 0
+  }
+}
 // Whether receiver is a RegExp whose exec, flags, global and unicode are the
 // builtins and whose lastIndex is an own number, so a symbol method may run
 // without the observable reads. The layout last proved (RuntimeState.regexpStandard)
-// is checked by shape versions and slot values alone.
+// is checked by shape versions and cached builtin pointer addresses alone.
 pub unsafe fn standard<'a>(realm: Realm<'a>, receiver: ValueBits) -> bool {
-  let lent = unsafe lendBits(&receiver, receiver)
-  if !support.regexp(lent) { return false }
+  if !receiver.isObject() { return false }
   let cell = core.reference(receiver)
   let mut anchor = ()
   let cache = realm.runtimeState(&anchor).regexpStandard
-  let version = unsafe versionOf(cell)
-  let prototype = unsafe prototypeOf(cell)
-  if version == cache.receiverVersion {
-    match Pointer.nonNullMut<HeapHeader>(prototype) {
-      Option<*mut HeapHeader>.Some { value: proto } => {
-        if unsafe versionOf(proto) == cache.protoVersion {
-          // The same versions keep the proven slot kinds: lastIndex and exec
-          // data slots, the three getters accessors. Only their values can change.
-          let lastIndex = (unsafe rawSlot(cell, u32.toUsize(cache.lastIndex))).valueBits()
-          if lastIndex.tag() != 0 && lastIndex.tag() != 8 { return false }
-          return unsafe native((unsafe rawSlot(proto, u32.toUsize(cache.exec))).valueBits(), 7, 0) &&
-            unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.flags))).getter(), 3, 0) &&
-            unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.global))).getter(), 4, u32.toI32(FLAG_GLOBAL)) &&
-            unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.unicode))).getter(), 4, u32.toI32(FLAG_UNICODE))
-        }
+  let obj = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cell)
+  if obj.classId() != classes.JS_CLASS_REGEXP { return false }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, obj.shape)
+  let version = shape.version
+  let prototype = shape.prototype
+  drop shape
+  if version == cache.receiverVersion && cache.receiverVersion != 0 {
+    let lastIndex = (unsafe obj.slotUnchecked(u32.toUsize(cache.lastIndex))).valueBits()
+    drop obj
+    if lastIndex.tag() != 0 && lastIndex.tag() != 8 { return false }
+    if let Option<*mut HeapHeader>.Some { value: proto } = Pointer.nonNullMut<HeapHeader>(prototype) {
+      let protoObj = unsafe HeapCell.payload<ObjectData, ()>(&anchor, proto)
+      let protoShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, protoObj.shape)
+      let sameProto = protoShape.version == cache.protoVersion
+      drop protoShape
+      if sameProto {
+        return unsafe slotAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.exec))) == cache.execFn &&
+          unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.flags))) == cache.flagsFn &&
+          unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.global))) == cache.globalFn &&
+          unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.unicode))) == cache.unicodeFn
       }
-      Option<*mut HeapHeader>.None => ()
     }
-  }
+  } else { drop obj }
+  return unsafe standardSlow(realm, receiver, cell, version, prototype)
+}
+/// Combined standard() + standardReplace() in a single cache check and single
+/// borrow of receiver and prototype, for String.prototype.replace fast paths.
+@inlineAlways
+unsafe fn standardForReplace<'a>(realm: Realm<'a>, receiver: ValueBits) -> bool {
+  let cell = core.reference(receiver)
+  let anchor = ()
+  let cache = realm.runtimeState(&anchor).regexpStandard
+  let obj = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cell)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, obj.shape)
+  let version = shape.version
+  let prototype = shape.prototype
+  drop shape
+  if version == cache.receiverVersion && cache.receiverVersion != 0 && cache.replace != u32.MAX {
+    let lastIndex = (unsafe obj.slotUnchecked(u32.toUsize(cache.lastIndex))).valueBits()
+    drop obj
+    if lastIndex.tag() != 0 && lastIndex.tag() != 8 { return false }
+    if let Option<*mut HeapHeader>.Some { value: proto } = Pointer.nonNullMut<HeapHeader>(prototype) {
+      let protoObj = unsafe HeapCell.payload<ObjectData, ()>(&anchor, proto)
+      let protoShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, protoObj.shape)
+      let sameProto = protoShape.version == cache.protoVersion
+      drop protoShape
+      if sameProto {
+        return unsafe slotAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.exec))) == cache.execFn &&
+          unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.flags))) == cache.flagsFn &&
+          unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.global))) == cache.globalFn &&
+          unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.unicode))) == cache.unicodeFn &&
+          unsafe slotAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.replace))) == cache.replaceFn
+      }
+    }
+  } else { drop obj }
+  return unsafe standardSlow(realm, receiver, cell, version, prototype) && unsafe standardReplace(realm, receiver)
+}
+@cold
+unsafe fn standardSlow<'a>(realm: Realm<'a>, receiver: ValueBits, cell: *mut HeapHeader, version: u64, prototype: ?*mut HeapHeader) -> bool {
+  let lent = unsafe lendBits(&receiver, receiver)
   match findSlot(lent, atoms.JS_ATOM_lastIndex, true) {
     Option<PropertySlot>.Some { value } => { if !unsafe standardLastIndex(value) { return false } }
     _ => { return false }
@@ -560,15 +629,27 @@ pub unsafe fn standard<'a>(realm: Realm<'a>, receiver: ValueBits) -> bool {
     Option<usize>.None => { return true }
   }
   let mut replace: u32 = u32.MAX
+  let mut replaceFn: usize = 0
   if !(unsafe ownIndex(cell, atoms.JS_ATOM_Symbol_replace)).isSome() {
     if let Option<usize>.Some { value } = unsafe ownIndex(proto, atoms.JS_ATOM_Symbol_replace) {
       // standardReplace reads it as a data slot.
-      if let PropertySlot.Value { .. } = unsafe slotAt(proto, value) { replace = usize.toU32(value) }
+      if let PropertySlot.Value { value: fnVal } = unsafe slotAt(proto, value) {
+        if unsafe native(fnVal, 11, 0) {
+          replace = usize.toU32(value)
+          replaceFn = Pointer.address<HeapHeader>(core.reference(fnVal))
+        }
+      }
     }
   }
+  let execFn = unsafe slotAddress(unsafe rawSlot(proto, u32.toUsize(slots[0])))
+  let flagsFn = unsafe getterAddress(unsafe rawSlot(proto, u32.toUsize(slots[1])))
+  let globalFn = unsafe getterAddress(unsafe rawSlot(proto, u32.toUsize(slots[2])))
+  let unicodeFn = unsafe getterAddress(unsafe rawSlot(proto, u32.toUsize(slots[3])))
+  let mut anchor = ()
   let state = realm.runtimeStateMut(&mut anchor)
   state.regexpStandard = RegExpStandardCache { receiverVersion: version, protoVersion: unsafe versionOf(proto),
-    lastIndex: usize.toU32(last), exec: slots[0], flags: slots[1], global: slots[2], unicode: slots[3], replace: replace }
+    lastIndex: usize.toU32(last), exec: slots[0], flags: slots[1], global: slots[2], unicode: slots[3], replace: replace,
+    execFn: execFn, flagsFn: flagsFn, globalFn: globalFn, unicodeFn: unicodeFn, replaceFn: replaceFn }
   return true
 }
 /// Whether the standard RegExp receiver's Symbol.replace is the builtin, by the
@@ -577,10 +658,10 @@ unsafe fn standardReplace<'a>(realm: Realm<'a>, receiver: ValueBits) -> bool {
   let cell = core.reference(receiver)
   let anchor = ()
   let cache = realm.runtimeState(&anchor).regexpStandard
-  if cache.replace == u32.MAX || unsafe versionOf(cell) != cache.receiverVersion { return false }
+  if cache.replace == u32.MAX || cache.receiverVersion == 0 || unsafe versionOf(cell) != cache.receiverVersion { return false }
   return match Pointer.nonNullMut<HeapHeader>(unsafe prototypeOf(cell)) {
     Option<*mut HeapHeader>.Some { value: proto } => unsafe versionOf(proto) == cache.protoVersion &&
-      unsafe native((unsafe rawSlot(proto, u32.toUsize(cache.replace))).valueBits(), 11, 0)
+      unsafe slotAddress(unsafe rawSlot(proto, u32.toUsize(cache.replace))) == cache.replaceFn
     Option<*mut HeapHeader>.None => false
   }
 }
@@ -591,18 +672,24 @@ unsafe fn standardReplace<'a>(realm: Realm<'a>, receiver: ValueBits) -> bool {
 unsafe fn literalStandard<'a>(realm: Realm<'a>, shape: *mut HeapHeader) -> bool {
   let anchor = ()
   let cache = realm.runtimeState(&anchor).regexpStandard
-  if cache.replace == u32.MAX { return false }
+  if cache.replace == u32.MAX || cache.receiverVersion == 0 { return false }
   let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
   let version = data.version let prototype = data.prototype
   drop data
   if version != cache.receiverVersion { return false }
   return match Pointer.nonNullMut<HeapHeader>(prototype) {
-    Option<*mut HeapHeader>.Some { value: proto } => unsafe versionOf(proto) == cache.protoVersion &&
-      unsafe native((unsafe rawSlot(proto, u32.toUsize(cache.exec))).valueBits(), 7, 0) &&
-      unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.flags))).getter(), 3, 0) &&
-      unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.global))).getter(), 4, u32.toI32(FLAG_GLOBAL)) &&
-      unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.unicode))).getter(), 4, u32.toI32(FLAG_UNICODE)) &&
-      unsafe native((unsafe rawSlot(proto, u32.toUsize(cache.replace))).valueBits(), 11, 0)
+    Option<*mut HeapHeader>.Some { value: proto } => {
+      let protoObj = unsafe HeapCell.payload<ObjectData, ()>(&anchor, proto)
+      let protoShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, protoObj.shape)
+      let sameProto = protoShape.version == cache.protoVersion
+      drop protoShape
+      sameProto &&
+        unsafe slotAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.exec))) == cache.execFn &&
+        unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.flags))) == cache.flagsFn &&
+        unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.global))) == cache.globalFn &&
+        unsafe getterAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.unicode))) == cache.unicodeFn &&
+        unsafe slotAddress(unsafe protoObj.slotUnchecked(u32.toUsize(cache.replace))) == cache.replaceFn
+    }
     Option<*mut HeapHeader>.None => false
   }
 }
@@ -639,14 +726,25 @@ pub effect fn literalReplace<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks
 /// receiver and replacement and a standard RegExp search whose Symbol.replace is
 /// the builtin. Otherwise it declines (none) before any effect, and the full
 /// call runs. The builtin would take the same optimizedReplace path.
-@inlineAlways
+@inlineNever
 pub effect fn quickReplace<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueBits, search: ValueBits, replacement: ValueBits) -> Option<ValueBits>
   ! JsException ? &mut Allocator {
+  if receiver.tag() != -7 || replacement.tag() != -7 || !search.isObject() { return Option<ValueBits>.none() }
+  let anchor = ()
+  let obj = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(search))
+  if obj.classId() != classes.JS_CLASS_REGEXP { return Option<ValueBits>.none() }
+  let code = match &obj.payload {
+    ObjectPayload.RegExp { regexp } => regexp.bytecode()
+    _ => { return Option<ValueBits>.none() }
+  }
+  drop obj
+  let program = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
+  let flags = u16.toU32(readU16(program.latin1.asSlice(), 0))
+  drop program
+  if (flags & FLAG_NAMED_GROUPS) != 0 { return Option<ValueBits>.none() }
+  if !unsafe standardForReplace(realm, search) { return Option<ValueBits>.none() }
   let pattern = unsafe lendBits(&search, search)
-  if receiver.tag() != -7 || replacement.tag() != -7 || !support.regexp(pattern) { return Option<ValueBits>.none() }
-  if (support.flags(pattern) & FLAG_NAMED_GROUPS) != 0 { return Option<ValueBits>.none() }
-  if !unsafe standard(realm, search) || !unsafe standardReplace(realm, search) { return Option<ValueBits>.none() }
   let attempted = run Effect.result(optimizedReplace(&mut hooks, memory, realm, pattern,
     unsafe lendBits(&receiver, receiver), unsafe lendBits(&replacement, replacement)))
   return match move attempted {
@@ -666,9 +764,9 @@ effect fn optimizedReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHoo
   let global = (flags & FLAG_GLOBAL) != 0
   let sticky = (flags & FLAG_STICKY) != 0
   let fullUnicode = (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0
-  if global { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
   let mut lastIndex: i64 = 0
-  if global || sticky { lastIndex = run execution.getLastIndex(&mut hooks, realm, receiver) }
+  if global { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
+  else if sticky { lastIndex = run execution.getLastIndex(&mut hooks, realm, receiver) }
   let length = usize.toI64(Strings.length(string.view()))
   // A replacement without `$` is inserted as is.
   let plain = !contains(replacement.view(), 36)
@@ -729,6 +827,7 @@ unsafe fn wideFlat(value: ValueBits) -> bool {
 /// Bytes of a Latin-1 replace result kept on the stack before the builder takes over.
 const REPLACE_SCRATCH: usize = 1024
 /// Copies source into the REPLACE_SCRATCH bytes at raw, at offset at.
+@inlineAlways
 unsafe fn copyAt(raw: [*]mut u8, at: usize, source: &[u8]) -> () {
   let mut token = ()
   Slice.copyInto(unsafe Pointer.borrowManyMut<(), u8>(&mut token, raw, REPLACE_SCRATCH), at, source)
@@ -773,24 +872,32 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
   if literal != 0 && global && !sticky && start == 0 && size <= REPLACE_SCRATCH {
     let spots = unsafe Intrinsic.stackAllocate<usize>(LITERAL_SPOTS)
     let count = RegExpExecutor.literalSpots8(code, text, spots)
-    if count != usize.MAX && size - count * literal + count * insert.length <= REPLACE_SCRATCH {
+    if count != usize.MAX && usize.wrappingAdd(usize.wrappingSubtract(size, usize.wrappingMultiply(count, literal)), usize.wrappingMultiply(count, insert.length)) <= REPLACE_SCRATCH {
       if indexed { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
       if count == 0 { return string.dup().intoBits() }
-      let lastHit = unsafe Pointer.read<usize>(unsafe Pointer.atMut<usize>(spots, count - 1))
-      execution.recordSpan(&mut hooks, realm, string.view(), lastHit, lastHit + literal)
+      let lastHit = unsafe Pointer.read<usize>(unsafe Pointer.atMut<usize>(spots, usize.wrappingSubtract(count, 1)))
+      execution.recordSpan(&mut hooks, realm, string.view(), lastHit, usize.wrappingAdd(lastHit, literal))
       let mut from: usize = 0
       let mut i: usize = 0
       while i < count {
         let hit = unsafe Pointer.read<usize>(unsafe Pointer.atMut<usize>(spots, i))
-        unsafe copyAt(raw, used, Slice.view(text, from, hit - from))
-        used = used + (hit - from)
-        unsafe copyAt(raw, used, insert)
-        used = used + insert.length
-        from = hit + literal
-        i = i + 1
+        let chunk = usize.wrappingSubtract(hit, from)
+        if chunk != 0 {
+          unsafe copyAt(raw, used, Slice.view(text, from, chunk))
+          used = usize.wrappingAdd(used, chunk)
+        }
+        if insert.length != 0 {
+          unsafe copyAt(raw, used, insert)
+          used = usize.wrappingAdd(used, insert.length)
+        }
+        from = usize.wrappingAdd(hit, literal)
+        i = usize.wrappingAdd(i, 1)
       }
-      unsafe copyAt(raw, used, Slice.view(text, from, size - from))
-      used = used + (size - from)
+      let rem = usize.wrappingSubtract(size, from)
+      if rem != 0 {
+        unsafe copyAt(raw, used, Slice.view(text, from, rem))
+        used = usize.wrappingAdd(used, rem)
+      }
       if used == 0 { return run core.atomValue(&mut hooks, realm, atoms.JS_ATOM_empty_string) }
       return run Strings.joinLatin1(Slice.view(view, 0, used), Slice.view(view, 0, 0))
     }
@@ -819,12 +926,12 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
       let mut i: usize = 0
       while i < count {
         let hit = hits.get(i)
-        run out.appendBytes(Slice.view(text, from, hit - from))
-        run out.appendBytes(insert)
-        from = hit + literal
-        i = i + 1
+        run out.appendBytes(Slice.view(text, from, usize.wrappingSubtract(hit, from)))
+        if insert.length != 0 { run out.appendBytes(insert) }
+        from = usize.wrappingAdd(hit, literal)
+        i = usize.wrappingAdd(i, 1)
       }
-      run out.appendBytes(Slice.view(text, from, size - from))
+      run out.appendBytes(Slice.view(text, from, usize.wrappingSubtract(size, from)))
       return run Strings.adoptLatin1(move out)
     }
   }
@@ -836,43 +943,47 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     let mut first: usize = 0
     let mut end: usize = 0
     if literal != 0 {
-      let at = RegExpExecutor.findLiteral8(code, text, i64.toUsize(lastIndex))
+      let at = RegExpExecutor.findLiteral8(code, text, i64.wrappingToUsize(lastIndex))
       if at < 0 {
         if indexed && (global || sticky) { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
         break
       }
-      first = i64.toUsize(at)
-      end = first + literal
+      first = i64.wrappingToUsize(at)
+      end = usize.wrappingAdd(first, literal)
     } else {
-      let matched = run execution.matchLatin1(&mut hooks, memory, realm, code, text, i64.toUsize(lastIndex), &mut captures)
+      let matched = run execution.matchLatin1(&mut hooks, memory, realm, code, text, i64.wrappingToUsize(lastIndex), &mut captures)
       if !matched {
         if indexed && (global || sticky) { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
         break
       }
       if !found { execution.recordSubject(&mut hooks, realm, string.view()) }
-      first = i32.toUsize(captures.get(0))
-      end = i32.toUsize(captures.get(1))
+      first = i32.wrappingToUsize(captures.get(0))
+      end = i32.wrappingToUsize(captures.get(1))
     }
     found = true
     let mut before = Slice.view(text, 0, 0)
-    if first > nextSource { before = Slice.view(text, nextSource, first - nextSource) }
-    if !spilled && used + before.length + insert.length <= REPLACE_SCRATCH {
-      unsafe copyAt(raw, used, before)
-      used = used + before.length
-      unsafe copyAt(raw, used, insert)
-      used = used + insert.length
+    if first > nextSource { before = Slice.view(text, nextSource, usize.wrappingSubtract(first, nextSource)) }
+    if !spilled && usize.wrappingAdd(usize.wrappingAdd(used, before.length), insert.length) <= REPLACE_SCRATCH {
+      if before.length != 0 {
+        unsafe copyAt(raw, used, before)
+        used = usize.wrappingAdd(used, before.length)
+      }
+      if insert.length != 0 {
+        unsafe copyAt(raw, used, insert)
+        used = usize.wrappingAdd(used, insert.length)
+      }
     } else {
       if !spilled {
         spilled = true
         if !run builder.reserve(&mut hooks, realm, size + insert.length, false) { fail JsException {} }
         if !run builder.appendLatin1(&mut hooks, realm, Slice.view(view, 0, used)) { fail JsException {} }
       }
-      if !run builder.appendLatin1(&mut hooks, realm, before) { fail JsException {} }
-      if !run builder.appendLatin1(&mut hooks, realm, insert) { fail JsException {} }
+      if before.length != 0 && !run builder.appendLatin1(&mut hooks, realm, before) { fail JsException {} }
+      if insert.length != 0 && !run builder.appendLatin1(&mut hooks, realm, insert) { fail JsException {} }
     }
     nextSource = end
     if !global {
-      if indexed && sticky { run execution.setLastIndex(&mut hooks, realm, receiver, usize.toI32(end)) }
+      if indexed && sticky { run execution.setLastIndex(&mut hooks, realm, receiver, usize.wrappingToI32(end)) }
       break
     }
     lastIndex = usize.toI64(end)
@@ -880,12 +991,14 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
   }
   // Without a match the result is the string itself.
   if !found { return string.dup().intoBits() }
-  if literal != 0 { execution.recordSpan(&mut hooks, realm, string.view(), nextSource - literal, nextSource) }
+  if literal != 0 { execution.recordSpan(&mut hooks, realm, string.view(), usize.wrappingSubtract(nextSource, literal), nextSource) }
   let mut tail = Slice.view(text, 0, 0)
-  if size > nextSource { tail = Slice.view(text, nextSource, size - nextSource) }
-  if !spilled && used + tail.length <= REPLACE_SCRATCH {
-    unsafe copyAt(raw, used, tail)
-    used = used + tail.length
+  if size > nextSource { tail = Slice.view(text, nextSource, usize.wrappingSubtract(size, nextSource)) }
+  if !spilled && usize.wrappingAdd(used, tail.length) <= REPLACE_SCRATCH {
+    if tail.length != 0 {
+      unsafe copyAt(raw, used, tail)
+      used = usize.wrappingAdd(used, tail.length)
+    }
     if used == 0 { return run core.atomValue(&mut hooks, realm, atoms.JS_ATOM_empty_string) }
     return run Strings.joinLatin1(Slice.view(view, 0, used), Slice.view(view, 0, 0))
   }
@@ -893,7 +1006,7 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     if !run builder.reserve(&mut hooks, realm, size + insert.length, false) { fail JsException {} }
     if !run builder.appendLatin1(&mut hooks, realm, Slice.view(view, 0, used)) { fail JsException {} }
   }
-  if !run builder.appendLatin1(&mut hooks, realm, tail) { fail JsException {} }
+  if tail.length != 0 && !run builder.appendLatin1(&mut hooks, realm, tail) { fail JsException {} }
   return run builder.finish(&mut hooks, realm)
 }
 

@@ -55,10 +55,10 @@ impl Copy for RuntimeMemoryStats {}
 // own reclaim callback.
 const ARENA_BYTES: usize = 16384
 // One child allocation serves this many arenas: one huge page of payload. On
-// Linux the payload asks for transparent huge pages (madvise), so a growing heap
-// takes one page fault and one TLB entry per group instead of 512; the group is
-// then resident once touched. Elsewhere a group's unused tail is never touched,
-// so it costs address space but no resident memory.
+// Arena groups are 2 MiB-aligned (HUGE_PAGE_BYTES) so Darwin retireIdleArenas
+// can find the group header by masking. On Linux we deliberately avoid
+// MADV_HUGEPAGE because under the standard thp/defrag=madvise setting it forces
+// synchronous memory compaction inside page faults on fragmented memory.
 const GROUP_ARENAS: usize = 128
 const HUGE_PAGE_BYTES: usize = 2097152
 static if Intrinsic.targetOperatingSystem() == "linux" || Intrinsic.targetOperatingSystem() == "darwin" {
@@ -67,8 +67,6 @@ static if Intrinsic.targetOperatingSystem() == "linux" || Intrinsic.targetOperat
 static if Intrinsic.targetOperatingSystem() == "darwin" {
   unsafe extern "C" fn nativePageSize() -> i32 as "getpagesize"
 }
-/// MADV_HUGEPAGE.
-const ADVICE_HUGE_PAGES: i32 = 14
 /// MADV_DONTNEED.
 const ADVICE_DONT_NEED: i32 = 4
 /// Darwin's MADV_FREE_REUSABLE: the pages leave the process's footprint at once and
@@ -185,6 +183,10 @@ struct ArenaHeader {
   // system: every carved block is then a spill bit, so nothing reads them until
   // unspillInto links the blocks again.
   released: bool,
+  // Whether the previous automatic post-GC idle check already saw this arena
+  // wholly idle: cleared on reuse (unspillInto) so actively cycling arenas are
+  // never released by MADV_DONTNEED.
+  idleSinceGc: bool,
   // In a group's first arena only: a bit per arena of the group that
   // retireIdleArenas gave back whole. A retired arena has no header and is on no
   // list until takeArena writes it a new one.
@@ -707,9 +709,20 @@ impl AllocationObserver {
   /// runtime's collector lists can go this way, so an embedder with a runtime calls
   /// js_runtime.releaseIdle, which lets go of the arenas its cells have left first.
   pub fn releaseIdle(self: &Self, reserve: usize) -> usize {
-    static if Intrinsic.targetOperatingSystem() == "linux" { return unsafe releaseIdleArenas(self.ledger, reserve) }
+    static if Intrinsic.targetOperatingSystem() == "linux" { return unsafe releaseIdleArenas(self.ledger, reserve, false) }
     else {
-      static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe retireIdleArenas(self.ledger, reserve) }
+      static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe retireIdleArenas(self.ledger, reserve, false) }
+      else { return 0 }
+    }
+  }
+  /// Like releaseIdle, but releases only arenas that stayed wholly idle and
+  /// untouched since the previous automatic check; newly idle arenas are only
+  /// marked for the next check. Prevents cyclic workloads from thrashing
+  /// MADV_DONTNEED and huge-page splits on arenas about to be reused.
+  pub fn releaseSettledIdle(self: &Self, reserve: usize) -> usize {
+    static if Intrinsic.targetOperatingSystem() == "linux" { return unsafe releaseIdleArenas(self.ledger, reserve, true) }
+    else {
+      static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe retireIdleArenas(self.ledger, reserve, true) }
       else { return 0 }
     }
   }
@@ -1233,7 +1246,7 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
           nextLive: state.firstPooledArena, records: Intrinsic.pointerRequalify<?*mut PoolRecord, *mut PoolRecord>(spareRecords), carved: 0,
           cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16], youngNext: Pointer.null<u8>(), youngListed: false, young: [0; 16],
           idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16],
-          spillNext: Pointer.null<ArenaHeader>(), spillChild: Pointer.null<ArenaHeader>(), spillListed: false, spill: [0; 16], released: false, retired: [0; 2] })
+          spillNext: Pointer.null<ArenaHeader>(), spillChild: Pointer.null<ArenaHeader>(), spillListed: false, spill: [0; 16], released: false, idleSinceGc: false, retired: [0; 2] })
         state.firstPooledArena = owner
         drop state
         unlockLedger(ledger)
@@ -1260,8 +1273,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
   let mut groupStorage = unsafe RawBuffer.from<u8>(move groupAllocation, groupBytes)
   let groupBase = Slot.address(RawBuffer.slot<u8>(&mut groupStorage, 0))
   if usize.bitAnd(Pointer.address<u8>(groupBase), ARENA_BYTES - 1) != 0 { Intrinsic.trap("pool arena is not aligned to its size") }
-  // Only advice: a kernel without transparent huge pages keeps small pages.
-  static if Intrinsic.targetOperatingSystem() == "linux" { let _advised = unsafe nativeMadvise(groupBase, payloadBytes, ADVICE_HUGE_PAGES) }
+  // Do not call MADV_HUGEPAGE on Linux: under default thp/defrag=madvise it
+  // forces synchronous direct compaction during page faults.
   let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(groupBase)
   let second = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(groupBase), ARENA_BYTES)
   let records = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut PoolRecord>(
@@ -1280,7 +1293,7 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
       nextLive: firstLive, records: records, carved: 0,
       cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16], youngNext: Pointer.null<u8>(), youngListed: false, young: [0; 16],
       idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16],
-          spillNext: Pointer.null<ArenaHeader>(), spillChild: Pointer.null<ArenaHeader>(), spillListed: false, spill: [0; 16], released: false, retired: [0; 2] })
+          spillNext: Pointer.null<ArenaHeader>(), spillChild: Pointer.null<ArenaHeader>(), spillListed: false, spill: [0; 16], released: false, idleSinceGc: false, retired: [0; 2] })
     pool.arenas = Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner)
     // A racing refill's leftover spares stay owned by its group, unused.
     pool.spare = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(second)
@@ -2879,7 +2892,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
   }
 
   @inlineNever
-  unsafe fn retireIdleArenas(ledger: LedgerPointers, reserve: usize) -> usize {
+  unsafe fn retireIdleArenas(ledger: LedgerPointers, reserve: usize, settledOnly: bool) -> usize {
     // A group is found from any of its arenas by masking, and a retired arena is
     // whole pages.
     if ARENA_BYTES * GROUP_ARENAS != HUGE_PAGE_BYTES { return 0 }
@@ -2924,8 +2937,18 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
       let idleWhole = carved != 0 && bits == carved && !carving
         && usize.bitAnd(address, HUGE_PAGE_BYTES - 1) != 0
         && header.cellOwner == 0 && !header.pendingListed && !header.youngListed && !header.idleListed
-      if !idleWhole || kept < reserve {
-        if idleWhole { kept = kept + ARENA_BYTES }
+      if !idleWhole {
+        header.idleSinceGc = false
+        link = Pointer.fromMutRef<?*mut ArenaHeader>(&mut header.nextLive)
+        continue
+      }
+      if settledOnly && !header.idleSinceGc {
+        header.idleSinceGc = true
+        link = Pointer.fromMutRef<?*mut ArenaHeader>(&mut header.nextLive)
+        continue
+      }
+      if kept < reserve {
+        kept = kept + ARENA_BYTES
         link = Pointer.fromMutRef<?*mut ArenaHeader>(&mut header.nextLive)
         continue
       }
@@ -2994,7 +3017,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
 // idle gives its pages after the header's back and stays listed.
 static if Intrinsic.targetOperatingSystem() == "linux" {
   @inlineNever
-  unsafe fn releaseIdleArenas(ledger: LedgerPointers, reserve: usize) -> usize {
+  unsafe fn releaseIdleArenas(ledger: LedgerPointers, reserve: usize, settledOnly: bool) -> usize {
     let mut poolAnchor = ()
     let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
     if !pool.ownerActive { return 0 }
@@ -3021,12 +3044,20 @@ static if Intrinsic.targetOperatingSystem() == "linux" {
       let mut bits: usize = 0
       let mut word: usize = 0
       while word < 16 { bits = bits + u32.toUsize(u64.countOnes(header.spill[word])) word = word + 1 }
-      if bits != header.carved { continue }
+      if bits != header.carved {
+        header.idleSinceGc = false
+        continue
+      }
+      if settledOnly && !header.idleSinceGc {
+        header.idleSinceGc = true
+        continue
+      }
       if kept < reserve { kept = kept + ARENA_BYTES continue }
       let pages = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut ArenaHeader, *mut u8>(pointer)), RELEASE_KEPT_BYTES)
       // A refusal (a system with larger pages) leaves the arena as it was.
       if unsafe nativeMadvise(pages, ARENA_BYTES - RELEASE_KEPT_BYTES, ADVICE_DONT_NEED) == 0 {
         header.released = true
+        header.idleSinceGc = false
         released = released + ARENA_BYTES - RELEASE_KEPT_BYTES
       }
     }
@@ -3057,6 +3088,7 @@ unsafe fn unspillInto(pool: &mut Pool, class: usize) -> () {
   let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arena)
   header.spillListed = false
   header.released = false
+  header.idleSinceGc = false
   let mut head = Pointer.null<u8>()
   let mut last = Pointer.null<u8>()
   let mut beforeLast = Pointer.null<u8>()

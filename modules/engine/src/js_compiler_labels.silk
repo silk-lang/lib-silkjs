@@ -8,6 +8,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
 import silk.num.i32
 import silk.num.u8
 import silk.num.u16
@@ -23,7 +24,7 @@ import js_debugger_metadata { Location }
 import js_compiler_state { computePc2Line }
 import js_compiler_emit { updateLabel, MAX_BYTECODE_CAPACITY }
 import js_compiler_code { CodeContext, matchCode, opcode, M2, M3, M4, signedWord, unsignedWord, skipDeadCode, slotCompareShape }
-import js_compiler_label_support { addPosition, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps, fuseNullishBranches, fuseKeepBranches, fuseBackEdges }
+import js_compiler_label_support { addPosition, addPositionWithin, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps, fuseNullishBranches, fuseKeepBranches, fuseBackEdges }
 import js_opcode_data as op
 import js_core_types { SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK }
 import js_compiler_tdz as tdz
@@ -32,24 +33,43 @@ import js_bytecode { FIELDS_PREFIX_OPERAND, FIELDS_PREFIX_SIZE, FIELDS_INIT_SIZE
 fn matchedLine(cc: &CodeContext, line: &mut i32) -> () {
   if cc.lineNumber >= 0 { line.* = cc.lineNumber }
 }
+/// Non-effect reserved-capacity copy of an unchanged instruction (the 100% path
+/// inside resolve after reserveExact). Checks total needed room before mutating
+/// so a false return leaves fd and out completely untouched.
 @inlineAlways
+fn unchangedWithin(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, at: usize, code: u8, length: i32, line: i32) -> bool {
+  let size = u32.toUsize(i32.wrappingToU32(length))
+  let ext = op.movedToExtended(code)
+  let keyed = code == op.OP_get_field || code == op.OP_put_field
+  let mut needed = size
+  if ext { needed = needed + 1 }
+  if keyed { needed = needed + 8 }
+  if out.capacity() - out.length() < needed { return false }
+  if !addPositionWithin(&mut fd, &out.*, line) { return false }
+  if ext { drop out.appendWithin(op.OP_extended) }
+  if bytes.length - at < 8 || !out.appendWordPrefixWithin(readU64(bytes, at), size) {
+    drop out.appendSliceWithin(Slice.view<u8>(bytes, at, size))
+  }
+  if keyed { drop out.appendWithinU64(EMPTY_FIELD_KEY) }
+  if code == op.OP_is_undefined_or_null || code == op.OP_is_null { fd.nullishEnd = usize.toI32(out.length()) }
+  if code == op.OP_dup { fd.dupEnd = usize.toI32(out.length()) }
+  return true
+}
 effect fn unchanged(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, position: i32, length: i32, line: i32) -> ()
   ! OutOfMemoryError ? &mut Allocator {
+  let at = i32.toUsize(position)
+  let code = bytes[at]
+  if unchangedWithin(&mut fd, bytes, &mut out, at, code, length, line) { return () }
   run addPosition(&mut fd, &out.*, line)
-  // resolve reserved the whole output, so the in-capacity copy is the path taken.
-  // Most instructions fit one 8-byte load and store instead of a byte loop.
-  let at = i32.toUsize(position) let size = i32.toUsize(length)
+  let size = i32.toUsize(length)
   // Cold opcodes whose numbers hold fusions in final code go behind OP_extended.
-  if op.movedToExtended(bytes[at]) { run out.append(op.OP_extended) }
+  if op.movedToExtended(code) { run out.append(op.OP_extended) }
   if bytes.length - at < 8 || !out.appendWordPrefixWithin(readU64(bytes, at), size) {
     let piece = Slice.view<u8>(bytes, at, size)
     if !out.appendSliceWithin(piece) { run out.appendSlice(piece) }
   }
-  let code = bytes[i32.toUsize(position)]
   if code == op.OP_get_field || code == op.OP_put_field {
-    let low = u64.toU32(EMPTY_FIELD_KEY & 0xffffffff) let high = u64.toU32(u64.shiftRight(EMPTY_FIELD_KEY, 32))
-    if out.capacity() - out.length() >= 8 { drop out.appendWithinU32(low) drop out.appendWithinU32(high) }
-    else { run out.writeU64(EMPTY_FIELD_KEY) }
+    if !out.appendWithinU64(EMPTY_FIELD_KEY) { run out.writeU64(EMPTY_FIELD_KEY) }
   }
   if code == op.OP_is_undefined_or_null || code == op.OP_is_null { fd.nullishEnd = usize.toI32(out.length()) }
   if code == op.OP_dup { fd.dupEnd = usize.toI32(out.length()) }
@@ -75,19 +95,153 @@ effect fn constantTest(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8]
   return cc.position
 }
 
+/// Bitmask of next-opcode peephole triggers indexed by next opcode:
+///   1: OP_get_loc, 2: OP_get_arg, 4: OP_push_i32, 8: OP_dup
+const PEEP_NEXT: [u8; 256] = [0, 3, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 9, 0, 3, 8, 0, 1, 8, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 7, 3, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+@inlineAlways
+fn peekNextCodePtr(ptr: [*]const u8, len: usize, nextPos: usize) -> u8 {
+  let mut at = nextPos
+  while at < len && unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, at)) == op.OP_line_num { at = usize.wrappingAdd(at, 5) }
+  return if at < len { unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, at)) } else { 0 }
+}
+@inlineAlways
+fn peekNextCode(bytes: &[u8], next: i32) -> u8 {
+  if bytes.length == 0 { return 0 }
+  let ptr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+  return peekNextCodePtr(ptr, bytes.length, u32.toUsize(i32.wrappingToU32(next)))
+}
+// Fast dispatch stays inline in resolve using non-effect *Within helpers;
+// the full peephole chain stays out of line so resolve's loop fits in L1i.
+@inlineAlways
+effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], ptr: [*]const u8, out: &mut ByteBuffer,
+    position: i32, pos: usize, code: u8, line: &mut i32, dead: u64, cc: &mut CodeContext, debug: bool, branches: &mut usize) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let size = u8.toUsize(op.opcodeInfo(code, false).size)
+  let length = u8.toI32(op.opcodeInfo(code, false).size)
+  let next = i32.wrappingAdd(position, length)
+  let nextPos = usize.wrappingAdd(pos, size)
+  if code == op.OP_line_num { line.* = signedWord(readU32(bytes, usize.wrappingAdd(pos, 1))) fd.lineEnd = next return next }
+  if code == op.OP_label {
+    resolveLabel(&mut fd, &mut out, signedWord(readU32(bytes, usize.wrappingAdd(pos, 1))))
+    fd.runStart = next fd.runOut = usize.toI32(out.length()) branches.* = fd.jumps.length() + fd.relocations.length()
+    return next
+  }
+  if !debug {
+    // Erased code (scope-slot markers, elided dead zone markers) runs nowhere.
+    if code == op.OP_nop { return next }
+    // Most opcodes have no rewrite: skip the peephole chain for them.
+    if PEEPHOLE_HEAD[u8.toUsize(code)] == 0 {
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*)
+      return next
+    }
+    // Common short-encoding and rarely-rewritten opcodes: avoid the out-of-line
+    // peephole call and its 40-branch chain.
+    if code == op.OP_get_field {
+      let atom = readU32(bytes, usize.wrappingAdd(pos, 1))
+      if atom == atoms.JS_ATOM_length {
+        table.release(atom) run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_get_length) return next
+      }
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    if code == op.OP_push_const || code == op.OP_fclosure {
+      let index = signedWord(readU32(bytes, usize.wrappingAdd(pos, 1)))
+      if index < 256 {
+        if out.capacity() - out.length() >= 2 && addPositionWithin(&mut fd, &out.*, line.*) {
+          drop out.appendWithin(i32.toU8(opcode(op.OP_push_const8) + opcode(code) - opcode(op.OP_push_const)))
+          drop out.appendWithin(i32.toU8(index)) return next
+        }
+        run addPosition(&mut fd, &out.*, line.*)
+        run out.append(i32.toU8(opcode(op.OP_push_const8) + opcode(code) - opcode(op.OP_push_const)))
+        run out.append(i32.toU8(index)) return next
+      }
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    let nc = peekNextCodePtr(ptr, bytes.length, nextPos)
+    if code == op.OP_get_loc && (PEEP_NEXT[u8.toUsize(nc)] & 1) == 0 {
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+    }
+    if code == op.OP_get_arg && (PEEP_NEXT[u8.toUsize(nc)] & 2) == 0 {
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+    }
+    if code == op.OP_put_loc {
+      let index = u16.toI32(readU16(bytes, pos + 1))
+      if !isDead(dead, index) && nc != op.OP_get_loc {
+        run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+      }
+    }
+    if code == op.OP_put_arg && nc != op.OP_get_arg {
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+    }
+    if code == op.OP_put_var_ref && nc != op.OP_get_var_ref {
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+    }
+    if code == op.OP_get_var_ref && nc != op.OP_get_array_el && nc != op.OP_get_loc && nc != op.OP_get_arg {
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+    }
+    if code == op.OP_get_var_ref_check && nc != op.OP_get_array_el && nc != op.OP_dup {
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    if (code == op.OP_call || code == op.OP_call_method) && nc != op.OP_return {
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+    }
+    if code == op.OP_push_i32 && (PEEP_NEXT[u8.toUsize(nc)] & 4) == 0 {
+      run addPosition(&mut fd, &out.*, line.*) run pushShortInt(&mut out, signedWord(readU32(bytes, pos + 1))) return next
+    }
+    if code == op.OP_push_atom_value && nc != op.OP_drop {
+      let atom = readU32(bytes, pos + 1)
+      if atom == atoms.JS_ATOM_empty_string {
+        table.release(atom) run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_push_empty_string) return next
+      }
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    if code == op.OP_drop && nc != op.OP_return_undef {
+      run addPosition(&mut fd, &out.*, line.*)
+      if !out.appendWithin(code) { run out.append(code) }
+      return next
+    }
+    if code == op.OP_dup && (PEEP_NEXT[u8.toUsize(nc)] & 8) == 0 {
+      run addPosition(&mut fd, &out.*, line.*)
+      if !out.appendWithin(code) { run out.append(code) }
+      fd.dupEnd = usize.toI32(out.length())
+      return next
+    }
+    if code == op.OP_get_var && nc != op.OP_get_loc && nc != op.OP_get_arg {
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    if (code == op.OP_push_false || code == op.OP_push_true || code == op.OP_lnot) && nc != op.OP_if_false && nc != op.OP_if_true {
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    if code == op.OP_insert2 && nc != op.OP_put_field {
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+    if (code == op.OP_null || code == op.OP_undefined) && nc != op.OP_drop && nc != op.OP_return
+      && nc != op.OP_if_false && nc != op.OP_if_true && nc != op.OP_strict_eq && nc != op.OP_strict_neq
+      && nc != op.OP_eq && nc != op.OP_neq {
+      if unchangedWithin(&mut fd, bytes, &mut out, pos, code, length, line.*) { return next }
+      run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+    }
+  }
+  let res = run resolvePeephole(&mut fd, &mut table, bytes, &mut out, position, pos, code, length, next, &mut line, dead, &mut cc, debug)
+  let totalBranches = fd.jumps.length() + fd.relocations.length()
+  if totalBranches != branches.* {
+    fd.runStart = res fd.runOut = usize.toI32(out.length()) branches.* = totalBranches
+  }
+  return res
+}
 // One source switch arm per branch below. Returning next is the source's break;
 // unchanged is no_change, and emitBranch implements has_goto/has_label.
-@inlineAlways
-effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
-    position: i32, line: &mut i32, dead: u64, cc: &mut CodeContext, debug: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let pos = i32.toUsize(position)
-  let code = bytes[pos]
-  let length = u8.toI32(op.opcodeInfo(code, false).size)
-  let mut next = position + length
-  if code == op.OP_line_num { line.* = signedWord(readU32(bytes, pos + 1)) fd.lineEnd = next return next }
-  if code == op.OP_label { resolveLabel(&mut fd, &mut out, signedWord(readU32(bytes, pos + 1))) return next }
-  // Erased code (scope-slot markers, elided dead zone markers) runs nowhere.
-  if code == op.OP_nop && !debug { return next }
+@inlineNever
+effect fn resolvePeephole(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
+    position: i32, pos: usize, code: u8, length: i32, nextStart: i32, line: &mut i32, dead: u64, cc: &mut CodeContext, debug: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut next = nextStart
   // Debug compilation preserves instruction/lexical boundaries. Ordinary
   // compilation keeps the existing peepholes and QuickJS byte-for-byte output.
   if debug {
@@ -99,15 +253,6 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       || code == op.OP_with_make_ref || code == op.OP_with_get_ref {
       run emitWith(&mut fd, bytes, &mut out, position, line.*) return next
     }
-    run unchanged(&mut fd, bytes, &mut out, position, length, line.*)
-    return next
-  }
-  // Outside debug code a nop is only a scope plan's removed local access
-  // (js_compiler_scopes.plan): `const a` captured by a closure leaves its
-  // set_loc_uninitialized as three nops, each a generic step per run.
-  if code == op.OP_nop { return next }
-  // Most opcodes have no rewrite: skip the chain below for them.
-  if PEEPHOLE_HEAD[u8.toUsize(code)] == 0 {
     run unchanged(&mut fd, bytes, &mut out, position, length, line.*)
     return next
   }
@@ -297,74 +442,97 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
     }
   } else if code == op.OP_get_loc {
     let index = u16.toI32(readU16(bytes, pos + 1))
+    let nc = peekNextCode(bytes, next)
     // `dead = local;` as a statement reads nothing and stores nowhere.
-    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_dup), opcode(op.OP_put_loc), -1, opcode(op.OP_drop), -1]) && isDead(dead, cc.index) {
+    if nc == op.OP_dup && matchCode(&mut cc, bytes, next, &[opcode(op.OP_dup), opcode(op.OP_put_loc), -1, opcode(op.OP_drop), -1]) && isDead(dead, cc.index) {
       matchedLine(&cc, &mut line) return cc.position
     }
-    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_put_loc), -1, -1]) && isDead(dead, cc.index) {
+    if nc == op.OP_put_loc && matchCode(&mut cc, bytes, next, &[opcode(op.OP_put_loc), -1, -1]) && isDead(dead, cc.index) {
       matchedLine(&cc, &mut line) return cc.position
     }
     // The source intentionally leaves get_loc >=256 unchanged, rather than
     // examining its peepholes (the three-byte encoding is already minimal).
     if index < 256 {
+      // Fast exit for the most common successors of get_loc.
+      if nc == op.OP_get_field {
+        if fieldRead(&mut cc, bytes, next) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_get_loc_field8) run out.writeU32(cc.atom) run out.writeU64(EMPTY_FIELD_KEY) run out.append(i32.toU8(index)) return cc.position
+        }
+        if index != fd.argumentsVarIndex && lengthRead(&mut cc, bytes, next) {
+          table.release(cc.atom) matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_get_loc_length8) run out.append(i32.toU8(index)) return cc.position
+        }
+        run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+      }
+      if nc != op.OP_get_loc && nc != op.OP_get_arg && nc != op.OP_push_i32
+        && nc != op.OP_post_dec && nc != op.OP_post_inc && nc != op.OP_dec && nc != op.OP_inc
+        && nc != op.OP_add && nc != op.OP_sub && nc != op.OP_mul
+        && nc != op.OP_push_atom_value && nc != op.OP_get_var_ref && nc != op.OP_get_var {
+        run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+      }
       // `heap[(x + k) >> s]`: the prefix goes first, then every instruction
       // as it would be without it (the read below, add_imm, sar_imm, get_array_el).
       // `a[i] = v;` on slots and small constants: the store prefix.
-      if index < 128 && index != fd.argumentsVarIndex {
+      if (nc == op.OP_get_loc || nc == op.OP_push_i32) && index < 128 && index != fd.argumentsVarIndex {
         let stored = run slotStore(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
         if stored >= 0 { return stored }
       }
       // A loop's last test, with its step: the slot compare prefix.
-      if index != fd.argumentsVarIndex {
+      if (nc == op.OP_post_dec || nc == op.OP_post_inc || nc == op.OP_dec || nc == op.OP_inc) && index != fd.argumentsVarIndex {
         let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
         if compared >= 0 { return compared }
       }
       // `i < n` then a branch: the prefix, then the reads and the comparison.
-      if index != fd.argumentsVarIndex && run compareBranch(&mut fd, &mut out, &mut cc, bytes, next, code, index, &mut line) { return cc.position }
-      let address = addressElement(&mut cc, bytes, next)
-      let mut read: i32 = 2 if index < 4 { read = 1 }
-      let readEnd = cc.position
-      if address >= 0 && heapReadRoom(&fd.*, &out.*, &mut cc, bytes, position, readEnd, 5 + read + address / 16777216) {
-        run out.append(op.OP_fuse_prefix) run out.writeU32(unsignedWord(address + read * 16777216))
-        run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+      if (nc == op.OP_get_loc || nc == op.OP_get_arg || nc == op.OP_push_i32) && index != fd.argumentsVarIndex && run compareBranch(&mut fd, &mut out, &mut cc, bytes, next, code, index, &mut line) { return cc.position }
+      if nc == op.OP_push_i32 {
+        let address = addressElement(&mut cc, bytes, next)
+        let mut read: i32 = 2 if index < 4 { read = 1 }
+        let readEnd = cc.position
+        if address >= 0 && heapReadRoom(&fd.*, &out.*, &mut cc, bytes, position, readEnd, 5 + read + address / 16777216) {
+          run out.append(op.OP_fuse_prefix) run out.writeU32(unsignedWord(address + read * 16777216))
+          run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+        }
       }
-      if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1])
-        || matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
-        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-        let mut replacement = op.OP_dec_loc
-        if cc.opcode == opcode(op.OP_inc) || cc.opcode == opcode(op.OP_post_inc) { replacement = op.OP_inc_loc }
-        run out.append(replacement) run out.append(i32.toU8(index)) return cc.position
+      if nc == op.OP_post_dec || nc == op.OP_post_inc || nc == op.OP_dec || nc == op.OP_inc {
+        if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1])
+          || matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          let mut replacement = op.OP_dec_loc
+          if cc.opcode == opcode(op.OP_inc) || cc.opcode == opcode(op.OP_post_inc) { replacement = op.OP_inc_loc }
+          run out.append(replacement) run out.append(i32.toU8(index)) return cc.position
+        }
+        // `++x`, `--x`, `x++` and `x--` with the value used: step_loc8 steps the
+        // local in place and pushes its new or its old value.
+        if matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_loc), index, -1])
+          || matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_loc), index, -1]) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_step_loc8) run out.append(i32.toU8(index)) run out.append(stepMode(cc.opcode)) return cc.position
+        }
       }
-      // `++x`, `--x`, `x++` and `x--` with the value used: step_loc8 steps the
-      // local in place and pushes its new or its old value.
-      if matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_loc), index, -1])
-        || matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_loc), index, -1]) {
-        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-        run out.append(op.OP_step_loc8) run out.append(i32.toU8(index)) run out.append(stepMode(cc.opcode)) return cc.position
-      }
-      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_atom_value), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+      if nc == op.OP_push_atom_value && matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_atom_value), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
         if cc.atom == atoms.JS_ATOM_empty_string { table.release(cc.atom) run out.append(op.OP_push_empty_string) }
         else { run out.append(op.OP_push_atom_value) run out.writeU32(cc.atom) }
         run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
       }
-      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_i32), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+      if nc == op.OP_push_i32 && matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_i32), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run pushShortInt(&mut out, cc.label)
         run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
       }
-      if matchCode(&mut cc, bytes, next, &[M3(op.OP_get_loc, op.OP_get_arg, op.OP_get_var_ref), -1, opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+      if (nc == op.OP_get_loc || nc == op.OP_get_arg || nc == op.OP_get_var_ref) && matchCode(&mut cc, bytes, next, &[M3(op.OP_get_loc, op.OP_get_arg, op.OP_get_var_ref), -1, opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, i32.toU8(cc.opcode), cc.index)
         run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
       }
       // `x += g` with g a global: reading x after g only differs when g's getter
       // can write x, which needs x captured (or eval, or a debugger).
-      if globalReadSafe(&fd, index) && matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_var), -1, opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+      if nc == op.OP_get_var && globalReadSafe(&fd, index) && matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_var), -1, opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, op.OP_get_var, cc.index)
         run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
       }
       // `x += t[k]` and `x += t[i]` with locals t and i: the same argument, since
       // the element read may run a getter.
-      if globalReadSafe(&fd, index) && matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_loc), -1, -1]) {
+      if nc == op.OP_get_loc && globalReadSafe(&fd, index) && matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_loc), -1, -1]) {
         let table = cc.index let after = cc.position
         if matchCode(&mut cc, bytes, after, &[opcode(op.OP_push_i32), opcode(op.OP_get_array_el), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
           matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
@@ -381,18 +549,18 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       }
       if index != fd.argumentsVarIndex {
         // `a + b`, `a - b` and `a * b` on two locals: both read in place.
-        if matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_loc), -1, M3(op.OP_add, op.OP_sub, op.OP_mul), -1])
+        if nc == op.OP_get_loc && matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_loc), -1, M3(op.OP_add, op.OP_sub, op.OP_mul), -1])
           && cc.index < 256 && cc.index != fd.argumentsVarIndex {
           matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
           run out.append(localArithmetic(i32.toU8(cc.opcode), true)) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
         }
         // `... + b`: the right operand read in place.
-        if matchCode(&mut cc, bytes, next, &[M3(op.OP_add, op.OP_sub, op.OP_mul), -1]) {
+        if (nc == op.OP_add || nc == op.OP_sub || nc == op.OP_mul) && matchCode(&mut cc, bytes, next, &[M3(op.OP_add, op.OP_sub, op.OP_mul), -1]) {
           matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
           run out.append(localArithmetic(i32.toU8(cc.opcode), false)) run out.append(i32.toU8(index)) return cc.position
         }
       }
-      if index != fd.thisVarIndex && index != fd.argumentsVarIndex {
+      if (nc == op.OP_get_loc || nc == op.OP_get_arg) && index != fd.thisVarIndex && index != fd.argumentsVarIndex {
         // The value is read in place too (not the arguments local, whose reads
         // lazyArgumentsSite tracks).
         if fieldWrite(&mut cc, bytes, next) && cc.index < 256 && !(cc.opcode == opcode(op.OP_get_loc) && cc.index == fd.argumentsVarIndex) {
@@ -401,24 +569,16 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
           run out.writeU32(cc.atom) run out.writeU64(EMPTY_FIELD_KEY) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
         }
       }
-      if fieldRead(&mut cc, bytes, next) {
-        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-        run out.append(op.OP_get_loc_field8) run out.writeU32(cc.atom) run out.writeU64(EMPTY_FIELD_KEY) run out.append(i32.toU8(index)) return cc.position
-      }
-      if index != fd.argumentsVarIndex && lengthRead(&mut cc, bytes, next) {
-        table.release(cc.atom) matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-        run out.append(op.OP_get_loc_length8) run out.append(i32.toU8(index)) return cc.position
-      }
-      if index != fd.argumentsVarIndex && elementRead(&mut cc, bytes, next, fd.argumentsVarIndex) {
+      if nc == op.OP_get_loc && index != fd.argumentsVarIndex && elementRead(&mut cc, bytes, next, fd.argumentsVarIndex) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
         run out.append(op.OP_get_loc_el8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
       }
-      if index != fd.argumentsVarIndex && argumentElementRead(&mut cc, bytes, next) {
+      if nc == op.OP_get_arg && index != fd.argumentsVarIndex && argumentElementRead(&mut cc, bytes, next) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
         run out.append(op.OP_get_loc_el_arg8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
       }
       // `a[++i]`: the step first, then both read in place.
-      if index != fd.argumentsVarIndex && globalReadSafe(&fd, index) && steppedElementRead(&mut cc, bytes, next, fd.argumentsVarIndex) && cc.index != index {
+      if nc == op.OP_get_loc && index != fd.argumentsVarIndex && globalReadSafe(&fd, index) && steppedElementRead(&mut cc, bytes, next, fd.argumentsVarIndex) && cc.index != index {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
         let mut step = op.OP_dec_loc
         if cc.opcode == opcode(op.OP_inc) { step = op.OP_inc_loc }
@@ -433,10 +593,11 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       if fused >= 0 { return fused }
     }
     let index = u16.toI32(readU16(bytes, pos + 1))
+    let nc = peekNextCode(bytes, next)
     // `heap[(x + k) >> s]` with heap a captured variable or a global and x a
     // local or an argument: the prefix goes first, then every instruction as it
     // would be without it. For a capture it acts only if that becomes a get_scope0.
-    if code != op.OP_get_arg && matchCode(&mut cc, bytes, next, &[M2(op.OP_get_loc, op.OP_get_arg), -1, -1]) && cc.index < 256 {
+    if code != op.OP_get_arg && (nc == op.OP_get_loc || nc == op.OP_get_arg) && matchCode(&mut cc, bytes, next, &[M2(op.OP_get_loc, op.OP_get_arg), -1, -1]) && cc.index < 256 {
       let read = i32.toU8(cc.opcode) let slot = cc.index let afterRead = cc.position let readLine = cc.lineNumber
       let address = addressElement(&mut cc, bytes, afterRead)
       // The capture's three bytes, then the read: one byte for slots 0-3,
@@ -453,59 +614,69 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       }
     }
     if code == op.OP_get_var { run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next }
-    if code == op.OP_get_arg && index < 256 && fieldRead(&mut cc, bytes, next) {
-      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-      run out.append(op.OP_get_arg_field8) run out.writeU32(cc.atom) run out.writeU64(EMPTY_FIELD_KEY) run out.append(i32.toU8(index)) return cc.position
-    }
-    if code == op.OP_get_arg && index < 256 && lengthRead(&mut cc, bytes, next) {
-      table.release(cc.atom) matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-      run out.append(op.OP_get_arg_length8) run out.append(i32.toU8(index)) return cc.position
-    }
-    if code == op.OP_get_arg && index < 256 && elementRead(&mut cc, bytes, next, fd.argumentsVarIndex) {
-      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-      run out.append(op.OP_get_arg_el8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
-    }
-    if code == op.OP_get_arg && index < 256 && argumentElementRead(&mut cc, bytes, next) {
-      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-      run out.append(op.OP_get_arg_el_arg8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
-    }
-    if code == op.OP_get_arg && index < 4 {
-      let stored = run slotStore(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
-      if stored >= 0 { return stored }
-    }
     if code == op.OP_get_arg && index < 256 {
-      let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
-      if compared >= 0 { return compared }
-    }
-    if code == op.OP_get_arg && index < 4 && run compareBranch(&mut fd, &mut out, &mut cc, bytes, next, code, index, &mut line) { return cc.position }
-    if code == op.OP_get_arg && index < 256 {
-      // `n--;` and `++n;` as statements: the argument steps in place and the
-      // pushed value is dropped.
-      if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_arg), index, opcode(op.OP_drop), -1])
-        || matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_arg), index, opcode(op.OP_drop), -1]) {
-        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-        run out.append(op.OP_step_arg8) run out.append(i32.toU8(index)) run out.append(stepMode(cc.opcode) | 1)
-        run out.append(op.OP_drop) return cc.position
+      if nc == op.OP_get_field {
+        if fieldRead(&mut cc, bytes, next) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_get_arg_field8) run out.writeU32(cc.atom) run out.writeU64(EMPTY_FIELD_KEY) run out.append(i32.toU8(index)) return cc.position
+        }
+        if lengthRead(&mut cc, bytes, next) {
+          table.release(cc.atom) matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_get_arg_length8) run out.append(i32.toU8(index)) return cc.position
+        }
+        run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
       }
-      // The same with the value used: its new or its old value stays pushed.
-      if matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_arg), index, -1])
-        || matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_arg), index, -1]) {
+      if nc != op.OP_get_loc && nc != op.OP_get_arg && nc != op.OP_push_i32
+        && nc != op.OP_post_dec && nc != op.OP_post_inc && nc != op.OP_dec && nc != op.OP_inc
+        && nc != op.OP_add && nc != op.OP_sub && nc != op.OP_mul {
+        run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+      }
+      if nc == op.OP_get_loc && elementRead(&mut cc, bytes, next, fd.argumentsVarIndex) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-        run out.append(op.OP_step_arg8) run out.append(i32.toU8(index)) run out.append(stepMode(cc.opcode)) return cc.position
+        run out.append(op.OP_get_arg_el8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
+      }
+      if nc == op.OP_get_arg && argumentElementRead(&mut cc, bytes, next) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+        run out.append(op.OP_get_arg_el_arg8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
+      }
+      if index < 4 && (nc == op.OP_get_loc || nc == op.OP_push_i32) {
+        let stored = run slotStore(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
+        if stored >= 0 { return stored }
+      }
+      if nc == op.OP_post_dec || nc == op.OP_post_inc || nc == op.OP_dec || nc == op.OP_inc {
+        let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
+        if compared >= 0 { return compared }
+      }
+      if index < 4 && (nc == op.OP_get_loc || nc == op.OP_get_arg || nc == op.OP_push_i32) && run compareBranch(&mut fd, &mut out, &mut cc, bytes, next, code, index, &mut line) { return cc.position }
+      if nc == op.OP_post_dec || nc == op.OP_post_inc || nc == op.OP_dec || nc == op.OP_inc {
+        // `n--;` and `++n;` as statements: the argument steps in place and the
+        // pushed value is dropped.
+        if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_arg), index, opcode(op.OP_drop), -1])
+          || matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_arg), index, opcode(op.OP_drop), -1]) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_step_arg8) run out.append(i32.toU8(index)) run out.append(stepMode(cc.opcode) | 1)
+          run out.append(op.OP_drop) return cc.position
+        }
+        // The same with the value used: its new or its old value stays pushed.
+        if matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_arg), index, -1])
+          || matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_arg), index, -1]) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(op.OP_step_arg8) run out.append(i32.toU8(index)) run out.append(stepMode(cc.opcode)) return cc.position
+        }
       }
       // `... + n`: the right operand read in place.
-      if matchCode(&mut cc, bytes, next, &[M3(op.OP_add, op.OP_sub, op.OP_mul), -1]) {
+      if (nc == op.OP_add || nc == op.OP_sub || nc == op.OP_mul) && matchCode(&mut cc, bytes, next, &[M3(op.OP_add, op.OP_sub, op.OP_mul), -1]) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
         run out.append(argumentArithmetic(i32.toU8(cc.opcode))) run out.append(i32.toU8(index)) return cc.position
       }
-    }
-    // `a[++i]` with a an argument: the step first, then both read in place.
-    if code == op.OP_get_arg && index < 256 && argumentReadSafe(&fd, index) && steppedElementRead(&mut cc, bytes, next, fd.argumentsVarIndex) {
-      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-      let mut step = op.OP_dec_loc
-      if cc.opcode == opcode(op.OP_inc) { step = op.OP_inc_loc }
-      run out.append(step) run out.append(i32.toU8(cc.index))
-      run out.append(op.OP_get_arg_el8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
+      // `a[++i]` with a an argument: the step first, then both read in place.
+      if nc == op.OP_get_loc && argumentReadSafe(&fd, index) && steppedElementRead(&mut cc, bytes, next, fd.argumentsVarIndex) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+        let mut step = op.OP_dec_loc
+        if cc.opcode == opcode(op.OP_inc) { step = op.OP_inc_loc }
+        run out.append(step) run out.append(i32.toU8(cc.index))
+        run out.append(op.OP_get_arg_el8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
+      }
     }
     run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
   } else if code == op.OP_put_loc || code == op.OP_put_loc_check || code == op.OP_put_arg || code == op.OP_put_var_ref {
@@ -612,13 +783,13 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   let mut calls = Intrinsic.replace(fd.callSiteSources, List<PcSourcePosition>.make())
   let mut callIndex: usize = 0 let mut callOutput: usize = 0
   let locations = Intrinsic.replace(fd.debuggerMetadata.locations, BoxList<Location>.make())
-  run fd.debuggerMetadata.locations.reserveExact(locations.length())
+  if locations.length() != 0 { run fd.debuggerMetadata.locations.reserveExact(locations.length()) }
   let mut locationIndex: usize = 0
   let mut nextCall = u32.MAX if calls.length() != 0 { nextCall = calls.get(0).pc }
   let mut nextLocation = u32.MAX if locations.length() != 0 { nextLocation = locations.get(0).pc }
   let mut input = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
   run tdz.elideChecks(&fd, &mut input)
-  let dead = writeOnlyLocals(&fd, input.asSlice())
+  let dead = if fd.vars.length() != 0 { writeOnlyLocals(&fd, input.asSlice()) } else { 0 }
   run initializeLocals(&mut fd, &mut out)
   let mut position: i32 = 0 let mut line = signedWord(fd.sourcePosition)
   fd.runStart = 0 fd.runOut = usize.toI32(out.length())
@@ -626,42 +797,55 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   // One match state for every instruction: each probe sets what it reads.
   let mut cc = CodeContext.make()
   let debug = fd.debuggerMetadata.enabled
-  while i32.toUsize(position) < input.length() {
-    let start = out.length()
-    let inputPosition = position
-    position = run resolveInstruction(&mut fd, &mut table, input.asSlice(), &mut out, position, &mut line, dead, &mut cc, debug)
-    // Call sites inside what this step consumed name its output: a peephole
-    // such as `insert2 put_field drop` starts before the store it keeps.
-    if i32.toU32(position) > nextCall {
-      while callIndex < calls.length() && calls.get(callIndex).pc < i32.toU32(position) {
-        let entry = calls.get(callIndex)
-        if entry.pc >= i32.toU32(inputPosition) && start != out.length() {
-          // Two sites fused into one instruction: the later one throws last.
-          if callOutput > 0 && calls.get(callOutput - 1).pc == usize.toU32(start) { callOutput = callOutput - 1 }
-          calls.set(callOutput, PcSourcePosition { pc: usize.toU32(start), sourcePosition: entry.sourcePosition })
-          callOutput = callOutput + 1
+  let inputBytes = input.asSlice()
+  let inputLen = inputBytes.length
+  if inputLen != 0 {
+    let inputPtr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(inputBytes))
+    let mut pos: usize = 0
+    while pos < inputLen {
+      let startCode = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(inputPtr, pos))
+      if startCode == op.OP_line_num && !debug && u32.toUsize(nextCall) >= usize.wrappingAdd(pos, 5) {
+        line = signedWord(readU32(inputBytes, usize.wrappingAdd(pos, 1)))
+        pos = usize.wrappingAdd(pos, 5)
+        position = i32.wrappingAdd(position, 5)
+        fd.lineEnd = position
+        continue
+      }
+      let start = out.length()
+      let inputPosition = position
+      let inputPosU32 = i32.wrappingToU32(inputPosition)
+      position = run resolveInstruction(&mut fd, &mut table, inputBytes, inputPtr, &mut out, position, pos, startCode, &mut line, dead, &mut cc, debug, &mut branches)
+      let newPosU32 = i32.wrappingToU32(position)
+      pos = u32.toUsize(newPosU32)
+      // Call sites inside what this step consumed name its output: a peephole
+      // such as `insert2 put_field drop` starts before the store it keeps.
+      if newPosU32 > nextCall {
+        while callIndex < calls.length() && calls.get(callIndex).pc < newPosU32 {
+          let entry = calls.get(callIndex)
+          if entry.pc >= inputPosU32 && start != out.length() {
+            // Two sites fused into one instruction: the later one throws last.
+            if callOutput > 0 && calls.get(callOutput - 1).pc == usize.toU32(start) { callOutput = callOutput - 1 }
+            calls.set(callOutput, PcSourcePosition { pc: usize.toU32(start), sourcePosition: entry.sourcePosition })
+            callOutput = callOutput + 1
+          }
+          callIndex = callIndex + 1
         }
-        callIndex = callIndex + 1
+        nextCall = u32.MAX
+        if callIndex < calls.length() { nextCall = calls.get(callIndex).pc }
       }
-      nextCall = u32.MAX
-      if callIndex < calls.length() { nextCall = calls.get(callIndex).pc }
-    }
-    // A label or a branch ends the straight run prefixRoom counts in.
-    if input.get(i32.toUsize(inputPosition)) == op.OP_label || fd.jumps.length() + fd.relocations.length() != branches {
-      fd.runStart = position fd.runOut = usize.toI32(out.length()) branches = fd.jumps.length() + fd.relocations.length()
-    }
-    if i32.toU32(inputPosition) >= nextLocation {
-      while locationIndex < locations.length() && locations.get(locationIndex).pc < i32.toU32(inputPosition) {
-        locationIndex = locationIndex + 1
+      if inputPosU32 >= nextLocation {
+        while locationIndex < locations.length() && locations.get(locationIndex).pc < inputPosU32 {
+          locationIndex = locationIndex + 1
+        }
+        if start != out.length() && locationIndex < locations.length()
+          && locations.get(locationIndex).pc == inputPosU32 {
+          let mut location = locations.get(locationIndex) location.pc = usize.toU32(start)
+          run fd.debuggerMetadata.locations.append(location)
+          locationIndex = locationIndex + 1
+        }
+        nextLocation = u32.MAX
+        if locationIndex < locations.length() { nextLocation = locations.get(locationIndex).pc }
       }
-      if start != out.length() && locationIndex < locations.length()
-        && locations.get(locationIndex).pc == i32.toU32(inputPosition) {
-        let mut location = locations.get(locationIndex) location.pc = usize.toU32(start)
-        run fd.debuggerMetadata.locations.append(location)
-        locationIndex = locationIndex + 1
-      }
-      nextLocation = u32.MAX
-      if locationIndex < locations.length() { nextLocation = locations.get(locationIndex).pc }
     }
   }
   calls.truncate(callOutput)
@@ -691,10 +875,12 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
     }
     fd.debuggerMetadata.catchTargets.set(j, target) i = i + 1
   }
-  shrinkJumps(&mut fd, &mut out)
-  fuseNullishBranches(&fd, &mut out)
-  fuseKeepBranches(&fd, &mut out)
-  fuseBackEdges(&fd, &mut out)
+  if fd.jumps.length() != 0 {
+    shrinkJumps(&mut fd, &mut out)
+    if fd.nullishEnd != 0 { fuseNullishBranches(&fd, &mut out) }
+    if fd.dupEnd != 0 { fuseKeepBranches(&fd, &mut out) }
+    fuseBackEdges(&fd, &mut out)
+  }
   // Surviving atom operands transfer without retain/release; removed ones were
   // released at their source rewrite. Publish before debug encoding can fail.
   fd.bytecode = move out fd.useShortOpcodes = true

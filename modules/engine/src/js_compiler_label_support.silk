@@ -1,6 +1,7 @@
 //! Final-pass mechanics from quickjs.c:35332-35579,35797-35920,36385-36460.
 //! Allocations are reserved by resolveLabels before atom ownership is changed.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import silk.num.i32
 import silk.num.i8
 import silk.num.u8
@@ -18,26 +19,85 @@ import js_opcode_data as op
 import js_compiler_scopes as scopePlans
 
 @inlineAlways
-pub effect fn addPosition(fd: &mut FunctionDef, out: &ByteBuffer, line: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+pub fn addPositionWithin(fd: &mut FunctionDef, out: &ByteBuffer, line: i32) -> bool {
   let pc = usize.toU32(out.length())
   let source = unsignedWord(line)
   if !fd.stripDebug && fd.lineNumbers.length() < fd.lineNumberCapacity
     && pc >= fd.lineNumberLastPc && source != fd.lineNumberLast {
-    run fd.lineNumbers.append(PcSourcePosition { pc: pc, sourcePosition: source })
+    if fd.lineNumbers.length() >= fd.lineNumbers.capacity() { return false }
+    unsafe fd.lineNumbers.pushUnchecked(PcSourcePosition { pc: pc, sourcePosition: source })
     fd.lineNumberLastPc = pc fd.lineNumberLast = source
   }
+  return true
 }
+@inlineAlways
+pub effect fn addPosition(fd: &mut FunctionDef, out: &ByteBuffer, line: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if addPositionWithin(&mut fd, out, line) { return () }
+  let pc = usize.toU32(out.length())
+  let source = unsignedWord(line)
+  run fd.lineNumbers.append(PcSourcePosition { pc: pc, sourcePosition: source })
+  fd.lineNumberLastPc = pc fd.lineNumberLast = source
+}
+@inlineAlways
+pub fn pushShortIntWithin(out: &mut ByteBuffer, value: i32) -> bool {
+  if value >= 0 && value <= 1 {
+    return out.appendWithin(i32.toU8(opcode(op.OP_push_0) + value))
+  } else if value >= -128 && value <= 127 {
+    if out.capacity() - out.length() < 2 { return false }
+    let b = u32.toU8(unsignedWord(value) & 255)
+    drop out.appendWithin(op.OP_push_i8) drop out.appendWithin(b)
+    return true
+  } else if value >= -32768 && value <= 32767 {
+    if out.capacity() - out.length() < 3 { return false }
+    let w = u32.toU16(unsignedWord(value) & 65535)
+    drop out.appendWithin(op.OP_push_i16) drop out.appendWithinU16(w)
+    return true
+  }
+  if out.capacity() - out.length() < 5 { return false }
+  drop out.appendWithin(op.OP_push_i32) drop out.appendWithinU32(unsignedWord(value))
+  return true
+}
+@inlineAlways
 pub effect fn pushShortInt(out: &mut ByteBuffer, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
   // -1 and 2 to 7 take push_i8: their one-byte forms hold the fusion prefix
   // and the local-operand arithmetic opcodes.
-  if value >= 0 && value <= 1 { run out.append(i32.toU8(opcode(op.OP_push_0) + value)) }
-  else if value >= -128 && value <= 127 {
+  if pushShortIntWithin(&mut out, value) { return () }
+  if value >= 0 && value <= 1 {
+    run out.append(i32.toU8(opcode(op.OP_push_0) + value))
+  } else if value >= -128 && value <= 127 {
     run out.append(op.OP_push_i8) run out.append(u32.toU8(unsignedWord(value) & 255))
   } else if value >= -32768 && value <= 32767 {
     run out.append(op.OP_push_i16) run out.writeU16(u32.toU16(unsignedWord(value) & 65535))
   } else { run out.append(op.OP_push_i32) run out.writeU32(unsignedWord(value)) }
 }
+@inlineAlways
+pub fn putShortCodeWithin(out: &mut ByteBuffer, code: u8, index: i32) -> bool {
+  if index < 4 {
+    let mut base: i32 = -1
+    if code == op.OP_get_loc { base = opcode(op.OP_get_loc0) }
+    else if code == op.OP_put_loc { base = opcode(op.OP_put_loc0) }
+    else if code == op.OP_get_arg { base = opcode(op.OP_get_arg0) }
+    else if code == op.OP_call { base = opcode(op.OP_call0) }
+    if base >= 0 { return out.appendWithin(i32.toU8(base + index)) }
+  }
+  if index < 256 {
+    let mut base: i32 = -1
+    if code == op.OP_get_loc { base = opcode(op.OP_get_loc8) }
+    else if code == op.OP_put_loc { base = opcode(op.OP_put_loc8) }
+    else if code == op.OP_set_loc { base = opcode(op.OP_set_loc8) }
+    if base >= 0 {
+      if out.capacity() - out.length() < 2 { return false }
+      drop out.appendWithin(i32.toU8(base)) drop out.appendWithin(i32.toU8(index))
+      return true
+    }
+  }
+  if out.capacity() - out.length() < 3 { return false }
+  drop out.appendWithin(code) drop out.appendWithinU16(i32.toU16(index))
+  return true
+}
+@inlineAlways
 pub effect fn putShortCode(out: &mut ByteBuffer, code: u8, index: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if putShortCodeWithin(&mut out, code, index) { return () }
   if index < 4 {
     let mut base: i32 = -1
     if code == op.OP_get_loc { base = opcode(op.OP_get_loc0) }
@@ -343,20 +403,32 @@ pub fn shrinkJumps(fd: &mut FunctionDef, out: &mut ByteBuffer) -> () {
   // Move the code once: each shrunk jump drops the tail of its old operand.
   let mut write: usize = 0 let mut read: usize = 0 let mut before: i32 = 0
   let bytes = out.asMutSlice()
-  i = 0
-  while i < count {
-    let jump = fd.jumps.get(i)
-    let delta = jump.removed - before
-    if delta != 0 {
-      let cut = i32.toUsize(jump.position + jump.size)
-      if write == read { write = cut read = cut }
-      else { while read < cut { bytes[write] = bytes[read] write = write + 1 read = read + 1 } }
-      read = read + i32.toUsize(delta)
-      before = jump.removed
+  let byteLen = bytes.length
+  if byteLen != 0 {
+    let bytesPtr = unsafe Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Intrinsic.pointerFromMutSlice<u8>(&mut bytes))
+    i = 0
+    while i < count {
+      let jump = fd.jumps.get(i)
+      let delta = jump.removed - before
+      if delta != 0 {
+        let cut = u32.toUsize(i32.wrappingToU32(i32.wrappingAdd(jump.position, jump.size)))
+        if write == read { write = cut read = cut }
+        else {
+          while read < cut {
+            unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(bytesPtr, write), unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(bytesPtr, read)))
+            write = usize.wrappingAdd(write, 1) read = usize.wrappingAdd(read, 1)
+          }
+        }
+        read = usize.wrappingAdd(read, u32.toUsize(i32.wrappingToU32(delta)))
+        before = jump.removed
+      }
+      i = usize.wrappingAdd(i, 1)
     }
-    i = i + 1
+    while read < byteLen {
+      unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(bytesPtr, write), unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(bytesPtr, read)))
+      write = usize.wrappingAdd(write, 1) read = usize.wrappingAdd(read, 1)
+    }
   }
-  while read < bytes.length { bytes[write] = bytes[read] write = write + 1 read = read + 1 }
   out.truncate(write)
   // Every pc after a shrunk jump moves back by what was removed before it.
   let mut j: usize = 0
@@ -365,19 +437,49 @@ pub fn shrinkJumps(fd: &mut FunctionDef, out: &mut ByteBuffer) -> () {
     if slot.address >= 0 { slot.address = slot.address - removedBefore(&fd.*, count, slot.address) fd.labels.set(j, slot) }
     j = j + 1
   }
-  j = 0 let mut k: usize = 0
-  while j < fd.lineNumbers.length() {
-    let mut entry = fd.lineNumbers.get(j)
-    while k < count && u32.toI32(entry.pc) > fd.jumps.get(k).position { k = k + 1 }
-    if k > 0 { entry.pc = entry.pc - i32.toU32(fd.jumps.get(k - 1).removed) fd.lineNumbers.set(j, entry) }
-    j = j + 1
+  let jumpsSlice = fd.jumps.asSlice()
+  let jumpsPtr = unsafe Intrinsic.pointerRequalify<?[*]const JumpSlot, [*]const JumpSlot>(Pointer.fromSlice<JumpSlot>(jumpsSlice))
+  let lineCount = fd.lineNumbers.length()
+  if lineCount != 0 {
+    let linesPtr = unsafe Intrinsic.pointerRequalify<?[*]const PcSourcePosition, [*]const PcSourcePosition>(Pointer.fromSlice<PcSourcePosition>(fd.lineNumbers.asSlice()))
+    let mut k: usize = 0
+    let mut removed: u32 = 0
+    let mut nextJumpPos = i32.wrappingToU32((unsafe Pointer.read<JumpSlot>(unsafe Pointer.at<JumpSlot>(jumpsPtr, 0))).position)
+    j = 0
+    while j < lineCount {
+      let mut entry = unsafe Pointer.read<PcSourcePosition>(unsafe Pointer.at<PcSourcePosition>(linesPtr, j))
+      while k < count && entry.pc > nextJumpPos {
+        removed = i32.wrappingToU32((unsafe Pointer.read<JumpSlot>(unsafe Pointer.at<JumpSlot>(jumpsPtr, k))).removed)
+        k = usize.wrappingAdd(k, 1)
+        if k < count { nextJumpPos = i32.wrappingToU32((unsafe Pointer.read<JumpSlot>(unsafe Pointer.at<JumpSlot>(jumpsPtr, k))).position) }
+      }
+      if removed != 0 {
+        entry.pc = u32.wrappingSubtract(entry.pc, removed)
+        unsafe fd.lineNumbers.setUnchecked(j, entry)
+      }
+      j = usize.wrappingAdd(j, 1)
+    }
   }
-  j = 0 k = 0
-  while j < fd.callSiteSources.length() {
-    let mut entry = fd.callSiteSources.get(j)
-    while k < count && u32.toI32(entry.pc) > fd.jumps.get(k).position { k = k + 1 }
-    if k > 0 { entry.pc = entry.pc - i32.toU32(fd.jumps.get(k - 1).removed) fd.callSiteSources.set(j, entry) }
-    j = j + 1
+  let callCount = fd.callSiteSources.length()
+  if callCount != 0 {
+    let callsPtr = unsafe Intrinsic.pointerRequalify<?[*]mut PcSourcePosition, [*]mut PcSourcePosition>(Intrinsic.pointerFromMutSlice<PcSourcePosition>(&mut fd.callSiteSources.asMutSlice()))
+    let mut k: usize = 0
+    let mut removed: u32 = 0
+    let mut nextJumpPos = i32.wrappingToU32((unsafe Pointer.read<JumpSlot>(unsafe Pointer.at<JumpSlot>(jumpsPtr, 0))).position)
+    j = 0
+    while j < callCount {
+      let mut entry = unsafe Pointer.read<PcSourcePosition>(unsafe Pointer.atMut<PcSourcePosition>(callsPtr, j))
+      while k < count && entry.pc > nextJumpPos {
+        removed = i32.wrappingToU32((unsafe Pointer.read<JumpSlot>(unsafe Pointer.at<JumpSlot>(jumpsPtr, k))).removed)
+        k = usize.wrappingAdd(k, 1)
+        if k < count { nextJumpPos = i32.wrappingToU32((unsafe Pointer.read<JumpSlot>(unsafe Pointer.at<JumpSlot>(jumpsPtr, k))).position) }
+      }
+      if removed != 0 {
+        entry.pc = u32.wrappingSubtract(entry.pc, removed)
+        unsafe Pointer.write<PcSourcePosition>(unsafe Pointer.atMut<PcSourcePosition>(callsPtr, j), entry)
+      }
+      j = usize.wrappingAdd(j, 1)
+    }
   }
   // A jump moves by what earlier jumps removed; then its displacement is final.
   i = 0 before = 0
