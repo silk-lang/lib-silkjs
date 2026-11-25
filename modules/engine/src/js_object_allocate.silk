@@ -948,6 +948,56 @@ pub unsafe effect fn shapedArray<'a, H: HeapHooks>(hooks: &mut H, memory: &Alloc
   }
   return run unsafe freshNodeWith(&mut hooks, memory, realm, ownedShape, classes.JS_CLASS_ARRAY, true, true, extra, Pointer.null<HeapHeader>(), true, 4, exact)
 }
+/// Fast path for empty fast arrays (`[]` and `Object.keys({})`): borrows a
+/// Bin 1 (PAIR_SLOTS, non-small) spare cell directly, sets length = 0 and an
+/// empty plain FastArrayData, and publishes without freshNodeWith. Returns
+/// Uninitialized without side effects on miss, OOM, or observed fresh allocations.
+@inlineAlways
+pub unsafe effect fn emptyArrayFast<H: HeapHooks>(hooks: &mut H, observer: &AllocationObserver,
+  context: *mut HeapHeader, runtime: *mut HeapHeader) -> ValueBits ? &mut Allocator {
+  if unsafe gc.observesFresh(runtime) { return ValueBits.Uninitialized }
+  let ctxAnchor = ()
+  let shapeOpt = (unsafe HeapCell.payload<ContextState, ()>(&ctxAnchor, context)).arrayShape
+  let shape = match Pointer.nonNullMut<HeapHeader>(shapeOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let shapeAnchor = ()
+  if (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)).properties.length() != 1 {
+    return ValueBits.Uninitialized
+  }
+  let tail = shapes.PAIR_SLOTS
+  unsafe HeapCell.retain(shape)
+  let spare = unsafe gc.takeSpareCell(runtime, tail, false)
+  let fresh = match Pointer.nonNullMut<HeapHeader>(spare) {
+    Option<*mut HeapHeader>.Some { value } => unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, value)
+    Option<*mut HeapHeader>.None => {
+      let tailBytes = usize.wrappingMultiply(tail, Layout.of<SlotBits>().bytes)
+      match Pointer.nonNullMut<HeapHeader>(run unsafe allocateInlineCellOrNull(&mut hooks, observer, runtime, tailBytes)) {
+        Option<*mut HeapHeader>.Some { value } => value
+        Option<*mut HeapHeader>.None => {
+          unsafe gc.releaseHeader(&mut hooks, runtime, shape)
+          return ValueBits.Uninitialized
+        }
+      }
+    }
+  }
+  unsafe census.censusBump(runtime, census.CENSUS_OBJECTS_ALLOCATED, 1)
+  unsafe memory.prefetch(usize.wrappingAdd(Pointer.address<HeapHeader>(fresh), 64))
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, fresh)
+  let slotBase = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe HeapCell.tailAddress<ObjectData>(fresh))
+  unsafe Pointer.put<SlotBits>(slotBase, SlotBits.value(ValueBits.Int { value: 0 }))
+  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotBase, tail)
+  unsafe slots.extendFilled(1)
+  unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(data.slotListMut()), move slots)
+  let array = unsafe FastArrayData.ofPlain(ThinList<ValueBits>.make())
+  unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), ObjectPayload.FastArray { array: move array })
+  data.initHeader(classes.JS_CLASS_ARRAY, shape, true, true, false)
+  drop data
+  unsafe gc.publishObject(runtime, fresh)
+  return ValueBits.Object { reference: fresh }
+}
 /// The longest array whose values arrayWithCapacity keeps in the object's own cell.
 const LITERAL_TAIL_VALUES: usize = 16
 /// array with value storage for exactly count elements (an array literal's or a
@@ -955,6 +1005,10 @@ const LITERAL_TAIL_VALUES: usize = 16
 /// Array intrinsic cached shape.
 pub effect fn arrayWithCapacity<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
   count: usize) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  if count == 0 {
+    let fast = run unsafe emptyArrayFast(&mut hooks, memory, realm.context(), realm.runtime())
+    if fast.isObject() { return fast }
+  }
   let _context = realm.context()
   let runtime = realm.runtime()
   let anchor = ()
