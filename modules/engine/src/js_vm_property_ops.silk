@@ -19,7 +19,7 @@ import js_core_types as census
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { lendBits, lendFor, Value }
-import js_core_types { storeFieldEntry, SiteShapes, noteSiteShape, siteShapeAt, SITE_SHAPES, fieldGetterKey, PolyFieldEntry, polyFieldIndex, POLY_OWN, POLY_PROTO, POLY_GETTER, POLY_ABSENT, POLY_WRITABLE, RuntimeState, StringCharCodeCache, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldAbsentKey, fieldCacheIndex, fieldSpareIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
+import js_core_types { storeFieldEntry, SiteShapes, noteSiteShape, siteShapeAt, SITE_SHAPES, fieldGetterKey, fieldSetterKey, PolyFieldEntry, polyFieldIndex, POLY_OWN, POLY_PROTO, POLY_GETTER, POLY_ABSENT, POLY_WRITABLE, RuntimeState, StringCharCodeCache, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldAbsentKey, fieldCacheIndex, fieldSpareIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
   PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -1463,6 +1463,100 @@ pub unsafe fn typedViewGetter(runtime: *mut HeapHeader, object: *mut HeapHeader,
     Option<*mut HeapHeader>.Some { value } => unsafe typedRead.viewGetterMethod(value)
     Option<*mut HeapHeader>.None => u32.MAX
   }
+}
+@inlineAlways
+unsafe fn accessorSetter(data: &ObjectData, index: usize) -> ?*mut HeapHeader {
+  let anchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let flags = (unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags
+  drop shape
+  return match (unsafe data.slotUnchecked(index)).view(flags) {
+    PropertySlot.GetterSetter { setter, .. } => match Pointer.nonNullMut<HeapHeader>(setter) {
+      Option<*mut HeapHeader>.Some { value } => {
+        let function = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+        if function.classId() == classes.JS_CLASS_BYTECODE_FUNCTION { value } else { Pointer.null<HeapHeader>() }
+      }
+      Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+    }
+    _ => Pointer.null<HeapHeader>()
+  }
+}
+@inlineNever
+unsafe fn storeSetterField(runtime: *mut HeapHeader, site: usize, slot: usize, version: u64, epoch: u64, holder: ?*mut HeapHeader, index: usize) -> () {
+  let mut anchor = ()
+  let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  storeFieldEntry(&mut cache, slot, FieldCacheEntry { site: site, key: fieldSetterKey(version), protoKey: 0, midKey: 0, farKey: 0, epoch: epoch, holder: holder, holderIndex: index })
+}
+/// The bytecode setter the site at ip remembers for object (a setter entry that
+/// still holds), or null.
+pub unsafe fn siteSetter(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.isExotic() { return Pointer.null<HeapHeader>() }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let site = Pointer.address<u8>(ip)
+  let slot = fieldCacheIndex(site)
+  let entry = if state.fieldCache[slot].site == site { &state.fieldCache[slot] } else { &state.fieldCache[fieldSpareIndex(slot)] }
+  if entry.site != site || entry.key != fieldSetterKey(shape.version) { return Pointer.null<HeapHeader>() }
+  return match Pointer.nonNullMut<HeapHeader>(entry.holder) {
+    Option<*mut HeapHeader>.Some { value } => {
+      if entry.epoch != state.shapeEpoch { return Pointer.null<HeapHeader>() }
+      let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+      unsafe accessorSetter(&holder, entry.holderIndex)
+    }
+    Option<*mut HeapHeader>.None => unsafe accessorSetter(&data, entry.holderIndex)
+  }
+}
+/// The setter of the accessor property atom that a write to object finds first,
+/// when that setter is a bytecode function; null for anything else (a data
+/// property anywhere on the way, a missing or native setter, a lazy slot, an
+/// exotic object, no property). Walks at most GETTER_DEPTH objects and caches
+/// the hit in fieldCache at ip for siteSetter.
+pub unsafe fn functionSetterAt(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let atom = unsafe fieldAtomAt(ip)
+  let anchor = ()
+  let receiverData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if receiverData.isExotic() { return Pointer.null<HeapHeader>() }
+  let receiverVersion = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, receiverData.shape)).version
+  drop receiverData
+  let mut current = object
+  let mut depth: usize = 0
+  while depth < GETTER_DEPTH {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+    if data.isExotic() { return Pointer.null<HeapHeader>() }
+    match unsafe shapes.find(data.shape, atom) {
+      Option<FoundProperty>.Some { value: found } => {
+        let setter: ?*mut HeapHeader = match (unsafe data.slotUnchecked(found.index)).view(found.flags) {
+          PropertySlot.GetterSetter { setter, .. } => match Pointer.nonNullMut<HeapHeader>(setter) {
+            Option<*mut HeapHeader>.Some { value } => {
+              let function = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+              if function.classId() == classes.JS_CLASS_BYTECODE_FUNCTION { unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(value) } else { Pointer.null<HeapHeader>() }
+            }
+            Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+          }
+          _ => Pointer.null<HeapHeader>()
+        }
+        drop data
+        if !Pointer.isNull<HeapHeader>(setter) && receiverVersion != 0 {
+          let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+          let epoch = state.shapeEpoch
+          drop state
+          let site = Pointer.address<u8>(ip)
+          let holder = if depth == 0 { Pointer.null<HeapHeader>() } else { unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(current) }
+          unsafe storeSetterField(runtime, site, fieldCacheIndex(site), receiverVersion, epoch, holder, found.index)
+        }
+        return setter
+      }
+      Option<FoundProperty>.None => ()
+    }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { current = value }
+      Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+    }
+    depth = depth + 1
+  }
+  return Pointer.null<HeapHeader>()
 }
 /// The setter of the accessor property atom that a write to object finds first,
 /// when that setter is a bytecode function; null for anything else (a data
