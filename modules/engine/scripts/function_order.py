@@ -77,6 +77,9 @@ def main():
     if 'silkjs_text_align' in known and execute_loop and execute_loop in known:
         pinned = ['silkjs_text_align', execute_loop]
         names = pinned + [n for n in names if n not in pinned]
+    leaf_eval = declarations.get('silkjs-engine:js_vm_leaf.silk::evaluate')
+    if 'silkjs_leaf_align' in known and leaf_eval and leaf_eval in known:
+        names = [n for n in names if n not in ('silkjs_leaf_align', leaf_eval)] + ['silkjs_leaf_align', leaf_eval]
     with open(os.path.join(ROOT, 'startup.order'), 'w') as out:
         out.write(HEADER)
         out.write(''.join(name + '\n' for name in names))
