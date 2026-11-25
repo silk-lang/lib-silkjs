@@ -3148,13 +3148,87 @@ unsafe fn destroyUnlinked<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
 /// released; ring is null otherwise.
 /// linked: node comes from drainZero's stack (phase Decrement), so its dying
 /// children go straight onto the zero stack; otherwise it is cycle garbage.
+/// Fast path for linked, undeferred dying inline-tail FastArrays (RegExp exec
+/// results, short array literals, Object.keys): kept out of line so
+/// drainZeroFrom's JS_CLASS_OBJECT hot loop stays compact without extra spills.
+@inlineNever
+unsafe fn destroyFastArrayInline<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, shape: *mut HeapHeader) -> bool {
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if !object.fastArray() || object.weakRefCount != 0 || object.hasRecordedRealm()
+    || !object.slotListMut().borrowsStorage() || !unsafe js_shapes.plainRecords(shape) {
+    return false
+  }
+  let mut isInlineFast = false
+  let mut elemCap: usize = 0
+  let mut elemCount: usize = 0
+  let mut elemPtr = Option<[*]const ValueBits>.none()
+  let mut plainElems = false
+  match &object.payload {
+    ObjectPayload.FastArray { array } => {
+      if array.values().borrowsStorage() {
+        isInlineFast = true
+        elemCap = array.values().capacity()
+        plainElems = array.isPlain()
+        let slice = array.values().asSlice()
+        elemCount = slice.length
+        if elemCount != 0 {
+          elemPtr = Option<[*]const ValueBits>.some(unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(slice)))
+        }
+      }
+    }
+    _ => ()
+  }
+  if !isInlineFast { return false }
+  let stateAnchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
+  let classes = state.classes.asSlice()
+  let arrayIdx = u32.toUsize(JS_CLASS_ARRAY)
+  let builtin = if arrayIdx < classes.length {
+    match &classes[arrayIdx].finalizer {
+      Option<NativeFunctionId>.Some { value: NativeFunctionId.Builtin { family: BuiltinFamily.Runtime, method } } => method == NATIVE_JS_ARRAY_FINALIZER
+      _ => false
+    }
+  } else { false }
+  drop state
+  if !builtin { return false }
+  let slotCount = object.slotCount()
+  let slotCap = object.slotCapacity()
+  let slots = unsafe object.slotListMut().dataMut()
+  drop object
+  let mut sIdx: usize = 1
+  while sIdx < slotCount {
+    let value = (unsafe Pointer.read<SlotBits>(unsafe Pointer.atMut<SlotBits>(slots, sIdx))).valueBits()
+    if value.tag() < 0 { unsafe releaseDraining(&mut hooks, runtime, value) }
+    sIdx = usize.wrappingAdd(sIdx, 1)
+  }
+  if !plainElems {
+    match elemPtr {
+      Option<[*]const ValueBits>.Some { value: ptr } => {
+        let mut eIdx: usize = 0
+        while eIdx < elemCount {
+          let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(ptr, eIdx))
+          if value.tag() < 0 { unsafe releaseDraining(&mut hooks, runtime, value) }
+          eIdx = usize.wrappingAdd(eIdx, 1)
+        }
+      }
+      Option<[*]const ValueBits>.None => ()
+    }
+  }
+  unsafe releaseObjectHeader(&mut hooks, runtime, shape)
+  unsafe leave(runtime, node)
+  unsafe mark(node, 0)
+  let totalTail = if slotCap != 0 { usize.wrappingAdd(slotCap, elemCap) } else { 0 }
+  unsafe recycleObjectCell(runtime, node, totalTail, false)
+  return true
+}
 // Inlined: drainZero's loop runs it for nearly every dying object, and the
 // call's frame setup and spills were ~15% of its instructions.
 @inlineAlways
 unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool,
   deferred: bool, ring: ?*mut ReleaseRing) -> () {
   let mut anchor = ()
-  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let mut object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   require(!object.freeMark())
   let shape = object.shape
   let classId = object.classId()
@@ -3227,6 +3301,11 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     unsafe mark(node, 0)
     unsafe recycleObjectCell(runtime, node, slotCap, true)
     return ()
+  }
+  if linked && !deferred && classId == JS_CLASS_ARRAY {
+    drop object
+    if unsafe destroyFastArrayInline(&mut hooks, runtime, node, shape) { return () }
+    object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   }
   object.setFreeMark(true)
   let properties = object.takeSlots()
