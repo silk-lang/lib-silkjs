@@ -58,10 +58,12 @@ fn cookedEscape(source: &[u8], at: usize, strict: bool, template: bool) -> Cooke
 /// source end. Sixteen bytes a step while a whole block fits.
 fn plainRunEnd(source: &[u8], from: usize, separator: u32) -> usize {
   let mut q = from
-  if source.length >= 16 {
-    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+  let len = source.length
+  if q >= len { return q }
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+  if len - q >= 16 {
     let quote = u8x16.splat(u32.toU8(separator))
-    while q + 16 <= source.length {
+    while q + 16 <= len {
       let lanes = unsafe Pointer.readUnaligned<simd<u8, 16>>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) simd<u8, 16>>(unsafe Pointer.at<u8>(base, q)))
       let stops = mask16.toBits(u8x16.lanesGreaterOrEqual(lanes, u8x16.splat(128))) | mask16.toBits(u8x16.lanesEqual(lanes, quote))
         | mask16.toBits(u8x16.lanesEqual(lanes, u8x16.splat(92))) | mask16.toBits(u8x16.lanesEqual(lanes, u8x16.splat(10)))
@@ -70,10 +72,11 @@ fn plainRunEnd(source: &[u8], from: usize, separator: u32) -> usize {
       q = q + 16
     }
   }
-  while q < source.length {
-    let plain = byte(source, q)
-    if plain >= 128 || plain == separator || plain == 92 || plain == 10 || plain == 13 { return q }
-    q = q + 1
+  let sep = u32.toU8(separator)
+  while q < len {
+    let plain = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, q))
+    if plain >= 128 || plain == sep || plain == 92 || plain == 10 || plain == 13 { return q }
+    q = usize.wrappingAdd(q, 1)
   }
   return q
 }
@@ -81,8 +84,8 @@ pub effect fn scanString(source: &[u8], start: usize, strict: bool, skipValue: b
   ! LexError | StringLengthError | OutOfMemoryError ? &mut Allocator {
   if start >= source.length { fail LexError.at(start, "Invalid or unexpected token") }
   let separator = byte(source, start)
-  let mut p = start + 1
-  // A plain ASCII literal becomes its string directly, without a builder.
+  let p = start + 1
+  // A plain ASCII literal becomes its string directly, without a builder or stack buffer.
   let q = plainRunEnd(source, p, separator)
   if q < source.length && byte(source, q) == separator {
     let mut length = q - p
@@ -91,38 +94,177 @@ pub effect fn scanString(source: &[u8], start: usize, strict: bool, skipValue: b
     return Token { kind: TOK_STRING, start: start, end: q + 1, gotLineFeed: false,
       payload: TokenPayload.String { value: run hold(&mut held, move plainValue), separator: separator } }
   }
+  return run scanStringEscaped(source, start, p, q, separator, strict, skipValue, &mut held)
+}
+
+/// Hexadecimal digit lookup table (0..15 for valid hex digits, 255 otherwise).
+const HEX_DIGIT: [u8; 256] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255, 255, 255, 255, 255, 10, 11, 12, 13, 14, 15, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 10, 11, 12, 13, 14, 15, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+
+@inlineNever
+effect fn scanStringEscaped(source: &[u8], start: usize, firstStart: usize, firstEnd: usize, separator: u32, strict: bool, skipValue: bool, held: &mut List<StringOwner>) -> Token
+  ! LexError | StringLengthError | OutOfMemoryError ? &mut Allocator {
   let mut builder = StringBuilder.make()
+  let mut hasBuilder = false
+  let mut isWide = false
+  let mut buf: [u8; 256] = [0; 256]
+  let mut bufLen: usize = 0
+  let mut wbuf: [u16; 128] = [0; 128]
+  let mut wbufLen: usize = 0
+  let srcPtr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+  let mut p = firstStart
+  let mut plainEnd = firstEnd
   while true {
-    // Plain ASCII runs between escapes go in with one append.
-    let plainEnd = plainRunEnd(source, p, separator)
     if plainEnd > p {
-      if !skipValue { run builder.appendLatin1(Slice.view(source, p, plainEnd - p)) }
+      if !skipValue {
+        let runLen = plainEnd - p
+        if !isWide {
+          if runLen <= 256 - bufLen {
+            let mut j: usize = 0
+            while j < runLen {
+              buf[bufLen + j] = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + j))
+              j = usize.wrappingAdd(j, 1)
+            }
+            bufLen = bufLen + runLen
+          } else {
+            if bufLen > 0 {
+              run builder.appendLatin1(Slice.view(&buf, 0, bufLen))
+              bufLen = 0
+            }
+            run builder.appendLatin1(Slice.view(source, p, runLen))
+            hasBuilder = true
+          }
+        } else {
+          if runLen <= 128 - wbufLen {
+            let mut j: usize = 0
+            while j < runLen {
+              wbuf[wbufLen + j] = u8.toU16(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + j)))
+              j = usize.wrappingAdd(j, 1)
+            }
+            wbufLen = wbufLen + runLen
+          } else {
+            if wbufLen > 0 {
+              run builder.appendUtf16(Slice.view(&wbuf, 0, wbufLen))
+              wbufLen = 0
+            }
+            run builder.appendLatin1(Slice.view(source, p, runLen))
+          }
+        }
+      }
       p = plainEnd
     }
     if p >= source.length { fail LexError.at(start, "Invalid or unexpected token") }
-    let mut c = byte(source, p)
+    let mut c = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p)))
     p = p + 1
     if c == separator { break }
     if c == 10 || c == 13 { fail LexError.at(start, "Invalid or unexpected token") }
     if c == 92 {
       let slash = p - 1
       if p >= source.length { fail LexError.at(start, "Invalid or unexpected token") }
-      let parsed = cookedEscape(source, p, strict, false)
-      if parsed.point == -4 { fail LexError.at(start, "invalid UTF-8 sequence") }
-      if parsed.point == -3 {
-        fail LexError.at(slash, "Octal escape sequences are not allowed in strict mode.")
+      let esc = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p))
+      let mut fast = false
+      if esc == 117 && p + 4 < source.length {
+        let b0 = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + 1))
+        if b0 != 123 {
+          let h0 = HEX_DIGIT[u8.toUsize(b0)]
+          let h1 = HEX_DIGIT[u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + 2)))]
+          let h2 = HEX_DIGIT[u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + 3)))]
+          let h3 = HEX_DIGIT[u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + 4)))]
+          if (h0 | h1 | h2 | h3) < 16 {
+            c = u32.shiftLeft(u8.toU32(h0), 12) | u32.shiftLeft(u8.toU32(h1), 8) | u32.shiftLeft(u8.toU32(h2), 4) | u8.toU32(h3)
+            p = p + 5
+            fast = true
+          }
+        }
+      } else if esc == 120 && p + 2 < source.length {
+        let h0 = HEX_DIGIT[u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + 1)))]
+        let h1 = HEX_DIGIT[u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(srcPtr, p + 2)))]
+        if (h0 | h1) < 16 {
+          c = u32.shiftLeft(u8.toU32(h0), 4) | u8.toU32(h1)
+          p = p + 3
+          fast = true
+        }
+      } else if esc == 110 { c = 10 p = p + 1 fast = true }
+      else if esc == 34 || esc == 39 || esc == 92 || esc == 47 { c = u8.toU32(esc) p = p + 1 fast = true }
+      else if esc == 114 { c = 13 p = p + 1 fast = true }
+      else if esc == 116 { c = 9 p = p + 1 fast = true }
+      if !fast {
+        let parsed = cookedEscape(source, p, strict, false)
+        if parsed.point == -4 { fail LexError.at(start, "invalid UTF-8 sequence") }
+        if parsed.point == -3 {
+          fail LexError.at(slash, "Octal escape sequences are not allowed in strict mode.")
+        }
+        if parsed.point == -1 { fail LexError.at(slash, if esc == 120 { "Invalid hexadecimal escape sequence" } else { "Invalid Unicode escape sequence" }) }
+        p = parsed.end
+        if parsed.point == -2 {
+          plainEnd = plainRunEnd(source, p, separator)
+          continue
+        }
+        c = i32.toU32(parsed.point)
       }
-      if parsed.point == -1 { fail LexError.at(slash, if byte(source, p) == 120 { "Invalid hexadecimal escape sequence" } else { "Invalid Unicode escape sequence" }) }
-      p = parsed.end
-      if parsed.point == -2 { continue }
-      c = i32.toU32(parsed.point)
     } else if c >= 128 {
       let decoded = decode(source, p - 1)
       if !decoded.valid { fail LexError.at(start, "invalid UTF-8 sequence") }
       c = decoded.point
       p = decoded.end
     }
-    if !skipValue { run builder.appendCodePoint(c) }
+    if !skipValue {
+      if !isWide {
+        if c < 256 {
+          if bufLen == 256 {
+            run builder.appendLatin1(Slice.view(&buf, 0, bufLen))
+            bufLen = 0
+            hasBuilder = true
+          }
+          buf[bufLen] = u32.toU8(c)
+          bufLen = bufLen + 1
+        } else {
+          if bufLen > 0 {
+            run builder.appendLatin1(Slice.view(&buf, 0, bufLen))
+            bufLen = 0
+          }
+          hasBuilder = true
+          isWide = true
+          if c < 65536 {
+            wbuf[0] = u32.toU16(c)
+            wbufLen = 1
+          } else {
+            let adj = c - 65536
+            wbuf[0] = u32.toU16(0xd800 + u32.shiftRight(adj, 10))
+            wbuf[1] = u32.toU16(0xdc00 + (adj & 1023))
+            wbufLen = 2
+          }
+        }
+      } else {
+        if c < 65536 {
+          if wbufLen == 128 {
+            run builder.appendUtf16(Slice.view(&wbuf, 0, wbufLen))
+            wbufLen = 0
+          }
+          wbuf[wbufLen] = u32.toU16(c)
+          wbufLen = wbufLen + 1
+        } else {
+          if wbufLen > 126 {
+            run builder.appendUtf16(Slice.view(&wbuf, 0, wbufLen))
+            wbufLen = 0
+          }
+          let adj = c - 65536
+          wbuf[wbufLen] = u32.toU16(0xd800 + u32.shiftRight(adj, 10))
+          wbuf[wbufLen + 1] = u32.toU16(0xdc00 + (adj & 1023))
+          wbufLen = wbufLen + 2
+        }
+      }
+    }
+    plainEnd = plainRunEnd(source, p, separator)
+  }
+  if !hasBuilder {
+    let value = StringOwner.adopt(run Strings.fromLatin1(Slice.view(&buf, 0, bufLen)))
+    return Token { kind: TOK_STRING, start: start, end: p, gotLineFeed: false,
+      payload: TokenPayload.String { value: run hold(&mut held, move value), separator: separator } }
+  }
+  if isWide {
+    if wbufLen > 0 { run builder.appendUtf16(Slice.view(&wbuf, 0, wbufLen)) }
+  } else {
+    if bufLen > 0 { run builder.appendLatin1(Slice.view(&buf, 0, bufLen)) }
   }
   let value = StringOwner.adopt(run builder.finish())
   return Token { kind: TOK_STRING, start: start, end: p, gotLineFeed: false,
@@ -350,7 +492,17 @@ pub effect fn scanRegExp(source: &[u8], start: usize, held: &mut List<StringOwne
 }
 
 /// Keeps owner in held, the scanning lexer's list, and returns its index there.
+@inlineAlways
 effect fn hold(held: &mut List<StringOwner>, owner: StringOwner) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let index = held.length()
+  if index < held.capacity() {
+    let _ok = held.appendWithinCapacity(move owner)
+    return usize.toU32(index)
+  }
+  return run holdSlow(&mut held, move owner)
+}
+@inlineNever
+effect fn holdSlow(held: &mut List<StringOwner>, owner: StringOwner) -> u32 ! OutOfMemoryError ? &mut Allocator {
   let index = usize.toU32(held.length())
   run held.append(move owner)
   return index
