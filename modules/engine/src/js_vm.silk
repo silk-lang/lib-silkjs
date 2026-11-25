@@ -2628,17 +2628,7 @@ unsafe effect fn regexpMethodInline<H: HeapHooks + CoercionHooks + OwnPropertyHo
   if test && !unsafe regexpSymbols.standard(unsafe lendRealm(&home, home), receiver) { return false }
   let data = unsafe operandCell(machine.stackTop, count)
   unsafe machine.publishPc()
-  let mut previous = ValueBits.Undefined
-  if !test {
-    let obsAnchor = ()
-    if !(unsafe HeapCell.payload<RuntimeState, ()>(&obsAnchor, machine.runtime)).observeInstructions {
-      let store = unsafe machine.peekU8(2)
-      if store >= op.OP_put_loc0 && store <= op.OP_put_loc3 { previous = unsafe machine.local(u8.toUsize(store - op.OP_put_loc0)) }
-      else if store == op.OP_put_loc8 || store == op.OP_set_loc8 { previous = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(3))) }
-      else if store == op.OP_put_loc || store == op.OP_set_loc { previous = unsafe machine.local(u16.toUsize(unsafe machine.peekU16At(3))) }
-    }
-  }
-  let quick = run regexpExec.quickExec(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, unsafe Pointer.read<ValueBits>(data), test, previous)
+  let quick = run regexpExec.quickExec(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, unsafe Pointer.read<ValueBits>(data), test)
   let answer = match move quick { Option<ValueBits>.Some { value } => value Option<ValueBits>.None => { return false } }
   unsafe machine.skip(2)
   unsafe Pointer.write<i32>(counter, left - 1)
@@ -3083,7 +3073,7 @@ unsafe effect fn testInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   let mut answer = ValueBits.Undefined
   let mut quick = Option<ValueBits>.none()
   if unsafe regexpSymbols.standard(unsafe lendRealm(&home, home), receiver) {
-    quick = run regexpExec.quickExec(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, unsafe argv.get(0), true, ValueBits.Undefined)
+    quick = run regexpExec.quickExec(&mut hooks, memory, unsafe lendRealm(&home, home), receiver, unsafe argv.get(0), true)
   }
   match move quick {
     Option<ValueBits>.Some { value } => { answer = value }
@@ -3378,25 +3368,32 @@ unsafe fn applyInline<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> ?*m
 /// callInline to handle.
 @inlineNever
 unsafe fn enterCall<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode: u8) -> ?*mut Machine { return unsafe enterCallFor(&mut hooks, &mut machine, opcode) }
-/// Lean non-effectful inline entry for target.call(thisArg, ...args) on a plain
-/// bytecode function (e.g. ES5 `_super.call(this, ...)`): avoids callInline's
-/// effectful 14-trait frame and supports frameless leaf targets too. Returns
-/// null with machine untouched for apply/Reflect.apply/bound/full-region/poll.
+/// Lean non-effectful inline entry for target.call(thisArg, ...args) and
+/// target.apply(thisArg, arguments) on a plain bytecode function (e.g. ES5
+/// `_super.call(this, ...)` / `fn.apply(this, arguments)`): avoids callInline's
+/// effectful 14-trait frame and lazyArgumentsSlot bytecode scan, and supports
+/// frameless leaf targets too. Returns null with machine untouched on fallback.
 @inlineNever
 unsafe fn enterApplyInline<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, count: usize) -> ?*mut Machine {
   if count == 0 { return Pointer.null<Machine>() }
-  if count == 2 && (unsafe machine.top(1)).tag() == 4 { return Pointer.null<Machine>() }
   let data = unsafe operandCell(machine.stackTop, count)
   let function = unsafe Pointer.read<ValueBits>(unsafe operandCell(data, 1))
-  if !unsafe invoke.isCall(function) { return Pointer.null<Machine>() }
+  let mut copy = false
+  let mut forwarded = FrameSlots { data: unsafe operandCell(data, usize.wrappingSubtract(0, 1)), count: count - 1 }
+  if count == 2 && (unsafe machine.top(1)).tag() == 4 {
+    if !unsafe invoke.isApply(function) { return Pointer.null<Machine>() }
+    forwarded = unsafe Pointer.read<FrameSlots>(unsafe activation.originalArgumentsOf(&machine))
+    copy = true
+  } else if !unsafe invoke.isCall(function) {
+    return Pointer.null<Machine>()
+  }
   let first = unsafe operandCell(data, 2)
   let target = unsafe Pointer.read<ValueBits>(first)
   if !target.isObject() || unsafe classId(target) != classes.JS_CLASS_BYTECODE_FUNCTION { return Pointer.null<Machine>() }
   let thisArg = unsafe Pointer.read<ValueBits>(data)
-  let forwarded = FrameSlots { data: unsafe operandCell(data, usize.wrappingSubtract(0, 1)), count: count - 1 }
   let running = Pointer.fromMutRef<Machine>(&mut machine)
   let callee = unsafe activation.calleeOf(target)
-  if unsafe leaves.runsLeaf(callee.bytecode, count - 1) {
+  if unsafe leaves.runsLeaf(callee.bytecode, forwarded.count) {
     if unsafe leaves.attempt(&mut hooks, running, target, callee.bytecode, forwarded, first, data) {
       unsafe machine.skip(2)
       return running
@@ -3408,9 +3405,9 @@ unsafe fn enterApplyInline<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, c
   if left <= 1 { return Pointer.null<Machine>() }
   unsafe Pointer.write<i32>(counter, left - 1)
   unsafe machine.skip(2)
-  unsafe machine.publishPc()
+  unsafe machine.publishFramePc()
   let entered = unsafe activation.enterDecoded(machine.runtime, target, callee, forwarded, first, running, machine.context, thisArg,
-    ValueBits.Undefined, false, false)
+    ValueBits.Undefined, false, copy)
   match entered {
     Option<*mut Machine>.Some { value } => { return value }
     Option<*mut Machine>.None => {
@@ -3453,7 +3450,13 @@ unsafe fn enterCallWith<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opco
     receiver = unsafe Pointer.read<ValueBits>(first)
   }
   let running = Pointer.fromMutRef<Machine>(&mut machine)
-  if !function.isObject() { return unsafe enterKnownCall(&mut hooks, &mut machine, function, argv, first, width) }
+  if !function.isObject() {
+    if opcode == op.OP_call_method { return Pointer.null<Machine>() }
+    return match function {
+      ValueBits.FunctionBytecode { reference } => unsafe enterKnownCall(&mut hooks, &mut machine, reference, count, width)
+      _ => Pointer.null<Machine>()
+    }
+  }
   // A leaf callee runs without a frame (js_vm_leaf); a declined run changed nothing.
   // A leaf cannot loop or recurse (forward branches, one nesting level), so it
   // is not charged to the interrupt counter, and runs before that store.
@@ -3471,7 +3474,7 @@ unsafe fn enterCallWith<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opco
   // Charged up front so left is dead across the frame setup; refunded on a miss.
   unsafe Pointer.write<i32>(counter, left - 1)
   unsafe machine.skip(width)
-  unsafe machine.publishPc()
+  unsafe machine.publishFramePc()
   let entered = unsafe activation.enterDecoded(machine.runtime, function, callee, argv, first, running, machine.context, receiver,
     ValueBits.Undefined, false, false)
   match entered {
@@ -3484,15 +3487,20 @@ unsafe fn enterCallWith<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opco
   }
 }
 /// enterCallWith for a known local function (calleeIsBytecode): out of line, so
-/// closure calls inline none of it. A leaf runs frameless, as a closure's would.
+/// closure calls inline none of it. Takes 5 register arguments (no stack args,
+/// no ValueBits tag check) and resolves knownContext at most once.
 @inlineNever
-unsafe fn enterKnownCall<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, function: ValueBits, argv: FrameSlots, first: *mut ValueBits,
-  width: usize) -> ?*mut Machine {
-  let bytecode = match function { ValueBits.FunctionBytecode { reference } => reference _ => { return Pointer.null<Machine>() } }
-  if unsafe leaves.runsLeaf(bytecode, argv.count) {
-    let running = Pointer.fromMutRef<Machine>(&mut machine)
-    let emptyRefs = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ?*mut HeapHeader>(running))
-    let known = unsafe activation.knownContext(bytecode, unsafe Intrinsic.pointerRequalify<*mut Machine, *const Machine>(running), emptyRefs)
+unsafe fn enterKnownCall<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, bytecode: *mut HeapHeader, count: usize, width: usize) -> ?*mut Machine {
+  let data = unsafe operandCell(machine.stackTop, count)
+  let argv = FrameSlots { data: data, count: count }
+  let first = unsafe operandCell(data, 1)
+  let running = Pointer.fromMutRef<Machine>(&mut machine)
+  let emptyRefs = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ?*mut HeapHeader>(running))
+  let mut known = activation.KnownContext { references: emptyRefs, scope: Pointer.null<HeapHeader>() }
+  let mut haveKnown = false
+  if unsafe leaves.runsKnownLeaf(bytecode, count) {
+    known = unsafe activation.knownContext(bytecode, unsafe Intrinsic.pointerRequalify<*mut Machine, *const Machine>(running), emptyRefs)
+    haveKnown = true
     if unsafe leaves.attemptKnown(&mut hooks, running, bytecode, known.references, known.scope, argv, first) { unsafe machine.skip(width) return running }
     unsafe leaves.miss(bytecode)
   }
@@ -3501,9 +3509,11 @@ unsafe fn enterKnownCall<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, fun
   if left <= 1 { return Pointer.null<Machine>() }
   unsafe Pointer.write<i32>(counter, left - 1)
   unsafe machine.skip(width)
-  unsafe machine.publishPc()
-  let running = Pointer.fromMutRef<Machine>(&mut machine)
-  match unsafe activation.enterKnown(machine.runtime, function, argv, first, running, machine.context) {
+  unsafe machine.publishFramePc()
+  if !haveKnown {
+    known = unsafe activation.knownContext(bytecode, unsafe Intrinsic.pointerRequalify<*mut Machine, *const Machine>(running), emptyRefs)
+  }
+  match unsafe activation.enterKnownWithContext(machine.runtime, bytecode, known, argv, first, running, machine.context) {
     Option<*mut Machine>.Some { value } => { return value }
     Option<*mut Machine>.None => {
       unsafe machine.skip(usize.wrappingSubtract(0, width))

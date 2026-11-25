@@ -69,6 +69,14 @@ def main():
         name = declarations.get(name, name)
         if name in known and name not in names and not CLI_ONLY.match(name):
             names.append(name)
+    # Keep silkjs_text_align immediately before executeLoop so executeLoop's
+    # main indirect-jump dispatch header lands cleanly on a 64B cache-line
+    # boundary instead of straddling a 32B DSB or 64B line boundary.
+    execute_loop = declarations.get('silkjs-engine:js_vm.silk::executeLoop')
+    pinned = []
+    if 'silkjs_text_align' in known and execute_loop and execute_loop in known:
+        pinned = ['silkjs_text_align', execute_loop]
+        names = pinned + [n for n in names if n not in pinned]
     with open(os.path.join(ROOT, 'startup.order'), 'w') as out:
         out.write(HEADER)
         out.write(''.join(name + '\n' for name in names))

@@ -63,7 +63,7 @@ import regexp_types {
   FLAG_NAMED_GROUPS,
   FLAG_HINT
 }
-import regexp_validate { RegExpValidationError, validateMatch, validateCaptures }
+import regexp_validate { RegExpValidationError, validateMatch }
 import byte_buffer { readU16, readU32 }
 
 // Unlike VM polling, the regexp engine already maintains its own 10,000-event
@@ -251,7 +251,7 @@ effect fn executeInto<'a, H: InterruptHooks>(
     fail RegExpValidationError { offset: 0 }
   }
   if input.wide {
-    let matched = run RegExpExecutor.match16(
+    return run RegExpExecutor.match16(
       code.latin1.asSlice(),
       Slice.view(input.wideUnits(), 0, input.length()),
       start,
@@ -261,10 +261,6 @@ effect fn executeInto<'a, H: InterruptHooks>(
       },
       &mut out,
     )
-    if matched && !validateCaptures(out.asSlice(), u8.toUsize(code.latin1.get(2)), input.length()) {
-      fail RegExpValidationError { offset: 0 }
-    }
-    return matched
   }
   return run narrowInto(
     &mut hooks,
@@ -293,7 +289,7 @@ effect fn narrowInto<'a, H: InterruptHooks>(
   if start > text.length || text.length > i32.toUsize(i32.MAX) || code.length < 3 {
     fail RegExpValidationError { offset: 0 }
   }
-  let matched = run RegExpExecutor.match8(
+  return run RegExpExecutor.match8(
     code,
     text,
     start,
@@ -303,10 +299,6 @@ effect fn narrowInto<'a, H: InterruptHooks>(
     },
     &mut out,
   )
-  if matched && !validateCaptures(out.asSlice(), u8.toUsize(code[2]), text.length) {
-    fail RegExpValidationError { offset: 0 }
-  }
-  return matched
 }
 
 effect fn executeFlat<'a, H: InterruptHooks>(
@@ -535,32 +527,20 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
       let capSlice = captures.asSlice()
       if capSlice.length < usize.wrappingMultiply(count, 2) { Intrinsic.trap("Captures.get: index out of range") }
       let capPtr = unsafe Intrinsic.pointerRequalify<?[*]const i32, [*]const i32>(Pointer.fromSlice<i32>(capSlice))
-      let mut i: usize = 0
-      while i < count {
-        let pair = usize.wrappingMultiply(i, 2)
-        let start = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(capPtr, pair))
-        let end = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(capPtr, usize.wrappingAdd(pair, 1)))
-        if start < 0 || end < 0 {
-          unsafe Pointer.put<ValueBits>(unsafe Pointer.atMut<ValueBits>(output, i), ValueBits.Undefined)
-          i = usize.wrappingAdd(i, 1)
-          continue
+      let mut filled: usize = 0
+      let fillResult = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(
+        fillPlainCaptures(realm, string, bytes, narrow, length, capPtr, output, count, &mut filled),
+        failedCapture,
+      )
+      match move fillResult {
+        bool _ => {
+          unsafe array.valuesMut().extendFilled(count)
         }
-        let captured = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(
-          capturePiece(realm, string, bytes, narrow, length, start, end),
-          failedCapture,
-        )
-        match move captured {
-          ValueBits piece => {
-            unsafe Pointer.put<ValueBits>(unsafe Pointer.atMut<ValueBits>(output, i), piece)
-          }
-          FailedCapture { error } => {
-            unsafe array.valuesMut().extendFilled(i)
-            fail move error
-          }
+        FailedCapture { error } => {
+          unsafe array.valuesMut().extendFilled(filled)
+          fail move error
         }
-        i = usize.wrappingAdd(i, 1)
       }
-      unsafe array.valuesMut().extendFilled(count)
     }
     _ => {
       Intrinsic.trap("QuickJS invariant violated")
@@ -570,6 +550,37 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let result = state.object
   state.object = ValueBits.Undefined
   return result
+}
+
+@inlineAlways
+effect fn fillPlainCaptures<'a, 'b>(
+  realm: Realm<'a>,
+  string: ValueRef<'b>,
+  bytes: &[u8],
+  narrow: bool,
+  length: usize,
+  capPtr: [*]const i32,
+  output: [*]mut ValueBits,
+  count: usize,
+  filled: &mut usize,
+) -> bool
+  ! OutOfMemoryError | StringLengthError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < count {
+    let pair = usize.wrappingMultiply(i, 2)
+    let start = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(capPtr, pair))
+    let end = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(capPtr, usize.wrappingAdd(pair, 1)))
+    if start < 0 || end < 0 {
+      unsafe Pointer.put<ValueBits>(unsafe Pointer.atMut<ValueBits>(output, i), ValueBits.Undefined)
+    } else {
+      let piece = run capturePiece(realm, string, bytes, narrow, length, start, end)
+      unsafe Pointer.put<ValueBits>(unsafe Pointer.atMut<ValueBits>(output, i), piece)
+    }
+    i = usize.wrappingAdd(i, 1)
+    filled.* = i
+  }
+  return true
 }
 
 struct FailedCapture {
@@ -977,7 +988,6 @@ pub effect fn quickExec<
   receiver: ValueBits,
   input: ValueBits,
   test: bool,
-  previous: ValueBits,
 ) -> Option<ValueBits>
   ? &mut Allocator {
   if !receiver.isObject() || input.tag() != -7 {
@@ -1042,7 +1052,7 @@ pub effect fn quickExec<
     input,
     lastIndex,
     test,
-    previous,
+    ValueBits.Undefined,
     &mut captures,
   )
   if updatesIndex {
@@ -1194,15 +1204,15 @@ effect fn answer<
       &mut state,
     ),
   )
-  unsafe support.release(&mut hooks, realm, state.temporary)
-  unsafe support.release(&mut hooks, realm, state.object)
   return match move built {
     Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success {
       value
     } => Option<ValueBits>.some(value)
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => Option<
-      ValueBits
-    >.none()
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => {
+      unsafe support.release(&mut hooks, realm, state.temporary)
+      unsafe support.release(&mut hooks, realm, state.object)
+      Option<ValueBits>.none()
+    }
   }
 }
 
