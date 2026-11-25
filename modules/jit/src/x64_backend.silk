@@ -293,6 +293,8 @@ pub struct Emitter {
   inlineFrames: i32,
   /// The closure value each inlined callee's `inline.frame` names, by frame number less one.
   inlineClosures: List<u32>,
+  /// Whether inline target k is a known local FunctionBytecode (ssa.TARGET_KNOWN_FN).
+  knownFns: List<bool>,
   /// Inst.frame of the instruction being lowered: whose frame, code and closure it runs for.
   frameOf: u32,
   /// Frame mode, and the frame.
@@ -726,11 +728,16 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(), construct: helpers.constructLayout(), math: helpers.mathLayout(), closureHome: baseline_env.closureHomeOffset(), usedXmm: usedXmm,
     undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cachedArr: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
-    inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), frameOf: 0,
+    inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), knownFns: List<bool>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), checkConstructSlows: List<CheckConstructSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), coldEdges: List<ColdEdge>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(), aliased: List<bool>.make(),
     leaveAt: u32.wrappingToI32(leaveAt), leaveBytes: leaveBytes, callAt: callAt, bodyAt: callAt + bodyCells * SLOT_BYTES }
   run emitter.inlineClosures.appendRepeated(NONE, u32.toUsize(inlined))
+  let mut kf: usize = 0
+  while kf < function.inlineTargets.length() {
+    run emitter.knownFns.append(u32.bitAnd(function.inlineTargets.get(kf), ssa.TARGET_KNOWN_FN) != 0)
+    kf = kf + 1
+  }
   let mut own0: u32 = 0
   while own0 < values { run emitter.stored.append(own0) own0 = own0 + 1 }
   run emitter.aliased.appendRepeated(false, u32.toUsize(values))
@@ -914,13 +921,34 @@ fn supported(function: &Function, on: bool, stress: u32, steps: &List<u32>) -> O
     i = i + 1
   }
   if !on && function.virtualObjs.length() != 0 { return Option<&'static [u8]>.some(b"virtual object off a baseline frame") }
+  if !on {
+    let mut ti: usize = 0
+    while ti < function.inlineTargets.length() {
+      if u32.bitAnd(function.inlineTargets.get(ti), ssa.TARGET_KNOWN_FN) != 0 { return Option<&'static [u8]>.some(b"known function inline target off a baseline frame") }
+      ti = ti + 1
+    }
+  }
   return Option<&'static [u8]>.none()
+}
+
+/// Whether frame-mode code needs `realmAt` populated (for polls, inlined frames, or constructs).
+fn needsRealm(function: &Function) -> bool {
+  if function.inlineTargets.length() != 0 || function.constructTargets.length() != 0 { return true }
+  let mut i: usize = 0
+  while i < function.insts.length() {
+    let op = function.insts.get(i).op
+    if op == Op.Poll || op == Op.CheckConstruct { return true }
+    i = i + 1
+  }
+  return false
 }
 
 impl Emitter {
   pub fn saves(self: &Self, index: usize) -> bool { return u32.bitAnd(u32.shiftRight(self.places.savedMask, usize.toU32(index)), 1) != 0 }
   /// Where value v lives.
   fn at(self: &Self, v: u32) -> Place { return self.places.place(v, slotOf(v)) }
+  /// Whether inline target k is a known local FunctionBytecode (ssa.TARGET_KNOWN_FN).
+  fn knownFn(self: &Self, k: u32) -> bool { return u32.toUsize(k) < self.knownFns.length() && self.knownFns.get(u32.toUsize(k)) }
   /// Whether lowering `given` in frame mode may safely consume or preserve the cached
   /// trusted fast-array `(cachedArr, r9 = elements, eax = elementCount)` without clobbering
   /// `rax`/`r9` or mutating array length/storage. Instructions with conditional `rax`/`r9`
@@ -948,10 +976,20 @@ impl Emitter {
       if readsK(op) { inst.k = u32.wrappingToI32(self.storage(i32.wrappingToU32(inst.k))) }
     }
     if op == Op.CheckCallee {
-      // A bytecode closure (tag, class) whose FunctionBytecode cell is the target's.
+      // A bytecode closure (tag, class) whose FunctionBytecode cell is the target's,
+      // or a known local function (ValueBits.FunctionBytecode, tag -2) whose payload is the cell.
       run self.stressGuard(inst.exit)
       let layout = self.settings.layout
       let leave = self.exitLabels.get(u32.toUsize(inst.exit))
+      if self.knownFn(i32.wrappingToU32(inst.k)) {
+        run self.unlessTag(inst.a, layout.tagOf(-2), leave)
+        let target = self.symbol(i32.wrappingToU32(inst.k) * 3)
+        let fresh = self.isFresh(inst.a)
+        run self.a.movSymbol(Reg.Rax, target)
+        if fresh { run self.a.alu(Alu.Cmp, Width.W64, Reg.Rax, Reg.R9) } else { run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, payloadOf(inst.a)) }
+        run self.a.jcc(Cond.NotEqual, leave)
+        return ()
+      }
       run self.unlessTag(inst.a, layout.object(), leave)
       if self.exact(&function, i32.wrappingToU32(inst.k)) {
         // The one closure itself: an object at its address.
@@ -2434,14 +2472,19 @@ impl Emitter {
         // value (a cell still in its frame, or a binding in its dead zone, is the helper's).
         let f = self.plan.f
         let slow = run self.a.label()
+        let knownTarget = self.frameOf != 0 && self.knownFn(self.frameOf - 1)
         if self.frameOf == 0 { let own = self.plan.sf(f.currentFunction + 8) run self.a.load(Width.W64, Reg.Rax, own) }
+        else if knownTarget {
+          let target = self.symbol((self.frameOf - 1) * 3)
+          run self.a.movSymbol(Reg.Rax, target)
+        }
         else if self.exact(&function, self.frameOf - 1) {
           // The body's one closure, by its address: the read waits for no load of the callee.
           let closure = self.symbol((self.frameOf - 1) * 3 + 2)
           run self.a.movSymbol(Reg.Rax, closure)
         }
         else { run self.a.load(Width.W64, Reg.Rax, payloadOf(self.inlineClosures.get(u32.toUsize(self.frameOf - 1)))) }
-        if self.frameOf == 0 && self.plan.known {
+        if (self.frameOf == 0 && self.plan.known) || knownTarget {
           run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(f.knownRefs)))
           run self.a.test(Width.W64, Reg.Rax, Reg.Rax)
           run self.a.jcc(Cond.Equal, slow)
@@ -2473,13 +2516,18 @@ impl Emitter {
         let c = self.construct
         let slow = run self.a.label()
         let oldNotHeap = run self.a.label()
+        let knownTarget = self.frameOf != 0 && self.knownFn(self.frameOf - 1)
         if self.frameOf == 0 { let own = self.plan.sf(f.currentFunction + 8) run self.a.load(Width.W64, Reg.R8, own) }
+        else if knownTarget {
+          let target = self.symbol((self.frameOf - 1) * 3)
+          run self.a.movSymbol(Reg.R8, target)
+        }
         else if self.exact(&function, self.frameOf - 1) {
           let closureSym = self.symbol((self.frameOf - 1) * 3 + 2)
           run self.a.movSymbol(Reg.R8, closureSym)
         }
         else { run self.a.load(Width.W64, Reg.R8, payloadOf(self.inlineClosures.get(u32.toUsize(self.frameOf - 1)))) }
-        if self.frameOf == 0 && self.plan.known {
+        if (self.frameOf == 0 && self.plan.known) || knownTarget {
           run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R8, signed(f.knownRefs)))
           run self.a.test(Width.W64, Reg.R8, Reg.R8)
           run self.a.jcc(Cond.Equal, slow)
@@ -3760,6 +3808,15 @@ impl Emitter {
   effect fn calleeFlags(self: &mut Self, function: &Function, test: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
     let layout = self.settings.layout
     let other = run self.a.label()
+    if self.knownFn(i32.wrappingToU32(test.k)) {
+      run self.unlessTag(test.a, layout.tagOf(-2), other)
+      let target = self.symbol(i32.wrappingToU32(test.k) * 3)
+      let fresh = self.isFresh(test.a)
+      run self.a.movSymbol(Reg.Rax, target)
+      if fresh { run self.a.alu(Alu.Cmp, Width.W64, Reg.Rax, Reg.R9) } else { run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, payloadOf(test.a)) }
+      self.a.bind(other)
+      return ()
+    }
     run self.unlessTag(test.a, layout.object(), other)
     if self.exact(&function, i32.wrappingToU32(test.k)) {
       let closure = self.symbol(i32.wrappingToU32(test.k) * 3 + 2)
@@ -4714,8 +4771,13 @@ impl Emitter {
     run self.a.load(Width.W64, Reg.R10, payloadOf(closure))
     run self.a.lea(Width.W64, Reg.Rax, slotOf(closure))
     run self.a.store(Width.W64, Mem.at(Reg.Rsp, f), Reg.Rax)
-    run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_BYTECODE))
-    run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 8), Reg.R8)
+    let knownTarget = self.knownFn(k)
+    if knownTarget {
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 8), Reg.R10)
+    } else {
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_BYTECODE))
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 8), Reg.R8)
+    }
     if self.on {
       run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.Rsp, self.realmAt))
       run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 16), Reg.R8)
@@ -4727,13 +4789,21 @@ impl Emitter {
       run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R9, FRAME_RUNTIME))
       run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 24), Reg.R8)
     }
-    run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_REFERENCES))
+    if knownTarget {
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, signed(self.plan.f.knownRefs)))
+    } else {
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_REFERENCES))
+    }
     run self.a.lea(Width.W64, Reg.Rax, Mem.at(Reg.R8, compiled.DIRECT_BOX_DATA))
     run self.a.test(Width.W64, Reg.R8, Reg.R8)
     run self.a.cmov(Cond.Equal, Width.W64, Reg.Rax, Reg.Rsp)
     run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 32), Reg.Rax)
-    run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_SCOPE))
-    run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 40), Reg.R8)
+    if knownTarget {
+      run self.a.storeImm(Width.W64, Mem.at(Reg.Rsp, f + 40), 0)
+    } else {
+      run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_SCOPE))
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 40), Reg.R8)
+    }
     run self.a.storeImm(Width.W64, Mem.at(Reg.Rsp, f + 48), 0)
     let source = self.symbol(k * 3 + 1)
     run self.a.movSymbol(Reg.Rax, source)
@@ -5200,6 +5270,11 @@ impl Emitter {
         run self.a.aluImm(Alu.Sub, Width.W32, Reg.Rcx, 1)
         run self.a.jcc(Cond.NotEqual, more)
       }
+      if needsRealm(&function) {
+        // r11 still holds bytecode on the fast non-copy path: read realm directly.
+        run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.R11, signed(p.f.bytecodeRealm)))
+        run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.realmAt), Reg.Rax)
+      }
     }
     self.a.bind(self.prologued)
     if p.scoped {
@@ -5208,20 +5283,6 @@ impl Emitter {
       run self.a.lea(Width.W64, Reg.Rsi, p.rec(0))
       run self.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rbp, p.scopeAt))
       run self.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.SCOPE)))
-    }
-    // The realm, for the polls and for an inlined callee's CompiledFrame.
-    let mut needed = function.inlineTargets.length() != 0 || function.constructTargets.length() != 0
-    let mut i: usize = 0
-    while i < function.insts.length() {
-      let op = function.insts.get(i).op
-      if op == Op.Poll || op == Op.CheckConstruct { needed = true }
-      i = i + 1
-    }
-    if needed {
-      run self.a.load(Width.W64, Reg.Rax, p.sf(p.f.currentFunction + 8))
-      if !p.known { run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, compiled.DIRECT_CLOSURE_BYTECODE)) }
-      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(p.f.bytecodeRealm)))
-      run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.realmAt), Reg.Rax)
     }
     // The slots of the values that are a known closure whenever they are read (presets).
     let mut first = true
@@ -5256,6 +5317,12 @@ impl Emitter {
     run self.a.lea(Width.W64, Reg.R14, Mem.at(Reg.Rbp, p.argumentAt(0)))
     run self.a.movImm32(Reg.R10, counts)
     if p.known { run self.a.callSymbol(stubs.STUB_PROLOGUE_KNOWN) } else { run self.a.callSymbol(stubs.STUB_PROLOGUE) }
+    if needsRealm(&function) {
+      run self.a.load(Width.W64, Reg.Rax, p.sf(p.f.currentFunction + 8))
+      if !p.known { run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, compiled.DIRECT_CLOSURE_BYTECODE)) }
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rax, signed(p.f.bytecodeRealm)))
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, self.realmAt), Reg.Rax)
+    }
     run self.a.jmp(self.prologued)
     // A return's ends (Op.Return): the result in rax:rdx.
     self.a.bind(self.leaveOwn)

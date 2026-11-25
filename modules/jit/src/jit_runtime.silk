@@ -44,7 +44,7 @@ import jit_recompile { History }
 import jit_recompile as recompile
 import ssa_input { inputOf }
 import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, Refusal as TranslateRefusal }
-import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_FLAGS, KNOWN_SYMBOLS, SITE_ARRAY }
+import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_KNOWN_FN, TARGET_FLAGS, KNOWN_SYMBOLS, SITE_ARRAY }
 import jit_helpers { CompiledEnv, ConstructDesc }
 import jit_helpers as helpers
 import silkjs.js_gc as gc
@@ -93,6 +93,10 @@ const CANDIDATE_BYTES: usize = 460
 /// Tighter limits for `OP_get_var` -> `OP_call` candidates so large/looped global helpers stay out-of-line.
 const VAR_CALL_BYTES: usize = 96
 const VAR_CALL_DEPTH: u32 = 2
+/// Largest caller (in bytecode bytes) allowed to inline a looped var-call helper at depth 0:
+/// larger callers can hold dozens of such sites whose duplicated loops cost more to compile
+/// than the call overhead saves.
+const LOOPED_VAR_CALLER_BYTES: usize = 1500
 /// Address space reserved for machine code.
 const CODE_BYTES: usize = 67108864
 
@@ -548,8 +552,8 @@ pub unsafe fn attach(jit: &mut Jit, rt: *mut HeapHeader) -> () {
       // The helpers of optimized code: the report that makes it, its exits, and the
       // CompiledEnv whose helpers it calls for what it has no stub for.
       baselineEnv.owner = jit.setupData()
-      let tier: extern "C" fn(*mut BaselineEnv, *mut HeapHeader, ?*mut HeapHeader) -> () = jitTierUp
-      baselineEnv.helpers[u32.toUsize(baseline_env.TIER)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut HeapHeader, ?*mut HeapHeader) -> (), *const ?*const u8>(Pointer.fromRef(&tier)))
+      let tier: extern "C" fn(*mut BaselineEnv, *mut HeapHeader, ?*mut HeapHeader, u32) -> () = jitTierUp
+      baselineEnv.helpers[u32.toUsize(baseline_env.TIER)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut HeapHeader, ?*mut HeapHeader, u32) -> (), *const ?*const u8>(Pointer.fromRef(&tier)))
       let exit: extern "C" fn(*mut BaselineEnv, *mut BaselineFrame, *mut u8, *mut u32, *mut u64, u32) -> u64 = jitFrameLeft
       baselineEnv.helpers[u32.toUsize(baseline_env.FRAME_EXIT)] = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut BaselineEnv, *mut BaselineFrame, *mut u8, *mut u32, *mut u64, u32) -> u64, *const ?*const u8>(Pointer.fromRef(&exit)))
       baselineEnv.compiled = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut CompiledEnv, *mut u8>(Pointer.fromMutRef<CompiledEnv>(&mut jit.env.asMutSlice()[0])))
@@ -783,14 +787,16 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
 
 /// BaselineEnv.TIER: the shared prologue's count of bytecode's entries ran out. The call
 /// that reported it goes on in the code it entered; the next one finds what this made.
-export "C" fn jitTierUp(env: *mut BaselineEnv, bytecode: *mut HeapHeader, closure: ?*mut HeapHeader) -> () {
+export "C" fn jitTierUp(env: *mut BaselineEnv, bytecode: *mut HeapHeader, owner: ?*mut HeapHeader, isKnown: u32) -> () {
   let envAnchor = ()
-  let owner = (unsafe Pointer.borrow<(), BaselineEnv>(&envAnchor, env)).owner
+  let jitOwner = (unsafe Pointer.borrow<(), BaselineEnv>(&envAnchor, env)).owner
   let mut anchor = ()
-  let jit = unsafe jitOf(&mut anchor, owner)
+  let jit = unsafe jitOf(&mut anchor, jitOwner)
   let mut system = Allocator.systemAllocatorProvider()
+  let closure = if isKnown == 0 { owner } else { Pointer.null<HeapHeader>() }
+  let knownScope = if isKnown != 0 { owner } else { Pointer.null<HeapHeader>() }
   let started = now()
-  let outcome = run Effect.result(unsafe compileOptimized(&mut jit, bytecode, closure)) |> Effect.provideMut<Allocator>(&mut system)
+  let outcome = run Effect.result(unsafe compileOptimized(&mut jit, bytecode, closure, knownScope)) |> Effect.provideMut<Allocator>(&mut system)
   jit.compileNanoseconds = jit.compileNanoseconds + elapsed(started)
   match move outcome {
     Result<(), OutOfMemoryError | MemoryError | LinkError>.Success { .. } => ()
@@ -1080,7 +1086,7 @@ effect fn sayOptimizer(dump: bool, text: &[u8]) -> () ! OutOfMemoryError ? &mut 
 /// (x64_backend.lowerOnFrame, docs/jit/optimizer.md), or leaves it its baseline code.
 /// closure: the function's closure object as its prologue had it, or null for a known
 /// local function (a function's own methods read off its variables need it, candidates).
-unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, closure: ?*mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
+unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, closure: ?*mut HeapHeader, knownScope: ?*mut HeapHeader) -> () ! OutOfMemoryError | MemoryError | LinkError ? &mut Allocator {
   // The count stays clear of the prologue's report from here on, whatever comes of this.
   unsafe engineBaseline.countFrom(bytecode, PARKED)
   let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jit.runtime)
@@ -1150,9 +1156,9 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     let mut firstHolders = List<?*mut HeapHeader>.make()
     let mut dummyDescs = List<ConstructDesc>.make()
     let mut dummyConstructs = List<ConstructTarget>.make()
-    let _watched = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs)
+    let _watched = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, knownScope, Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs)
     run unsafe watchRecords(&mut jit, rt, &firstClosures)
-    targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>(), &mut localDescs, &mut rootConstructs)
+    targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, knownScope, Pointer.null<HeapHeader>(), &mut localDescs, &mut rootConstructs)
   }
   // Leaf-executed callees bypass the baseline tier until linked, so their float arithmetic
   // misses are not yet in BaselineEnv.misses. Compile un-baselined numeric inline candidates
@@ -1607,7 +1613,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   let mut dummyDescs = List<ConstructDesc>.make()
   let mut dummyConstructs = List<ConstructTarget>.make()
   let activeMisses = run collectActiveMisses(&jit)
-  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs) }
+  if jit.options.calls && jit.options.inlining { targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, false, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs) }
   let lowered = run Effect.result(unsafe lower.lowerInlining(&function, jit.options.stress, jit.options.calls, &plan.sites, move targets, &plan.elements, &mut cost))
   jit.cost.add(&cost)
   if jit.options.dump { run dumpCost(b"jit: cost entry", &cost) }
@@ -2007,7 +2013,7 @@ unsafe fn ownedCells(closure: ?*mut HeapHeader) -> u64 {
 /// (null else): the variables it reads are its, and a method read off one is a target too;
 /// receiver is the object its `this` is when that is known (an own method read off a
 /// variable, inlined there), and a method read off `this` is a target too.
-unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, receiver: ?*mut HeapHeader, constructDescs: &mut List<ConstructDesc>, outConstructs: &mut List<ConstructTarget>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mut HeapHeader, depth: u32, cells: &mut List<?*mut HeapHeader>, closures: &mut List<?*mut HeapHeader>, holders: &mut List<?*mut HeapHeader>, exact: bool, watch: bool, owner: ?*mut HeapHeader, knownScope: ?*mut HeapHeader, receiver: ?*mut HeapHeader, constructDescs: &mut List<ConstructDesc>, outConstructs: &mut List<ConstructTarget>) -> List<CallTarget> ! OutOfMemoryError ? &mut Allocator {
   let mut targets = List<CallTarget>.make()
   let rt = match Pointer.nonNullMut<HeapHeader>(jit.runtime) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return move targets } }
   let anchor = ()
@@ -2041,7 +2047,7 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
         run closures.append(Pointer.null<HeapHeader>())
         run appendKnown(&mut holders, &KnownMethod.none())
         let mut childConstructs = List<ConstructTarget>.make()
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
         input.constructs = move childConstructs
         run targets.append(CallTarget { pc: site.offset, id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
       }
@@ -2056,12 +2062,13 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
   let mut chainPc: usize = usize.MAX
   let mut this = usize.MAX
   if !Pointer.isNull<HeapHeader>(receiver) { this = thisLocal(bytes) }
-  // Straight-line stack tracking for `get_var; <args>; call/call0..3` direct function calls.
-  let trackVars = exact && !Pointer.isNull<HeapHeader>(owner)
+  let startScope = if !Pointer.isNull<HeapHeader>(knownScope) { knownScope } else { unsafe ownerScope(owner) }
+  // Straight-line stack tracking for `get_var`/`get_scope0`; `<args>`; `call/call0..3` direct function calls.
+  let trackVars = exact && (!Pointer.isNull<HeapHeader>(owner) || !Pointer.isNull<HeapHeader>(knownScope) || function.known.refs.length() != 0)
   let callerHasLoop = hasBackEdge(bytes)
   let mut jumpTargets = List<bool>.make()
   if trackVars { jumpTargets = run markJumpTargets(bytes) }
-  let mut varStack: [?*mut HeapHeader; 32] = [Pointer.null<HeapHeader>(); 32]
+  let mut varStack: [ValueBits; 32] = [ValueBits.Undefined; 32]
   let mut varDepth: usize = 0
   while pc < bytes.length && cells.length() < MAX_CANDIDATES {
     if trackVars && jumpTargets.get(pc) { varDepth = 0 }
@@ -2092,14 +2099,16 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
           if jit.options.dump && depth == 0 && !watch { run say(b"jit: no inline target: ", b"one of the site's methods is too long") }
           continue
         }
-        let mut input = run inputOf(&callee)
-        if !watch {
-          input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
-          input.siteShapes = run unsafe siteShapesOf(rt, cell)
-        }
         let mut id = usize.toU32(cells.length())
         run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
         run closures.append(object)
+        if watch {
+          if depth < CANDIDATE_DEPTH { drop run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, true, object, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut outConstructs) }
+          continue
+        }
+        let mut input = run inputOf(&callee)
+        input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+        input.siteShapes = run unsafe siteShapesOf(rt, cell)
         // Known for the shapes that read it through watched prototypes (ssa.TARGET_KNOWN):
         // the receiver's shape then tells the callee, with no read and no test of it.
         let mut found = KnownMethod.none()
@@ -2107,7 +2116,7 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
         run appendKnown(&mut holders, &found)
         if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
         if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
-        if jit.options.dump && !watch {
+        if jit.options.dump {
           // `jit: chained target: <pc> <depth> <exact> <known shapes>`.
           let mut line = List<u8>.make()
           run decimal(&mut line, usize.toU64(pc)) run line.append(32) run decimal(&mut line, u32.toU64(depth)) run line.append(32)
@@ -2115,7 +2124,7 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
           run say(b"jit: chained target: ", line.asSlice())
         }
         let mut childConstructs = List<ConstructTarget>.make()
-        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+        if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, false, object, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
         input.constructs = move childConstructs
         run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: true, owned: unsafe ownedCells(object), known: knownShapes(&found) })
       }
@@ -2143,25 +2152,27 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
         if !exact { object = Pointer.null<HeapHeader>() }
         let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
         if (unsafe callee.code.asSlice()).length <= CANDIDATE_BYTES {
-          let mut input = run inputOf(&callee)
-          if !watch {
-            input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
-            input.siteShapes = run unsafe siteShapesOf(rt, cell)
-          }
           let mut id = usize.toU32(cells.length())
           run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
           run closures.append(object)
-          // The method read through watched prototypes is known without the read
-          // (ssa.TARGET_KNOWN).
-          let mut found = KnownMethod.none()
-          if let Option<*mut HeapHeader>.Some { value: closure } = Pointer.nonNullMut<HeapHeader>(object) { unsafe inline.knownMethod(rt, bytecode, usize.toU32(pc), closure, &mut found) }
-          run appendKnown(&mut holders, &found)
-          if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
-          if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
-          let mut childConstructs = List<ConstructTarget>.make()
-          if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, object, holder, &mut constructDescs, &mut childConstructs) }
-          input.constructs = move childConstructs
-          run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), known: knownShapes(&found) })
+          if watch {
+            if depth < CANDIDATE_DEPTH { drop run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, true, object, Pointer.null<HeapHeader>(), holder, &mut constructDescs, &mut outConstructs) }
+          } else {
+            let mut input = run inputOf(&callee)
+            input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+            input.siteShapes = run unsafe siteShapesOf(rt, cell)
+            // The method read through watched prototypes is known without the read
+            // (ssa.TARGET_KNOWN).
+            let mut found = KnownMethod.none()
+            if let Option<*mut HeapHeader>.Some { value: closure } = Pointer.nonNullMut<HeapHeader>(object) { unsafe inline.knownMethod(rt, bytecode, usize.toU32(pc), closure, &mut found) }
+            run appendKnown(&mut holders, &found)
+            if !Pointer.isNull<HeapHeader>(object) { id = u32.bitOr(id, TARGET_EXACT) }
+            if found.count != 0 { id = u32.bitOr(id, TARGET_KNOWN) }
+            let mut childConstructs = List<ConstructTarget>.make()
+            if depth < CANDIDATE_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, false, object, Pointer.null<HeapHeader>(), holder, &mut constructDescs, &mut childConstructs) }
+            input.constructs = move childConstructs
+            run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: false, chained: false, owned: unsafe ownedCells(object), known: knownShapes(&found) })
+          }
         } else if jit.options.dump && depth == 0 && !watch { run say(b"jit: no inline target: ", b"the method is too long") }
       } else if jit.options.dump && depth == 0 && !watch {
         let why = unsafe inline.methodMiss(rt, bytecode, usize.toU32(pc))
@@ -2180,84 +2191,140 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
     } else if trackVars && ((opcode == op.OP_call && size == 3) || (opcode >= op.OP_call0 && opcode <= op.OP_call3)) {
       let argc = if opcode == op.OP_call { u8.toUsize(bytes[pc + 1]) | usize.shiftLeft(u8.toUsize(bytes[pc + 2]), 8) } else { u8.toUsize(opcode - op.OP_call0) }
       if varDepth >= argc + 1 {
-        let calleeOpt = varStack[varDepth - argc - 1]
-        if let Option<*mut HeapHeader>.Some { value: calleeObj } = Pointer.nonNullMut<HeapHeader>(calleeOpt) {
-          let mut seenAtCall = false
-          let mut ti: usize = 0
-          while ti < targets.length() {
-            let existing = &targets.asSlice()[ti]
-            if existing.atCall && existing.pc == usize.toU32(pc) { seenAtCall = true break }
-            ti = ti + 1
-          }
-          if !seenAtCall {
-            if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.closureBytecode(ValueBits.Object { reference: calleeObj })) {
-              if Pointer.address<HeapHeader>(cell) != Pointer.address<HeapHeader>(bytecode) {
+        let calleeVal = varStack[varDepth - argc - 1]
+        let mut seenAtCall = false
+        let mut ti: usize = 0
+        while ti < targets.length() {
+          let existing = &targets.asSlice()[ti]
+          if existing.atCall && existing.pc == usize.toU32(pc) { seenAtCall = true break }
+          ti = ti + 1
+        }
+        if !seenAtCall {
+          match calleeVal {
+            ValueBits.Object { reference: calleeObj } => {
+              let calleeOpt = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(calleeObj)
+              if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(unsafe inline.closureBytecode(calleeVal)) {
+                if Pointer.address<HeapHeader>(cell) != Pointer.address<HeapHeader>(bytecode) {
+                  let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
+                  let calleeBytes = unsafe callee.code.asSlice()
+                  let codeLen = calleeBytes.length
+                  if callee.scopeSlots == 0 && callee.varRefCount == 0
+                    && Pointer.address<HeapHeader>(callee.realm) == Pointer.address<HeapHeader>(function.realm)
+                    && codeLen > 0 && codeLen <= VAR_CALL_BYTES && ((depth == 0 && bytes.length <= LOOPED_VAR_CALLER_BYTES) || !hasBackEdge(calleeBytes)) {
+                    let id = u32.bitOr(usize.toU32(cells.length()), TARGET_EXACT)
+                    run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
+                    run closures.append(calleeOpt)
+                    if watch {
+                      if depth < VAR_CALL_DEPTH { drop run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, true, calleeOpt, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut outConstructs) }
+                    } else {
+                      let mut input = run inputOf(&callee)
+                      input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
+                      input.siteShapes = run unsafe siteShapesOf(rt, cell)
+                      run appendKnown(&mut holders, &KnownMethod.none())
+                      let mut childConstructs = List<ConstructTarget>.make()
+                      if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, false, calleeOpt, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+                      input.constructs = move childConstructs
+                      run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: unsafe ownedCells(calleeOpt), known: KnownShapes.none() })
+                    }
+                  }
+                }
+              }
+            }
+            ValueBits.FunctionBytecode { reference: cell } => {
+              if Pointer.address<HeapHeader>(cell) != Pointer.address<HeapHeader>(bytecode) && unsafe inline.plainTarget(cell, bytecode) {
                 let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
                 let calleeBytes = unsafe callee.code.asSlice()
                 let codeLen = calleeBytes.length
                 if callee.scopeSlots == 0 && callee.varRefCount == 0
-                  && Pointer.address<HeapHeader>(callee.realm) == Pointer.address<HeapHeader>(function.realm)
-                  && codeLen > 0 && codeLen <= VAR_CALL_BYTES && !hasBackEdge(calleeBytes) {
-                  let mut input = run inputOf(&callee)
-                  if !watch {
+                  && codeLen > 0 && codeLen <= VAR_CALL_BYTES && ((depth == 0 && bytes.length <= LOOPED_VAR_CALLER_BYTES) || !hasBackEdge(calleeBytes)) {
+                  let id = u32.bitOr(usize.toU32(cells.length()), TARGET_KNOWN_FN)
+                  run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
+                  run closures.append(Pointer.null<HeapHeader>())
+                  if watch {
+                    if depth < VAR_CALL_DEPTH { drop run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, true, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut outConstructs) }
+                  } else {
+                    let mut input = run inputOf(&callee)
                     input.doubleSites = run calleeDoubleSites(jit, activeMisses, &callee)
                     input.siteShapes = run unsafe siteShapesOf(rt, cell)
+                    run appendKnown(&mut holders, &KnownMethod.none())
+                    let mut childConstructs = List<ConstructTarget>.make()
+                    if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
+                    input.constructs = move childConstructs
+                    run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
                   }
-                  let id = u32.bitOr(usize.toU32(cells.length()), TARGET_EXACT)
-                  run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
-                  run closures.append(calleeOpt)
-                  run appendKnown(&mut holders, &KnownMethod.none())
-                  let mut childConstructs = List<ConstructTarget>.make()
-                  if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, watch, calleeOpt, Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
-                  input.constructs = move childConstructs
-                  run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: unsafe ownedCells(calleeOpt), known: KnownShapes.none() })
                 }
               }
             }
+            _ => ()
           }
         }
       }
     }
     if opcode == op.OP_get_var && size == 3 {
+      let varIdx = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8)
       chainObj = Pointer.null<HeapHeader>()
       if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
-        chainObj = unsafe engineBaseline.variableObject(reader, u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8))
+        chainObj = unsafe engineBaseline.variableObject(reader, varIdx)
+      } else if function.known.refs.length() != 0 {
+        chainObj = unsafe knownVariableObject(bytecode, varIdx)
       }
       chainEnd = pc + size
       chainPc = pc
       if trackVars {
-        if varDepth < 32 { varStack[varDepth] = chainObj varDepth = varDepth + 1 } else { varDepth = 0 }
+        let pushed = match Pointer.nonNullMut<HeapHeader>(chainObj) {
+          Option<*mut HeapHeader>.Some { value } => ValueBits.Object { reference: value }
+          Option<*mut HeapHeader>.None => ValueBits.Undefined
+        }
+        if varDepth < 32 { varStack[varDepth] = pushed varDepth = varDepth + 1 } else { varDepth = 0 }
       }
     } else if (opcode == op.OP_get_scope0 || opcode == op.OP_get_scope0_check) && size == 3 {
       chainObj = Pointer.null<HeapHeader>()
-      if callerHasLoop && function.scopeSlots == 0 {
-        if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
-          let slot = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8)
-          chainObj = unsafe scopeObject(reader, 0, slot)
+      let mut pushed = ValueBits.Undefined
+      if function.scopeSlots == 0 && !Pointer.isNull<HeapHeader>(startScope) {
+        let slot = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8)
+        let val = unsafe scopeValue(startScope, 0, slot)
+        match val {
+          ValueBits.FunctionBytecode { .. } => { pushed = val }
+          ValueBits.Object { reference } => {
+            if callerHasLoop {
+              pushed = val
+              chainObj = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
+            }
+          }
+          _ => ()
         }
       }
       chainEnd = pc + size
       chainPc = usize.MAX
       if trackVars {
-        if varDepth < 32 { varStack[varDepth] = chainObj varDepth = varDepth + 1 } else { varDepth = 0 }
+        if varDepth < 32 { varStack[varDepth] = pushed varDepth = varDepth + 1 } else { varDepth = 0 }
       }
     } else if (opcode == op.OP_get_var_ref || opcode == op.OP_get_var_ref_check) && size == 3 {
       let raw = u8.toU16(bytes[pc + 1]) | u16.shiftLeft(u8.toU16(bytes[pc + 2]), 8)
       chainObj = Pointer.null<HeapHeader>()
-      if callerHasLoop && raw >= SCOPE_OPERAND {
+      let mut pushed = ValueBits.Undefined
+      if raw >= SCOPE_OPERAND && !Pointer.isNull<HeapHeader>(startScope) {
         let hop = u16.toU32(u16.shiftRight(raw, SCOPE_DEPTH_SHIFT) & 7)
         let ownOffset: u32 = if function.scopeSlots != 0 { 1 } else { 0 }
         if hop >= ownOffset {
-          if let Option<*mut HeapHeader>.Some { value: reader } = Pointer.nonNullMut<HeapHeader>(owner) {
-            let slot = u16.toU32(raw & SCOPE_SLOT_MASK)
-            chainObj = unsafe scopeObject(reader, hop - ownOffset, slot)
+          let slot = u16.toU32(raw & SCOPE_SLOT_MASK)
+          let val = unsafe scopeValue(startScope, hop - ownOffset, slot)
+          match val {
+            ValueBits.FunctionBytecode { .. } => { pushed = val }
+            ValueBits.Object { reference } => {
+              if callerHasLoop {
+                pushed = val
+                chainObj = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
+              }
+            }
+            _ => ()
           }
         }
       }
       chainEnd = pc + size
       chainPc = usize.MAX
       if trackVars {
-        if varDepth < 32 { varStack[varDepth] = chainObj varDepth = varDepth + 1 } else { varDepth = 0 }
+        if varDepth < 32 { varStack[varDepth] = pushed varDepth = varDepth + 1 } else { varDepth = 0 }
       }
     } else {
       if opcode == op.OP_push_this && size == 1 {
@@ -2299,7 +2366,7 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
               varDepth = 0
             } else {
               let mut p: usize = 0
-              while p < pushes { varStack[varDepth] = Pointer.null<HeapHeader>() varDepth = varDepth + 1 p = p + 1 }
+              while p < pushes { varStack[varDepth] = ValueBits.Undefined varDepth = varDepth + 1 p = p + 1 }
             }
           }
         }
@@ -2310,35 +2377,66 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
   return move targets
 }
 
-/// The object held in slot `slot` at `depth` hops up `owner`'s captured scope chain
-/// (`OP_get_scope0` / `OP_get_scope0_check` at depth 0, or scoped `OP_get_var_ref` /
-/// `OP_get_var_ref_check`), or null.
-unsafe fn scopeObject(owner: *mut HeapHeader, depth: u32, slot: u32) -> ?*mut HeapHeader {
+/// The captured lexical scope of closure `owner`, or null.
+unsafe fn ownerScope(owner: ?*mut HeapHeader) -> ?*mut HeapHeader {
+  let obj = match Pointer.nonNullMut<HeapHeader>(owner) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+  }
   let anchor = ()
-  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, owner)
-  let mut scopeOpt = match &data.payload {
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, obj)
+  return match &data.payload {
     ObjectPayload.BytecodeFunction { function: closure } => closure.scope
     _ => Pointer.null<HeapHeader>()
   }
-  drop data
+}
+
+/// The object held in global variable cell `index` of a known local function's `known.refs`,
+/// or null.
+unsafe fn knownVariableObject(bytecode: *mut HeapHeader, index: u32) -> ?*mut HeapHeader {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if u32.toUsize(index) >= code.known.refs.length() { return Pointer.null<HeapHeader>() }
+  let cell = code.known.refs.get(u32.toUsize(index))
+  drop code
+  let found = match Pointer.nonNullMut<HeapHeader>(cell) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+  }
+  let binding = unsafe HeapCell.payload<VarRef, ()>(&anchor, found)
+  return match binding.state {
+    VarRefState.Detached { value } => match value {
+      ValueBits.Object { reference } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
+      _ => Pointer.null<HeapHeader>()
+    }
+    _ => Pointer.null<HeapHeader>()
+  }
+}
+
+/// The object or known-function value held in slot `slot` at `depth` hops up `startScope`,
+/// or Undefined.
+unsafe fn scopeValue(startScope: ?*mut HeapHeader, depth: u32, slot: u32) -> ValueBits {
+  let anchor = ()
+  let mut scopeOpt = startScope
   let mut hop: u32 = 0
   while hop < depth {
     let cur = match Pointer.nonNullMut<HeapHeader>(scopeOpt) {
       Option<*mut HeapHeader>.Some { value } => value
-      Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+      Option<*mut HeapHeader>.None => { return ValueBits.Undefined }
     }
     scopeOpt = (unsafe HeapCell.payload<ScopeData, ()>(&anchor, cur)).parent
     hop = hop + 1
   }
   let scope = match Pointer.nonNullMut<HeapHeader>(scopeOpt) {
     Option<*mut HeapHeader>.Some { value } => value
-    Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+    Option<*mut HeapHeader>.None => { return ValueBits.Undefined }
   }
   let count = (unsafe HeapCell.payload<ScopeData, ()>(&anchor, scope)).count
-  if slot >= count { return Pointer.null<HeapHeader>() }
+  if slot >= count { return ValueBits.Undefined }
   return match unsafe Pointer.read<ValueBits>(unsafe scopeSlot(scope, u32.toUsize(slot))) {
-    ValueBits.Object { reference } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
-    _ => Pointer.null<HeapHeader>()
+    ValueBits.Object { reference } => ValueBits.Object { reference: reference }
+    ValueBits.FunctionBytecode { reference } => ValueBits.FunctionBytecode { reference: reference }
+    _ => ValueBits.Undefined
   }
 }
 
