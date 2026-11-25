@@ -114,8 +114,9 @@ pub struct FramePlan {
   /// baseline.extent: the record and the first cell from rbp, the frame's bytes below rbp.
   pub record: i32, pub cells: i32, pub below: i32,
   pub arguments: u32, pub locals: u32,
-  /// Shape.copies, known, codeWord and codeDelta, for the prologue.
-  pub copies: bool, pub known: bool, pub codeWord: u32, pub codeDelta: u32
+  /// Shape.copies, known, codeWord, codeDelta, and constants layout for prologue and Op.ConstVal.
+  pub copies: bool, pub known: bool, pub codeWord: u32, pub codeDelta: u32,
+  pub constantsWord: u32, pub constantsDelta: i32, pub constants: u32
 }
 impl Copy for FramePlan {}
 fn signed(value: u32) -> i32 { return u32.wrappingToI32(value) }
@@ -123,11 +124,13 @@ impl FramePlan {
   pub fn of(base: BaselineLayout, shape: &Shape) -> FramePlan {
     let at = stubs.extent(&base, &shape)
     return FramePlan { f: base, record: at.record, cells: at.cells, below: at.below, arguments: shape.arguments, locals: shape.locals,
-      copies: shape.copies, known: shape.known, codeWord: shape.codeWord, codeDelta: shape.codeDelta }
+      copies: shape.copies, known: shape.known, codeWord: shape.codeWord, codeDelta: shape.codeDelta,
+      constantsWord: shape.constantsWord, constantsDelta: signed(shape.constantsDelta), constants: shape.constants }
   }
   /// The plan of code for the compiled-entry ABI: no frame.
   fn none() -> FramePlan {
-    return FramePlan { f: frames.layout(), record: 0, cells: 0, below: 0, arguments: 0, locals: 0, copies: false, known: false, codeWord: 0, codeDelta: 0 }
+    return FramePlan { f: frames.layout(), record: 0, cells: 0, below: 0, arguments: 0, locals: 0, copies: false, known: false, codeWord: 0, codeDelta: 0,
+      constantsWord: u32.MAX, constantsDelta: 0, constants: 0 }
   }
   /// A field of the record, and of its StackFrame.
   pub fn rec(self: &Self, offset: u32) -> Mem { return Mem.at(Reg.Rbp, self.record + signed(offset)) }
@@ -389,7 +392,7 @@ fn r11Kept(function: &Function, inst: Inst) -> bool {
   if op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
     || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Imul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
     || op == Op.BitNot || op == Op.Neg || op == Op.NotBool
-    || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64
+    || op == Op.ConstF64 || op == Op.ConstVal || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64
     || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64
     || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.ExactI32
     || op == Op.Removed { return true }
@@ -626,6 +629,16 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   match supported(&function, on, settings.stress, &steps) {
     Option<&'static [u8]>.Some { value } => { return Lowering.Unsupported { reason: Unsupported { why: value } } }
     Option<&'static [u8]>.None => ()
+  }
+  if on {
+    let mut ci: usize = 0
+    while ci < function.insts.length() {
+      let cinst = function.insts.get(ci)
+      if cinst.op == Op.ConstVal && (plan.constantsWord == u32.MAX || plan.constantsWord > 2040 || i32.wrappingToU32(cinst.k) >= plan.constants) {
+        return Lowering.Unsupported { reason: Unsupported { why: b"constant table layout unavailable" } }
+      }
+      ci = ci + 1
+    }
   }
   let values = function.valueCount()
   let mut pool = regalloc.entryPool()
@@ -889,7 +902,8 @@ fn supported(function: &Function, on: bool, stress: u32, steps: &List<u32>) -> O
     if on && inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_CALL && (inst.k & calls.LAZY_ARGUMENTS) != 0 { return Option<&'static [u8]>.some(b"a lazy arguments call on a baseline frame") }
     if inst.op == Op.PutKey && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a keyed store off the function's own baseline frame") }
     if inst.op == Op.Call && calls.kindOf(inst) == compiled.SITE_ADD && (!on || inst.frame != 0) { return Option<&'static [u8]>.some(b"a concatenation off the function's own baseline frame") }
-    if !on && (inst.op == Op.NewObject || inst.op == Op.InitSlot || inst.op == Op.CheckConstruct || inst.op == Op.KnownMethod) { return Option<&'static [u8]>.some(b"inlined construct off a baseline frame") }
+    if !on && (inst.op == Op.NewObject || inst.op == Op.InitSlot || inst.op == Op.CheckConstruct || inst.op == Op.KnownMethod || inst.op == Op.ConstVal) { return Option<&'static [u8]>.some(b"inlined construct or constant off a baseline frame") }
+    if inst.op == Op.ConstVal && (inst.frame != 0 || inst.k < 0) { return Option<&'static [u8]>.some(b"constant load off own frame") }
     i = i + 1
   }
   if !on && function.virtualObjs.length() != 0 { return Option<&'static [u8]>.some(b"virtual object off a baseline frame") }
@@ -2523,6 +2537,22 @@ impl Emitter {
       run self.callHelper(helpers.ATOM_VALUE)
       run self.a.test(Width.W32, Reg.Rax, Reg.Rax)
       run self.a.jcc(Cond.Equal, self.exitLabels.get(u32.toUsize(inst.exit)))
+      return ()
+    }
+    if op == Op.ConstVal {
+      let p = self.plan
+      let f = p.f
+      let index = i32.wrappingToU32(inst.k)
+      run self.a.load(Width.W64, Reg.Rcx, p.sf(f.currentFunction + 8))
+      if !p.known { run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.Rcx, signed(f.closureBytecode))) }
+      run self.a.load(Width.W64, Reg.Rcx, Mem.at(Reg.Rcx, signed(p.constantsWord)))
+      let at = p.constantsDelta + signed(index * 16)
+      run self.a.load(Width.W64, Reg.Rax, Mem.at(Reg.Rcx, at))
+      run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.Rcx, at + 8))
+      run self.a.store(Width.W64, slotOf(inst.result), Reg.Rax)
+      run self.a.store(Width.W64, payloadOf(inst.result), Reg.R9)
+      if function.value(inst.result).own != Own.Borrowed { run self.retainBits(Reg.Rax, Reg.R9) }
+      self.setFresh(inst.result)
       return ()
     }
     if op == Op.PutField {

@@ -302,16 +302,152 @@ export "C" fn baselineScope(env: *mut BaselineEnv, record: *mut engine.BaselineF
 export "C" fn baselineRelease(env: *mut BaselineEnv, value: *const ValueBits) -> () {
   unsafe engine.release(unsafe Pointer.read<ValueBits>(value))
 }
+struct PendingSiteShape {
+  valid: bool,
+  key: u64,
+  protoKey: u64,
+  holder: ?*mut HeapHeader,
+  first: ?*mut HeapHeader,
+  epoch: u64,
+}
+impl Copy for PendingSiteShape {}
+
+unsafe fn probeBaselineFieldShape(rt: *mut HeapHeader, ip: *const u8, receiver: ValueBits, isWrite: bool, checkRc: bool) -> PendingSiteShape {
+  let empty = PendingSiteShape { valid: false, key: 0, protoKey: 0, holder: Pointer.null<HeapHeader>(), first: Pointer.null<HeapHeader>(), epoch: 0 }
+  let object = match receiver {
+    ValueBits.Object { reference } => reference
+    _ => { return empty }
+  }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  if Pointer.isNull<census.SiteShapes>(state.compiled.siteShapes) { return empty }
+  let epoch = state.shapeEpoch
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let version = shape.version
+  if version == 0 || version >= 2147483648 { return empty }
+  let atom = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(ip))
+  let poly = &state.polyFields[census.polyFieldIndex(version, atom)]
+  if poly.version != version || poly.atom != atom { return empty }
+  let kind = poly.kind
+  let exotic = data.isExotic()
+  let valid = if exotic {
+    u32.shiftRight(kind, 8) == data.classId() && (data.classId() != classes.JS_CLASS_ARRAY || data.fastArray())
+  } else { kind <= 0xff }
+  if !valid { return empty }
+  let answer = kind & 0x7f
+  let index = u64.toUsize(poly.stamp & 0xffff)
+  if answer == census.POLY_OWN {
+    if isWrite {
+      if !shape.isHashed || (kind & census.POLY_WRITABLE) == 0 { return empty }
+      let inlineKey = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 4)))
+      if inlineKey != (u64.shiftLeft(version, 16) | usize.toU64(index)) { return empty }
+    }
+    return PendingSiteShape {
+      valid: true,
+      key: u64.shiftLeft(version, 16) | usize.toU64(index),
+      protoKey: 0,
+      holder: Pointer.null<HeapHeader>(),
+      first: Pointer.null<HeapHeader>(),
+      epoch: 0,
+    }
+  }
+  if !isWrite && answer == census.POLY_PROTO && u64.shiftRight(poly.stamp, 16) == epoch {
+    let holder = match Pointer.nonNullMut<HeapHeader>(poly.holder) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return empty }
+    }
+    if checkRc {
+      let holderHeader = unsafe Pointer.borrow<(), HeapHeader>(&anchor, holder)
+      if holderHeader.referenceCount <= 1 { return empty }
+    }
+    let holderData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+    let holderShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, holderData.shape)
+    let holderVersion = holderShape.version
+    if holderVersion == 0 || holderVersion >= 2147483648 { return empty }
+    let key = u64.shiftLeft(version, 16) | census.FIELD_PROTO_KEY
+    let protoKey = u64.shiftLeft(holderVersion, 16) | usize.toU64(index)
+    if Pointer.address<HeapHeader>(shape.prototype) == Pointer.address<HeapHeader>(holder) {
+      return PendingSiteShape {
+        valid: true,
+        key: key,
+        protoKey: protoKey,
+        holder: poly.holder,
+        first: Pointer.null<HeapHeader>(),
+        epoch: epoch,
+      }
+    }
+    if let Option<*mut HeapHeader>.Some { value: first } = Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      if checkRc {
+        let firstHeader = unsafe Pointer.borrow<(), HeapHeader>(&anchor, first)
+        if firstHeader.referenceCount <= 1 { return empty }
+      }
+      let firstData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, first)
+      let firstShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, firstData.shape)
+      if Pointer.address<HeapHeader>(firstShape.prototype) == Pointer.address<HeapHeader>(holder) {
+        return PendingSiteShape {
+          valid: true,
+          key: key,
+          protoKey: protoKey,
+          holder: poly.holder,
+          first: shape.prototype,
+          epoch: epoch,
+        }
+      }
+    }
+  }
+  return empty
+}
+
+unsafe fn commitBaselineFieldShape(rt: *mut HeapHeader, ip: *const u8, pending: PendingSiteShape) -> () {
+  if !pending.valid { return () }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let table = match Pointer.nonNullMut<census.SiteShapes>(state.compiled.siteShapes) {
+    Option<*mut census.SiteShapes>.Some { value } => value
+    Option<*mut census.SiteShapes>.None => { return () }
+  }
+  if pending.epoch != 0 && state.shapeEpoch != pending.epoch { return () }
+  let mask = state.compiled.siteShapeMask
+  drop state
+  unsafe census.noteSiteShape(table, mask, Pointer.address<u8>(ip), pending.key, pending.protoKey, pending.holder, pending.first, pending.epoch)
+}
+
+unsafe fn objectShapeVersion(value: ValueBits) -> u64 {
+  let object = match value {
+    ValueBits.Object { reference } => reference
+    _ => { return 0 }
+  }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+}
+
 export "C" fn baselineGetField(env: *mut BaselineEnv, ip: *const u8, cell: *const ValueBits, out: *mut ValueBits) -> u32 {
-  if unsafe engine.readField(unsafe runtimeOf(env), ip, cell, out) { return 1 }
+  let rt = unsafe runtimeOf(env)
+  if unsafe engine.readField(rt, ip, cell, out) {
+    let pending = unsafe probeBaselineFieldShape(rt, ip, unsafe Pointer.read<ValueBits>(cell), false, false)
+    unsafe commitBaselineFieldShape(rt, ip, pending)
+    return 1
+  }
   return 0
 }
 export "C" fn baselineGetFieldTop(env: *mut BaselineEnv, ip: *const u8, cell: *mut ValueBits) -> u32 {
-  if unsafe engine.readFieldTop(unsafe runtimeOf(env), ip, cell) { return 1 }
+  let rt = unsafe runtimeOf(env)
+  let pending = unsafe probeBaselineFieldShape(rt, ip, unsafe Pointer.read<ValueBits>(cell), false, true)
+  if unsafe engine.readFieldTop(rt, ip, cell) {
+    unsafe commitBaselineFieldShape(rt, ip, pending)
+    return 1
+  }
   return 0
 }
 export "C" fn baselineGetField2(env: *mut BaselineEnv, ip: *const u8, cell: *const ValueBits, out: *mut ValueBits, bytecode: *mut HeapHeader) -> u32 {
-  if unsafe engine.readFieldCached(unsafe runtimeOf(env), ip, cell, out, bytecode) { return 1 }
+  let rt = unsafe runtimeOf(env)
+  if unsafe engine.readFieldCached(rt, ip, cell, out, bytecode) {
+    let pending = unsafe probeBaselineFieldShape(rt, ip, unsafe Pointer.read<ValueBits>(cell), false, false)
+    unsafe commitBaselineFieldShape(rt, ip, pending)
+    return 1
+  }
   return 0
 }
 export "C" fn baselineLength(env: *mut BaselineEnv, source: *const ValueBits, out: *mut ValueBits) -> u32 {
@@ -319,7 +455,16 @@ export "C" fn baselineLength(env: *mut BaselineEnv, source: *const ValueBits, ou
   return 0
 }
 export "C" fn baselinePutField(env: *mut BaselineEnv, ip: *const u8, target: *const ValueBits, source: *mut ValueBits, pops: u32) -> u32 {
-  if unsafe engine.writeField(unsafe runtimeOf(env), ip, target, source, pops != 0) { return 1 }
+  let rt = unsafe runtimeOf(env)
+  let receiver = unsafe Pointer.read<ValueBits>(target)
+  let beforeVersion = unsafe objectShapeVersion(receiver)
+  if unsafe engine.writeField(rt, ip, target, source, pops != 0) {
+    if beforeVersion != 0 && unsafe objectShapeVersion(receiver) == beforeVersion {
+      let pending = unsafe probeBaselineFieldShape(rt, ip, receiver, true, false)
+      unsafe commitBaselineFieldShape(rt, ip, pending)
+    }
+    return 1
+  }
   return 0
 }
 export "C" fn baselineGetVar(env: *mut BaselineEnv, function: *mut HeapHeader, index: u32, out: *mut ValueBits) -> u32 {

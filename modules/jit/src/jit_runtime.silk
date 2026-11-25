@@ -25,7 +25,7 @@ import silkjs.js_compiled as compiled
 import silkjs.js_compiled_inline as inline
 import silkjs.js_compiled_inline { KnownMethod, WatchedRecord }
 import ssa_translate { CallTarget, ConstructTarget, SiteShape, RecordSlot, CONSTRUCT_PLAN_STORES, CONSTRUCT_PLAN_RECIPE, CONSTRUCT_PLAN_PREINIT, RCONST_UNDEF, RCONST_NULL, RCONST_FALSE, RCONST_TRUE, RCONST_INT, RCONST_F64, RECIPE_CONST, RECIPE_ARG, RECIPE_RECEIVER, RECIPE_NOT, RECIPE_SELECT }
-import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, BuiltinFamily, SiteShapes, ObjectData, ObjectPayload, RuntimeState, ShapeData, ScopeData, VarRef, VarRefState, scopeSlot, SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK, JS_PROP_TMASK, JS_PROP_WRITABLE }
+import silkjs.js_core_types { HOT_ENTRY_BUDGET, FunctionBytecode, CompiledEntry, OsrEntry, OSR_ONLY_CALL_WORDS, HostHook, NativeFunctionId, BuiltinFamily, SiteShapes, noteSiteShape, fieldCacheIndex, fieldSpareIndex, FIELD_PROTO_KEY, ObjectData, ObjectPayload, RuntimeState, ShapeData, ScopeData, VarRef, VarRefState, scopeSlot, SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK, JS_PROP_TMASK, JS_PROP_WRITABLE }
 import silkjs.js_class_data as classes
 import silkjs.js_atom_data as atomData
 import silkjs.js_constructor_ops as constructors
@@ -48,7 +48,7 @@ import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_FLAGS, KN
 import jit_helpers { CompiledEnv, ConstructDesc }
 import jit_helpers as helpers
 import silkjs.js_gc as gc
-import jit_cost { Cost, now }
+import jit_cost { Cost, now, elapsed }
 import baseline
 import baseline { Settings as BaselineSettings, Outcome as BaselineOutcome, Stubs as BaselineStubs }
 import baseline_env { BaselineEnv }
@@ -739,7 +739,10 @@ unsafe effect fn compileBaseline(jit: &mut Jit, bytecode: *mut HeapHeader) -> ()
         mark = mark + 3
       }
       run jit.baselineInfo.append(info)
-      if jit.options.optimize { unsafe engineBaseline.countFrom(bytecode, wait) }
+      if jit.options.optimize {
+        unsafe syncSiteShapes(rt, bytecode, true)
+        unsafe engineBaseline.countFrom(bytecode, wait)
+      }
       jit.baselineCompiled = jit.baselineCompiled + 1
       jit.baselineBytes = jit.baselineBytes + usize.toU64(code.bytes.length())
       jit.baselineUncovered = jit.baselineUncovered + usize.toU64(uncovered.length())
@@ -788,7 +791,7 @@ export "C" fn jitTierUp(env: *mut BaselineEnv, bytecode: *mut HeapHeader, closur
   let mut system = Allocator.systemAllocatorProvider()
   let started = now()
   let outcome = run Effect.result(unsafe compileOptimized(&mut jit, bytecode, closure)) |> Effect.provideMut<Allocator>(&mut system)
-  jit.compileNanoseconds = jit.compileNanoseconds + (now() - started)
+  jit.compileNanoseconds = jit.compileNanoseconds + elapsed(started)
   match move outcome {
     Result<(), OutOfMemoryError | MemoryError | LinkError>.Success { .. } => ()
     Result<(), OutOfMemoryError | MemoryError | LinkError>.Failure { .. } => { jit.failed = jit.failed + 1 }
@@ -882,12 +885,24 @@ unsafe effect fn noteLeft(jit: &mut Jit, record: *mut BaselineFrame, pc: u32, ar
   // learned a new site to widen/step on recompile.
   if info.exits >= EXIT_BURST && (u32.toU64(info.exits) * EXIT_RATE > entries || (info.learned && info.hasLoop)) {
     unsafe engineBaseline.relink(rt, linked, info.code, info.construct)
+    unsafe syncSiteShapes(rt, bytecode, true)
     jit.optimizeBacked = jit.optimizeBacked + 1
     info.exits = 0
     info.tier = TIER_NONE
     let mut wait = jit.options.optimizeEntries
     if wait == 0 { wait = 1 }
-    if info.learned { info.stale = 0 } else if info.stale < 255 { info.stale = info.stale + 1 }
+    if info.learned {
+      info.stale = 0
+      // Gentle backoff once a function has already recompiled multiple times so
+      // remaining polymorphic inline caches settle in baseline without starving
+      // hot functions on their first 1-2 recompiles.
+      if wait >= 10 && info.compiles >= 2 {
+        let shift = if info.compiles < 6 { u8.toU32(info.compiles - 1) } else { 5 }
+        let scaled = wait * u32.shiftLeft(1, shift)
+        if scaled > wait { wait = scaled }
+        if wait > 512 { wait = 512 }
+      }
+    } else if info.stale < 255 { info.stale = info.stale + 1 }
     info.learned = false
     let mut n: u8 = 0
     while n < info.stale && wait < 16777216 { wait = wait * OPTIMIZE_BACKOFF n = n + 1 }
@@ -1011,6 +1026,17 @@ fn numericOpcode(opcode: u8) -> bool {
     || opcode == op.OP_neg || opcode == op.OP_plus
     || opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8
 }
+fn hasNumericOpcode(bytes: &[u8]) -> bool {
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    if numericOpcode(opcode) { return true }
+    pc = pc + size
+  }
+  return false
+}
 /// Whether opcode is a named property read or store, whose site baseline code notes where
 /// it met an accessor (BaselineEnv.misses).
 fn fieldOpcode(opcode: u8) -> bool { return op.fieldKeyed(opcode) || opcode == op.OP_get_field2 }
@@ -1068,6 +1094,7 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
   if info.tier != TIER_NONE { return () }
   info.tier = TIER_REFUSED
   jit.baselineInfo.set(index, info)
+  unsafe syncSiteShapes(rt, bytecode, false)
   // A method call of the function's own code that has not run yet is a call for good in
   // its optimized code (no exit there teaches a later compile its target): the first
   // optimization waits, up to UNSEEN_WAITS times, while baseline code runs them. A wait
@@ -1131,6 +1158,38 @@ unsafe effect fn compileOptimized(jit: &mut Jit, bytecode: *mut HeapHeader, clos
     let _watched = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut firstCells, &mut firstClosures, &mut firstHolders, true, true, closure, Pointer.null<HeapHeader>(), &mut dummyDescs, &mut dummyConstructs)
     run unsafe watchRecords(&mut jit, rt, &firstClosures)
     targets = run unsafe candidates(&jit, &activeMisses, bytecode, 0, &mut cells, &mut closures, &mut holders, true, false, closure, Pointer.null<HeapHeader>(), &mut localDescs, &mut rootConstructs)
+  }
+  // Leaf-executed callees bypass the baseline tier until linked, so their float arithmetic
+  // misses are not yet in BaselineEnv.misses. Compile un-baselined numeric inline candidates
+  // to baseline and wait one short warmup so baseline records their float sites before inlining.
+  if jit.options.inlining && info.compiles == 0 && info.waits < UNSEEN_WAITS && !defaultLoopFree {
+    let mut warmed: u32 = 0
+    let mut ci: usize = 0
+    while ci < cells.length() {
+      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(cells.get(ci)) {
+        if Pointer.address<HeapHeader>(cell) != Pointer.address<HeapHeader>(bytecode) {
+          let cAnchor = ()
+          let callee = unsafe HeapCell.payload<FunctionBytecode, ()>(&cAnchor, cell)
+          let needsBaseline = callee.baseline == 0 && hasNumericOpcode(unsafe callee.code.asSlice())
+          drop callee
+          if needsBaseline {
+            run unsafe compileBaseline(&mut jit, cell)
+            warmed = warmed + 1
+          }
+        }
+      }
+      ci = ci + 1
+    }
+    if warmed > 0 {
+      info.waits = info.waits + 1
+      info.tier = TIER_NONE
+      jit.baselineInfo.set(index, info)
+      let mut wait = jit.options.optimizeEntries
+      if wait == 0 { wait = 1 }
+      unsafe engineBaseline.countFrom(bytecode, wait)
+      run sayOptimizer(jit.options.dump, b"an inline callee has not run baseline yet: waits")
+      return ()
+    }
   }
   // Where its earlier code left at guards.
   let mut sites = List<u32>.make()
@@ -1345,7 +1404,7 @@ export "C" fn jitHotFunction(rt: *mut HeapHeader, bytecode: *mut HeapHeader, dat
   let mut system = Allocator.systemAllocatorProvider()
   let started = now()
   let outcome = run Effect.result(unsafe compileHot(&mut jit, bytecode)) |> Effect.provideMut<Allocator>(&mut system)
-  jit.compileNanoseconds = jit.compileNanoseconds + (now() - started)
+  jit.compileNanoseconds = jit.compileNanoseconds + elapsed(started)
   match move outcome {
     Result<(), OutOfMemoryError | MemoryError | LinkError>.Success { .. } => ()
     Result<(), OutOfMemoryError | MemoryError | LinkError>.Failure { .. } => { jit.failed = jit.failed + 1 }
@@ -1565,7 +1624,7 @@ pub unsafe effect fn compileHot(jit: &mut Jit, bytecode: *mut HeapHeader) -> () 
   if loopPc != NO_LOOP {
     let started = now()
     run osr.append(run unsafe compileHeader(&mut jit, bytecode, &plan.sites, loopPc))
-    spent = now() - started
+    spent = elapsed(started)
   }
   let result = match move lowered {
     Result<Lowered, OutOfMemoryError | UnboundLabelError>.Success { value } => move value
@@ -1638,7 +1697,7 @@ unsafe effect fn addHeader(jit: &mut Jit, bytecode: *mut HeapHeader, index: usiz
     let started = now()
     run list.append(run unsafe compileHeader(&mut jit, bytecode, &sites, pc))
     let books = jit.books.asMutSlice()
-    books[index].spent = books[index].spent + (now() - started)
+    books[index].spent = books[index].spent + elapsed(started)
   }
   run unsafe attachOsr(&mut jit, index, move list)
 }
@@ -3123,8 +3182,82 @@ fn knownShapes(known: &KnownMethod) -> KnownShapes {
   while n < known.count { shapes.shapes[n] = u64.wrappingToU32(known.shapes[n]) shapes.lengths[n] = known.lengths[n] n = n + 1 }
   return shapes
 }
+/// Merges live bytecode inline keys and fieldCache own entries of bytecode into
+/// RuntimeState.compiled.siteShapes (covering interpreter/engine polyFields hits that
+/// bypass noteSiteShape). When clearMethodCache is true, also clears get_field2
+/// fieldCache entries of bytecode so baseline warms them through baselineGetField2.
+unsafe fn syncSiteShapes(rt: *mut HeapHeader, bytecode: *mut HeapHeader, clearMethodCache: bool) -> () {
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, rt)
+  let table = match Pointer.nonNullMut<SiteShapes>(state.compiled.siteShapes) {
+    Option<*mut SiteShapes>.Some { value } => value
+    Option<*mut SiteShapes>.None => { return () }
+  }
+  let mask = state.compiled.siteShapeMask
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let bytes = unsafe function.code.asSlice()
+  let codeStart = unsafe Pointer.assumeMany<u8>(unsafe function.code.start())
+  let base = Pointer.address<u8>(unsafe function.code.start())
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    let site = base + pc + 1
+    if (opcode == op.OP_get_field || opcode == op.OP_get_loc_field8 || opcode == op.OP_get_arg_field8
+        || opcode == op.OP_put_field || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8)
+      && size >= 13 {
+      let key = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(codeStart, pc + 5)))
+      if key != 0 && u64.shiftRight(key, 62) == 0 {
+        let version = u64.shiftRight(key, 16)
+        if version != 0 && version < 2147483648 {
+          unsafe noteSiteShape(table, mask, site, key, 0, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), 0)
+        }
+      }
+      let slot = fieldCacheIndex(site)
+      let spare = fieldSpareIndex(slot)
+      let mut pass: usize = 0
+      while pass < 2 {
+        let idx = if pass == 0 { slot } else { spare }
+        if state.fieldCache[idx].site == site {
+          let fk = state.fieldCache[idx].key
+          if fk != 0 && u64.shiftRight(fk, 62) == 0 {
+            let fv = u64.shiftRight(fk, 16)
+            if fv != 0 && fv < 2147483648 {
+              unsafe noteSiteShape(table, mask, site, fk, 0, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), 0)
+            }
+          }
+        }
+        pass = pass + 1
+      }
+    } else if opcode == op.OP_get_field2 {
+      let slot = fieldCacheIndex(site)
+      let spare = fieldSpareIndex(slot)
+      let mut pass: usize = 0
+      while pass < 2 {
+        let idx = if pass == 0 { slot } else { spare }
+        if state.fieldCache[idx].site == site {
+          let fk = state.fieldCache[idx].key
+          if fk != 0 && u64.shiftRight(fk, 62) == 0 {
+            let fv = u64.shiftRight(fk, 16)
+            if fv != 0 && fv < 2147483648 {
+              unsafe noteSiteShape(table, mask, site, fk, 0, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), 0)
+            }
+          }
+          if clearMethodCache && (state.fieldCache[idx].protoKey == 0 || u64.bitAnd(fk, FIELD_PROTO_KEY) != 0) {
+            state.fieldCache[idx].site = 0
+          }
+        }
+        pass = pass + 1
+      }
+    }
+    pc = pc + size
+  }
+}
 /// What the runtime recorded of each get_field2 of bytecode (FunctionInput.siteShapes).
 unsafe effect fn siteShapesOf(rt: *mut HeapHeader, bytecode: *mut HeapHeader) -> List<SiteShape> ! OutOfMemoryError ? &mut Allocator {
+  unsafe syncSiteShapes(rt, bytecode, false)
   let mut found = List<SiteShape>.make()
   let anchor = ()
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
