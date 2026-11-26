@@ -2647,8 +2647,24 @@ unsafe effect fn leanInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   if kind == nativeFunctions.CALL_KIND_ASYNC_CONTEXT && unsafe asyncContextCall(&mut hooks, &mut machine, opcode, count, function) { return true }
   return run unsafe leanCall(&mut hooks, memory, &mut machine, opcode, count, function)
 }
-/// A CALL_KIND_OBJECT_KEYS call (`Object.keys(obj)`): runs objectIntrinsics.quickKeys
-/// directly without leanCall/genericFamilies/object_intrinsics dispatch layers.
+@inlineNever
+unsafe effect fn objectKeysSlow<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  machine: &mut Machine, opcode: u8, home: *mut HeapHeader, data: *mut ValueBits, input: ValueBits,
+  counter: *mut i32, left: i32) -> bool ? &mut Allocator {
+  unsafe machine.publishPc()
+  let answer = run unsafe objectIntrinsics.quickKeys(&mut hooks, memory, unsafe lendRealm(&home, home), input)
+  if !answer.isObject() { return false }
+  let mut extra: usize = 1
+  if opcode == op.OP_call_method { extra = 2 }
+  if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
+  unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
+  unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
+  unsafe machine.push(answer)
+  return true
+}
+/// A CALL_KIND_OBJECT_KEYS call (`Object.keys(obj)`): runs objectIntrinsics.quickKeysSpare
+/// directly without leanCall/genericFamilies/object_intrinsics dispatch layers,
+/// outlining the allocator-using quickKeys fallback and unrolling operand release.
 /// False leaves machine untouched.
 @inlineNever
 unsafe effect fn objectKeysInline<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
@@ -2662,18 +2678,28 @@ unsafe effect fn objectKeysInline<H: HeapHooks>(hooks: &mut H, memory: &Allocati
   }
   let data = unsafe operandCell(machine.stackTop, 1)
   let input = unsafe Pointer.read<ValueBits>(data)
-  let mut answer = unsafe objectIntrinsics.quickKeysSpare(machine.runtime, home, input)
+  let answer = unsafe objectIntrinsics.quickKeysSpare(machine.runtime, home, input)
   if !answer.isObject() {
-    unsafe machine.publishPc()
-    answer = run unsafe objectIntrinsics.quickKeys(&mut hooks, memory, unsafe lendRealm(&home, home), input)
-    if !answer.isObject() { return false }
+    return run unsafe objectKeysSlow(&mut hooks, memory, &mut machine, opcode, home, data, input, counter, left)
   }
-  let mut extra: usize = 1
-  if opcode == op.OP_call_method { extra = 2 }
-  if opcode == op.OP_call || opcode == op.OP_call_method { unsafe machine.skip(2) }
-  unsafe Pointer.write<i32>(counter, left - 1)
-  unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, extra))
-  unsafe machine.push(answer)
+  let isMethod = opcode == op.OP_call_method
+  let first = if isMethod { unsafe operandCell(data, 2) } else { unsafe operandCell(data, 1) }
+  if opcode == op.OP_call || isMethod { unsafe machine.skip(2) }
+  unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
+  let runtime = machine.runtime
+  if isMethod {
+    let receiver = unsafe Pointer.read<ValueBits>(first)
+    machine.stackTop = first
+    if unsafe keepsHolder(receiver) { unsafe dropShared(receiver) } else { unsafe gc.release(&mut hooks, runtime, receiver) }
+    if unsafe keepsHolder(function) { unsafe dropShared(function) } else { unsafe gc.release(&mut hooks, runtime, function) }
+  } else {
+    machine.stackTop = first
+    if unsafe keepsHolder(function) { unsafe dropShared(function) } else { unsafe gc.release(&mut hooks, runtime, function) }
+  }
+  // quickKeysSpare only succeeds on Object inputs, so input is always an Object.
+  if unsafe keepsHolder(input) { unsafe dropShared(input) } else { unsafe gc.release(&mut hooks, runtime, input) }
+  unsafe Pointer.write<ValueBits>(first, answer)
+  machine.stackTop = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(first), 1)
   return true
 }
 /// A CALL_KIND_REGEXP_EXEC / _TEST call (`re.exec(s)` / `re.test(s)`): runs
@@ -3687,6 +3713,20 @@ unsafe effect fn readNativeGetter<H: HeapHooks + CoercionHooks + OwnPropertyHook
   return Pointer.fromMutRef<Machine>(&mut machine)
 }
 @inlineNever
+unsafe fn readBytecodeGetter<H: HeapHooks>(hooks: &mut H, machine: &mut Machine,
+  cell: *mut ValueBits, object: *mut HeapHeader, getter: *mut HeapHeader, owned: bool, width: usize) -> ?*mut Machine {
+  let function = ValueBits.Object { reference: getter }
+  if !owned { unsafe machine.push(unsafe receiverCopy(cell)) }
+  unsafe HeapCell.retain(getter)
+  unsafe machine.push(function)
+  let entered = unsafe enterCallWith(&mut hooks, &mut machine, op.OP_call_method, 0, width)
+  if Pointer.isNull<Machine>(entered) {
+    unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, getter) drop unsafe machine.pop()
+    if !owned { unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, object) drop unsafe machine.pop() }
+  }
+  return entered
+}
+@inlineNever
 unsafe effect fn readGetter<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits, owned: bool, width: usize) -> ?*mut Machine ! JsException ? &mut Allocator {
   let object = match unsafe Pointer.read<ValueBits>(cell) { ValueBits.Object { reference } => reference _ => { return Pointer.null<Machine>() } }
@@ -3702,20 +3742,36 @@ unsafe effect fn readGetter<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   }
   // A side-effect-free evaluation refuses getters on the generic path.
   if restricted.active(unsafe lendRealm(&machine, machine.context)) { return Pointer.null<Machine>() }
-  let getterClass = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, getter)).classId()
+  let getterData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, getter)
+  let getterClass = getterData.classId()
+  if getterClass == classes.JS_CLASS_BYTECODE_FUNCTION {
+    let bytecode = match &getterData.payload {
+      ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode
+      _ => { drop getterData return unsafe readBytecodeGetter(&mut hooks, &mut machine, cell, object, getter, owned, width) }
+    }
+    drop getterData
+    if unsafe leaves.runsLeaf(bytecode, 0) {
+      let mut result = ValueBits.Undefined
+      if unsafe leaves.attemptGetter(machine.runtime, machine.frame, getter, bytecode, cell, Pointer.fromMutRef<ValueBits>(&mut result)) {
+        let answer = unsafe result.retained()
+        unsafe machine.skip(width)
+        if owned {
+          let old = unsafe machine.pop()
+          unsafe machine.push(answer)
+          unsafe gc.release(&mut hooks, machine.runtime, old)
+        } else {
+          unsafe machine.push(answer)
+        }
+        return Pointer.fromMutRef<Machine>(&mut machine)
+      }
+    }
+    return unsafe readBytecodeGetter(&mut hooks, &mut machine, cell, object, getter, owned, width)
+  }
+  drop getterData
   if getterClass == classes.JS_CLASS_C_FUNCTION {
     return run unsafe readNativeGetter(&mut hooks, memory, &mut machine, cell, getter, owned, width)
   }
-  let function = ValueBits.Object { reference: getter }
-  if !owned { unsafe machine.push(unsafe receiverCopy(cell)) }
-  unsafe HeapCell.retain(getter)
-  unsafe machine.push(function)
-  let entered = unsafe enterCallWith(&mut hooks, &mut machine, op.OP_call_method, 0, width)
-  if Pointer.isNull<Machine>(entered) {
-    unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, getter) drop unsafe machine.pop()
-    if !owned { unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, object) drop unsafe machine.pop() }
-  }
-  return entered
+  return unsafe readBytecodeGetter(&mut hooks, &mut machine, cell, object, getter, owned, width)
 }
 /// put_field (ip at the atom) of an accessor with a bytecode setter: the setter
 /// runs as `call_method 1` would, in an inline frame tagged to drop its result
@@ -3725,12 +3781,9 @@ unsafe effect fn readGetter<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
 @inlineNever
 unsafe fn writeSetter<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> ?*mut Machine {
   let object = match unsafe machine.top(2) { ValueBits.Object { reference } => reference _ => { return Pointer.null<Machine>() } }
-  let setter = match Pointer.nonNullMut<HeapHeader>(unsafe properties.siteSetter(machine.runtime, machine.ip, object)) {
+  let setter = match Pointer.nonNullMut<HeapHeader>(unsafe properties.resolveSetter(machine.runtime, machine.ip, object)) {
     Option<*mut HeapHeader>.Some { value } => value
-    Option<*mut HeapHeader>.None => match Pointer.nonNullMut<HeapHeader>(unsafe properties.functionSetterAt(machine.runtime, machine.ip, object)) {
-      Option<*mut HeapHeader>.Some { value } => value
-      Option<*mut HeapHeader>.None => { return Pointer.null<Machine>() }
-    }
+    Option<*mut HeapHeader>.None => { return Pointer.null<Machine>() }
   }
   // A side-effect-free evaluation refuses setters on the generic path.
   if restricted.active(unsafe lendRealm(&machine, machine.context)) { return Pointer.null<Machine>() }
@@ -3957,6 +4010,32 @@ unsafe effect fn constructRecipeFast<H: HeapHooks>(hooks: &mut H, memory: &Alloc
 /// constructInline's prologue and spills off the common construct.
 @inlineNever
 unsafe effect fn constructStores<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine) -> bool ? &mut Allocator {
+  let count = u16.toUsize(unsafe machine.peekU16())
+  let function = unsafe machine.top(usize.wrappingAdd(count, 2))
+  let node = core.reference(function)
+  let data = unsafe operandCell(machine.stackTop, count)
+  let argv = FrameSlots { data: data, count: count }
+  let first = unsafe operandCell(data, 2)
+  let planned = run unsafe constructors.plannedConstructInPlace(&mut hooks, memory, machine.runtime, node, &argv)
+  if !planned.isObject() {
+    return run unsafe constructStoresFallback(&mut hooks, memory, &mut machine)
+  }
+  unsafe machine.skip(2)
+  let mut fnAnchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut fnAnchor, node)
+  let fnCount = header.referenceCount
+  if fnCount > 2 {
+    header.referenceCount = i32.wrappingSubtract(fnCount, 2)
+    drop header
+    unsafe Pointer.write<ValueBits>(first, planned)
+    machine.stackTop = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(first), 1)
+    return true
+  }
+  drop header
+  return unsafe finishConstructStoresDropSlow(&mut hooks, &mut machine, function, planned, first)
+}
+@inlineNever
+unsafe effect fn constructStoresFallback<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine) -> bool ? &mut Allocator {
   let count = u16.toUsize(unsafe machine.peekU16())
   let function = unsafe machine.top(usize.wrappingAdd(count, 2))
   let node = core.reference(function)

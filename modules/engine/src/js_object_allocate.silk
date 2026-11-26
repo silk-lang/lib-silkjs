@@ -1129,12 +1129,48 @@ pub unsafe effect fn emptyArrayFast<H: HeapHooks>(hooks: &mut H, observer: &Allo
   unsafe gc.publishObject(runtime, fresh)
   return ValueBits.Object { reference: fresh }
 }
-/// Non-effect spare-cell fast path for copiedArray (Object.keys on cached shapes):
-/// takes a Bin 0/4 spare cell with zero allocator/effect overhead, returning
-/// Uninitialized without side effects if no spare cell is available.
+/// Out-of-line fresh cell allocation for plannedConstructInPlace when the
+/// spare-cell bin is empty: avoids re-probing receiverCache while keeping
+/// allocateInlineCellOrNull out of the spare-hit hot path.
+@inlineNever
+pub unsafe effect fn allocatePlanCell<H: HeapHooks>(hooks: &mut H, observer: &AllocationObserver,
+  runtime: *mut HeapHeader, tail: usize) -> ?*mut HeapHeader ? &mut Allocator {
+  let mut tailBytes = usize.wrappingMultiply(tail, Layout.of<SlotBits>().bytes)
+  let reused = Layout.of<ObjectPayload>().bytes - PAYLOAD_TAG_BYTES
+  if tailBytes > reused { tailBytes = usize.wrappingSubtract(tailBytes, reused) } else { tailBytes = 0 }
+  return run unsafe allocateInlineCellOrNull(&mut hooks, observer, runtime, tailBytes)
+}
+/// Initializes a revived spare small cell for a planned constructor fast path
+/// (shape already retained by caller), sets inline slots over payload, and
+/// publishes the object without Allocator/effect overhead.
 @inlineAlways
-pub unsafe fn copiedArraySpare(context: *mut HeapHeader, runtime: *mut HeapHeader, values: *const ValueBits, count: usize) -> ValueBits {
-  if count == 0 || count >= shapes.WIDE_SLOTS || Layout.of<SlotBits>().bytes != Layout.of<ValueBits>().bytes || unsafe gc.observesFresh(runtime) {
+pub unsafe fn initPlanSpareCell(runtime: *mut HeapHeader, raw: *mut HeapHeader,
+  shape: *mut HeapHeader, written: usize, tail: usize) -> *mut HeapHeader {
+  let fresh = unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, raw)
+  unsafe census.censusBump(runtime, census.CENSUS_OBJECTS_ALLOCATED, 1)
+  unsafe memory.prefetch(usize.wrappingAdd(Pointer.address<HeapHeader>(fresh), 64))
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, fresh)
+  let payload = Pointer.fromMutRef<ObjectPayload>(&mut data.payload)
+  unsafe Pointer.put<ObjectPayload>(payload, ObjectPayload.Empty)
+  let slotBase = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(
+    unsafe Intrinsic.pointerReinterpret<*mut ObjectPayload, *mut u8>(payload)), PAYLOAD_TAG_BYTES))
+  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotBase, tail)
+  unsafe slots.extendFilled(written)
+  unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(data.slotListMut()), move slots)
+  let noTail = tail == shapes.PAIR_SLOTS && Layout.of<ObjectPayload>().bytes >= PAYLOAD_TAG_BYTES + shapes.PAIR_SLOTS * Layout.of<SlotBits>().bytes
+  data.initHeader(classes.JS_CLASS_OBJECT, shape, false, false, noTail)
+  drop data
+  unsafe gc.publishObject(runtime, fresh)
+  return fresh
+}
+/// Unified non-effect spare-cell fast path for Object.keys on cached shapes
+/// (count == 0 uses a Bin 1 PAIR_SLOTS cell; 1..WIDE_SLOTS-1 uses Bin 0/4):
+/// shares one observesFresh/arrayShape/takeSpareCell/publishObject path to
+/// keep objectKeysInline compact. Returns Uninitialized on miss.
+@inlineAlways
+pub unsafe fn keysArraySpare(context: *mut HeapHeader, runtime: *mut HeapHeader, values: ?*const ValueBits, count: usize) -> ValueBits {
+  if count >= shapes.WIDE_SLOTS || Layout.of<SlotBits>().bytes != Layout.of<ValueBits>().bytes || unsafe gc.observesFresh(runtime) {
     return ValueBits.Uninitialized
   }
   let ctxAnchor = ()
@@ -1147,13 +1183,12 @@ pub unsafe fn copiedArraySpare(context: *mut HeapHeader, runtime: *mut HeapHeade
   if (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)).properties.length() != 1 {
     return ValueBits.Uninitialized
   }
-  let totalTail = if count < shapes.INLINE_SLOTS { shapes.INLINE_SLOTS } else { shapes.WIDE_SLOTS }
+  let totalTail = if count == 0 { shapes.PAIR_SLOTS } else if count < shapes.INLINE_SLOTS { shapes.INLINE_SLOTS } else { shapes.WIDE_SLOTS }
   let spare = unsafe gc.takeSpareCell(runtime, totalTail, false)
   let raw = match Pointer.nonNullMut<HeapHeader>(spare) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
   }
-  let extra = usize.wrappingSubtract(totalTail, 1)
   unsafe HeapCell.retain(shape)
   let fresh = unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, raw)
   unsafe census.censusBump(runtime, census.CENSUS_OBJECTS_ALLOCATED, 1)
@@ -1163,65 +1198,32 @@ pub unsafe fn copiedArraySpare(context: *mut HeapHeader, runtime: *mut HeapHeade
   let tailRaw = unsafe HeapCell.tailAddress<ObjectData>(fresh)
   let slotBase = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(tailRaw)
   unsafe Pointer.put<SlotBits>(slotBase, SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
-  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotBase, 1)
+  let slotCap = if count == 0 { totalTail } else { 1 }
+  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotBase, slotCap)
   unsafe slots.extendFilled(1)
   unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(data.slotListMut()), move slots)
-  let valueBase = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(unsafe Pointer.atMut<u8>(
-    unsafe Pointer.assumeManyMut<u8>(tailRaw), Layout.of<SlotBits>().bytes))
-  let src = unsafe Pointer.assumeMany<ValueBits>(values)
-  let dst = unsafe Pointer.assumeManyMut<ValueBits>(valueBase)
-  let mut i: usize = 0
-  while i < count {
-    let v = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(src, i))
-    if let ValueBits.String { reference } = v { unsafe HeapCell.retain(reference) }
-    else if v.tag() < 0 { drop unsafe v.retained() }
-    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(dst, i), v)
-    i = usize.wrappingAdd(i, 1)
+  if count == 0 {
+    let array = unsafe FastArrayData.ofPlain(ThinList<ValueBits>.make())
+    unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), ObjectPayload.FastArray { array: move array })
+  } else {
+    let extra = usize.wrappingSubtract(totalTail, 1)
+    let valueBase = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(unsafe Pointer.atMut<u8>(
+      unsafe Pointer.assumeManyMut<u8>(tailRaw), Layout.of<SlotBits>().bytes))
+    let src = unsafe Pointer.assumeMany<ValueBits>(unsafe Intrinsic.pointerRequalify<?*const ValueBits, *const ValueBits>(values))
+    let dst = unsafe Pointer.assumeManyMut<ValueBits>(valueBase)
+    let mut i: usize = 0
+    while i < count {
+      let v = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(src, i))
+      if let ValueBits.String { reference } = v { unsafe HeapCell.retain(reference) }
+      else if v.tag() < 0 { drop unsafe v.retained() }
+      unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(dst, i), v)
+      i = usize.wrappingAdd(i, 1)
+    }
+    let mut items = unsafe ThinList<ValueBits>.borrowing(valueBase, extra)
+    unsafe items.extendFilled(count)
+    let array = FastArrayData.of(move items)
+    unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), ObjectPayload.FastArray { array: move array })
   }
-  let mut items = unsafe ThinList<ValueBits>.borrowing(valueBase, extra)
-  unsafe items.extendFilled(count)
-  let array = FastArrayData.of(move items)
-  unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), ObjectPayload.FastArray { array: move array })
-  data.initHeader(classes.JS_CLASS_ARRAY, shape, true, true, false)
-  drop data
-  unsafe gc.publishObject(runtime, fresh)
-  return ValueBits.Object { reference: fresh }
-}
-/// Non-effect spare-cell fast path for emptyArrayFast (`Object.keys({})`):
-/// takes a Bin 1 spare cell with zero allocator/effect overhead, returning
-/// Uninitialized without side effects if no spare cell is available.
-@inlineAlways
-pub unsafe fn emptyArraySpare(context: *mut HeapHeader, runtime: *mut HeapHeader) -> ValueBits {
-  if unsafe gc.observesFresh(runtime) { return ValueBits.Uninitialized }
-  let ctxAnchor = ()
-  let shapeOpt = (unsafe HeapCell.payload<ContextState, ()>(&ctxAnchor, context)).arrayShape
-  let shape = match Pointer.nonNullMut<HeapHeader>(shapeOpt) {
-    Option<*mut HeapHeader>.Some { value } => value
-    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
-  }
-  let shapeAnchor = ()
-  if (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)).properties.length() != 1 {
-    return ValueBits.Uninitialized
-  }
-  let tail = shapes.PAIR_SLOTS
-  let spare = unsafe gc.takeSpareCell(runtime, tail, false)
-  let raw = match Pointer.nonNullMut<HeapHeader>(spare) {
-    Option<*mut HeapHeader>.Some { value } => value
-    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
-  }
-  unsafe HeapCell.retain(shape)
-  let fresh = unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, raw)
-  unsafe census.censusBump(runtime, census.CENSUS_OBJECTS_ALLOCATED, 1)
-  unsafe memory.prefetch(usize.wrappingAdd(Pointer.address<HeapHeader>(fresh), 64))
-  let mut nodeAnchor = ()
-  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, fresh)
-  let slotBase = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe HeapCell.tailAddress<ObjectData>(fresh))
-  unsafe Pointer.put<SlotBits>(slotBase, SlotBits.value(ValueBits.Int { value: 0 }))
-  let mut slots = unsafe ThinList<SlotBits>.borrowing(slotBase, tail)
-  unsafe slots.extendFilled(1)
-  unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(data.slotListMut()), move slots)
-  let array = unsafe FastArrayData.ofPlain(ThinList<ValueBits>.make())
-  unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), ObjectPayload.FastArray { array: move array })
   data.initHeader(classes.JS_CLASS_ARRAY, shape, true, true, false)
   drop data
   unsafe gc.publishObject(runtime, fresh)

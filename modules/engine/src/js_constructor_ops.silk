@@ -5,13 +5,14 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
 import silk.mem.pointer { Pointer }
+import silk.num.i32
 import silk.num.u32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { Value, lendBits, ValueRef, lendFor }
-import js_core_types { ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, PropertySlot, ShapeData, SlotBits, JS_PROP_TMASK, ForwardEntry }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, PropertySlot, ShapeData, SlotBits, JS_PROP_TMASK, ForwardEntry }
 import js_shapes as shapes
 import silk.core.option { Option }
 import silk.num.u8
@@ -427,6 +428,102 @@ pub unsafe effect fn plannedConstruct<'a, H: HeapHooks>(hooks: &mut H, memory: &
     index = index + 1
   }
   return created
+}
+/// In-place fast path of plannedConstructFast: probes RuntimeState.receiverCache
+/// in place (no vacantWay, no 40-byte PlannedShape stack copy), validates settled
+/// tail (PAIR_SLOTS or INLINE_SLOTS) and current shapeEpoch, pops a spare cell on
+/// the same RuntimeState borrow, or calls @inlineNever objects.allocatePlanCell
+/// directly on a spare-bin miss without re-probing receiverCache. Returns
+/// Uninitialized without side effects on plan/tail/epoch misses or OOM.
+@inlineAlways
+pub unsafe effect fn plannedConstructInPlace<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  runtime: *mut HeapHeader, function: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ? &mut Allocator {
+  let anchor = ()
+  let fnData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  if fnData.isExotic() { return ValueBits.Uninitialized }
+  let bytecode = match &fnData.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => Pointer.address<HeapHeader>(closure.bytecode)
+    _ => { return ValueBits.Uninitialized }
+  }
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, fnData.shape)).version
+  let address = Pointer.address<HeapHeader>(function)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  if state.observeFresh { return ValueBits.Uninitialized }
+  let slot = gc.findReceiverWay(&state.*, address)
+  if slot >= 64 { return ValueBits.Uninitialized }
+  let entry = &state.receiverCache[slot]
+  let stores = u8.toUsize(entry.stores)
+  if entry.version != version || entry.bytecode != bytecode || stores == 0
+    || (entry.sources[0] & PLAN_COVERS) == 0 || argv.count != stores || stores > 8 {
+    return ValueBits.Uninitialized
+  }
+  let tail = u8.toUsize(entry.tail)
+  if tail != shapes.PAIR_SLOTS && tail != shapes.INLINE_SLOTS { return ValueBits.Uninitialized }
+  if entry.epoch != state.shapeEpoch { return ValueBits.Uninitialized }
+  let final = match Pointer.nonNullMut<HeapHeader>(entry.final) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  let expectedProto = match Pointer.nonNullMut<HeapHeader>(finalShape.prototype) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  drop finalShape
+  match (unsafe fnData.slotUnchecked(entry.index)).valueBits() {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(expectedProto) { return ValueBits.Uninitialized }
+    }
+    _ => { return ValueBits.Uninitialized }
+  }
+  drop fnData
+  let mut finalHeaderAnchor = ()
+  let finalHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut finalHeaderAnchor, final)
+  let refCount = finalHeader.referenceCount
+  if refCount <= 0 { return ValueBits.Uninitialized }
+  let sources = entry.sources
+  drop entry
+  let bin: usize = if tail == shapes.PAIR_SLOTS { 3 } else { 2 }
+  let spareCount = state.spareCellCounts[bin]
+  let mut rawOpt = Pointer.null<HeapHeader>()
+  if spareCount != 0 {
+    let left = usize.wrappingSubtract(spareCount, 1)
+    state.spareCellCounts[bin] = left
+    let parked = unsafe Intrinsic.pointerRequalify<?[*]const ?*mut HeapHeader, [*]const ?*mut HeapHeader>(Pointer.fromSlice<?*mut HeapHeader>(state.spareCells.asSlice()))
+    rawOpt = unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(parked, usize.wrappingAdd(usize.wrappingMultiply(bin, gc.SPARE_CELLS), left)))
+  }
+  drop state
+  finalHeader.referenceCount = i32.wrappingAdd(refCount, 1)
+  drop finalHeader
+  let raw = match Pointer.nonNullMut<HeapHeader>(rawOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => match Pointer.nonNullMut<HeapHeader>(run unsafe objects.allocatePlanCell(&mut hooks, memory, runtime, tail)) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => {
+        unsafe gc.releaseHeader(&mut hooks, runtime, final)
+        return ValueBits.Uninitialized
+      }
+    }
+  }
+  let node = unsafe objects.initPlanSpareCell(runtime, raw, final, stores, tail)
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let operands = unsafe Pointer.assumeManyMut<ValueBits>(argv.data)
+  if stores == 2 {
+    let first = u8.toUsize(sources[0] & PLAN_SOURCE)
+    let second = u8.toUsize(sources[1] & PLAN_SOURCE)
+    unsafe data.setSlotUnchecked(0, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, first))))
+    unsafe data.setSlotUnchecked(1, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, second))))
+    return ValueBits.Object { reference: node }
+  }
+  let mut index: usize = 0
+  while index < stores {
+    let source = u8.toUsize(sources[index] & PLAN_SOURCE)
+    unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, source))))
+    index = usize.wrappingAdd(index, 1)
+  }
+  return ValueBits.Object { reference: node }
 }
 /// Fast path of plannedConstruct when every argument moves into the object
 /// (PLAN_COVERS && argv.count == stores): takes a spare cell inline or calls
