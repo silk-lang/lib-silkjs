@@ -275,6 +275,8 @@ pub struct Emitter {
   /// Frame mode: last trusted fast-array value whose elements pointer is live in R9 and
   /// elementCount in EAX (NONE when invalid). Reset at every block and non-whitelisted inst.
   cachedArr: u32,
+  /// Whether EAX holds cachedArr's count: an access proven in bounds loads the elements alone.
+  cachedCount: bool,
   /// Indexes a trusted access of this block bounded (below an Array's count, so at most
   /// 2^31 - 2): adding 1 to one cannot overflow. Cleared at each block.
   bounded: List<u32>,
@@ -727,7 +729,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     resumeLabels: List<Label>.make(), savedValues: List<u32>.make(), savedStart: List<u32>.make(), frame: frame,
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(), construct: helpers.constructLayout(), math: helpers.mathLayout(), closureHome: baseline_env.closureHomeOffset(), usedXmm: usedXmm,
-    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cachedArr: NONE, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
+    undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cachedArr: NONE, cachedCount: false, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
     inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), knownFns: List<bool>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), checkConstructSlows: List<CheckConstructSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), coldEdges: List<ColdEdge>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(), aliased: List<bool>.make(),
@@ -839,6 +841,12 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   while z < emitter.zeroInsts.length() {
     let inst = emitter.zeroInsts.get(z)
     emitter.a.bind(emitter.zeroLabels.get(z))
+    if inst.op == Op.ToInt32 {
+      let left = emitter.at(inst.a) let out = emitter.at(inst.result)
+      run float.toInt32Slow(&mut emitter.a, left, out, emitter.zeroBacks.get(z))
+      z = z + 1
+      continue
+    }
     let place = emitter.at(inst.a) run getI32(&mut emitter.a, Reg.R9, place)
     run emitter.operate(Alu.Or, Reg.R9, inst.b)
     run emitter.a.jcc(Cond.Sign, emitter.exitLabels.get(u32.toUsize(inst.exit)))
@@ -1540,6 +1548,18 @@ impl Emitter {
       run putBits(&mut self.a, out, Reg.Rax)
       return ()
     }
+    // An ordered double compare whose only reader is the branch right after it is that
+    // branch's flags.
+    if op == Op.CmpF64 && self.fusedCompare(&function, inst) { return () }
+    if op == Op.ToInt32 {
+      // The conversion of a double outside int64 is out of line (zeroInsts).
+      let slow = run self.a.label()
+      let back = run self.a.label()
+      let left = self.at(inst.a) let out = self.at(inst.result)
+      run float.toInt32Fast(&mut self.a, left, out, slow, back)
+      run self.zeroLabels.append(slow) run self.zeroBacks.append(back) run self.zeroInsts.append(inst)
+      return ()
+    }
     if isNumberOp(op) || op == Op.ConstF64 {
       let mut exit = self.blockLabels.get(0)
       if inst.exit != NONE { run self.stressGuard(inst.exit) exit = self.exitLabels.get(u32.toUsize(inst.exit)) }
@@ -1579,8 +1599,16 @@ impl Emitter {
       let def = self.defs.get(u32.toUsize(inst.a))
       if def != NONE && self.fusedCompare(&function, function.inst(def)) {
         let compared = function.inst(def)
-        run self.compare(&function, compared)
-        taken = condition(compared.k) untaken = condition(opposite(compared.k))
+        if compared.op == Op.CmpF64 {
+          let left = self.at(compared.a) let right = self.at(compared.b)
+          taken = run float.compareDoublesFlags(&mut self.a, compared.k, left, right)
+          // Below and BelowOrEqual hold for an unordered result: NaN takes the false edge.
+          untaken = Cond.BelowOrEqual
+          if taken == Cond.AboveOrEqual { untaken = Cond.Below }
+        } else {
+          run self.compare(&function, compared)
+          taken = condition(compared.k) untaken = condition(opposite(compared.k))
+        }
       } else if def != NONE && self.fusedEquals(&function, function.inst(def)) {
         run self.equalsFlags(&function, function.inst(def))
         taken = Cond.Equal untaken = Cond.NotEqual
@@ -1829,6 +1857,24 @@ impl Emitter {
       run self.stressGuard(inst.exit)
       let miss = self.exitLabels.get(u32.toUsize(inst.exit))
       run self.arrayGuard(inst.a, miss)
+      return ()
+    }
+    if op == Op.CheckBound {
+      // The object is a fast Array (the `check.array` before it): the index against its
+      // count, unsigned, so one below zero leaves too.
+      run self.stressGuard(inst.exit)
+      let fields = self.fields
+      let mut arr = inst.a
+      if self.on { arr = self.storage(inst.a) }
+      let place = self.at(inst.b)
+      run self.a.load(Width.W64, Reg.R11, payloadOf(arr))
+      run getI32(&mut self.a, Reg.R8, place)
+      run self.a.aluLoad(Alu.Cmp, Width.W32, Reg.R8, Mem.at(Reg.R11, u32.wrappingToI32(fields.elementCount)))
+      run self.a.jcc(Cond.AboveOrEqual, self.exitLabels.get(u32.toUsize(inst.exit)))
+      // Below 2^31 too, whatever the count: a proven access doubles its index in 32 bits.
+      run self.a.test(Width.W32, Reg.R8, Reg.R8)
+      run self.a.jcc(Cond.Sign, self.exitLabels.get(u32.toUsize(inst.exit)))
+      self.cachedArr = NONE
       return ()
     }
     if op == Op.CheckTag {
@@ -2190,7 +2236,7 @@ impl Emitter {
         } else if inst.trusted {
           // Past the count the interpreter takes over: no helper runs (ssa_opt_hoist).
           let miss = self.exitLabels.get(u32.toUsize(inst.exit))
-          run self.trustedSlot(inst.a, index, miss)
+          run self.trustedSlot(inst.a, index, miss, inst.proven)
           self.elementAt = self.cursor self.elementObject = self.storage(inst.a) self.elementIndex = index
           run self.bound(&function, index)
         } else if only != 0 {
@@ -3490,7 +3536,7 @@ impl Emitter {
   }
   /// Whether compare's only reader is its block's terminator, a branch, with no code between.
   fn fusedCompare(self: &Self, function: &Function, compare: Inst) -> bool {
-    if compare.op != Op.Cmp || self.uses.get(u32.toUsize(compare.result)) != 1 { return false }
+    if !(compare.op == Op.Cmp || (compare.op == Op.CmpF64 && float.ordered(compare.k))) || self.uses.get(u32.toUsize(compare.result)) != 1 { return false }
     let block = function.blocks.get(u32.toUsize(compare.block))
     let last = block.firstInst + block.instCount - 1
     let branch = function.inst(last)
@@ -4313,20 +4359,32 @@ impl Emitter {
   /// elementSlot for an access whose object a `check.array` proved a fast Array (Inst.trusted):
   /// the count test alone. In frame mode, caches `(cachedArr, r9 = elements, eax = count)`
   /// across consecutive trusted accesses on the same array.
-  effect fn trustedSlot(self: &mut Self, value: u32, index: u32, miss: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  /// `proven`: the index is below the count (Inst.proven), so nothing is tested and the count
+  /// stays unread; the cache then holds the elements alone (cachedCount).
+  effect fn trustedSlot(self: &mut Self, value: u32, index: u32, miss: Label, proven: bool) -> () ! OutOfMemoryError ? &mut Allocator {
     let place = self.at(index)
     if self.on {
       let arr = self.storage(value)
       let fields = self.fields
-      if self.cachedArr != arr {
+      if self.cachedArr != arr || (!proven && !self.cachedCount) {
         run self.a.load(Width.W64, Reg.R9, payloadOf(arr))
-        run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R9, u32.wrappingToI32(fields.elementCount)))
+        if !proven { run self.a.load(Width.W32, Reg.Rax, Mem.at(Reg.R9, u32.wrappingToI32(fields.elementCount))) }
         run self.a.load(Width.W64, Reg.R9, Mem.at(Reg.R9, u32.wrappingToI32(fields.elements)))
         self.cachedArr = arr
+        self.cachedCount = !proven
+      }
+      if proven && place.kind == GPR {
+        // The index is below 2^31 (a `check.bound` took both its ends for indexes that are
+        // not negative as i32): twice it fits 32 bits, and times eight more is its offset.
+        run self.a.lea(Width.W32, Reg.R11, Mem.indexed(place.gpr, place.gpr, Scale.One, 0))
+        run self.a.lea(Width.W64, Reg.R11, Mem.indexed(Reg.R9, Reg.R11, Scale.Eight, 0))
+        return ()
       }
       run getI32(&mut self.a, Reg.R8, place)
-      run self.a.alu(Alu.Cmp, Width.W32, Reg.R8, Reg.Rax)
-      run self.a.jcc(Cond.AboveOrEqual, miss)
+      if !proven {
+        run self.a.alu(Alu.Cmp, Width.W32, Reg.R8, Reg.Rax)
+        run self.a.jcc(Cond.AboveOrEqual, miss)
+      }
       run self.a.shiftImm(Shift.Shl, Width.W64, Reg.R8, 4)
       run self.a.lea(Width.W64, Reg.R11, Mem.indexed(Reg.R9, Reg.R8, Scale.One, 0))
       return ()
@@ -5515,7 +5573,7 @@ impl Emitter {
     let layout = self.settings.layout
     let miss = self.exitLabels.get(u32.toUsize(inst.exit))
     // The element a trusted read of the same index found just before is the one (R11).
-    if !self.reusesElement(function, inst) { run self.trustedSlot(inst.a, i32.wrappingToU32(inst.k), miss) }
+    if !self.reusesElement(function, inst) { run self.trustedSlot(inst.a, i32.wrappingToU32(inst.k), miss, inst.proven) }
     self.elementAt = NONE
     run self.bound(function, i32.wrappingToU32(inst.k))
     let cold = run self.a.label()
@@ -5573,7 +5631,7 @@ impl Emitter {
   /// Whether `add.i32 x, 1` cannot overflow: x is an index a trusted access earlier in the
   /// block bounded (bound), below a count of elements, which is far below 2^31.
   fn cannotOverflow(self: &Self, function: &Function, inst: Inst) -> bool {
-    if addSubRangeSafe(&function, inst) { return true }
+    if inst.proven || addSubRangeSafe(&function, inst) { return true }
     if inst.op != Op.Add || inst.b == NONE || function.inst(self.cursor).block != self.boundedBlock { return false }
     match self.constants.get(u32.toUsize(inst.b)) {
       Option<i32>.Some { value } => { if value != 1 { return false } }

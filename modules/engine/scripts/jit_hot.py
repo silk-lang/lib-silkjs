@@ -89,6 +89,11 @@ def parse_dump(path):
                 kind = {"osr ": "osr", "optimized ": "optimized", "baseline ": "baseline"}.get(match.group(1), "entry")
                 blocks.append({"address": int(match.group(2)), "bytes": bytes.fromhex(match.group(3)),
                                "kind": kind, "bytecode": bytecode, "ssa": list(ssa)})
+    order = sorted(range(len(blocks)), key=lambda i: blocks[i]["address"])
+    for a, b in zip(order, order[1:]):
+        gap = blocks[b]["address"] - blocks[a]["address"]
+        if 0 < gap < len(blocks[a]["bytes"]):
+            blocks[a]["bytes"] = blocks[a]["bytes"][:gap]
     return blocks
 
 

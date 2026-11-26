@@ -1,0 +1,402 @@
+//! Element indexes of a counted loop, proved below the count in front of the loop
+//! (docs/jit/code-quality.md, "Bounds").
+//!
+//! A counted loop has one latch, reached only by the true edge of `branch (i + n < limit)` or
+//! `(i + n <= limit)`: `i` a header parameter the latch passes back plus 1, `limit` a value
+//! from outside the loop. Turn m of the loop (the first is 0) then runs only when
+//! `m <= limit - start(i) + e` for a constant e, the trip bound, where `start` is what the
+//! entry edge passes. A header parameter the latch passes back plus a positive constant
+//! (a step) is `start + m * step` in turn m, so an index `q + d` of a step `q` stays between
+//! `start(q) + d` and `start(q) + d + bound * step(q)`.
+//!
+//! For every Array and step that the loop's trusted element accesses (ssa_opt_hoist) index
+//! that way, a new block on the loop's entry edge computes those two ends with exiting
+//! arithmetic and tests each against the Array's count (`check.bound`). The accesses then
+//! test nothing (Inst.proven), and the adds that make their indexes cannot overflow: the
+//! ends were computed without. Neither can the counter's own add, once `start(i) + 1` and
+//! `limit + 1` were computed in front.
+//!
+//! The count of a checked Array cannot change in the loop: the pass asks what trusting an
+//! access asks (no call, no stepped read, no store to a field or a binding, every element
+//! store trusted, which leaves instead of appending), of the whole loop the checks are in
+//! front of, loops inside it included.
+//!
+//! The new guards exit at the loop's header, as the entry edge carries the state there. A
+//! `check.bound` that fails is remembered apart (ssa.SITE_BOUND): the next compile proves
+//! nothing in that loop and keeps its trust. A loop that left at its header before, or
+//! whose `check.array` failed, is left alone.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import ssa { Function, Inst, Cmp, Own, Op, Type, NONE, SITE_ARRAY, SITE_BOUND, edgeCount, steppedRead }
+import ssa_ownership { fixSlots }
+import ssa_opt_borrow { quiet }
+import ssa_opt_hoist { graphOf, dominates, has, hasPrefix, copied, defOp, entryState, entryExit, backEdge, split }
+
+/// A header parameter the latch passes back plus `by`; `start` is the entry edge's argument.
+struct Step { value: u32, by: i64, start: u32 }
+impl Copy for Step {}
+/// An Array and a step: the least and the greatest constant its accesses add to the step.
+struct Reach { object: u32, step: usize, low: i64, high: i64 }
+impl Copy for Reach {}
+/// `base + offset`: a header parameter and a constant, or NONE.
+struct Affine { base: u32, offset: i64 }
+impl Copy for Affine {}
+
+/// The greatest constant an index or a step may add.
+const MAX_OFFSET: i64 = 65536
+/// Array and step pairs one loop's front block checks.
+const MAX_REACHES: usize = 12
+
+fn constant(f: &Function, v: u32) -> bool { return defOp(f, v) == Op.ConstI32 }
+fn constantOf(f: &Function, v: u32) -> i64 { return i32.toI64(f.inst(f.value(v).def).k) }
+
+/// `v` as a parameter of block `header` plus a constant, through `add.i32` and `sub.i32` of
+/// constants; a base of NONE for anything else.
+fn affine(f: &Function, header: u32, v: u32) -> Affine {
+  let none = Affine { base: NONE, offset: 0 }
+  let mut at = v
+  let mut offset: i64 = 0
+  let mut steps: u32 = 0
+  while steps < 8 {
+    if at == NONE || u32.toUsize(at) >= f.values.length() { return none }
+    let info = f.value(at)
+    if info.ty != Type.I32 { return none }
+    if info.def == NONE {
+      if info.block != header { return none }
+      return Affine { base: at, offset: offset }
+    }
+    let inst = f.inst(info.def)
+    if inst.op == Op.Add && constant(f, inst.b) { offset = offset + constantOf(f, inst.b) at = inst.a }
+    else if inst.op == Op.Add && constant(f, inst.a) { offset = offset + constantOf(f, inst.a) at = inst.b }
+    else if inst.op == Op.Sub && constant(f, inst.b) { offset = offset - constantOf(f, inst.b) at = inst.a }
+    else { return none }
+    if offset > MAX_OFFSET || offset < 0 - MAX_OFFSET { return none }
+    steps = steps + 1
+  }
+  return none
+}
+
+/// The step of parameter `p`, or usize.MAX.
+fn stepOf(steps: &List<Step>, p: u32) -> usize {
+  let mut i: usize = 0
+  while i < steps.length() { if steps.get(i).value == p { return i } i = i + 1 }
+  return usize.MAX
+}
+
+/// The index operand of an element access.
+fn indexOf(inst: Inst) -> u32 { if inst.op == Op.PutElem { return i32.wrappingToU32(inst.k) } return inst.b }
+
+/// Puts the instruction just appended at `order` of the front block, outside any inlined body.
+fn place(f: &mut Function, order: &mut u32) -> u32 {
+  let i = f.lastInst()
+  let mut made = f.inst(i)
+  made.order = order.* made.frame = 0
+  f.setInst(i, made)
+  order.* = order.* + 2
+  return i
+}
+
+/// What the front block is being filled with: its guards share one exit at the header.
+struct Front { block: u32, order: u32, exit: u32, pc: u32 }
+
+/// `op a, b` in the front block, an exiting i32 operation; its result.
+effect fn guarded(f: &mut Function, front: &mut Front, op: Op, a: u32, b: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let v = run f.emit(front.block, op, true, Type.I32, Own.Unboxed, a, b, 0, front.pc)
+  let i = place(&mut f, &mut front.order)
+  let mut made = f.inst(i) made.exit = front.exit f.setInst(i, made)
+  return v
+}
+/// `const.i32 k` in the front block.
+effect fn number(f: &mut Function, front: &mut Front, k: i64) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let v = run f.emit(front.block, Op.ConstI32, true, Type.I32, Own.Unboxed, NONE, NONE, i64.wrappingToI32(k), front.pc)
+  drop place(&mut f, &mut front.order)
+  return v
+}
+/// `v + k` in the front block (v itself for 0).
+effect fn plus(f: &mut Function, front: &mut Front, v: u32, k: i64) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  if k == 0 { return v }
+  let c = run number(&mut f, &mut front, k)
+  return run guarded(&mut f, &mut front, Op.Add, v, c)
+}
+
+/// Proves what the module comment says in every loop of a compacted function. Answers
+/// whether anything changed; the caller compacts. `sites` as ssa_opt_hoist.hoist takes them.
+pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blockCount = f.blockCount()
+  let mut loops = false
+  let mut scan: u32 = 0
+  while scan < blockCount && !loops {
+    let block = f.blocks.get(u32.toUsize(scan))
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      let mut e: u32 = 0
+      while e < edgeCount(last.op) { if f.edge(last.edge + e).target <= scan { loops = true } e = e + 1 }
+    }
+    scan = scan + 1
+  }
+  if !loops { return false }
+  let graph = run graphOf(&f.*)
+  f.work = f.work + usize.toU64(f.edges.length()) + u32.toU64(blockCount)
+  let mut member = List<u32>.make() run member.appendRepeated(0, u32.toUsize(blockCount))
+  let mut stack = List<u32>.make()
+  let mut entryArgs = List<u32>.make()
+  let mut steps = List<Step>.make()
+  let mut reaches = List<Reach>.make()
+  let mut checked = List<u32>.make()
+  let mut serial: u32 = 0
+  let mut changed = false
+  let mut h = blockCount
+  while h > 0 {
+    h = h - 1
+    // The one back edge into h, and its one other edge.
+    let mut entry = NONE
+    let mut entries: u32 = 0
+    let mut latch = NONE
+    let mut latches: u32 = 0
+    let mut k = graph.first.get(u32.toUsize(h))
+    while k < graph.first.get(u32.toUsize(h) + 1) {
+      let e = graph.edges.get(u32.toUsize(k))
+      let from = graph.source.get(u32.toUsize(e))
+      if from != NONE {
+        if from >= h && dominates(&graph.idom, h, from) { latch = from latches = latches + 1 }
+        else { entry = e entries = entries + 1 }
+      }
+      k = k + 1
+    }
+    if latches != 1 || entries != 1 { continue }
+    serial = serial + 1
+    // The loop's blocks: h and whatever reaches the latch without passing h.
+    member.set(u32.toUsize(h), serial)
+    stack.clear()
+    if member.get(u32.toUsize(latch)) != serial { member.set(u32.toUsize(latch), serial) run stack.append(latch) }
+    while stack.length() > 0 {
+      let b = stack.get(stack.length() - 1)
+      drop stack.pop()
+      let mut q = graph.first.get(u32.toUsize(b))
+      while q < graph.first.get(u32.toUsize(b) + 1) {
+        let from = graph.source.get(u32.toUsize(graph.edges.get(u32.toUsize(q))))
+        if from != NONE && member.get(u32.toUsize(from)) != serial { member.set(u32.toUsize(from), serial) run stack.append(from) }
+        q = q + 1
+      }
+    }
+    // Nothing in the loop may change an Array's count, and something must be left to prove.
+    let mut still = true
+    let mut wanted = false
+    let mut poll = NONE
+    let mut b = h
+    while b <= latch && still {
+      if member.get(u32.toUsize(b)) == serial {
+        let block = f.blocks.get(u32.toUsize(b))
+        let mut i = block.firstInst
+        while i < block.firstInst + block.instCount {
+          let inst = f.inst(i)
+          if inst.block == b {
+            if !quiet(inst.op) || steppedRead(inst) || inst.op == Op.PutField || inst.op == Op.PutVar || inst.op == Op.PutScope { still = false }
+            else if inst.op == Op.PutElem && !inst.trusted { still = false }
+            else if (inst.op == Op.PutElem || (inst.op == Op.GetElem && inst.k == 0)) && inst.trusted && !inst.proven { wanted = true }
+            else if inst.op == Op.Poll && inst.exit != NONE && b == latch { poll = i }
+          }
+          i = i + 1
+        }
+        f.work = f.work + u32.toU64(block.instCount)
+      }
+      b = b + 1
+    }
+    if !still || !wanted || poll == NONE { continue }
+    let state = f.exit(f.inst(poll).exit)
+    if state.drops != 0 || hasPrefix(sites, deoptCount, state.pc) || has(sites, u32.bitOr(state.pc, SITE_ARRAY)) || has(sites, u32.bitOr(state.pc, SITE_BOUND)) { continue }
+    let back = backEdge(&f.*, latch, h)
+    if back == NONE { continue }
+    let header = f.blocks.get(u32.toUsize(h))
+    if f.edge(entry).argCount != header.paramCount || f.edge(back).argCount != header.paramCount { continue }
+    // The steps.
+    steps.clear()
+    let mut g: u32 = 0
+    while g < header.paramCount {
+      let p = f.paramAt(header, g)
+      let start = f.edgeArg(f.edge(entry), g)
+      if f.value(p).ty == Type.I32 && f.value(start).ty == Type.I32 {
+        let returned = affine(&f.*, h, f.edgeArg(f.edge(back), g))
+        if returned.base == p && returned.offset > 0 { run steps.append(Step { value: p, by: returned.offset, start: start }) }
+      }
+      g = g + 1
+    }
+    if steps.length() == 0 { continue }
+    // The test: the latch's one way in is the true edge of a compare of a counter with a
+    // value from outside the loop.
+    if graph.first.get(u32.toUsize(latch) + 1) - graph.first.get(u32.toUsize(latch)) != 1 { continue }
+    let way = graph.edges.get(u32.toUsize(graph.first.get(u32.toUsize(latch))))
+    let tester = graph.source.get(u32.toUsize(way))
+    if tester == NONE || member.get(u32.toUsize(tester)) != serial { continue }
+    let testBlock = f.blocks.get(u32.toUsize(tester))
+    let branch = f.inst(testBlock.firstInst + testBlock.instCount - 1)
+    if branch.op != Op.Branch || branch.edge != way || defOp(&f.*, branch.a) != Op.Cmp { continue }
+    let compare = f.inst(f.value(branch.a).def)
+    let below = compare.k == u8.toI32(Cmp.value(Cmp.Lt))
+    if !below && compare.k != u8.toI32(Cmp.value(Cmp.Le)) { continue }
+    let limit = compare.b
+    if limit == NONE || u32.toUsize(limit) >= f.values.length() || f.value(limit).ty != Type.I32 || member.get(u32.toUsize(f.value(limit).block)) == serial { continue }
+    let tested = affine(&f.*, h, compare.a)
+    if tested.base == NONE { continue }
+    let counter = stepOf(&steps, tested.base)
+    if counter == usize.MAX || steps.get(counter).by != 1 { continue }
+    // Turn m runs only when m <= limit - start + trip.
+    let mut trip = 1 - tested.offset
+    if below { trip = trip - 1 }
+    // What the accesses reach.
+    reaches.clear()
+    let mut fits = true
+    b = h
+    while b <= latch && fits {
+      if member.get(u32.toUsize(b)) == serial {
+        let block = f.blocks.get(u32.toUsize(b))
+        let mut i = block.firstInst
+        while i < block.firstInst + block.instCount && fits {
+          let inst = f.inst(i)
+          if inst.block == b && (inst.op == Op.PutElem || (inst.op == Op.GetElem && inst.k == 0)) && inst.trusted && !inst.proven {
+            let object = copied(&f.*, inst.a)
+            let index = affine(&f.*, h, indexOf(inst))
+            let mut step = usize.MAX
+            if index.base != NONE { step = stepOf(&steps, index.base) }
+            if step != usize.MAX && member.get(u32.toUsize(f.value(object).block)) != serial {
+              let mut r: usize = 0
+              let mut found = false
+              while r < reaches.length() {
+                let mut reach = reaches.get(r)
+                if reach.object == object && reach.step == step {
+                  if index.offset < reach.low { reach.low = index.offset }
+                  if index.offset > reach.high { reach.high = index.offset }
+                  reaches.set(r, reach)
+                  found = true
+                }
+                r = r + 1
+              }
+              if !found {
+                if reaches.length() == MAX_REACHES { fits = false }
+                else { run reaches.append(Reach { object: object, step: step, low: index.offset, high: index.offset }) }
+              }
+            }
+          }
+          i = i + 1
+        }
+      }
+      b = b + 1
+    }
+    if !fits || reaches.length() == 0 { continue }
+    // The state at the header, as the guards' exit has it.
+    if !run entryState(&mut f, &member, serial, state, entry, back, &mut entryArgs) { continue }
+    // The Arrays the block the entry edge leaves checked already (ssa_opt_hoist's front
+    // block, when it trusted the accesses at this loop).
+    checked.clear()
+    let before = graph.source.get(u32.toUsize(entry))
+    if before != NONE {
+      let block = f.blocks.get(u32.toUsize(before))
+      let mut i = block.firstInst
+      while i < block.firstInst + block.instCount {
+        let inst = f.inst(i)
+        if inst.block == before && inst.op == Op.CheckArray && !has(&checked, inst.a) { run checked.append(inst.a) }
+        i = i + 1
+      }
+    }
+    let pc = f.inst(header.firstInst).pc
+    let frontBlock = run split(&mut f, entry, h)
+    let mut front = Front { block: frontBlock, order: 2, exit: NONE, pc: pc }
+    // The trip bound; its sub is the first guard, and the others take its exit.
+    let begin = steps.get(counter).start
+    let span = run f.emit(front.block, Op.Sub, true, Type.I32, Own.Unboxed, limit, begin, 0, pc)
+    let first = place(&mut f, &mut front.order)
+    front.exit = run entryExit(&mut f, first, state, &entryArgs)
+    let turns = run plus(&mut f, &mut front, span, trip)
+    // The counter's own add: at most start + 1, or limit + 1 (limit under `<`).
+    if tested.offset == 1 && defOp(&f.*, compare.a) == Op.Add {
+      drop run plus(&mut f, &mut front, begin, 1)
+      if !below { drop run plus(&mut f, &mut front, limit, 1) }
+      let at = f.value(compare.a).def
+      let mut add = f.inst(at) add.proven = true f.setInst(at, add)
+    }
+    let mut boundExit = NONE
+    let mut r: usize = 0
+    while r < reaches.length() {
+      let reach = reaches.get(r)
+      let step = steps.get(reach.step)
+      if !has(&checked, reach.object) {
+        drop run f.emit(front.block, Op.CheckArray, false, Type.I32, Own.Unboxed, reach.object, NONE, 0, pc)
+        let check = place(&mut f, &mut front.order)
+        drop run entryExit(&mut f, check, state, &entryArgs)
+        run checked.append(reach.object)
+      }
+      let low = run plus(&mut f, &mut front, step.start, reach.low)
+      let mut high = low
+      if reach.high != reach.low { high = run plus(&mut f, &mut front, step.start, reach.high) }
+      let mut across = turns
+      if step.by != 1 {
+        let by = run number(&mut f, &mut front, step.by)
+        across = run guarded(&mut f, &mut front, Op.Mul, turns, by)
+      }
+      let last = run guarded(&mut f, &mut front, Op.Add, high, across)
+      // The first turn reaches low to high whatever the trip bound is; the later ones up
+      // to last. A negative index is no index below a count.
+      let mut which: u32 = 0
+      while which < 3 {
+        let mut index = low
+        if which == 1 { index = high }
+        if which == 2 { index = last }
+        if which != 1 || high != low {
+          drop run f.emit(front.block, Op.CheckBound, false, Type.I32, Own.Unboxed, reach.object, index, 0, pc)
+          let check = place(&mut f, &mut front.order)
+          if boundExit == NONE { boundExit = run entryExit(&mut f, check, state, &entryArgs) }
+          else { let mut made = f.inst(check) made.exit = boundExit f.setInst(check, made) }
+        }
+        which = which + 1
+      }
+      r = r + 1
+    }
+    // The accesses, and the adds between a step and an index.
+    b = h
+    while b <= latch {
+      if member.get(u32.toUsize(b)) == serial {
+        let block = f.blocks.get(u32.toUsize(b))
+        let mut i = block.firstInst
+        while i < block.firstInst + block.instCount {
+          let mut inst = f.inst(i)
+          if inst.block == b && (inst.op == Op.PutElem || (inst.op == Op.GetElem && inst.k == 0)) && inst.trusted && !inst.proven {
+            let object = copied(&f.*, inst.a)
+            let index = affine(&f.*, h, indexOf(inst))
+            if index.base != NONE && within(&reaches, &steps, object, index) {
+              inst.proven = true
+              f.setInst(i, inst)
+            }
+          } else if inst.block == b && (inst.op == Op.Add || inst.op == Op.Sub) && !inst.proven && inst.result != NONE {
+            let sum = affine(&f.*, h, inst.result)
+            if sum.base != NONE && within(&reaches, &steps, NONE, sum) {
+              inst.proven = true
+              f.setInst(i, inst)
+            }
+          }
+          i = i + 1
+        }
+      }
+      b = b + 1
+    }
+    changed = true
+  }
+  if changed { run fixSlots(&mut f) }
+  return changed
+}
+
+/// Whether some reach of `object` (of any Array, for NONE) covers `index`.
+fn within(reaches: &List<Reach>, steps: &List<Step>, object: u32, index: Affine) -> bool {
+  let mut r: usize = 0
+  while r < reaches.length() {
+    let reach = reaches.get(r)
+    if (object == NONE || reach.object == object) && steps.get(reach.step).value == index.base && index.offset >= reach.low && index.offset <= reach.high { return true }
+    r = r + 1
+  }
+  return false
+}

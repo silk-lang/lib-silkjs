@@ -158,6 +158,56 @@ Crypto's `am3`: 143 instructions an iteration where there were 164; Crypto at sc
 3.26G instructions where there were 3.48G. At scale 20 the optimizer takes 1,019 ms (V8:
 325), where before this and the fragile registers it took 1,256.
 
+## Bounds in front of the loop
+
+A trusted access still loads the Array's count and compares its index with it on every
+turn, and the `++` that makes the index tests for overflow: three or four instructions an
+access. `ssa_opt_bounds` proves both once, in front of the loop, for a counted loop: one
+latch, reached only by the true edge of `branch (i + n < limit)` or `(i + n <= limit)`,
+where `i` is a header parameter the latch passes back plus 1 (the counter) and `limit` is
+defined outside the loop. Turn m (from 0) then runs only when m is at most
+`limit - start(i) + e` for a constant `e`, the trip bound, `start` being what the entry
+edge passes. A header parameter the latch passes back plus a positive constant (a step,
+`++currentRow`) is `start + m * step` in turn m, so an index `q + d` of a step `q` stays
+between `start(q) + d` and `start(q) + d + bound * step(q)`.
+
+For each Array and step the loop's trusted accesses index that way, a new block on the
+entry edge computes those ends with exiting arithmetic and tests each against the count:
+`check.bound a, x` leaves unless `x` is an index below the count of `a` and below 2^31. It
+tests the first turn's least and greatest index and the last turn's greatest, so a trip
+bound below zero (a `do` loop entered past its limit) still covers the one turn that runs.
+The accesses are then proven (`Inst.proven`): they load the elements and index them, with
+no count and no test. An `add.i32` or `sub.i32` whose result is a step plus a constant
+between the offsets checked cannot overflow, as the ends were computed without, and is
+proven too; so is the counter's own add, after `start(i) + 1` and `limit + 1` were
+computed in front (`limit` alone under `<`).
+
+The count must not change in the loop. The pass asks of the whole loop, loops inside it
+included, what trust asks: no call, no stepped read, no store of a field or a binding,
+every element store trusted (it leaves instead of appending). An index must be a header
+parameter plus a constant: `a[base + i]` with `base` from outside the loop is not proven
+yet, nor is an index that is a product.
+
+The new arithmetic exits at the header like the other hoisted guards. A `check.bound`
+that fails has a record of its own (`jit_exit_state.CODE_BOUND_CHECK`), remembered as the
+header's pc with `ssa.SITE_BOUND`: the next compile proves nothing in that loop and keeps
+its trust and its hoisting. Such a loop would have left at the access anyway (a trusted
+access leaves where its index is not below the count), a turn or a hundred later.
+`--jit-no-bounds` turns the pass off. `tests/baseline/t88.js` runs counted loops in
+bounds, before the start, past the end, with steps of two and three, with a limit above
+the Array, an Array that grows, counters next to 2^31, and a relaxation step on grids too
+small for it.
+
+A proven access with its index in a register makes the element's address with two `lea`
+(`lea r11d, [i + i]`, `lea r11, [r9 + r11 * 8]`): the index is below 2^31, so twice it
+fits 32 bits whatever the register's upper half holds.
+
+NavierStokes' `lin_solve` runs 49 instructions a turn where it ran 68 (five accesses, four
+steps), and the benchmark at scale 20 2.69G instructions where it ran 3.29G. The clock
+moves far less than that: the loop's time is the chain of four additions and two
+multiplications from one turn's result to the next (about 14 cycles), which the removed
+compares and branches were never part of.
+
 ## Inlined loops
 
 Code inlined from a callee with a loop (Crypto's `am3` in `montReduce` and `bnpSquareTo`)
@@ -261,6 +311,15 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
 - **A store of an immediate skips its heap test.** `put.elem` of a value that is
   `Own.Imm` (a boxed number, undefined, a boolean) does not test whether the new value is
   counted.
+- **A compare of doubles feeds its branch.** `lt.f64`, `le.f64`, `gt.f64` and `ge.f64`
+  whose one reader is the branch right after are `ucomisd` and one conditional jump
+  (`compareDoublesFlags`, with the operands swapped for `<` and `<=` so that an unordered
+  compare takes the false edge), where they were `setcc`, a test and a jump.
+- **`x | 0` of a double converts in line.** `to.int32` is `cvttsd2si` to 64 bits, a
+  compare that overflows only for the one value the conversion answers what it cannot
+  convert with, and a 32-bit move; NaN, the infinities and values past 2^63 go to a piece
+  after the blocks (`toInt32Slow`). And `x | 0` or `x ^ 0` of an int32 is `x`
+  (ssa_ownership.fold): after `(a * b) | 0` only the conversion is left.
 - **`add.i32` and `sub.i32` in place.** When the result takes the first operand's register
   the operation runs there, two instructions where there were four. The exit state reads
   the operand, so the overflow jump goes to a short piece after the blocks that undoes the

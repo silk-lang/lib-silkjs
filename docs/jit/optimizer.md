@@ -452,6 +452,14 @@ the two guards are what is left.
   `set_loc` whose value stays on the stack, and the store's retain, the release of the old
   value and the local's loop parameter all go. The pass runs on the function's own code and
   on each inlined body. An exit names undefined for such a local, which nothing reads.
+  The same holds across a loop's back edge: a local the loop writes before it reads it is
+  dead at the header, so the latch lets its value go and passes undefined
+  (`Translator.destination`, for locals some instruction between the header and the jump
+  writes: `Liveness.kill`). The loop then has no parameter for the temporary, and no turn
+  boxes it for the next. A dead local the loop never writes stays as it is: it is one
+  value on every turn, and a release in the latch would be all that makes the loop carry
+  it. NavierStokes' `advect` carried `x`, `y`, `i0` and `i1` boxed through frame slots:
+  279M instructions at scale 20 where it ran 430M.
   Two other uses of the same liveness measured no gain on DeltaBlue: releasing a local where
   it dies (the release only moves), and taking the local's count at its last `get_loc` (on
   a path that reads it last, while another path keeps it, the merge gets a new parameter
