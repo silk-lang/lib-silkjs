@@ -1133,12 +1133,83 @@ unsafe fn prependStoredShort(machine: &mut Machine, width: usize) -> bool {
 /// Frees addStoredShort's piece, whose last reference the operand stack held.
 @inlineNever
 unsafe fn releasedPiece(piece: ValueBits) -> bool { releaseString(piece) return true }
+/// Whether the instruction right after OP_add stores to a local, arg, or scope0
+/// slot that addStored or storedSlotHolds can mutate in place.
+@inlineAlways
+unsafe fn hasTextStoreTarget(ip: *const u8) -> bool {
+  let next = unsafe Pointer.read<u8>(ip)
+  return (next >= op.OP_put_loc0 && next <= op.OP_put_loc3)
+    || next == op.OP_put_loc8 || next == op.OP_set_loc8
+    || next == op.OP_put_loc || next == op.OP_set_loc
+    || next == op.OP_put_loc_check || next == op.OP_set_loc_check
+    || next == op.OP_put_arg || next == op.OP_set_arg
+    || next == op.OP_put_scope0 || next == op.OP_set_scope0 || next == op.OP_put_scope0_check
+}
+/// Out-of-line in-place append/prepend/growable path for `s = s + piece` and
+/// `s = piece + s` when the instruction after OP_add writes a local/arg/scope0:
+/// keeps addTextEntry compact (~2KB vs 12KB) for ordinary non-stored concats.
+@inlineNever
+unsafe effect fn addTextStored(machine: &mut Machine, left: ValueBits, right: ValueBits) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if right.tag() == -7 && left.tag() == -7 {
+    if run unsafe addStored(&mut machine, left, right) { return true }
+  }
+  if left.isString() && right.isString() {
+    if unsafe storedSlotHolds(&machine, left) {
+      // The common short Latin-1 piece onto a buffer with room: no reference juggling.
+      if Strings.appendShortLatin1(left, right, 2) {
+        releaseString(right)
+        unsafe machine.discard(1)
+        return true
+      }
+      if run Strings.appendInPlaceShared(left, right) {
+        releaseString(right)
+        unsafe machine.discard(1)
+        return true
+      }
+      // The local still holds left; the store that follows replaces it.
+      match run Strings.joinGrowable(left, right, 2) {
+        Option<ValueBits>.Some { value } => {
+          releaseString(left) releaseString(right)
+          unsafe machine.set(2, value) unsafe machine.discard(1)
+          return true
+        }
+        Option<ValueBits>.None => ()
+      }
+    }
+  }
+  // `s = piece + s` into a flat s the local alone holds: grow its buffer at the
+  // front, or move it once into a buffer with room.
+  if right.tag() == -7 && left.tag() == -7 && Strings.heldTwice(right) && unsafe storedSlotHolds(&machine, right) {
+    if run Strings.prependShortLatin1(right, left, 2) {
+      releaseString(left)
+      unsafe machine.set(2, right) unsafe machine.discard(1)
+      return true
+    }
+    match run Strings.joinGrowableFront(left, right, 2) {
+      Option<ValueBits>.Some { value } => {
+        releaseString(left) releaseString(right)
+        unsafe machine.set(2, value) unsafe machine.discard(1)
+        return true
+      }
+      Option<ValueBits>.None => ()
+    }
+  }
+  // `s = piece + s` into the local s came from: grow the rope s already is.
+  if right.tag() == -6 && left.tag() == -7 && unsafe storedSlotHolds(&machine, right) {
+    if run Strings.prependInPlaceShared(right, left) {
+      releaseString(left)
+      unsafe machine.set(2, right) unsafe machine.discard(1)
+      return true
+    }
+  }
+  return false
+}
 /// OP_add's own entry to addText, when either operand is a string.
 @inlineNever
 pub unsafe effect fn addTextEntry(machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let right = unsafe machine.top(1)
+  let left = unsafe machine.top(2)
   if right.tag() == -7 {
-    let left = unsafe machine.top(2)
     if left.tag() == -7 {
       // `left + right + atom` joinCache hit: avoids addStored/addText/addThree,
       // storedAtomValue retain/release, and full releaseString calls.
@@ -1156,8 +1227,6 @@ pub unsafe effect fn addTextEntry(machine: &mut Machine) -> bool ! OutOfMemoryEr
           }
         }
       }
-      // `s = piece + s` or `s = s + piece`, written into s, storing s itself.
-      if run unsafe addStored(&mut machine, left, right) { return true }
     }
     // `n + ''` with an Int n: the number's text, before addText's string checks.
     match left {
@@ -1165,7 +1234,7 @@ pub unsafe effect fn addTextEntry(machine: &mut Machine) -> bool ! OutOfMemoryEr
       _ => ()
     }
   }
-  if !(unsafe machine.top(2)).isString() && !right.isString() { return false }
+  if !left.isString() && !right.isString() { return false }
   return run unsafe addText(&mut machine)
 }
 /// `s = piece + s` or `s = s + piece` with a plain put_loc or put_arg of s next,
@@ -1242,64 +1311,16 @@ pub unsafe effect fn intTextTop(machine: &Machine) -> bool ? &mut Allocator {
 @inlineAlways
 unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let left = unsafe machine.top(2) let right = unsafe machine.top(1)
+  if !left.isString() || !right.isString() { return run unsafe addNumberText(&mut machine) }
   // `a + b + 'c'`: when the next two instructions add a string literal, build
   // the whole result at once. All three are strings, so no conversion runs.
-  if unsafe machine.peekU8(0) == op.OP_push_atom_value && unsafe machine.peekU8(5) == op.OP_add
-    && left.isString() && right.isString() {
+  if unsafe machine.peekU8(0) == op.OP_push_atom_value && unsafe machine.peekU8(5) == op.OP_add {
     if run unsafe addThree(&mut machine, left, right) { return true }
   }
-  // `s = s + piece` / `s += piece` into the local s came from: the store replaces
-  // the local's reference, so append in place when no one else holds s.
-  if left.isString() && right.isString() {
-    if unsafe storedSlotHolds(&machine, left) {
-      // The common short Latin-1 piece onto a buffer with room: no reference juggling.
-      if Strings.appendShortLatin1(left, right, 2) {
-        releaseString(right)
-        unsafe machine.discard(1)
-        return true
-      }
-      if run Strings.appendInPlaceShared(left, right) {
-        releaseString(right)
-        unsafe machine.discard(1)
-        return true
-      }
-      // The local still holds left; the store that follows replaces it.
-      match run Strings.joinGrowable(left, right, 2) {
-        Option<ValueBits>.Some { value } => {
-          releaseString(left) releaseString(right)
-          unsafe machine.set(2, value) unsafe machine.discard(1)
-          return true
-        }
-        Option<ValueBits>.None => ()
-      }
-    }
+  // `s = s + piece` / `s = piece + s` into a local/arg/scope0 slot.
+  if unsafe hasTextStoreTarget(machine.ip) {
+    if run unsafe addTextStored(&mut machine, left, right) { return true }
   }
-  // `s = piece + s` into a flat s the local alone holds: grow its buffer at the
-  // front, or move it once into a buffer with room.
-  if right.tag() == -7 && left.tag() == -7 && Strings.heldTwice(right) && unsafe storedSlotHolds(&machine, right) {
-    if run Strings.prependShortLatin1(right, left, 2) {
-      releaseString(left)
-      unsafe machine.set(2, right) unsafe machine.discard(1)
-      return true
-    }
-    match run Strings.joinGrowableFront(left, right, 2) {
-      Option<ValueBits>.Some { value } => {
-        releaseString(left) releaseString(right)
-        unsafe machine.set(2, value) unsafe machine.discard(1)
-        return true
-      }
-      Option<ValueBits>.None => ()
-    }
-  }
-  // `s = piece + s` into the local s came from: grow the rope s already is.
-  if right.tag() == -6 && left.tag() == -7 && unsafe storedSlotHolds(&machine, right) {
-    if run Strings.prependInPlaceShared(right, left) {
-      releaseString(left)
-      unsafe machine.set(2, right) unsafe machine.discard(1)
-      return true
-    }
-  }
-  if !left.isString() || !right.isString() { return run unsafe addNumberText(&mut machine) }
   let joined = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(Strings.concatOwned(left, right), failedText)
   match move joined {
     ValueBits value => {
