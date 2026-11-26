@@ -1003,11 +1003,15 @@ pub effect fn quickExec<
   test: bool,
 ) -> Option<ValueBits>
   ? &mut Allocator {
-  if !receiver.isObject() || input.tag() != -7 {
+  if input.tag() != -7 {
     return Option<ValueBits>.none()
   }
+  let receiverCell = match receiver {
+    ValueBits.Object { reference } => reference
+    _ => { return Option<ValueBits>.none() }
+  }
   let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, receiverCell)
   if object.classId() != classes.JS_CLASS_REGEXP {
     return Option<ValueBits>.none()
   }
@@ -1026,11 +1030,15 @@ pub effect fn quickExec<
   let shapePtr = object.shape
   drop object
   let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
-  let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
-  drop flat
+  let codeSlice = flat.latin1.asSlice()
+  let flags = u16.toU32(readU16(codeSlice, 0))
+  let count = u8.toUsize(codeSlice[2])
   if !test && (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 {
     return Option<ValueBits>.none()
   }
+  let inputFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
+  let narrow = !inputFlat.wide
+  let inputLen = inputFlat.length()
   let updatesIndex = (flags & (FLAG_GLOBAL | FLAG_STICKY)) != 0
   let mut lastIndex: usize = 0
   if updatesIndex {
@@ -1043,8 +1051,10 @@ pub effect fn quickExec<
     if stored > 0 {
       lastIndex = i32.wrappingToUsize(stored)
     }
-    if lastIndex > Strings.length(input) {
-      unsafe quickLastIndex(receiver, 0)
+    if lastIndex > inputLen {
+      drop inputFlat
+      drop flat
+      unsafe quickLastIndexCell(receiverCell, 0)
       if test {
         return Option<ValueBits>.some(ValueBits.Bool { value: false })
       }
@@ -1056,18 +1066,45 @@ pub effect fn quickExec<
   // The match goes straight into the realm's last match.
   let mut place = ()
   let captures = unsafe lastCaptures(realm, &mut place)
-  let quick = run answer(
-    &mut hooks,
-    memory,
-    realm,
-    code,
-    flags,
-    input,
-    lastIndex,
-    test,
-    ValueBits.Undefined,
-    &mut captures,
-  )
+  let quick = if narrow {
+    let inputBytes = Slice.view(unsafe latin1Bytes(&anchor, stringReference(input)), 0, inputLen)
+    let answered = run answerLatin1(
+      &mut hooks,
+      memory,
+      realm,
+      code,
+      codeSlice,
+      count,
+      flags,
+      input,
+      inputBytes,
+      inputLen,
+      lastIndex,
+      test,
+      ValueBits.Undefined,
+      &mut captures,
+    )
+    drop inputFlat
+    drop flat
+    answered
+  } else {
+    drop inputFlat
+    drop flat
+    run answerWide(
+      &mut hooks,
+      memory,
+      realm,
+      code,
+      count,
+      flags,
+      input,
+      inputLen,
+      lastIndex,
+      test,
+      ValueBits.Undefined,
+      &mut captures,
+    )
+  }
   if updatesIndex {
     if let Option<ValueBits>.Some { value } = quick {
       let matched = match value {
@@ -1076,9 +1113,9 @@ pub effect fn quickExec<
         _ => true
       }
       if matched {
-        unsafe quickLastIndex(receiver, captures.get(1))
+        unsafe quickLastIndexCell(receiverCell, captures.get(1))
       } else {
-        unsafe quickLastIndex(receiver, 0)
+        unsafe quickLastIndexCell(receiverCell, 0)
       }
     }
   }
@@ -1108,22 +1145,63 @@ pub effect fn literalExec<
   }
   let anchor = ()
   let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
-  let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
-  drop flat
+  let codeSlice = flat.latin1.asSlice()
+  let flags = u16.toU32(readU16(codeSlice, 0))
+  let count = u8.toUsize(codeSlice[2])
   if !test && (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 {
     return Option<ValueBits>.none()
   }
+  let inputFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
+  let narrow = !inputFlat.wide
+  let inputLen = inputFlat.length()
 
   // The match goes straight into the realm's last match.
   let mut place = ()
   let captures = unsafe lastCaptures(realm, &mut place)
-  return run answer(&mut hooks, memory, realm, code, flags, input, 0, test, previous, &mut captures)
+  if narrow {
+    let inputBytes = Slice.view(unsafe latin1Bytes(&anchor, stringReference(input)), 0, inputLen)
+    let answered = run answerLatin1(
+      &mut hooks,
+      memory,
+      realm,
+      code,
+      codeSlice,
+      count,
+      flags,
+      input,
+      inputBytes,
+      inputLen,
+      0,
+      test,
+      previous,
+      &mut captures,
+    )
+    drop inputFlat
+    drop flat
+    return move answered
+  }
+  drop inputFlat
+  drop flat
+  return run answerWide(
+    &mut hooks,
+    memory,
+    realm,
+    code,
+    count,
+    flags,
+    input,
+    inputLen,
+    0,
+    test,
+    previous,
+    &mut captures,
+  )
 }
 
-/// The match and its answer for quickExec and literalExec: Null (false for test)
-/// without a match, else the result array (true); none on a failure.
-@inlineAlways
-effect fn answer<
+/// Cold UTF-16 match and answer path for quickExec and literalExec, outlined so
+/// the Latin-1 hot paths do not inline literalInto16 or match16.
+@inlineNever
+effect fn answerWide<
   'a,
   H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks
 >(
@@ -1131,8 +1209,10 @@ effect fn answer<
   memory: &AllocationObserver,
   realm: Realm<'a>,
   code: ValueBits,
+  count: usize,
   flags: u32,
   input: ValueBits,
+  inputLen: usize,
   lastIndex: usize,
   test: bool,
   previous: ValueBits,
@@ -1141,38 +1221,21 @@ effect fn answer<
   ? &mut Allocator {
   let anchor = ()
   let codeFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
-  let count = u8.toUsize(codeFlat.latin1.asSlice()[2])
   let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
-  let narrow = !text.wide
-  let inputLen = text.length()
-  let mut inputBytes = Slice.view(codeFlat.latin1.asSlice(), 0, 0)
-  if narrow {
-    inputBytes = unsafe latin1Bytes(&anchor, stringReference(input))
-  }
-
-  // A pattern that is one literal is a substring search: no matcher entry.
   let mut literal = LITERAL_NONE
   if (flags & FLAG_HINT) != 0 {
-    if !narrow {
-      literal = RegExpExecutor.literalInto16(
-        codeFlat.latin1.asSlice(),
-        Slice.view(text.wideUnits(), 0, inputLen),
-        lastIndex,
-        &mut captures,
-      )
-    } else {
-      literal = RegExpExecutor.literalInto8(
-        codeFlat.latin1.asSlice(),
-        Slice.view(inputBytes, 0, inputLen),
-        lastIndex,
-        &mut captures,
-      )
-    }
+    literal = RegExpExecutor.literalInto16(
+      codeFlat.latin1.asSlice(),
+      Slice.view(text.wideUnits(), 0, inputLen),
+      lastIndex,
+      &mut captures,
+    )
   }
   let mut matched = literal == LITERAL_HIT
   if literal == LITERAL_NONE {
+    let empty = Slice.view(codeFlat.latin1.asSlice(), 0, 0)
     let attempted = run Effect.result(
-      executeInto(&mut hooks, realm, &codeFlat, &text, inputBytes, lastIndex, &mut captures),
+      executeInto(&mut hooks, realm, &codeFlat, &text, empty, lastIndex, &mut captures),
     )
     matched = match move attempted {
       Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success {
@@ -1192,6 +1255,70 @@ effect fn answer<
     return Option<ValueBits>.some(ValueBits.Null)
   }
   recordSubject(&mut hooks, realm, input)
+  if test {
+    return Option<ValueBits>.some(ValueBits.Bool { value: true })
+  }
+  if previous.isObject()
+    && run unsafe refillResult(&mut hooks, realm, previous, input, code, &captures) {
+    return Option<ValueBits>.some(unsafe previous.retained())
+  }
+  return run buildPlainResult(&mut hooks, memory, realm, input, count, false, inputLen, &captures)
+}
+
+/// Latin-1 match and answer for quickExec and literalExec: Null (false for test)
+/// without a match, else the result array (true); none on a failure.
+@inlineAlways
+effect fn answerLatin1<
+  'a,
+  H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks
+>(
+  hooks: &mut H,
+  memory: &AllocationObserver,
+  realm: Realm<'a>,
+  code: ValueBits,
+  codeSlice: &[u8],
+  count: usize,
+  flags: u32,
+  input: ValueBits,
+  inputBytes: &[u8],
+  inputLen: usize,
+  lastIndex: usize,
+  test: bool,
+  previous: ValueBits,
+  captures: &mut Captures,
+) -> Option<ValueBits>
+  ? &mut Allocator {
+  // A pattern that is one literal is a substring search: no matcher entry.
+  let mut literal = LITERAL_NONE
+  if (flags & FLAG_HINT) != 0 {
+    literal = RegExpExecutor.literalInto8(
+      codeSlice,
+      inputBytes,
+      lastIndex,
+      &mut captures,
+    )
+  }
+  let mut matched = literal == LITERAL_HIT
+  if literal == LITERAL_NONE {
+    let attempted = run Effect.result(
+      narrowInto(&mut hooks, realm, codeSlice, inputBytes, lastIndex, &mut captures),
+    )
+    matched = match move attempted {
+      Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success {
+        value
+      } => value
+      Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { .. } => {
+        return Option<ValueBits>.none()
+      }
+    }
+  }
+  if !matched {
+    if test {
+      return Option<ValueBits>.some(ValueBits.Bool { value: false })
+    }
+    return Option<ValueBits>.some(ValueBits.Null)
+  }
+  recordSubject(&mut hooks, realm, input)
 
   // test (with exec the builtin, see the VM's caller) needs no result array.
   if test {
@@ -1201,7 +1328,7 @@ effect fn answer<
     && run unsafe refillResult(&mut hooks, realm, previous, input, code, &captures) {
     return Option<ValueBits>.some(unsafe previous.retained())
   }
-  return run buildPlainResult(&mut hooks, memory, realm, input, count, narrow, inputLen, &captures)
+  return run buildPlainResult(&mut hooks, memory, realm, input, count, true, inputLen, &captures)
 }
 
 /// Cold fallback for buildPlainResult when regexpResultFast declines (count > 12
@@ -1618,10 +1745,11 @@ fn sameWide(old: ValueBits, input: ValueBits, start: usize, count: usize) -> boo
 }
 
 /// Stores an Int lastIndex into a slot quickExec found Int and writable.
-unsafe fn quickLastIndex(receiver: ValueBits, index: i32) -> () {
+@inlineAlways
+unsafe fn quickLastIndexCell(cell: *mut HeapHeader, index: i32) -> () {
   let mut anchor = ()
-  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(receiver))
-  object.setSlot(0, SlotBits.value(ValueBits.Int { value: index }))
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, cell)
+  unsafe object.setSlotUnchecked(0, SlotBits.value(ValueBits.Int { value: index }))
 }
 
 // RegExp's legacy statics (RegExp.$1-$9, input, lastMatch, lastParen,
