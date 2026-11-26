@@ -32,6 +32,16 @@
 //! once in front of it instead of on every turn, and the latch is left a bare jump, which
 //! the backend's branch jumps through (x64_backend.through).
 //!
+//! A loop that only fills an Array (`while (--i >= 0) r[i] = 0`, a copy) stores to every
+//! index from its first to its last and cannot leave on the way (`fills`). Past the end of
+//! the Array each of those stores would leave, or step in the interpreter when the site is
+//! compiled by key; from the top down the first of them also leaves a gap, which costs the
+//! Array its fast kind. For such a loop the front block grows the Array instead
+//! (`grow.bound`, in place of the `check.bound` of the far end): to the greatest index plus
+//! one, the new elements undefined until the loop stores them, when the least index is at
+//! most the count and the Array may be appended to. The poll comes before it and the
+//! `elements` after it, as growing moves them.
+//!
 //! The new guards exit at the loop's header, as the entry edge carries the state there. A
 //! `check.bound` that fails is remembered apart (ssa.SITE_BOUND): the next compile proves
 //! nothing in that loop and keeps its trust. A loop that left at its header before, or
@@ -134,6 +144,75 @@ effect fn plus(f: &mut Function, front: &mut Front, v: u32, k: i64) -> u32 ! Out
   if k == 0 { return v }
   let c = run number(&mut f, &mut front, k)
   return run guarded(&mut f, &mut front, Op.Add, v, c)
+}
+
+/// Operations that read nothing but their operands, change nothing and cannot leave (when
+/// they carry no exit).
+fn pure(op: Op) -> bool {
+  return op == Op.ConstI32 || op == Op.Imm || op == Op.ConstF64 || op == Op.BoxI32 || op == Op.BoxBool || op == Op.BoxF64 || op == Op.ToF64
+    || op == Op.Cmp || op == Op.CmpF64 || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr
+    || op == Op.BitNot || op == Op.NotBool || op == Op.Retain || op == Op.Release || op == Op.Jump || op == Op.Branch || op == Op.InlineFrame
+    || op == Op.Removed
+}
+
+/// Whether the loop fills reach `r` of its Array: once entered it stores to every index
+/// from the reach's first to its last, and nothing can tell how far it has come. Then the
+/// front block may grow the Array to take them all (`grow.bound`), where each store past
+/// the end would otherwise leave. That asks:
+///
+/// - one index a turn, each next to the last (one constant, a step of 1 or -1), and no
+///   other reach of the same Array;
+/// - a store of the reach in a block that dominates the test's (it runs in every turn the
+///   header does), and the test the one way out of the loop, so the turns are exactly
+///   the trip bound's;
+/// - nothing in the loop that leaves or runs anything: the element accesses and adds this
+///   pass proves (`counter` is the counter's own add, or NONE), the loop's `poll`, which
+///   moves in front, and operations on their operands alone. Whatever reads the Array
+///   reads it through a reach of another value, proved against the count from before.
+fn fills(f: &Function, idom: &List<u32>, member: &List<u32>, serial: u32, h: u32, latch: u32, tester: u32, poll: u32, counter: u32,
+  reaches: &List<Reach>, steps: &List<Step>, r: usize) -> bool {
+  let reach = reaches.get(r)
+  let by = steps.get(reach.step).by
+  if reach.low != reach.high || (by != 1 && by != 0 - 1) { return false }
+  let mut q: usize = 0
+  while q < reaches.length() { if q != r && reaches.get(q).object == reach.object { return false } q = q + 1 }
+  let mut every = false
+  let mut b = h
+  while b <= latch {
+    if member.get(u32.toUsize(b)) == serial {
+      let block = f.blocks.get(u32.toUsize(b))
+      let mut i = block.firstInst
+      while i < block.firstInst + block.instCount {
+        let inst = f.inst(i)
+        if inst.block == b {
+          if inst.op == Op.PutElem || inst.op == Op.GetElem {
+            if !inst.trusted || inst.proven || (inst.op == Op.GetElem && inst.k != 0) { return false }
+            let object = copied(f, inst.a)
+            if within(reaches, steps, object, affine(f, h, indexOf(inst))) == usize.MAX { return false }
+            if object == reach.object {
+              if inst.op != Op.PutElem { return false }
+              if dominates(idom, b, tester) { every = true }
+            }
+          } else if inst.op == Op.Add || inst.op == Op.Sub {
+            if inst.exit != NONE && !inst.proven && i != counter
+              && (inst.result == NONE || within(reaches, steps, NONE, affine(f, h, inst.result)) == usize.MAX) { return false }
+          } else if inst.op == Op.Poll {
+            if i != poll { return false }
+          } else if !pure(inst.op) || inst.exit != NONE { return false }
+          if b != tester {
+            let mut e: u32 = 0
+            while e < edgeCount(inst.op) {
+              if member.get(u32.toUsize(f.edge(inst.edge + e).target)) != serial { return false }
+              e = e + 1
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    b = b + 1
+  }
+  return every
 }
 
 /// Proves what the module comment says in every loop of a compacted function. Answers
@@ -322,6 +401,18 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
         i = i + 1
       }
     }
+    // The reach the front block grows its Array for, if the loop fills one.
+    let toward = steps.get(counter).by
+    let own = defOp(&f.*, compare.a)
+    let mut counterAdd = NONE
+    if tested.offset == toward && (own == Op.Add || (down && own == Op.Sub)) { counterAdd = f.value(compare.a).def }
+    let mut grown = usize.MAX
+    let mut candidate: usize = 0
+    while candidate < reaches.length() && grown == usize.MAX {
+      if fills(&f.*, &graph.idom, &member, serial, h, latch, tester, poll, counterAdd, &reaches, &steps, candidate) { grown = candidate }
+      candidate = candidate + 1
+    }
+    f.work = f.work + usize.toU64(reaches.length()) * u32.toU64(f.blocks.get(u32.toUsize(latch)).firstInst + f.blocks.get(u32.toUsize(latch)).instCount - f.blocks.get(u32.toUsize(h)).firstInst)
     let pc = f.inst(header.firstInst).pc
     let frontBlock = run split(&mut f, entry, h)
     let mut front = Front { block: frontBlock, order: 2, exit: NONE, pc: pc }
@@ -336,15 +427,15 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
     let turns = run plus(&mut f, &mut front, span, trip)
     // The counter's own add: at most start + 1, or limit + 1 (limit under `<`). Going down,
     // its sub: at least start - 1, or limit - 1 (limit under `>`).
-    let toward = steps.get(counter).by
-    let own = defOp(&f.*, compare.a)
-    if tested.offset == toward && (own == Op.Add || (down && own == Op.Sub)) {
+    if counterAdd != NONE {
       drop run plus(&mut f, &mut front, begin, toward)
       if !strict { drop run plus(&mut f, &mut front, limit, toward) }
-      let at = f.value(compare.a).def
-      let mut add = f.inst(at) add.proven = true f.setInst(at, add)
+      let mut add = f.inst(counterAdd) add.proven = true f.setInst(counterAdd, add)
     }
     let mut boundExit = NONE
+    // The two ends of the reach that grows its Array.
+    let mut growFirst = NONE
+    let mut growLast = NONE
     let mut r: usize = 0
     while r < reaches.length() {
       let reach = reaches.get(r)
@@ -372,6 +463,7 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
       // to last (down to it, for a step that goes down). A negative index is no index
       // below a count.
       let mut which: u32 = 0
+      if r == grown { growFirst = low growLast = last which = 3 }
       while which < 3 {
         let mut index = low
         if which == 1 { index = high }
@@ -385,6 +477,23 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
         which = which + 1
       }
       r = r + 1
+    }
+    if grown != usize.MAX {
+      // The loop's poll first, then the Array grown as the last thing that can leave: past
+      // it the loop runs to its end. Its first end too is then below the count.
+      drop run f.emit(front.block, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, pc)
+      let ahead = place(&mut f, &mut front.order)
+      drop run entryExit(&mut f, ahead, state, &entryArgs)
+      let mut top = growLast
+      let mut bottom = growFirst
+      if steps.get(reaches.get(grown).step).by < 0 { top = growFirst bottom = growLast }
+      drop run f.emit(front.block, Op.GrowBound, false, Type.I32, Own.Unboxed, reaches.get(grown).object, top, u32.wrappingToI32(bottom), pc)
+      let grow = place(&mut f, &mut front.order)
+      if boundExit == NONE { boundExit = run entryExit(&mut f, grow, state, &entryArgs) }
+      else { let mut made = f.inst(grow) made.exit = boundExit f.setInst(grow, made) }
+      drop run f.emit(front.block, Op.CheckBound, false, Type.I32, Own.Unboxed, reaches.get(grown).object, bottom, 0, pc)
+      let check = place(&mut f, &mut front.order)
+      let mut made = f.inst(check) made.exit = boundExit f.setInst(check, made)
     }
     // Where each checked Array's elements are, which stay there while its count does.
     held.clear()
@@ -432,9 +541,11 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
     }
     // The loop's poll, once in front of it: its turns are counted and none of them calls,
     // so it ends before long without one.
-    drop run f.emit(front.block, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, pc)
-    let ahead = place(&mut f, &mut front.order)
-    drop run entryExit(&mut f, ahead, state, &entryArgs)
+    if grown == usize.MAX {
+      drop run f.emit(front.block, Op.Poll, false, Type.I32, Own.Unboxed, NONE, NONE, 0, pc)
+      let ahead = place(&mut f, &mut front.order)
+      drop run entryExit(&mut f, ahead, state, &entryArgs)
+    }
     let mut turn = f.inst(poll) turn.op = Op.Removed f.setInst(poll, turn)
     changed = true
   }

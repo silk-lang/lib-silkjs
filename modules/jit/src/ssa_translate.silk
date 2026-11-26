@@ -22,7 +22,7 @@ import silk.num.u64
 import silk.num.usize
 import silkjs.js_opcode_data as op
 import silkjs.js_atom_data as atoms
-import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, KnownShapes, NONE, ELEM_STEP, ELEM_TRY, ELEM_STEPS, ELEM_ARGUMENTS, LENGTH_ARGUMENTS, FIELD_STEPS, TARGET_KNOWN_FN }
+import ssa { Function, Type, Own, RootKind, Op, Cmp, Imm, SlotMode, InlineMiss, KnownShapes, NONE, ELEM_STEP, ELEM_TRY, ELEM_STEPS, ELEM_ARGUMENTS, LENGTH_ARGUMENTS, FIELD_STEPS, TARGET_KNOWN_FN, SITE_ARRAY, SITE_BOUND }
 import ssa_calls as calls
 import silkjs.js_compiled as compiled
 import silkjs.js_compiled_objects as objects
@@ -48,6 +48,9 @@ pub struct FunctionInput {
   /// Bytecode offsets of arithmetic and comparison sites to compile as numbers (f64) rather
   /// than int32: sites that deoptimized in an earlier compilation of the same code.
   pub doubleSites: List<u32>,
+  /// How many of doubleSites, at its end, baseline code noted (jit_runtime.missedSites); the
+  /// ones before them are where optimized code left.
+  pub notedSites: usize,
   /// Some local is captured by a closure (VarDef.isCaptured): a callee could read or write
   /// its frame cell, so on-stack-replacement code that holds it must not make calls.
   pub capturedLocals: bool,
@@ -1059,6 +1062,20 @@ effect fn livenessOf(input: &FunctionInput) -> Liveness ! OutOfMemoryError ? &mu
   return move out
 }
 
+/// Whether baseline code noted a field store of `callee` (a setter, or a store that keeps
+/// turning between adding its property and finding it: jit_runtime.calleeDoubleSites).
+fn storeNoted(callee: &FunctionInput) -> bool {
+  let mut i: usize = 0
+  while i < callee.doubleSites.length() {
+    let pc = u32.toUsize(callee.doubleSites.get(i))
+    if pc < callee.code.length() {
+      let o = byteAt(callee, pc)
+      if o == op.OP_put_field || o == op.OP_put_loc_field_loc8 || o == op.OP_put_loc_field_arg8 { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
 /// Whether the field store at pc holds an add key (FieldLayout.addKey in its upper half):
 /// its last run added the property.
 fn addSite(input: &FunctionInput, pc: u32, addKey: u32) -> bool {
@@ -1793,6 +1810,61 @@ impl Translator {
     let mut i: usize = 0
     while i < self.doubleSites.length() { if self.doubleSites.get(i) == pc { return true } i = i + 1 }
     return false
+  }
+  /// Whether the store at `pc` of `input`, at the index `index`, stays an element store
+  /// though baseline code noted that it missed there: the loop around it may be a fill that
+  /// grows the Array in front (ssa_opt_bounds, grow.bound), where a store by key would step
+  /// for every element past the end. So when optimized code has not left at the store, the
+  /// index is a local as it stands (an index made by an addition leaves a gap below it), and
+  /// the innermost loop around the store has no other element store, no call, no field store
+  /// and no loop of its own, and none of its checks in front failed before (ssa.SITE_ARRAY,
+  /// ssa.SITE_BOUND). A loop that is no fill after all leaves at the store once, and the next
+  /// compile stores by key.
+  fn fillStore(self: &Self, input: &FunctionInput, pc: u32, index: u32) -> bool {
+    let sites = &self.doubleSites
+    if input.notedSites > sites.length() { return false }
+    let mut s: usize = 0
+    while s < sites.length() - input.notedSites { if sites.get(s) == pc { return false } s = s + 1 }
+    let mut local = index
+    let made = self.f.value(index).def
+    if made != NONE && self.f.inst(made).op == Op.Retain { local = self.f.inst(made).a }
+    let mut held = false
+    let mut l: usize = 0
+    while l < self.locals.length() { if self.locals.get(l) == local { held = true } l = l + 1 }
+    if !held { return false }
+    // The innermost loop around the store: the shortest backward jump over it.
+    let length = input.code.length()
+    let mut start = usize.MAX
+    let mut end: usize = 0
+    let mut at: usize = 0
+    while at < length {
+      let opcode = byteAt(input, at)
+      let size = sizeAt(input, at)
+      if size == 0 || at + size > length { return false }
+      if (isBranch(opcode) || isGoto(opcode)) && at >= u32.toUsize(pc) {
+        let target = targetOf(input, at)
+        if target >= 0 && target <= u32.toI64(pc) && (start == usize.MAX || at - i64.toUsize(target) < end - start) { start = i64.toUsize(target) end = at }
+      }
+      at = at + size
+    }
+    if start == usize.MAX { return false }
+    at = start
+    while at <= end {
+      let opcode = byteAt(input, at)
+      if at != u32.toUsize(pc) && opcode == op.OP_put_array_el { return false }
+      if callOpcode(opcode) || genericOpcode(opcode) || isReturn(opcode) || !supported(opcode)
+        || opcode == op.OP_put_field || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 { return false }
+      if at != end && (isBranch(opcode) || isGoto(opcode)) && targetOf(input, at) <= usize.toI64(at) { return false }
+      at = at + sizeAt(input, at)
+    }
+    s = 0
+    while s < sites.length() {
+      let site = sites.get(s)
+      let where = u32.bitAnd(site, u32.bitXor(u32.bitOr(SITE_ARRAY, SITE_BOUND), u32.MAX))
+      if site != where && u32.toUsize(where) >= start && u32.toUsize(where) <= end { return false }
+      s = s + 1
+    }
+    return true
   }
   /// Whether the instruction at `pc` left code that had it widened too (named twice in the
   /// sites, jit_runtime.LEFT_AGAIN): arithmetic there is the engine's, a step on the frame.
@@ -3077,6 +3149,10 @@ impl Translator {
         if !callee.normal || callee.closureVars != 0 || callee.scopeSlots != 0 { return usize.MAX }
         self.missed = b"the target is too long"
         if callee.code.length() == 0 || callee.code.length() > MAX_INLINE_BYTES { return usize.MAX }
+        // An inlined store tests the one shape its site last met and leaves on another:
+        // the call is made, and the target's own code stores the general way.
+        self.missed = b"a field store of the target is noted"
+        if storeNoted(callee) { return usize.MAX }
         if !self.affords(input, pc, callee, count) { return usize.MAX }
         return t
       }
@@ -3699,10 +3775,11 @@ impl Translator {
       let i = self.top(2)
       let o = self.top(3)
       if self.f.value(o).ty != Type.Value { fail refuse(at, opcode, b"an element of an unboxed number") }
-      if self.leaves && self.exits && self.depth == 0 && (self.f.elementKindAt(at) == u8.toU32(feedback.ELEMENT_ORDINARY) || self.widened(at)) {
+      if self.leaves && self.exits && self.depth == 0 && (self.f.elementKindAt(at) == u8.toU32(feedback.ELEMENT_ORDINARY) || (self.widened(at) && !self.fillStore(input, at, i))) {
         // A key that is not an index (this[kState] = v), as baseline code met at the site, or
         // a store that made the code leave there before (past the end, another kind of
-        // object): stored by key, with a step behind it.
+        // object): stored by key, with a step behind it. Not the one store of a loop that
+        // may fill its Array, which baseline code noted past the end (fillStore).
         if self.stepped(at) { return run self.generic(input, pc) }
         let key = run self.boxed(i, at)
         let bits = run self.boxed(v, at)

@@ -223,6 +223,43 @@ turn: the realm, the countdown, a branch) is therefore taken once in the front b
 an exit of its own at the header, and the latch is left a bare jump. A loop inside a
 counted loop keeps its own poll unless it is counted too.
 
+## A fill grows its Array in front
+
+`nbi()` gives Crypto's big numbers a fresh Array, and `multiplyTo`, `squareTo` and `copyTo`
+fill it from the top down (`while (--i >= 0) r[i] = 0`). The first store is past the end
+with a gap below it, which ends the Array's fast kind: every store of the loop was then a
+step in the interpreter on a slow Array (3,180 instructions each, 155,000 a run at scale
+20), and the last one made it fast again.
+
+A counted loop that only fills (`ssa_opt_bounds.fills`) stores to every index from its
+first to its last once it is entered: one reach of the Array, by a step of 1 or -1; a store
+in a block that runs on every turn; the loop's test the one way out; and nothing in the
+loop that can leave or run anything, only the proven accesses and adds, the poll that
+moves in front, and operations on their operands. For such a loop the front block has
+`grow.bound a, high, low` in place of the far end's `check.bound`: where `high` is not
+below the count, the engine grows the Array to `high + 1` elements, the new ones undefined
+(`baseline.ARRAY_GROW`, `js_native_functions.quickGrow`), when `low` is at most the count
+(no index stays without a store), the Array is fast with a writable length, and an append
+may add to it (extensible, no accessor or value for an index on the prototype chain). It
+leaves otherwise, with nothing changed, like a `check.bound` that fails. The undefined
+elements are never seen: the loop cannot leave before it has stored them all, and reads of
+the same Array through another value were proved against the count from before. The
+`elements` of every Array of the loop are loaded after the grow, which moves them.
+
+Baseline code notes the store as one that missed, and a noted store is compiled by key
+(a helper, then a step) from the first compile on. `ssa_translate.fillStore` keeps it an
+element store where the loop may be a fill: optimized code never left at it, its index is a
+local as it stands (`r[i + n]` leaves a gap below, which cannot be grown), and the innermost
+loop around it has no other element store, no call, no field store, no loop inside, and
+no failed check in front. A loop that is no fill after all leaves at the store once and is
+compiled by key next time.
+
+Crypto's slow stores went from 155,081 to 76,441 a run; the rest are `dlShiftTo` and
+`lShiftTo`, whose first loop stores above a gap. `tests/baseline/t93.js` fills from both
+ends, with offsets, two counters, Arrays that are shorter, as long and longer, one Array on
+both sides, loops that are no fill, Arrays that may not grow (sealed, frozen, a fixed
+length, sparse, a prototype's), and setters and values on the prototype chain.
+
 ## Elements in front of the loop
 
 A proven access still loaded the Array from its slot and the elements from the Array, and

@@ -578,6 +578,22 @@ function every six orders.
   to live until its function is optimized, which in a server is often thousands of requests
   later (a first compile waits for method calls not yet run), while every getter the
   runtime's streams read is noted too, hence 4096 entries.
+- **Baseline code says which field stores turn.** A store compiles against what its site's
+  inline key held last: a store to the property where it is tests that one shape and leaves
+  on any other, a store that added the property is compiled general (`addSite`). A site that
+  does both (`r.t = n` on a number that is fresh in one call and used again in the next)
+  left eight times, was unlinked and compiled again, once for each such site: Crypto's
+  `dlShiftTo` compiled four times and `lShiftTo` five. `baselinePutField` now compares what
+  the key named before the store (`js_baseline.fieldSiteKind`) with what the store did, and
+  the second time a site turns from adding to storing or back it is noted
+  (`baseline_env.noteTurn`; the first turn only marks the entry, `MISS_ONCE`, as an object's
+  first store among later ones turns once). A noted store is general from the first compile.
+  A function with a noted field store is not inlined (`storeNoted`): inside a caller the
+  store has only the guarded form, which leaves at the call, and the caller then compiled
+  again without the body. Crypto at scale 20: 70 compiles to 62, 21 unlinks to 13, 20,150
+  SSA instructions translated to 14,892. `tests/baseline/t94.js` turns stores both ways, in
+  callers that would inline them, with setters, fixed properties and objects that may not
+  grow.
 - `put.key` with an Int key stores over an element of a fast Array inline, as `put.elem`
   does, so a widened `a[i] = v` keeps its fast case.
 - **A method read on a string, number or boolean** (`str.slice(...)`, a `get_field2` of a
