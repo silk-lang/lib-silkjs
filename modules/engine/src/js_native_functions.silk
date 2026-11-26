@@ -719,7 +719,7 @@ const NUMBER_IS_SAFE_INTEGER: u32 = 4
 const OBJECT_KEYS: u32 = 9
 const OBJECT_IS: u32 = 16
 const OBJECT_HAS_OWN: u32 = 23
-const OBJECT_HAS_OWN_PROPERTY: u32 = 27
+pub const OBJECT_HAS_OWN_PROPERTY: u32 = 27
 fn answers(id: NativeFunctionId) -> bool {
   return match id {
     NativeFunctionId.Builtin { family, method } => match family {
@@ -737,6 +737,107 @@ fn answers(id: NativeFunctionId) -> bool {
 /// nothing throws, allocates or runs JavaScript. Uninitialized declines (a Proxy
 /// for Array.isArray, or non-ordinary object / non-flat-string key for hasOwn),
 /// leaving the full call.
+@cold
+unsafe fn leanAnswerRareBits(family: BuiltinFamily, method: u32, data: *const ValueBits, count: usize) -> i8 {
+  let anchor = ()
+  let first = if count != 0 { unsafe Pointer.read<ValueBits>(data) } else { ValueBits.Undefined }
+  if family == BuiltinFamily.Number {
+    let number = match first {
+      ValueBits.Int { .. } => { return if method != NUMBER_IS_NAN { 1 } else { 0 } }
+      ValueBits.Float64 { value } => value
+      _ => { return 0 }
+    }
+    if method == NUMBER_IS_NAN { return if f64.isNaN(number) { 1 } else { 0 } }
+    if method == NUMBER_IS_NAN + 1 { return if f64.isFinite(number) { 1 } else { 0 } }
+    if method == NUMBER_IS_NAN + 2 { return if f64.isFinite(number) && f64.floor(number) == number { 1 } else { 0 } }
+    return if primitives.numberIsSafeInteger(number) { 1 } else { 0 }
+  }
+  let node = match first { ValueBits.Object { reference } => reference _ => { return 0 } }
+  let class = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).classId()
+  return if class >= classes.JS_CLASS_UINT8C_ARRAY && class <= classes.JS_CLASS_DATAVIEW { 1 } else { 0 }
+}
+@cold
+unsafe fn leanObjectIsSlow(data: *const ValueBits, count: usize) -> i8 {
+  let first = if count != 0 { unsafe Pointer.read<ValueBits>(data) } else { ValueBits.Undefined }
+  let second = if count > 1 { unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(unsafe Pointer.assumeMany<ValueBits>(data), 1)) } else { ValueBits.Undefined }
+  return if unsafe primitives.equal(first, second, EqualityMode.SameValue) { 1 } else { 0 }
+}
+@cold
+unsafe fn leanHasOwnSlow(runtime: *mut HeapHeader, shape: *mut HeapHeader, keyRef: *mut HeapHeader) -> i8 {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let atom = state.atoms.findString(ValueBits.String { reference: keyRef })
+  drop state
+  if atom == UNKNOWN_STRING_ATOM { return -1 }
+  if atom == 0 { return 0 }
+  return if (unsafe shapes.lookup(shape, atom)).isSome() { 1 } else { 0 }
+}
+/// Fast own-property check for already-unpacked ordinary object and flat-string headers.
+@inlineAlways
+pub unsafe fn leanHasOwnRefs(runtime: *mut HeapHeader, node: *mut HeapHeader, keyRef: *mut HeapHeader) -> i8 {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || data.fastArray() { return -1 }
+  let shape = data.shape
+  drop data
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let atom = state.atoms.findStringInline(keyRef)
+  drop state
+  if atom == UNKNOWN_STRING_ATOM { return unsafe leanHasOwnSlow(runtime, shape, keyRef) }
+  return if (unsafe shapes.lookup(shape, atom)).isSome() { 1 } else { 0 }
+}
+/// Fast own-property check for ordinary objects and flat-string keys.
+@inlineAlways
+pub unsafe fn leanHasOwnFast(runtime: *mut HeapHeader, target: ValueBits, key: ValueBits) -> i8 {
+  let node = match target { ValueBits.Object { reference } => reference _ => { return -1 } }
+  let keyRef = match key { ValueBits.String { reference } => reference _ => { return -1 } }
+  return unsafe leanHasOwnRefs(runtime, node, keyRef)
+}
+/// Frameless boolean answer for a CALL_KIND_ANSWER builtin whose (family, method)
+/// is already known: 1 true, 0 false, -1 decline.
+@inlineAlways
+pub unsafe fn leanAnswerKnown(runtime: *mut HeapHeader, family: BuiltinFamily, method: u32, receiver: ValueBits, data: *const ValueBits, count: usize) -> i8 {
+  let anchor = ()
+  let mut first = ValueBits.Undefined
+  if count != 0 { first = unsafe Pointer.read<ValueBits>(data) }
+  if family == BuiltinFamily.Object {
+    if method == OBJECT_IS {
+      let mut second = ValueBits.Undefined
+      if count > 1 { second = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(unsafe Pointer.assumeMany<ValueBits>(data), 1)) }
+      let t1 = first.tag()
+      let t2 = second.tag()
+      if t1 == t2 {
+        return match first {
+          ValueBits.Object { reference: a } => match second { ValueBits.Object { reference: b } => if Pointer.address<HeapHeader>(a) == Pointer.address<HeapHeader>(b) { 1 } else { 0 } _ => 0 }
+          ValueBits.Int { value: a } => match second { ValueBits.Int { value: b } => if a == b { 1 } else { 0 } _ => 0 }
+          ValueBits.Bool { value: a } => match second { ValueBits.Bool { value: b } => if a == b { 1 } else { 0 } _ => 0 }
+          ValueBits.Undefined => 1
+          ValueBits.Null => 1
+          ValueBits.Symbol { reference: a } => match second { ValueBits.Symbol { reference: b } => if Pointer.address<HeapHeader>(a) == Pointer.address<HeapHeader>(b) { 1 } else { 0 } _ => 0 }
+          _ => unsafe leanObjectIsSlow(data, count)
+        }
+      }
+      if (!first.isNumber() && !first.isString() && !first.isBigInt()) || (!second.isNumber() && !second.isString() && !second.isBigInt()) {
+        return 0
+      }
+      return unsafe leanObjectIsSlow(data, count)
+    }
+    let mut target = receiver
+    let mut key = first
+    if method == OBJECT_HAS_OWN {
+      target = first
+      key = if count > 1 { unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(unsafe Pointer.assumeMany<ValueBits>(data), 1)) } else { ValueBits.Undefined }
+    }
+    return unsafe leanHasOwnFast(runtime, target, key)
+  }
+  if family == BuiltinFamily.Array {
+    let node = match first { ValueBits.Object { reference } => reference _ => { return 0 } }
+    let class = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).classId()
+    if class == classes.JS_CLASS_PROXY { return -1 }
+    return if class == classes.JS_CLASS_ARRAY { 1 } else { 0 }
+  }
+  return unsafe leanAnswerRareBits(family, method, data, count)
+}
 @inlineAlways
 pub unsafe fn leanAnswer(runtime: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots) -> ValueBits {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
@@ -744,68 +845,9 @@ pub unsafe fn leanAnswer(runtime: *mut HeapHeader, function: ValueBits, receiver
   drop object
   let mut family = BuiltinFamily.Runtime let mut method: u32 = 0
   match id { NativeFunctionId.Builtin { family: f, method: m } => { family = f method = m } _ => { return ValueBits.Uninitialized } }
-  let mut first = ValueBits.Undefined
-  if argv.length() != 0 { first = unsafe argv.get(0) }
-  if family == BuiltinFamily.Number {
-    let number = match first {
-      ValueBits.Int { .. } => { return ValueBits.Bool { value: method != NUMBER_IS_NAN } }
-      ValueBits.Float64 { value } => value
-      _ => { return ValueBits.Bool { value: false } }
-    }
-    if method == NUMBER_IS_NAN { return ValueBits.Bool { value: f64.isNaN(number) } }
-    if method == NUMBER_IS_NAN + 1 { return ValueBits.Bool { value: f64.isFinite(number) } }
-    if method == NUMBER_IS_NAN + 2 { return ValueBits.Bool { value: f64.isFinite(number) && f64.floor(number) == number } }
-    return ValueBits.Bool { value: primitives.numberIsSafeInteger(number) }
-  }
-  if family == BuiltinFamily.Object {
-    if method == OBJECT_IS {
-      let mut second = ValueBits.Undefined
-      if argv.length() > 1 { second = unsafe argv.get(1) }
-      let t1 = first.tag()
-      let t2 = second.tag()
-      if t1 == t2 {
-        return ValueBits.Bool { value: match first {
-          ValueBits.Object { reference: a } => match second { ValueBits.Object { reference: b } => Pointer.address<HeapHeader>(a) == Pointer.address<HeapHeader>(b) _ => false }
-          ValueBits.Int { value: a } => match second { ValueBits.Int { value: b } => a == b _ => false }
-          ValueBits.Bool { value: a } => match second { ValueBits.Bool { value: b } => a == b _ => false }
-          ValueBits.Undefined => true
-          ValueBits.Null => true
-          ValueBits.Symbol { reference: a } => match second { ValueBits.Symbol { reference: b } => Pointer.address<HeapHeader>(a) == Pointer.address<HeapHeader>(b) _ => false }
-          _ => unsafe primitives.equal(first, second, EqualityMode.SameValue)
-        } }
-      }
-      if (!first.isNumber() && !first.isString() && !first.isBigInt()) || (!second.isNumber() && !second.isString() && !second.isBigInt()) {
-        return ValueBits.Bool { value: false }
-      }
-      return ValueBits.Bool { value: unsafe primitives.equal(first, second, EqualityMode.SameValue) }
-    }
-    let mut target = receiver
-    let mut key = first
-    if method == OBJECT_HAS_OWN {
-      target = first
-      key = if argv.length() > 1 { unsafe argv.get(1) } else { ValueBits.Undefined }
-    }
-    let node = match target { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
-    match key { ValueBits.String { .. } => () _ => { return ValueBits.Uninitialized } }
-    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-    if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || data.fastArray() { return ValueBits.Uninitialized }
-    let shape = data.shape
-    drop data
-    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-    let atom = state.atoms.findString(key)
-    drop state
-    if atom == UNKNOWN_STRING_ATOM { return ValueBits.Uninitialized }
-    if atom == 0 { return ValueBits.Bool { value: false } }
-    return ValueBits.Bool { value: (unsafe shapes.lookup(shape, atom)).isSome() }
-  }
-  let node = match first { ValueBits.Object { reference } => reference _ => { return ValueBits.Bool { value: false } } }
-  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-  let class = data.classId()
-  if family == BuiltinFamily.Array {
-    if class == classes.JS_CLASS_PROXY { return ValueBits.Uninitialized }
-    return ValueBits.Bool { value: class == classes.JS_CLASS_ARRAY }
-  }
-  return ValueBits.Bool { value: class >= classes.JS_CLASS_UINT8C_ARRAY && class <= classes.JS_CLASS_DATAVIEW }
+  let ans = unsafe leanAnswerKnown(runtime, family, method, receiver, unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(argv.data), argv.count)
+  if ans < 0 { return ValueBits.Uninitialized }
+  return ValueBits.Bool { value: ans != 0 }
 }
 /// function's callKind; CALL_KIND_SLOW for anything but a native function.
 @inlineAlways

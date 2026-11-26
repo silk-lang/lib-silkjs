@@ -248,6 +248,37 @@ fn plainOwnData(object: ValueBits, atom: u32) -> PlainOwnData {
   if (flags & JS_PROP_TMASK) != 0 { return absentData() }
   return PlainOwnData { found: true, enumerable: (flags & JS_PROP_ENUMERABLE) != 0, value: data.slot(index).valueBits() }
 }
+/// Non-effect fast path for Object.keys(input): answers ordinary objects whose
+/// shape already has a cached enumKeys table using the spare-cell pool without
+/// effect handlers, Allocator, or publishPc. Returns Uninitialized on miss.
+@inlineAlways
+pub unsafe fn quickKeysSpareRef(runtime: *mut HeapHeader, context: *mut HeapHeader, node: *mut HeapHeader) -> ValueBits {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.isExotic() || data.fastArray() { return ValueBits.Uninitialized }
+  let shapeNode = data.shape
+  let slots = data.slotCount()
+  drop data
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
+  if slots != shape.properties.length() { return ValueBits.Uninitialized }
+  if shape.enumVersion != shape.version { return ValueBits.Uninitialized }
+  let kind = shape.enumKind
+  if kind == shapes.ENUM_UNSUPPORTED { return ValueBits.Uninitialized }
+  let listed = shape.enumKeys.length()
+  if listed >= shapes.WIDE_SLOTS { return ValueBits.Uninitialized }
+  let firstPtr: ?*const *mut HeapHeader = if listed == 0 {
+    Pointer.null<*mut HeapHeader>()
+  } else {
+    unsafe Intrinsic.pointerRequalify<*const *mut HeapHeader, ?*const *mut HeapHeader>(unsafe Pointer.at<*mut HeapHeader>(unsafe shape.enumKeys.dataConst(), 0))
+  }
+  drop shape
+  return unsafe objects.keysArraySpare(context, runtime, firstPtr, listed)
+}
+@inlineAlways
+pub unsafe fn quickKeysSpare(runtime: *mut HeapHeader, context: *mut HeapHeader, input: ValueBits) -> ValueBits {
+  let node = match input { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+  return unsafe quickKeysSpareRef(runtime, context, node)
+}
 /// VM fast path for Object.keys(input): answers ordinary objects from the
 /// shape's enumKeys cache (using emptyArrayFast when listed == 0), returning
 /// Uninitialized on miss or OOM so leanCall can take the full path.
@@ -259,13 +290,19 @@ pub unsafe effect fn quickKeys<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocat
   let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   if data.isExotic() || data.fastArray() { return ValueBits.Uninitialized }
   let shapeNode = data.shape
-  let records = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)).properties.length()
-  if data.slotCount() != records { return ValueBits.Uninitialized }
+  let slots = data.slotCount()
   drop data
-  let kindResult = run Effect.result(unsafe shapes.enumKeys(realm.runtime(), shapeNode))
-  let kind = match move kindResult {
-    Result<u8, OutOfMemoryError>.Success { value } => value
-    Result<u8, OutOfMemoryError>.Failure { .. } => { return ValueBits.Uninitialized }
+  let shape0 = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
+  if slots != shape0.properties.length() { return ValueBits.Uninitialized }
+  let valid = shape0.enumVersion == shape0.version
+  let mut kind = shape0.enumKind
+  drop shape0
+  if !valid {
+    let kindResult = run Effect.result(unsafe shapes.enumKeys(realm.runtime(), shapeNode))
+    kind = match move kindResult {
+      Result<u8, OutOfMemoryError>.Success { value } => value
+      Result<u8, OutOfMemoryError>.Failure { .. } => { return ValueBits.Uninitialized }
+    }
   }
   if kind == shapes.ENUM_UNSUPPORTED { return ValueBits.Uninitialized }
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
@@ -274,14 +311,15 @@ pub unsafe effect fn quickKeys<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocat
     drop shape
     return run unsafe objects.emptyArrayFast(&mut hooks, memory, realm.context(), realm.runtime())
   }
-  let first = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(shape.enumKeys.asSlice()))
-  let firstPtr = unsafe Pointer.at<ValueBits>(first, 0)
+  let first = unsafe shape.enumKeys.dataConst()
+  let firstPtr = unsafe Pointer.at<*mut HeapHeader>(first, 0)
   drop shape
   if listed < shapes.WIDE_SLOTS {
-    let fast = run unsafe objects.copiedArrayFast(&mut hooks, memory, realm.context(), realm.runtime(), firstPtr, listed)
-    if fast.isObject() { return fast }
+    let spare = unsafe objects.keysArraySpare(realm.context(), realm.runtime(),
+      unsafe Intrinsic.pointerRequalify<*const *mut HeapHeader, ?*const *mut HeapHeader>(firstPtr), listed)
+    if spare.isObject() { return spare }
   }
-  let copied = run Effect.result(unsafe objects.copiedArray(&mut hooks, memory, realm, firstPtr, listed))
+  let copied = run Effect.result(unsafe objects.copiedStringArray(&mut hooks, memory, realm, firstPtr, listed))
   return match move copied {
     Result<ValueBits, OutOfMemoryError>.Success { value } => value
     Result<ValueBits, OutOfMemoryError>.Failure { .. } => ValueBits.Uninitialized
@@ -314,8 +352,8 @@ unsafe effect fn quickEnumerate<'a, H: HeapHooks>(hooks: &mut H, memory: &Alloca
       if fast.isObject() { return fast }
       return run objects.arrayWithCapacity(&mut hooks, memory, realm, 0)
     }
-    let first = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(shape.enumKeys.asSlice()))
-    return run unsafe objects.copiedArray(&mut hooks, memory, realm, unsafe Pointer.at<ValueBits>(first, 0), listed)
+    let first = unsafe shape.enumKeys.dataConst()
+    return run unsafe objects.copiedStringArray(&mut hooks, memory, realm, unsafe Pointer.at<*mut HeapHeader>(first, 0), listed)
   }
   if (kind & shapes.ENUM_PLAIN) == 0 { return ValueBits.Uninitialized }
   drop shape
@@ -328,7 +366,7 @@ unsafe effect fn quickEnumerate<'a, H: HeapHooks>(hooks: &mut H, memory: &Alloca
   let mut i: usize = 0
   let mut filled: usize = 0
   while filled < listed {
-    let name = cache.enumKeys.get(filled)
+    let name = ValueBits.String { reference: cache.enumKeys.get(filled) }
     let mut index = filled
     if !dense {
       // The next enumerable string-keyed record: the cache lists them in order.
