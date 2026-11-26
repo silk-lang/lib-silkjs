@@ -221,6 +221,17 @@ call stubs (about 230 instructions a call) and its prologue. Crypto at scale 4 w
 seed: 2.01G instructions where there were 2.44G; at scale 20, about 680 ms where there
 were 810 (medians of 15 runs; node 322).
 
+NavierStokes' `project` calls `lin_solve(0, p, div, 1, 4)`, a local function with no closure
+object, whose body starts `if (a === 0 && c === 1)`. A call that passes a literal number to
+a parameter the callee compares with a literal is inlined at the general size limit
+(inlining.md 4), and the body is compiled for those numbers: the copying branch goes, and
+`ssa_ownership.fold` makes a constant of `1 / c` and takes `a * (...)` for its operand
+(a product with 1 is the other operand for every double). The relaxation loop's chain from
+one turn's result to the next is then four additions and one multiplication where it had
+two. Against node run in the same round (40 frames after 20 of warm-up, medians of 15
+rounds), `project` takes 1.12 times node's time where it took 1.40, and the whole step 1.20
+where it took 1.45.
+
 ## Loops in one piece
 
 `Function.compact` orders blocks in reverse postorder. Its search used to take a branch's

@@ -297,6 +297,9 @@ pub struct Emitter {
   inlineClosures: List<u32>,
   /// Whether inline target k is a known local FunctionBytecode (ssa.TARGET_KNOWN_FN).
   knownFns: List<bool>,
+  /// Whether inline target k's body reads the scope it runs under (ssa.Function.inlineScoped):
+  /// the scope of its level on the frame's own chain.
+  scopedFns: List<bool>,
   /// Inst.frame of the instruction being lowered: whose frame, code and closure it runs for.
   frameOf: u32,
   /// Frame mode, and the frame.
@@ -730,7 +733,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
     scratch: u32.wrappingToI32(values * SLOT_BYTES), inputs: u32.wrappingToI32(inputs), settings: move settings, places: move places, fresh: NONE, freshAt: 0, freshBinds: 0, ownedCells: run function.ownedCells(), atoms: run function.linkedAtoms(),
     uses: List<u32>.make(), immediateUses: List<u32>.make(), defs: List<u32>.make(), constants: List<Option<i32>>.make(), current: 0, fields: objects.fieldLayout(), construct: helpers.constructLayout(), math: helpers.mathLayout(), closureHome: baseline_env.closureHomeOffset(), usedXmm: usedXmm,
     undoLabels: List<Label>.make(), undoInsts: List<Inst>.make(), zeroLabels: List<Label>.make(), zeroBacks: List<Label>.make(), zeroInsts: List<Inst>.make(), coldLabels: List<Label>.make(), coldBacks: List<Label>.make(), coldInsts: List<Inst>.make(), coldAux: List<u32>.make(), omitAt: NONE, elementAt: NONE, elementObject: NONE, elementIndex: NONE, cachedArr: NONE, cachedCount: false, bounded: List<u32>.make(), boundedBlock: NONE, raxValue: NONE, raxOffset: 0, raxBlock: NONE, flagsValue: NONE, flagsOffset: 0, flagsBlock: NONE, cursor: 0, skipAt: NONE, skipLabel: skipLabel, dropAt: NONE, preset: List<u32>.make(), presetGuard: List<u32>.make(),
-    inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), knownFns: List<bool>.make(), frameOf: 0,
+    inlineFrames: u32.wrappingToI32(inputs + own), inlineClosures: List<u32>.make(), knownFns: List<bool>.make(), scopedFns: List<bool>.make(), frameOf: 0,
     on: on, plan: plan, methods: move methods, polls: List<PollSlow>.make(), checkConstructSlows: List<CheckConstructSlow>.make(), outs: List<Out>.make(), stepSlows: List<StepSlow>.make(), coldEdges: List<ColdEdge>.make(), overflow: overflow, constructAt: 0, entered: entered, copying: copying, prologued: prologued, leaveOwn: leaveOwn, leaveBuilt: leaveBuilt, exitWith: List<Label>.make(), records: List<Label>.make(), steps: move steps,
     realmAt: u32.wrappingToI32(inputs + own + inlined * INLINE_FRAME_WORDS * 8), shapes: move shapes, stored: List<u32>.make(), aliased: List<bool>.make(),
     leaveAt: u32.wrappingToI32(leaveAt), leaveBytes: leaveBytes, callAt: callAt, bodyAt: callAt + bodyCells * SLOT_BYTES }
@@ -738,6 +741,7 @@ effect fn lowerIn(function: &Function, settings: Settings, on: bool, plan: Frame
   let mut kf: usize = 0
   while kf < function.inlineTargets.length() {
     run emitter.knownFns.append(u32.bitAnd(function.inlineTargets.get(kf), ssa.TARGET_KNOWN_FN) != 0)
+    run emitter.scopedFns.append(kf < function.inlineScoped.length() && function.inlineScoped.get(kf))
     kf = kf + 1
   }
   let mut own0: u32 = 0
@@ -956,6 +960,7 @@ impl Emitter {
   /// Where value v lives.
   fn at(self: &Self, v: u32) -> Place { return self.places.place(v, slotOf(v)) }
   /// Whether inline target k is a known local FunctionBytecode (ssa.TARGET_KNOWN_FN).
+  fn scopedFn(self: &Self, k: u32) -> bool { return u32.toUsize(k) < self.scopedFns.length() && self.scopedFns.get(u32.toUsize(k)) }
   fn knownFn(self: &Self, k: u32) -> bool { return u32.toUsize(k) < self.knownFns.length() && self.knownFns.get(u32.toUsize(k)) }
   /// Whether lowering `given` in frame mode may safely consume or preserve the cached
   /// trusted fast-array `(cachedArr, r9 = elements, eax = elementCount)` without clobbering
@@ -996,6 +1001,19 @@ impl Emitter {
         run self.a.movSymbol(Reg.Rax, target)
         if fresh { run self.a.alu(Alu.Cmp, Width.W64, Reg.Rax, Reg.R9) } else { run self.a.aluLoad(Alu.Cmp, Width.W64, Reg.Rax, payloadOf(inst.a)) }
         run self.a.jcc(Cond.NotEqual, leave)
+        if self.scopedFn(i32.wrappingToU32(inst.k)) {
+          // The body reads its scope: the one of the function's level on the frame's own
+          // chain, which must be on the heap (a count; a scope still in its frame has
+          // none), for an exit inside the body makes a closure that holds it
+          // (x64_frame_exit). Rax is the function's cell.
+          run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.Rax, signed(self.plan.f.knownLevel)))
+          run self.a.test(Width.W32, Reg.R8, Reg.R8)
+          run self.a.jcc(Cond.Equal, leave)
+          run self.ownScopeInto(Reg.R11)
+          run self.levelScope(Reg.R11, Reg.R8, leave)
+          run self.a.aluStoreImm(Alu.Cmp, Width.W32, Mem.at(Reg.R11, 0), 0)
+          run self.a.jcc(Cond.Equal, leave)
+        }
         return ()
       }
       run self.unlessTag(inst.a, layout.object(), leave)
@@ -4738,13 +4756,18 @@ impl Emitter {
   /// Load the lexical scope at `depth` hops into R11, jumping to `exit` if any link is null.
   effect fn loadScopeAt(self: &mut Self, depth: u32, exit: Label) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.frameOf == 0 && self.on {
-      let p = self.plan
-      if p.known || p.scoped {
-        run self.a.load(Width.W64, Reg.R11, p.rec(p.f.scope))
-      } else {
-        run self.a.load(Width.W64, Reg.R11, p.sf(p.f.currentFunction + 8))
-        run self.a.load(Width.W64, Reg.R11, Mem.at(Reg.R11, compiled.DIRECT_CLOSURE_SCOPE))
-      }
+      run self.ownScopeInto(Reg.R11)
+    } else if self.on && self.frameOf != 0 && self.scopedFn(self.frameOf - 1) {
+      // A known local function has no closure: it runs under the scope of its level on the
+      // chain of the code that calls it (js_scopes.atLevel), which for a body that reads
+      // its scope is the frame's own chain (ssa_translate's ownChain).
+      let closure = self.inlineClosures.get(u32.toUsize(self.frameOf - 1))
+      run self.a.load(Width.W64, Reg.R8, payloadOf(closure))
+      run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R8, signed(self.plan.f.knownLevel)))
+      run self.a.test(Width.W32, Reg.R8, Reg.R8)
+      run self.a.jcc(Cond.Equal, exit)
+      run self.ownScopeInto(Reg.R11)
+      run self.levelScope(Reg.R11, Reg.R8, exit)
     } else if self.frameOf == 0 {
       let frame = self.input(INPUT_FRAME)
       run self.a.load(Width.W64, Reg.R11, frame)
@@ -4763,6 +4786,31 @@ impl Emitter {
       run self.a.jcc(Cond.Equal, exit)
       hop = hop + 1
     }
+  }
+  /// reg = the scope the frame's own code runs under (frame mode): the activation's own or
+  /// the one its caller passed (a known local function's), else the closure's.
+  effect fn ownScopeInto(self: &mut Self, reg: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    let p = self.plan
+    if p.known || p.scoped {
+      run self.a.load(Width.W64, reg, p.rec(p.f.scope))
+    } else {
+      run self.a.load(Width.W64, reg, p.sf(p.f.currentFunction + 8))
+      run self.a.load(Width.W64, reg, Mem.at(reg, compiled.DIRECT_CLOSURE_SCOPE))
+    }
+  }
+  /// Walks scope from itself up its parents to the scope whose level is the 32-bit value in
+  /// level (js_scopes.atLevel); jumps to none when the chain ends first, scope null.
+  effect fn levelScope(self: &mut Self, scope: Reg, level: Reg, none: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    let walk = run self.a.label()
+    let found = run self.a.label()
+    self.a.bind(walk)
+    run self.a.test(Width.W64, scope, scope)
+    run self.a.jcc(Cond.Equal, none)
+    run self.a.aluLoad(Alu.Cmp, Width.W32, level, Mem.at(scope, signed(self.plan.f.scopeLevel)))
+    run self.a.jcc(Cond.Equal, found)
+    run self.a.load(Width.W64, scope, Mem.at(scope, u32.wrappingToI32(self.fields.scopeParent)))
+    run self.a.jmp(walk)
+    self.a.bind(found)
   }
   /// Read the lexical slot addressed by the bytecode. Inlined callees use the scope
   /// captured by their closure, the same pointer frameInto would put in their frame.
@@ -4856,8 +4904,20 @@ impl Emitter {
     run self.a.test(Width.W64, Reg.R8, Reg.R8)
     run self.a.cmov(Cond.Equal, Width.W64, Reg.Rax, Reg.Rsp)
     run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 32), Reg.Rax)
-    if knownTarget {
+    if knownTarget && !self.scopedFn(k) {
+      // It reads no scope.
       run self.a.storeImm(Width.W64, Mem.at(Reg.Rsp, f + 40), 0)
+    } else if knownTarget {
+      // The scope of its level on the frame's own chain (loadScopeAt), or none.
+      let none = run self.a.label()
+      run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R10, signed(self.plan.f.knownLevel)))
+      run self.a.movImm32(Reg.Rax, 0)
+      run self.a.test(Width.W32, Reg.R8, Reg.R8)
+      run self.a.jcc(Cond.Equal, none)
+      run self.ownScopeInto(Reg.Rax)
+      run self.levelScope(Reg.Rax, Reg.R8, none)
+      self.a.bind(none)
+      run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 40), Reg.Rax)
     } else {
       run self.a.load(Width.W64, Reg.R8, Mem.at(Reg.R10, compiled.DIRECT_CLOSURE_SCOPE))
       run self.a.store(Width.W64, Mem.at(Reg.Rsp, f + 40), Reg.R8)
@@ -6483,9 +6543,25 @@ impl Emitter {
       run self.mathCallOnFrame(inst, Reg.Rsp, u32.wrappingToI32(callee), answered)
     }
     let last = run self.bodyRecords(&function, exit, NONE)
+    let mut callCount = count
+    if !method && inst.frame != 0 && self.scopedFn(inst.frame - 1) {
+      // The body runs under the scope of its level on the frame's own chain (loadScopeAt),
+      // and a known local function it calls under one further up: the stub walks there
+      // from the record's scope word (bit 31 of the count, as callOnFrame's).
+      let p = self.plan
+      let none = run self.a.label()
+      let closure = self.inlineClosures.get(u32.toUsize(inst.frame - 1))
+      run self.a.load(Width.W64, Reg.R8, payloadOf(closure))
+      run self.a.load(Width.W32, Reg.R8, Mem.at(Reg.R8, signed(p.f.knownLevel)))
+      run self.ownScopeInto(Reg.R11)
+      run self.levelScope(Reg.R11, Reg.R8, none)
+      self.a.bind(none)
+      run self.a.store(Width.W64, word(Reg.Rsp, last - i32.wrappingToU32(0 - p.record) + p.f.scope), Reg.R11)
+      callCount = callCount | 0x80000000
+    }
     // The stub's site, as callOnFrame's, on the innermost body's record.
     run self.a.lea(Width.W64, Reg.R14, word(Reg.Rsp, callee))
-    run self.a.movImm32(Reg.Rdx, count)
+    run self.a.movImm32(Reg.Rdx, callCount)
     run self.a.movImm32(Reg.Rax, inst.pc + 1)
     run self.a.lea(Width.W64, Reg.Rbp, word(Reg.Rsp, last))
     if method { run self.a.callSymbol(stubs.STUB_CALL_METHOD_KEEP) } else { run self.a.callSymbol(stubs.STUB_CALL_KEEP) }

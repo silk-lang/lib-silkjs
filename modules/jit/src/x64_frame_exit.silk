@@ -9,7 +9,9 @@ import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import silkjs.js_heap { HeapHeader }
+import silk.core.option { Option }
+import silkjs.js_heap { HeapHeader, HeapCell }
+import silkjs.js_core_types { ObjectData, ObjectPayload, FunctionBytecode, ScopeData }
 import silkjs.js_value { ValueBits }
 import silkjs.js_gc as gc
 import silkjs.js_baseline { BaselineFrame, Inlined }
@@ -198,10 +200,36 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
     // The activations, innermost first so each names the one inside it. The frame itself is
     // at the outermost inlined call, past its opcode as baseline code leaves it at a call.
     let rt = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(counters.runtime)
+    // The bodies' functions, outermost first, each in its caller's operands: a known local
+    // function (a FunctionBytecode) becomes a closure for the engine to call. While every
+    // body around it is one too, it runs on the frame's own scope chain, and the closure
+    // holds the scope of its level there when that scope is on the heap (a body that reads
+    // its scope was entered only then: `check.callee`); any other gets none, and reads none.
+    let own = unsafe ownScope(record)
+    let mut chain = true
+    let mut before: usize = 0
+    let mut operandsAround = depth
+    let mut m: usize = 0
+    while m < frames {
+      let at = described + 1 + m * u32.toUsize(state.FRAME_WORDS)
+      let argc = u32.toUsize(unsafe wordAt(words, at + 1) & (state.FRAME_METHOD - 1))
+      if operandsAround >= argc + 1 {
+        let calleeSlot = if m == 0 { unsafe Pointer.atMut<ValueBits>(cells, frame.arguments + frame.locals + depth - argc - 1) }
+          else { unsafe Pointer.atMut<ValueBits>(kept, before - argc - 1) }
+        let old = unsafe Pointer.read<ValueBits>(calleeSlot)
+        if let ValueBits.FunctionBytecode { reference } = old {
+          let mut scope: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+          if chain { scope = unsafe heapScopeAt(own, unsafe levelOf(reference)) }
+          unsafe Pointer.write<ValueBits>(calleeSlot, unsafe helpers.materializeKnownClosure(rt, reference, scope))
+          unsafe gc.releaseDeferred(old)
+        } else { chain = false }
+      } else { chain = false }
+      operandsAround = u32.toUsize(unsafe wordAt(words, at + 3))
+      before = before + u32.toUsize(unsafe wordAt(words, at + 2)) + operandsAround
+      m = m + 1
+    }
     let mut next: ?*mut Inlined = Pointer.null<Inlined>()
     let mut cell = inner
-    let mut childArgc: usize = 0
-    let mut hasChild = false
     let mut n = frames
     while n > 0 {
       n = n - 1
@@ -211,30 +239,12 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
       let locals = u32.toUsize(unsafe wordAt(words, at + 2))
       let operands = u32.toUsize(unsafe wordAt(words, at + 3))
       cell = cell - locals - operands
-      if hasChild && operands >= childArgc + 1 {
-        let calleeSlot = unsafe Pointer.atMut<ValueBits>(kept, cell + locals + operands - childArgc - 1)
-        let old = unsafe Pointer.read<ValueBits>(calleeSlot)
-        if let ValueBits.FunctionBytecode { reference } = old {
-          unsafe Pointer.write<ValueBits>(calleeSlot, unsafe helpers.materializeKnownClosure(rt, reference))
-          unsafe gc.releaseDeferred(old)
-        }
-      }
       let place = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Inlined>(unsafe Pointer.atMut<u8>(bytes, area + n * u32.toUsize(state.INLINED_BYTES)))
       unsafe Pointer.write<Inlined>(place, Inlined { argc: argc, after: u32.toUsize(unsafe wordAt(words, at)),
         locals: unsafe Pointer.atMut<ValueBits>(kept, cell), count: locals, stack: unsafe Pointer.atMut<ValueBits>(kept, cell + locals), sp: operands,
         pc: u32.toUsize(unsafe wordAt(words, at + 4)), inner: next, method: (call & state.FRAME_METHOD) != 0, taken: false,
         threw: (how == HOW_CALL_THREW || how == HOW_POLL_THREW) && n + 1 == frames })
       next = unsafe Intrinsic.pointerRequalify<*mut Inlined, ?*mut Inlined>(place)
-      childArgc = argc
-      hasChild = true
-    }
-    if hasChild && depth >= childArgc + 1 {
-      let calleeSlot = unsafe Pointer.atMut<ValueBits>(cells, frame.arguments + frame.locals + depth - childArgc - 1)
-      let old = unsafe Pointer.read<ValueBits>(calleeSlot)
-      if let ValueBits.FunctionBytecode { reference } = old {
-        unsafe Pointer.write<ValueBits>(calleeSlot, unsafe helpers.materializeKnownClosure(rt, reference))
-        unsafe gc.releaseDeferred(old)
-      }
     }
     counters.inlinedExits = counters.inlinedExits + 1
     unsafe engine.setPc(record, pc + 1)
@@ -243,6 +253,53 @@ pub export "C" fn jitFrameExit(env: *mut BaselineEnv, record: *mut BaselineFrame
   if how == HOW_DEOPT || how == HOW_DECLINED { return engine.moved(pc, depth) }
   if how == HOW_CALL_THREW { unsafe engine.setPc(record, pc + 1) } else { unsafe engine.setPc(record, pc) }
   return usize.toU64(depth)
+}
+
+/// The scope the code of the frame of `record` runs under: the activation's own or the one
+/// its caller passed (a known local function's), else its closure's.
+unsafe fn ownScope(record: *mut BaselineFrame) -> ?*mut HeapHeader {
+  let anchor = ()
+  let running = unsafe Pointer.borrow<(), BaselineFrame>(&anchor, unsafe Intrinsic.pointerRequalify<*mut BaselineFrame, *const BaselineFrame>(record))
+  let function = running.frame.currentFunction
+  let passed = running.scope
+  drop running
+  match function {
+    ValueBits.Object { reference } => {
+      let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      match &data.payload {
+        ObjectPayload.BytecodeFunction { function: closure } => {
+          let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, closure.bytecode)
+          if code.scopeSlots != 0 { return passed }
+          return closure.scope
+        }
+        _ => { return Pointer.null<HeapHeader>() }
+      }
+    }
+    _ => { return passed }
+  }
+}
+/// The level a known local function's scope has on its callers' chains (KnownCall.envLevel).
+unsafe fn levelOf(bytecode: *mut HeapHeader) -> u32 {
+  let anchor = ()
+  return (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)).known.envLevel
+}
+/// The scope of `level` from `scope` up its parents (js_scopes.atLevel) when it is on the
+/// heap; null for level 0, a chain that ends first, or a scope still in its frame (no count).
+unsafe fn heapScopeAt(scope: ?*mut HeapHeader, level: u32) -> ?*mut HeapHeader {
+  if level == 0 { return Pointer.null<HeapHeader>() }
+  let mut current = scope
+  while true {
+    let at = match Pointer.nonNullMut<HeapHeader>(current) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { break } }
+    let anchor = ()
+    let data = unsafe HeapCell.payload<ScopeData, ()>(&anchor, at)
+    if data.level == level {
+      let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, unsafe Intrinsic.pointerRequalify<*mut HeapHeader, *const HeapHeader>(at))
+      if header.referenceCount == 0 { break }
+      return current
+    }
+    current = data.parent
+  }
+  return Pointer.null<HeapHeader>()
 }
 
 /// HOW_STEPPED: the frame of `record` after a step of shape `shape` that the code goes on

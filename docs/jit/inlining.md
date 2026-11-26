@@ -135,7 +135,37 @@ when the code is installed, so stored code holds no address. The runtime retains
 until it is destroyed (`js_compiled_inline.keep`), so the address cannot come to name
 another function.
 
-## 4. What is not done yet
+## 4. Local functions without a closure
+
+A variable that is only ever called holds its function's bytecode, with no closure object
+(`js_compiler_known`). A call runs it under the caller's scope chain, at the scope of the
+level the function was created in (`js_scopes.atLevel`). On a baseline frame such a function
+is a target too (`ssa.TARGET_KNOWN_FN`): `check.callee` compares the bytecode cell.
+
+**Its scope.** A body inlined through a guarded `check.callee` into the function's own code,
+or into such a body, runs on the frame's own chain (`Translator.ownChain`), and only such a
+body may read its scope (`get_scope0`): the backend walks from the frame's scope to the one
+of the callee's level (`x64_backend.loadScopeAt`, `levelScope`). A call the body makes to
+another local function passes that scope in the body's record (`callInBody`; bit 31 of the
+count, as a call from the function's own code).
+
+**Leaving.** An exit inside the body hands the engine a closure made for it
+(`jit_helpers.materializeKnownClosure`), which holds the scope: `x64_frame_exit` makes one
+per body, outermost first, while the bodies are local functions. A closure counts its scope,
+so the scope must be on the heap. `check.callee` tests that where the body begins (a scope
+still in its frame has no count) and leaves otherwise, and `jit_runtime.candidates` does not
+offer a body that reads its scope while that scope is in its frame. Resuming a body under a
+scope in its frame needs the engine to take the scope beside the function (`js_vm.callKnown`
+does for a call); that is not done.
+
+**Which.** A variable call's callee is at most 96 bytes of code (`VAR_CALL_BYTES`), so that
+long and looped helpers stay calls. A call that passes a literal number has the general
+limit (460 bytes): the body is compiled for that number, the branches it decides go, and
+`ssa_ownership.fold` makes constants of the conversions and arithmetic on it (`1 * x` is `x`).
+NavierStokes' `lin_solve(0, p, div, 1, 4)` in `project` is the case: the relaxation loop
+keeps four additions and one multiplication.
+
+## 5. What is not done yet
 
 - Callees with loops, and a guard after an effect, off a baseline frame: on one an exit
   names the bodies' frames (`ssa.Exit.frames`) and the engine resumes inside the callee.

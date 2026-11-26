@@ -43,7 +43,7 @@ import x64_lower as lower
 import jit_recompile { History }
 import jit_recompile as recompile
 import ssa_input { inputOf }
-import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, Refusal as TranslateRefusal }
+import ssa_translate { loopHeaders, loopRegion, translateOsr, admits, osrMarkers, readsScope, Refusal as TranslateRefusal }
 import ssa { Function, KnownShapes, TARGET_EXACT, TARGET_KNOWN, TARGET_KNOWN_FN, TARGET_FLAGS, KNOWN_SYMBOLS, SITE_ARRAY, SITE_BOUND }
 import jit_helpers { CompiledEnv, ConstructDesc }
 import jit_helpers as helpers
@@ -91,6 +91,10 @@ const CANDIDATE_DEPTH: u32 = 6
 /// A callee longer than this many bytes of code is not a candidate (ssa_translate's limit).
 const CANDIDATE_BYTES: usize = 460
 /// Tighter limits for `OP_get_var` -> `OP_call` candidates so large/looped global helpers stay out-of-line.
+/// A call that passes a literal number to a parameter the callee compares with a literal
+/// (`decides`) has the general limit: the body is compiled for that number, the branch is
+/// decided and the side not taken goes (NavierStokes' `lin_solve(0, p, div, 1, 4)`, whose
+/// body starts `if (a === 0 && c === 1)`).
 const VAR_CALL_BYTES: usize = 96
 const VAR_CALL_DEPTH: u32 = 2
 /// Largest caller (in bytecode bytes) allowed to inline a looped var-call helper at depth 0:
@@ -2194,6 +2198,13 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
       let argc = if opcode == op.OP_call { u8.toUsize(bytes[pc + 1]) | usize.shiftLeft(u8.toUsize(bytes[pc + 2]), 8) } else { u8.toUsize(opcode - op.OP_call0) }
       if varDepth >= argc + 1 {
         let calleeVal = varStack[varDepth - argc - 1]
+        // The arguments that are literal numbers, by position (the first 32).
+        let mut literals: u32 = 0
+        let mut argAt: usize = 0
+        while argAt < argc && argAt < 32 {
+          match varStack[varDepth - argc + argAt] { ValueBits.Int { .. } => { literals = u32.bitOr(literals, u32.shiftLeft(1, usize.toU32(argAt))) } _ => () }
+          argAt = argAt + 1
+        }
         let mut seenAtCall = false
         let mut ti: usize = 0
         while ti < targets.length() {
@@ -2212,7 +2223,7 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
                   let codeLen = calleeBytes.length
                   if callee.scopeSlots == 0 && callee.varRefCount == 0
                     && Pointer.address<HeapHeader>(callee.realm) == Pointer.address<HeapHeader>(function.realm)
-                    && codeLen > 0 && codeLen <= VAR_CALL_BYTES && ((depth == 0 && bytes.length <= LOOPED_VAR_CALLER_BYTES) || !hasBackEdge(calleeBytes)) {
+                    && codeLen > 0 && (codeLen <= VAR_CALL_BYTES || (codeLen <= CANDIDATE_BYTES && decides(calleeBytes, literals))) && ((depth == 0 && bytes.length <= LOOPED_VAR_CALLER_BYTES) || !hasBackEdge(calleeBytes)) {
                     let id = u32.bitOr(usize.toU32(cells.length()), TARGET_EXACT)
                     run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
                     run closures.append(calleeOpt)
@@ -2238,7 +2249,7 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
                 let calleeBytes = unsafe callee.code.asSlice()
                 let codeLen = calleeBytes.length
                 if callee.scopeSlots == 0 && callee.varRefCount == 0
-                  && codeLen > 0 && codeLen <= VAR_CALL_BYTES && ((depth == 0 && bytes.length <= LOOPED_VAR_CALLER_BYTES) || !hasBackEdge(calleeBytes)) {
+                  && codeLen > 0 && (codeLen <= VAR_CALL_BYTES || (codeLen <= CANDIDATE_BYTES && decides(calleeBytes, literals))) && ((depth == 0 && bytes.length <= LOOPED_VAR_CALLER_BYTES) || !hasBackEdge(calleeBytes)) {
                   let id = u32.bitOr(usize.toU32(cells.length()), TARGET_KNOWN_FN)
                   run cells.append(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell))
                   run closures.append(Pointer.null<HeapHeader>())
@@ -2252,7 +2263,12 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
                     let mut childConstructs = List<ConstructTarget>.make()
                     if depth < VAR_CALL_DEPTH { input.targets = run unsafe candidates(jit, activeMisses, cell, depth + 1, &mut cells, &mut closures, &mut holders, exact, false, Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), &mut constructDescs, &mut childConstructs) }
                     input.constructs = move childConstructs
-                    run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
+                    // A body that reads its scope is inlined only under a scope on the heap
+                    // (check.callee tests it where the body begins): one still in its frame
+                    // now would leave there every time.
+                    if !(readsScope(&input) && unsafe frameScopeAt(startScope, callee.known.envLevel)) {
+                      run targets.append(CallTarget { pc: usize.toU32(pc), id: id, input: move input, atCall: true, chained: false, owned: 0, known: KnownShapes.none() })
+                    }
                   }
                 }
               }
@@ -2367,8 +2383,11 @@ unsafe effect fn candidates(jit: &Jit, activeMisses: &List<usize>, bytecode: *mu
             if varDepth + pushes > 32 {
               varDepth = 0
             } else {
+              // A literal number is told from what is not known: a call that passes one
+              // may have a longer callee (VAR_CALL_BYTES).
+              let literal = literalPush(opcode)
               let mut p: usize = 0
-              while p < pushes { varStack[varDepth] = ValueBits.Undefined varDepth = varDepth + 1 p = p + 1 }
+              while p < pushes { varStack[varDepth] = if literal { ValueBits.Int { value: 0 } } else { ValueBits.Undefined } varDepth = varDepth + 1 p = p + 1 }
             }
           }
         }
@@ -2417,6 +2436,53 @@ unsafe fn knownVariableObject(bytecode: *mut HeapHeader, index: u32) -> ?*mut He
 
 /// The object or known-function value held in slot `slot` at `depth` hops up `startScope`,
 /// or Undefined.
+/// Whether the code compares one of the parameters in `literals` (a bit per position) with a
+/// literal number for equality: `get_arg k` followed by the compare with its operand, or by
+/// the literal's push and the compare.
+fn decides(bytes: &[u8], literals: u32) -> bool {
+  if literals == 0 { return false }
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    if size == 0 || pc + size > bytes.length { break }
+    let mut parameter: u32 = u32.MAX
+    if opcode >= op.OP_get_arg0 && opcode <= op.OP_get_arg3 { parameter = u8.toU32(opcode - op.OP_get_arg0) }
+    else if opcode == op.OP_get_arg && size == 3 { parameter = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8) }
+    let next = pc + size
+    if parameter < 32 && u32.bitAnd(literals, u32.shiftLeft(1, parameter)) != 0 && next < bytes.length {
+      let test = bytes[next]
+      if test == op.OP_strict_eq_imm8 || test == op.OP_strict_neq_imm8 { return true }
+      if literalPush(test) {
+        let after = next + u8.toUsize(op.opcodeInfo(test, true).size)
+        if after < bytes.length && (bytes[after] == op.OP_strict_eq || bytes[after] == op.OP_strict_neq || bytes[after] == op.OP_eq || bytes[after] == op.OP_neq) { return true }
+      }
+    }
+    pc = next
+  }
+  return false
+}
+/// Whether `opcode` pushes a literal integer.
+fn literalPush(opcode: u8) -> bool {
+  return opcode == op.OP_push_i32 || opcode == op.OP_push_0 || opcode == op.OP_push_1 || opcode == op.OP_push_i8 || opcode == op.OP_push_i16
+}
+
+/// Whether the scope of `level` on the chain from `startScope` (js_scopes.atLevel) is still
+/// in its frame (js_scopes.inFrame: no count), not on the heap.
+unsafe fn frameScopeAt(startScope: ?*mut HeapHeader, level: u32) -> bool {
+  let anchor = ()
+  let mut scopeOpt = startScope
+  while true {
+    let scope = match Pointer.nonNullMut<HeapHeader>(scopeOpt) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return false }
+    }
+    let data = unsafe HeapCell.payload<ScopeData, ()>(&anchor, scope)
+    if data.level == level { return (unsafe Pointer.borrow<(), HeapHeader>(&anchor, scope)).referenceCount == 0 }
+    scopeOpt = data.parent
+  }
+  return false
+}
 unsafe fn scopeValue(startScope: ?*mut HeapHeader, depth: u32, slot: u32) -> ValueBits {
   let anchor = ()
   let mut scopeOpt = startScope
