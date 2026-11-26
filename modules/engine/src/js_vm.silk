@@ -2648,10 +2648,46 @@ unsafe effect fn leanInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   if kind == nativeFunctions.CALL_KIND_ASYNC_CONTEXT && unsafe asyncContextCall(&mut hooks, &mut machine, opcode, count, function) { return true }
   return run unsafe leanCall(&mut hooks, memory, &mut machine, opcode, count, function)
 }
-@inlineNever
+/// Inline rc > 1 decrement with @cold releaseLastCold fallback so out-of-line
+/// VM helpers avoid spilling registers around teardown calls.
+@inlineAlways
+unsafe fn releaseHeaderCold<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+  let rc = header.referenceCount
+  if rc > 1 {
+    header.referenceCount = i32.wrappingSubtract(rc, 1)
+    return ()
+  }
+  drop header
+  unsafe gc.releaseLastCold(&mut hooks, runtime, node)
+}
+@inlineAlways
+unsafe fn releaseStackValueCold<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, value: ValueBits) -> () {
+  if value.tag() >= 0 { return () }
+  if let Option<*mut HeapHeader>.Some { value: cell } = ValueBits.heapReference(&value) {
+    unsafe releaseHeaderCold(&mut hooks, runtime, cell)
+  }
+}
+@cold
 unsafe effect fn objectKeysSlow<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  machine: &mut Machine, opcode: u8, home: *mut HeapHeader, data: *mut ValueBits, input: ValueBits,
-  counter: *mut i32, left: i32) -> bool ? &mut Allocator {
+  machine: &mut Machine, opcode: u8, funcRef: *mut HeapHeader) -> bool ? &mut Allocator {
+  let counter = unsafe interrupts.counter(machine.context)
+  let left = unsafe Pointer.read<i32>(counter)
+  if left <= 1 { return false }
+  let fnAnchor = ()
+  let fnData = unsafe HeapCell.payload<ObjectData, ()>(&fnAnchor, funcRef)
+  let homeOpt = match &fnData.payload {
+    ObjectPayload.NativeFunction { function: native } => native.realm()
+    _ => Pointer.null<HeapHeader>()
+  }
+  drop fnData
+  let home = match Pointer.nonNullMut<HeapHeader>(homeOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return false }
+  }
+  let data = unsafe operandCell(machine.stackTop, 1)
+  let input = unsafe Pointer.read<ValueBits>(data)
   unsafe machine.publishPc()
   let answer = run unsafe objectIntrinsics.quickKeys(&mut hooks, memory, unsafe lendRealm(&home, home), input)
   if !answer.isObject() { return false }
@@ -2695,43 +2731,53 @@ unsafe fn objectKeysFast<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opc
   let receiver = if isMethod { unsafe Pointer.read<ValueBits>(first) } else { ValueBits.Undefined }
   unsafe Pointer.write<ValueBits>(first, answer)
   machine.stackTop = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(first), 1)
-  if isMethod { unsafe releaseStackValueFast(&mut hooks, runtime, receiver) }
-  unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
-  unsafe gc.releaseObjectHeader(&mut hooks, runtime, inputRef)
+  if isMethod { unsafe releaseStackValueCold(&mut hooks, runtime, receiver) }
+  unsafe releaseHeaderCold(&mut hooks, runtime, funcRef)
+  unsafe releaseHeaderCold(&mut hooks, runtime, inputRef)
   return true
 }
-/// A CALL_KIND_OBJECT_KEYS call (`Object.keys(obj)`): runs objectIntrinsics.quickKeysSpare
-/// directly without leanCall/genericFamilies/object_intrinsics dispatch layers,
-/// outlining the allocator-using quickKeys fallback and unrolling operand release.
-/// False leaves machine untouched.
+/// A CALL_KIND_OBJECT_KEYS call (`Object.keys(obj)`): runs objectIntrinsics.quickKeysSpareRef
+/// directly with zero non-cold calls on its hot path (all slow paths @cold),
+/// unrolling operand release. False leaves machine untouched.
 @inlineNever
 unsafe effect fn objectKeysInline<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
   machine: &mut Machine, opcode: u8, function: ValueBits) -> bool ? &mut Allocator {
   let counter = unsafe interrupts.counter(machine.context)
   let left = unsafe Pointer.read<i32>(counter)
   if left <= 1 { return false }
-  let home = match Pointer.nonNullMut<HeapHeader>(unsafe nativeFunctions.nativeRealm(function)) {
+  let funcRef = match function { ValueBits.Object { reference } => reference _ => { return false } }
+  let fnAnchor = ()
+  let fnData = unsafe HeapCell.payload<ObjectData, ()>(&fnAnchor, funcRef)
+  let homeOpt = match &fnData.payload {
+    ObjectPayload.NativeFunction { function: native } => native.realm()
+    _ => Pointer.null<HeapHeader>()
+  }
+  drop fnData
+  let home = match Pointer.nonNullMut<HeapHeader>(homeOpt) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => { return false }
   }
   let data = unsafe operandCell(machine.stackTop, 1)
   let input = unsafe Pointer.read<ValueBits>(data)
-  let answer = unsafe objectIntrinsics.quickKeysSpare(machine.runtime, home, input)
+  let inputRef = match input {
+    ValueBits.Object { reference } => reference
+    _ => { return run unsafe objectKeysSlow(&mut hooks, memory, &mut machine, opcode, funcRef) }
+  }
+  let runtime = machine.runtime
+  let answer = unsafe objectIntrinsics.quickKeysSpareRef(runtime, home, inputRef)
   if !answer.isObject() {
-    return run unsafe objectKeysSlow(&mut hooks, memory, &mut machine, opcode, home, data, input, counter, left)
+    return run unsafe objectKeysSlow(&mut hooks, memory, &mut machine, opcode, funcRef)
   }
   let isMethod = opcode == op.OP_call_method
   let first = if isMethod { unsafe operandCell(data, 2) } else { unsafe operandCell(data, 1) }
   if opcode == op.OP_call || isMethod { unsafe machine.skip(2) }
   unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
-  let runtime = machine.runtime
   let receiver = if isMethod { unsafe Pointer.read<ValueBits>(first) } else { ValueBits.Undefined }
   unsafe Pointer.write<ValueBits>(first, answer)
   machine.stackTop = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(first), 1)
-  if isMethod { unsafe releaseStackValueFast(&mut hooks, runtime, receiver) }
-  unsafe gc.releaseObjectHeader(&mut hooks, runtime, core.reference(function))
-  // quickKeysSpare only succeeds on Object inputs, so input is always an Object.
-  unsafe gc.releaseObjectHeader(&mut hooks, runtime, core.reference(input))
+  if isMethod { unsafe releaseStackValueCold(&mut hooks, runtime, receiver) }
+  unsafe releaseHeaderCold(&mut hooks, runtime, funcRef)
+  unsafe releaseHeaderCold(&mut hooks, runtime, inputRef)
   return true
 }
 /// A CALL_KIND_REGEXP_EXEC / _TEST call (`re.exec(s)` / `re.test(s)`): runs
@@ -2882,13 +2928,13 @@ unsafe fn answerKnown<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode
     if count == 2 {
       let arg1 = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1))
       machine.stackTop = first
-      unsafe releaseStackValueFast(&mut hooks, runtime, arg1)
+      unsafe releaseStackValueCold(&mut hooks, runtime, arg1)
     } else {
       machine.stackTop = first
     }
-    unsafe releaseStackValueFast(&mut hooks, runtime, arg0)
-    unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
-    if isMethod { unsafe releaseStackValueFast(&mut hooks, runtime, receiver) }
+    unsafe releaseStackValueCold(&mut hooks, runtime, arg0)
+    unsafe releaseHeaderCold(&mut hooks, runtime, funcRef)
+    if isMethod { unsafe releaseStackValueCold(&mut hooks, runtime, receiver) }
   } else {
     unsafe releaseOperandsSlow(&mut hooks, &mut machine, first)
   }
@@ -2949,18 +2995,18 @@ unsafe fn callMethodAnswer<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, c
   let left = unsafe Pointer.read<i32>(counter)
   if left <= 1 { return false }
   let data = unsafe operandCell(machine.stackTop, 2)
-  let arg0 = unsafe Pointer.read<ValueBits>(data)
-  let arg1 = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1))
+  let objRef = match unsafe Pointer.read<ValueBits>(data) { ValueBits.Object { reference } => reference _ => { return false } }
+  let keyRef = match unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1)) { ValueBits.String { reference } => reference _ => { return false } }
   let runtime = machine.runtime
-  let answer = unsafe nativeFunctions.leanHasOwnFast(runtime, arg0, arg1)
+  let answer = unsafe nativeFunctions.leanHasOwnRefs(runtime, objRef, keyRef)
   if answer < 0 { return false }
   unsafe machine.skip(2)
   unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
   machine.stackTop = unsafe operandCell(data, 2)
-  unsafe releaseStackValueFast(&mut hooks, runtime, arg1)
-  unsafe releaseStackValueFast(&mut hooks, runtime, arg0)
-  unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
-  unsafe gc.releaseObjectHeader(&mut hooks, runtime, recvRef)
+  unsafe releaseHeaderCold(&mut hooks, runtime, keyRef)
+  unsafe releaseHeaderCold(&mut hooks, runtime, objRef)
+  unsafe releaseHeaderCold(&mut hooks, runtime, funcRef)
+  unsafe releaseHeaderCold(&mut hooks, runtime, recvRef)
   unsafe pushOrBranchBool(&mut machine, answer != 0)
   return true
 }
@@ -3845,7 +3891,7 @@ unsafe fn enterKnownCall<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, byt
 /// top operand (get_field), else a retained copy is pushed. Returns the machine
 /// to run next (machine itself once the value is pushed), or null with the
 /// machine as it was.
-@inlineNever
+@cold
 unsafe effect fn readTypedViewGetter<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits, object: *mut HeapHeader, owned: bool, width: usize) -> ?*mut Machine ! JsException ? &mut Allocator {
   if restricted.active(unsafe lendRealm(&machine, machine.context)) { return Pointer.null<Machine>() }
@@ -3868,8 +3914,11 @@ unsafe effect fn readNativeGetter<H: HeapHooks + CoercionHooks + OwnPropertyHook
   let size = unsafe invoke.collectionSize(getter, unsafe Pointer.read<ValueBits>(cell))
   if size >= 0 {
     let value = if size <= 2147483647 { ValueBits.Int { value: i64.toI32(size) } } else { ValueBits.Float64 { value: i64.toF64(size) } }
-    if owned { let old = unsafe machine.pop() unsafe machine.push(value) unsafe gc.release(&mut hooks, machine.runtime, old) }
-    else { unsafe machine.push(value) }
+    if owned {
+      let old = unsafe machine.top(1)
+      unsafe machine.set(1, value)
+      unsafe releaseStackValueCold(&mut hooks, machine.runtime, old)
+    } else { unsafe machine.push(value) }
     return Pointer.fromMutRef<Machine>(&mut machine)
   }
   // A Buffer's length, byteLength, byteOffset and buffer, read from the view.
@@ -3880,8 +3929,11 @@ unsafe effect fn readNativeGetter<H: HeapHooks + CoercionHooks + OwnPropertyHook
     match value {
       ValueBits.Uninitialized => ()
       _ => {
-        if owned { let old = unsafe machine.pop() unsafe machine.push(value) unsafe gc.release(&mut hooks, machine.runtime, old) }
-        else { unsafe machine.push(value) }
+        if owned {
+          let old = unsafe machine.top(1)
+          unsafe machine.set(1, value)
+          unsafe releaseStackValueCold(&mut hooks, machine.runtime, old)
+        } else { unsafe machine.push(value) }
         return Pointer.fromMutRef<Machine>(&mut machine)
       }
     }
@@ -3945,7 +3997,7 @@ unsafe effect fn readGetter<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
         unsafe machine.skip(width)
         if owned {
           unsafe machine.set(1, answer)
-          unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, object)
+          unsafe releaseHeaderCold(&mut hooks, machine.runtime, object)
         } else {
           unsafe machine.push(answer)
         }
