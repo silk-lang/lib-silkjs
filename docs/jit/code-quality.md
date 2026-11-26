@@ -198,6 +198,12 @@ bounds, before the start, past the end, with steps of two and three, with a limi
 the Array, an Array that grows, counters next to 2^31, and a relaxation step on grids too
 small for it.
 
+Such a loop ends before long whatever the program does: its turns are counted, nothing in
+it calls, and its accesses stay inside the Arrays it reads. Its `poll` (three instructions a
+turn: the realm, the countdown, a branch) is therefore taken once in the front block, with
+an exit of its own at the header, and the latch is left a bare jump. A loop inside a
+counted loop keeps its own poll unless it is counted too.
+
 A proven access with its index in a register makes the element's address with two `lea`
 (`lea r11d, [i + i]`, `lea r11, [r9 + r11 * 8]`): the index is below 2^31, so twice it
 fits 32 bits whatever the register's upper half holds.
@@ -244,6 +250,11 @@ whole range as the inner loop. Now the search takes first the successor in fewer
 (`loopDepths`: for each edge u -> v with v <= u, v and the blocks that reach u without
 passing v), so the exit comes after the loop's blocks, which follow their header with
 nothing between. It is still a reverse postorder, which the dominator computations need.
+A back edge is one to a block the search is still inside (`backEdges`), not one to a lower
+block number: the front blocks the hoisting passes append sit after the headers they jump
+to until the next compaction, and counting those jumps as loops laid the latch of a loop
+inside another out after the outer loop (NavierStokes' `advect`: two taken jumps a turn,
+and the inner counter in a frame slot).
 montReduce's inner loop: 90 instructions a turn where there were 106; Crypto at scale 4
 with a fixed seed, 1.80G instructions where there were 1.85G.
 
@@ -291,6 +302,10 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   about 745 ms where it took 850, though the instruction count hardly moved (moves between
   registers cost next to nothing, a value's trip through a frame slot does).
 
+- **A branch jumps through an empty latch.** A branch whose fall-through block holds only
+  a jump with no moves (a counted loop's latch, its poll taken in front) jumps straight to
+  that jump's target on its true edge (`through`): one taken jump a turn where there were
+  two.
 - **`mul.i32` tests for -0 out of line.** The product is taken from the second operand's
   register or slot (`imul eax, [slot]`); a zero product jumps to a piece after the blocks
   that ors the operands, still in their places, and leaves when that is negative, so a

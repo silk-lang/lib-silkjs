@@ -491,6 +491,16 @@ where an exit is certain or likely:
   `superConstructor.call`) adds from starting shapes the site's memo does not cover, and
   `put.field` left for each.
 
+An arithmetic site that leaves for the first time in a function with a loop unlinks the
+code at once (`jit_runtime.noteLeft`, `numericOpcode`). Such a site has learned all it can,
+that an operand was no int32, and the activation that left goes on in baseline code for the
+rest of its loop, which notes the other arithmetic sites it runs there: the next compile
+knows them all. Waiting for eight exits meant eight activations finished in baseline code.
+NavierStokes' first frames call `lin_solve` on fields that are still all integers: without
+the wait its second to fourth runs take 13 ms less between them (the first 3 ms more, for
+one more compile), and the whole benchmark at scale 20 takes 215 ms where it took 225 (node
+in the same rounds: 204).
+
 A method call the function's code has not run yet when it is first optimized (no shape
 recorded for its read, the field cache entry another site's: `jit_runtime.unseenCalls`)
 stays a call in that code for good, since no exit there teaches a later compile its
