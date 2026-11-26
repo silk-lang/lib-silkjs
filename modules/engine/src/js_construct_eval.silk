@@ -10,6 +10,7 @@
 // fast path does not cover, decline with nothing changed; the caller then
 // enters the usual frame.
 import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -361,6 +362,40 @@ fn buildFastOps(recipe: &mut ConstructRecipe) -> () {
   }
   recipe.simpleMask = 1
 }
+/// Pre-encodes SlotBits for stores 0..stores into RuntimeState.constructTemplates
+/// and compacts non-constant argument ops into recipe.fastOps (setting simpleMask = 2)
+/// so fillPlannedSlots bulk-copies all slots and patches only argument slots.
+fn buildTemplate(recipe: &mut ConstructRecipe, templates: &mut [SlotBits; 2048], slot: usize) -> () {
+  if recipe.simpleMask != 1 { return () }
+  let stores = u8.toUsize(recipe.stores)
+  if stores == 0 || stores > STORES_MAX { return () }
+  let base = usize.wrappingMultiply(slot & 63, STORES_MAX)
+  let mut packed: [u8; 32] = [0; 32]
+  let mut argCount: usize = 0
+  let mut index: usize = 0
+  while index < stores {
+    let op = recipe.fastOps[index]
+    let kind = op & 3
+    if kind == FAST_CONST {
+      templates[usize.wrappingAdd(base, index)] = SlotBits.value(recipe.constants[u8.toUsize(u8.shiftRight(op, 4))])
+    } else {
+      if argCount >= 15 { return () }
+      if kind == FAST_ARG {
+        templates[usize.wrappingAdd(base, index)] = SlotBits.value(ValueBits.Undefined)
+      } else {
+        templates[usize.wrappingAdd(base, index)] = SlotBits.value(recipe.constants[u8.toUsize(u8.shiftRight(op, 4))])
+      }
+      let pos = usize.wrappingAdd(1, usize.wrappingMultiply(argCount, 2))
+      packed[pos] = usize.toU8(index)
+      packed[usize.wrappingAdd(pos, 1)] = op
+      argCount = usize.wrappingAdd(argCount, 1)
+    }
+    index = usize.wrappingAdd(index, 1)
+  }
+  packed[0] = usize.toU8(argCount)
+  recipe.fastOps = packed
+  recipe.simpleMask = 2
+}
 /// Reads a CONSTRUCT_EVAL body into recipe: false when it holds anything the
 /// recipe cannot express (a store into another object, nested branches, too many nodes).
 fn analyze(bytes: &[u8], pool: &FunctionBytecode, recipe: &mut ConstructRecipe) -> bool {
@@ -520,7 +555,13 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
     let old = entry.final
     entry.code = address entry.final = Pointer.null<HeapHeader>() entry.base = 0
     if !analyze(unsafe code.code.asSlice(), &code, &mut entry.recipe) { entry.recipe = blankRecipe() }
-    drop entry drop state drop code
+    drop entry
+    if state.constructCache[slot].recipe.simpleMask == 1 {
+      let mut built = state.constructCache[slot].recipe
+      buildTemplate(&mut built, &mut state.constructTemplates, slot)
+      state.constructCache[slot].recipe = built
+    }
+    drop state drop code
     match Pointer.nonNullMut<HeapHeader>(old) { Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, runtime, value) } Option<*mut HeapHeader>.None => () }
     return unsafe construct(&mut hooks, runtime, owner, function, receiver, argv, note)
   }
@@ -755,57 +796,93 @@ pub unsafe effect fn plannedFast<H: HeapHooks>(hooks: &mut H, memory: &Allocatio
   let mut nodeAnchor = ()
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
   let slots = unsafe data.slotListMut().dataMut()
-  unsafe fillPlannedSlots(&entry.recipe, argv, slots, stores, &mut moved)
+  unsafe fillPlannedSlots(&state2.*, slot, &entry.recipe, argv, slots, stores, &mut moved)
   return ValueBits.Object { reference: node }
 }
 /// Evaluates recipe straight into slots[0..stores] in a single pass. On the first
 /// store of argument a (< 4), ownership moves bitwise from the caller's stack
 /// operand into the object slot without retain/release, recorded in moved.* bit a.
 @inlineAlways
-unsafe fn fillPlannedSlots(recipe: &ConstructRecipe, argv: &FrameSlots, slots: [*]mut SlotBits, stores: usize, moved: &mut u32) -> () {
+unsafe fn fillPlannedSlots(state: &RuntimeState, slot: usize, recipe: &ConstructRecipe, argv: &FrameSlots, slots: [*]mut SlotBits, stores: usize, moved: &mut u32) -> () {
   let given = argv.count
-  if recipe.simpleMask != 0 {
+  if recipe.simpleMask == 2 {
+    let base = usize.wrappingMultiply(slot & 63, STORES_MAX)
+    let mut dstAnchor = ()
+    let dst = unsafe Pointer.borrowManyMut<(), SlotBits>(&mut dstAnchor, slots, stores)
+    let srcAnchor = ()
+    let srcPtr = unsafe Pointer.assumeMany<SlotBits>(Pointer.fromRef<SlotBits>(&state.constructTemplates[base]))
+    let src = unsafe Pointer.borrowMany<(), SlotBits>(&srcAnchor, srcPtr, stores)
+    Slice.copyInto<SlotBits>(&mut dst, 0, src)
+    let argCount = u8.toUsize(recipe.fastOps[0])
     let mut movedMask: u32 = 0
-    let mut index: usize = 0
-    while index < stores {
-      let op = recipe.fastOps[index & 31]
-      let kind = op & 3
-      let mut value = ValueBits.Undefined
-      if kind == FAST_CONST {
-        value = recipe.constants[u8.toUsize(u8.shiftRight(op, 4))]
-      } else if kind == FAST_ARG {
-        let a = u8.toUsize(u8.shiftRight(op, 2) & 3)
-        if a < given {
-          value = unsafe argv.get(a)
+    let mut k: usize = 0
+    while k < argCount {
+      let pos = usize.wrappingAdd(1, usize.wrappingMultiply(k, 2))
+      let idx = u8.toUsize(recipe.fastOps[pos & 31])
+      let op = recipe.fastOps[usize.wrappingAdd(pos, 1) & 31]
+      let a = u8.toUsize(u8.shiftRight(op, 2) & 3)
+      if a < given {
+        let argVal = unsafe argv.get(a)
+        if (op & 3) == FAST_ARG || truthy(argVal) {
           let bit = u32.shiftLeft(1, usize.toU32(a))
           if (movedMask & bit) == 0 {
             movedMask = movedMask | bit
-          } else if value.tag() < 0 {
-            drop unsafe value.retained()
+          } else if argVal.tag() < 0 {
+            drop unsafe argVal.retained()
           }
-        }
-      } else {
-        let a = u8.toUsize(u8.shiftRight(op, 2) & 3)
-        let argVal = if a < given { unsafe argv.get(a) } else { ValueBits.Undefined }
-        if truthy(argVal) {
-          value = argVal
-          let bit = u32.shiftLeft(1, usize.toU32(a))
-          if (movedMask & bit) == 0 {
-            movedMask = movedMask | bit
-          } else if value.tag() < 0 {
-            drop unsafe value.retained()
-          }
-        } else {
-          value = recipe.constants[u8.toUsize(u8.shiftRight(op, 4))]
+          unsafe Pointer.put<SlotBits>(unsafe Pointer.atMut<SlotBits>(slots, idx), SlotBits.value(argVal))
         }
       }
-      unsafe Pointer.put<SlotBits>(unsafe Pointer.atMut<SlotBits>(slots, index), SlotBits.value(value))
-      index = usize.wrappingAdd(index, 1)
+      k = usize.wrappingAdd(k, 1)
     }
     moved.* = movedMask
+  } else if recipe.simpleMask != 0 {
+    unsafe fillSimpleOpsFallback(recipe, argv, slots, stores, &mut moved)
   } else {
     unsafe evalGeneralSlots(recipe, argv, slots, 0, stores)
   }
+}
+@inlineNever
+unsafe fn fillSimpleOpsFallback(recipe: &ConstructRecipe, argv: &FrameSlots, slots: [*]mut SlotBits, stores: usize, moved: &mut u32) -> () {
+  let given = argv.count
+  let mut movedMask: u32 = 0
+  let mut index: usize = 0
+  while index < stores {
+    let op = recipe.fastOps[index & 31]
+    let kind = op & 3
+    let mut value = ValueBits.Undefined
+    if kind == FAST_CONST {
+      value = recipe.constants[u8.toUsize(u8.shiftRight(op, 4))]
+    } else if kind == FAST_ARG {
+      let a = u8.toUsize(u8.shiftRight(op, 2) & 3)
+      if a < given {
+        value = unsafe argv.get(a)
+        let bit = u32.shiftLeft(1, usize.toU32(a))
+        if (movedMask & bit) == 0 {
+          movedMask = movedMask | bit
+        } else if value.tag() < 0 {
+          drop unsafe value.retained()
+        }
+      }
+    } else {
+      let a = u8.toUsize(u8.shiftRight(op, 2) & 3)
+      let argVal = if a < given { unsafe argv.get(a) } else { ValueBits.Undefined }
+      if truthy(argVal) {
+        value = argVal
+        let bit = u32.shiftLeft(1, usize.toU32(a))
+        if (movedMask & bit) == 0 {
+          movedMask = movedMask | bit
+        } else if value.tag() < 0 {
+          drop unsafe value.retained()
+        }
+      } else {
+        value = recipe.constants[u8.toUsize(u8.shiftRight(op, 4))]
+      }
+    }
+    unsafe Pointer.put<SlotBits>(unsafe Pointer.atMut<SlotBits>(slots, index), SlotBits.value(value))
+    index = usize.wrappingAdd(index, 1)
+  }
+  moved.* = movedMask
 }
 @inlineNever
 unsafe fn evalGeneralSlots(recipe: &ConstructRecipe, argv: &FrameSlots, slots: [*]mut SlotBits, start: usize, stores: usize) -> () {
@@ -844,7 +921,7 @@ unsafe effect fn plannedAllocSlow<H: HeapHooks>(hooks: &mut H, memory: &Allocati
     unsafe gc.releaseObjectHeader(&mut hooks, runtime, node)
     return ValueBits.Uninitialized
   }
-  unsafe fillPlannedSlots(&entry.recipe, argv, slots, stores, &mut moved)
+  unsafe fillPlannedSlots(&state.*, slot, &entry.recipe, argv, slots, stores, &mut moved)
   return ValueBits.Object { reference: node }
 }
 /// planned when the plan's stores or shapes are not the entry's at address

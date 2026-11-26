@@ -1117,6 +1117,63 @@ pub unsafe fn siteGetter(runtime: *mut HeapHeader, ip: *const u8, object: *mut H
     Option<*mut HeapHeader>.None => unsafe accessorGetter(&data, entry.holderIndex)
   }
 }
+@inlineNever
+unsafe fn walkAndCacheGetter(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let found = unsafe walkFunctionGetter(runtime, object, atom)
+  if !Pointer.isNull<HeapHeader>(found) { let _filled = unsafe fillPolyField(runtime, object, atom) }
+  return found
+}
+/// Combined site + polymorphic getter lookup for readGetter: loads object,
+/// shape, and runtime state once, checking fieldCache (primary + spare) and
+/// polyFields before falling back to walkAndCacheGetter.
+@inlineAlways
+pub unsafe fn resolveGetter(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let version = shape.version
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let site = Pointer.address<u8>(ip)
+  let slot = fieldCacheIndex(site)
+  let entry = if state.fieldCache[slot].site == site { &state.fieldCache[slot] } else { &state.fieldCache[fieldSpareIndex(slot)] }
+  if entry.site == site && entry.key == fieldGetterKey(version) {
+    if !data.isExotic() || (data.fastArray() && data.classId() == classes.JS_CLASS_ARRAY) {
+      match Pointer.nonNullMut<HeapHeader>(entry.holder) {
+        Option<*mut HeapHeader>.Some { value } => {
+          if entry.epoch == state.shapeEpoch {
+            let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+            let got = unsafe accessorGetter(&holder, entry.holderIndex)
+            if !Pointer.isNull<HeapHeader>(got) { return got }
+          }
+        }
+        Option<*mut HeapHeader>.None => {
+          let got = unsafe accessorGetter(&data, entry.holderIndex)
+          if !Pointer.isNull<HeapHeader>(got) { return got }
+        }
+      }
+    }
+  }
+  let atom = unsafe fieldAtomAt(ip)
+  let poly = &state.polyFields[polyFieldIndex(version, atom)]
+  if poly.version == version && poly.atom == atom {
+    let kind = poly.kind
+    let valid = if data.isExotic() {
+      u32.shiftRight(kind, 8) == data.classId() && (data.classId() != classes.JS_CLASS_ARRAY || data.fastArray())
+    } else { kind <= 0xff }
+    if valid && (kind & 0x7f) == POLY_GETTER && u64.shiftRight(poly.stamp, 16) == state.shapeEpoch {
+      let index = u64.toUsize(poly.stamp & 0xffff)
+      let holderPtr = match Pointer.nonNullMut<HeapHeader>(poly.holder) {
+        Option<*mut HeapHeader>.Some { value } => value
+        Option<*mut HeapHeader>.None => object
+      }
+      let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holderPtr)
+      let got = unsafe accessorGetter(&holder, index)
+      if !Pointer.isNull<HeapHeader>(got) { return got }
+    }
+  }
+  drop state drop shape drop data
+  return unsafe walkAndCacheGetter(runtime, object, atom)
+}
 const VICTIM_MISS: u8 = 0
 const VICTIM_VALUE: u8 = 1
 const VICTIM_GETTER: u8 = 2
@@ -2201,15 +2258,38 @@ pub unsafe fn readElementOperand(machine: &mut Machine) -> ?*mut HeapHeader {
   return node
 }
 /// obj[name] for a flat string key that is not an index (a hash table keyed by
-/// strings): the atom it spells, read through quickGet, without interning. A
-/// string no atom spells names no property, so the read is undefined once the
-/// chain is all ordinary objects. None leaves the read to step.
-unsafe fn namedStringRead(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits) -> Option<ValueBits> {
+/// strings): the atom it spells, probed directly across ordinary / Array shapes
+/// without interning. When retain is false, returns a borrowed ValueBits (for
+/// peekNamedString). None leaves the read to step.
+@inlineAlways
+unsafe fn namedStringLookup(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits, retain: bool) -> Option<ValueBits> {
   let anchor = ()
   let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).atoms.findString(key)
   if atom == UNKNOWN_STRING_ATOM { return Option<ValueBits>.none() }
-  if atom != 0 { return unsafe getters.quickGet(runtime, node, atom) }
   let mut current = node
+  if atom != 0 {
+    while true {
+      let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+      let mut cursor = unsafe shapes.unchecked<u32>(&shape.hashIndices, u32.toUsize(atom & shape.propertyHashMask))
+      while cursor != 0 {
+        let index = u32.toUsize(cursor - 1)
+        let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
+        if property.atom == atom {
+          if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 { return Option<ValueBits>.none() }
+          let found = (unsafe p.slotUnchecked(index)).valueBits()
+          return Option<ValueBits>.some(if retain { unsafe found.retained() } else { found })
+        }
+        cursor = property.hashNext
+      }
+      if p.isExotic() && p.classId() != classes.JS_CLASS_ARRAY { return Option<ValueBits>.none() }
+      match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+        Option<*mut HeapHeader>.None => { return Option<ValueBits>.some(ValueBits.Undefined) }
+        Option<*mut HeapHeader>.Some { value: next } => { current = next }
+      }
+    }
+    return Option<ValueBits>.none()
+  }
   while true {
     let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
     if p.isExotic() && p.classId() != classes.JS_CLASS_ARRAY { return Option<ValueBits>.none() }
@@ -2221,16 +2301,18 @@ unsafe fn namedStringRead(runtime: *mut HeapHeader, node: *mut HeapHeader, key: 
   }
   return Option<ValueBits>.none()
 }
+unsafe fn namedStringRead(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits) -> Option<ValueBits> {
+  return unsafe namedStringLookup(runtime, node, key, true)
+}
 /// namedStringRead for js_vm_leaf, returning a borrowed ValueBits (unretained)
 /// for non-index flat string keys on ordinary objects.
 @inlineNever
 pub unsafe fn peekNamedString(runtime: *mut HeapHeader, node: *mut HeapHeader, key: ValueBits, target: *mut ValueBits) -> bool {
   if key.tag() != -7 { return false }
-  let mut found = match unsafe namedStringRead(runtime, node, key) {
+  let found = match unsafe namedStringLookup(runtime, node, key, false) {
     Option<ValueBits>.Some { value } => value
     Option<ValueBits>.None => { return false }
   }
-  if found.tag() < 0 { unsafe lend(Pointer.fromMutRef<ValueBits>(&mut found)) }
   unsafe Pointer.write<ValueBits>(target, found)
   return true
 }
@@ -2776,6 +2858,10 @@ pub unsafe fn writeOwnField(ip: *const u8, node: *mut HeapHeader, source: *mut V
 @inlineNever
 unsafe effect fn writeFieldMiss<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, ip: *const u8, node: *mut HeapHeader, source: *mut ValueBits) -> bool ? &mut Allocator {
   let key = unsafe fieldKeyAt(ip)
+  if u64.shiftRight(key, 32) == u64.shiftRight(FIELD_ADD_KEY, 32) {
+    if unsafe writeFieldAddFast(runtime, ip, node, source, key) { return true }
+    return run unsafe writeFieldSlow(&mut hooks, runtime, ip, node, source)
+  }
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
   if u64.shiftRight(key, 16) == shape.version {
