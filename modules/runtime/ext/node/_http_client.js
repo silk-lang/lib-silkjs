@@ -107,7 +107,7 @@ let debug = require('internal/util/debuglog').debuglog('http', (fn) => {
   debug = fn;
 });
 
-const INVALID_PATH_REGEX = /[^\u0021-\u00ff]/;
+const httpNative = require('internal/host').httpParserNative;
 const kError = Symbol('kError');
 const kPath = Symbol('kPath');
 const kAuthority = Symbol('kAuthority');
@@ -369,7 +369,7 @@ function ClientRequest(input, options, cb) {
 
   if (options.path) {
     const path = String(options.path);
-    if (INVALID_PATH_REGEX.test(path)) {
+    if (httpNative(22, path)) {
       debug('Path contains unescaped characters: "%s"', path);
       throw new ERR_UNESCAPED_CHARACTERS('Request path');
     }

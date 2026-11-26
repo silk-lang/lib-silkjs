@@ -3,12 +3,13 @@
 'use strict';
 
 const { setUnrefTimeout } = require('internal/timers');
+const httpNative = require('internal/host').httpParserNative;
 const traceEvents = require('internal/trace_events');
 
 const { URL } = require('internal/url');
 const { Buffer } = require('buffer');
-const { isIPv4 } = require('internal/net');
 const { ERR_PROXY_INVALID_CONFIG } = require('internal/errors').codes;
+
 let utcCache;
 
 function utcDate() {
@@ -17,9 +18,8 @@ function utcDate() {
 }
 
 function cache() {
-  const d = new Date();
-  utcCache = d.toUTCString();
-  setUnrefTimeout(resetCache, 1000 - d.getMilliseconds());
+  utcCache = httpNative(23, false);
+  setUnrefTimeout(resetCache, 1000 - (Date.now() % 1000));
 }
 
 function resetCache() {
@@ -44,16 +44,6 @@ function traceBegin(name, id, args) {
 
 function traceEnd(name, id, args) {
   traceEvents.emit(traceEventCategory, name, 'e', args, id);
-}
-
-function ipToInt(ip) {
-  const octets = ip.split('.');
-  let result = 0;
-  for (let i = 0; i < octets.length; i++) {
-    result = (result << 8) + Number.parseInt(octets[i]);
-  }
-  // Force unsigned 32-bit result
-  return result >>> 0;
 }
 
 // There are two factors in play when proxying the request:
@@ -117,6 +107,7 @@ class ProxyConfig {
       const auth = `${decodeURIComponent(username)}:${decodeURIComponent(password)}`;
       this.auth = `Basic ${Buffer.from(auth).toString('base64')}`;
     }
+    this._rawNoProxy = noProxyList || '';
     if (noProxyList) {
       this.bypassList = noProxyList.split(',').map((entry) => entry.trim().toLowerCase());
     } else {
@@ -135,48 +126,10 @@ class ProxyConfig {
   // See: https://about.gitlab.com/blog/we-need-to-talk-no-proxy
   // TODO(joyeecheung): share code with undici.
   shouldUseProxy(hostname, port) {
-    const bypassList = this.bypassList;
     if (this.bypassList.length === 0) {
       return true; // No bypass list, always use the proxy.
     }
-
-    const host = hostname.toLowerCase();
-    const hostWithPort = port ? `${host}:${port}` : host;
-
-    for (let i = 0; i < bypassList.length; i++) {
-      const entry = bypassList[i];
-
-      if (entry === '*') return false;  // * bypasses all hosts.
-      if (entry === host || entry === hostWithPort) return false;  // Matching host and host:port
-
-      // Follow curl's behavior: strip leading dot before matching suffixes.
-      if (entry[0] === '.') {
-        const suffix = entry.substring(1);
-        if (host === suffix || (host.endsWith(suffix) && host[host.length - suffix.length - 1] === '.')) return false;
-      }
-
-      // Handle wildcards like *.example.com
-      if (entry.startsWith('*.') && host.endsWith(entry.substring(1))) return false;
-
-      // Handle IP ranges (simple format like 192.168.1.0-192.168.1.255)
-      // TODO(joyeecheung): support IPv6.
-      if (entry.includes('-') && isIPv4(host)) {
-        let { 0: startIP, 1: endIP } = entry.split('-');
-        startIP = startIP.trim();
-        endIP = endIP.trim();
-        if (startIP && endIP && isIPv4(startIP) && isIPv4(endIP)) {
-          const hostInt = ipToInt(host);
-          const startInt = ipToInt(startIP);
-          const endInt = ipToInt(endIP);
-          if (hostInt >= startInt && hostInt <= endInt) return false;
-        }
-      }
-
-      // It might be useful to support CIDR notation, but it's not so widely supported
-      // in other tools as a de-facto standard to follow, so we don't implement it for now.
-    }
-
-    return true; // If no matches found, use the proxy.
+    return httpNative(25, this._rawNoProxy, hostname, port ? Number(port) : 0);
   }
 }
 

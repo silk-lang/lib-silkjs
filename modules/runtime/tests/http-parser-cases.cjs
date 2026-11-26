@@ -110,3 +110,19 @@ run('missing lf', REQ, 'GET / HTTP/1.1\r\nHost: x\rY');
 run('status 1xx then', RES, 'HTTP/1.1 103 Early Hints\r\nLink: </s>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
 run('response split body', RES, 'HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789', { split: [39, 41, 45] });
 run('header field split', REQ, 'GET / HTTP/1.1\r\nContent-Type: text/plain\r\n\r\n', { split: [18, 22, 30, 32, 40] });
+// Extended lenient flags.
+run('lenient optional cr before lf request', REQ, 'GET / HTTP/1.1\nHost: x\nX-A: b\n\n', { lenient: HTTPParser.kLenientOptionalCRBeforeLF | HTTPParser.kLenientOptionalLFAfterCR });
+run('lenient optional cr before lf response', RES, 'HTTP/1.1 200 OK\nContent-Length: 2\n\nok', { lenient: HTTPParser.kLenientOptionalCRBeforeLF });
+run('lenient optional cr before lf chunked', REQ, 'POST / HTTP/1.1\nTransfer-Encoding: chunked\n\n2\nhi\n0\r\n\r\n', { lenient: HTTPParser.kLenientOptionalCRBeforeLF | HTTPParser.kLenientOptionalLFAfterCR });
+run('lenient optional lf after cr', REQ, 'GET / HTTP/1.1\rHost: x\r\n\r', { lenient: HTTPParser.kLenientOptionalLFAfterCR });
+run('lenient optional crlf after chunk', REQ, 'POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi0\r\n\r\n', { lenient: HTTPParser.kLenientOptionalCRLFAfterChunk });
+run('lenient spaces after chunk size', REQ, 'POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2  \r\nhi\r\n0 \t\r\n\r\n', { lenient: HTTPParser.kLenientSpacesAfterChunkSize });
+run('lenient relaxed header value control', REQ, 'GET / HTTP/1.1\r\nX-Ctrl: a\x01\x07\x7fb\r\n\r\n', { lenient: HTTPParser.kLenientHeaderValueRelaxed });
+// Regression cases for SilkHttp vs llhttp parity.
+run('cl then te rejected as invalid te', REQ, 'POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n');
+run('cl then te response rejected as invalid te', RES, 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n');
+run('te smuggling duplicate te after chunked', REQ, 'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked-false\r\n\r\n');
+run('te smuggling chunked not last in request', REQ, 'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n');
+run('lenient obs-fold multi-line header', RES, 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain;\r\n x-mode=0600;\r\n name="a.txt"\r\n\r\nhi', { lenient: HTTPParser.kLenientHeaders });
+run('chunk extension overflow', REQ, 'GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2;' + 'a'.repeat(17000) + '\r\nAA\r\n0\r\n\r\n');
+run('chunk extension overflow split', REQ, 'GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2;' + 'a'.repeat(17000) + '\r\nAA\r\n0\r\n\r\n', { split: [54, 8554] });

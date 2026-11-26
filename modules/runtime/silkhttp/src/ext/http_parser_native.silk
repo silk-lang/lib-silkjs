@@ -41,6 +41,10 @@ import silkjs.js_weakref_intrinsics_storage as weak
 import silkjsruntime.libs.core.capabilities { Composition }
 import silkjsruntime.libs.core.host as host
 import ext.http1 as c
+import ext.http_core as hcore
+import ext.http_incoming as hincoming
+import ext.http_outgoing as houtgoing
+import ext.http_agent as hagent
 
 pub struct State {
   handles: HashMap<Word, *mut Entry>,
@@ -49,11 +53,16 @@ pub struct State {
   engine: ?*mut u8,
   context: ?*mut HeapHeader,
   depth: usize,
-  allocator: *mut RuntimeHeap
+  allocator: *mut RuntimeHeap,
+  dateCache: hcore.DateCache,
+  connections: hcore.ConnectionsState,
+  outgoing: houtgoing.OutgoingScratch,
+  incoming: hincoming.IncomingScratch
 }
 struct Entry {
   state: *mut State,
   id: u64,
+  listId: u64,
   parser: *mut u8,
   callback: ValueBits,
   deferred: ?*mut Entry,
@@ -83,6 +92,20 @@ effect fn allocate<T>() -> *mut T ! OutOfMemoryError {
   return unsafe cast<T>(p)
 }
 fn number(v: ValueBits) -> u64 { return f64.toU64(v.numericValue()) }
+fn opInt(v: ValueBits) -> i32 {
+  return match v {
+    ValueBits.Int { value } => value
+    _ => f64.toI32(v.numericValue())
+  }
+}
+fn isTruthy(v: ValueBits) -> bool {
+  return match v {
+    ValueBits.Bool { value } => value
+    ValueBits.Int { value } => value != 0
+    ValueBits.Float64 { value } => value != 0.0
+    _ => false
+  }
+}
 
 pub effect fn open(allocator: *mut RuntimeHeap) -> *mut State ! OutOfMemoryError {
   let p = run allocate<State>()
@@ -90,7 +113,11 @@ pub effect fn open(allocator: *mut RuntimeHeap) -> *mut State ! OutOfMemoryError
     handles: HashMap<Word, *mut Entry>.make(Hash.seed(11000)),
     deferred: Pointer.null<Entry>(), next: 1,
     engine: Pointer.null<u8>(), context: Pointer.null<HeapHeader>(), depth: 0,
-    allocator: allocator
+    allocator: allocator,
+    dateCache: hcore.makeDateCache(),
+    connections: hcore.makeConnectionsState(),
+    outgoing: houtgoing.makeOutgoingScratch(),
+    incoming: hincoming.makeIncomingScratch()
   })
   return p
 }
@@ -104,7 +131,9 @@ unsafe fn lookup(state: *mut State, id: u64) -> ?*mut Entry {
 unsafe fn destroy<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, entry: *mut Entry) -> () {
   let owned = unsafe Pointer.take<Entry>(entry)
   let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
-  let _removed = s.handles.remove(Hash.word(owned.id)) drop s
+  let _removed = s.handles.remove(Hash.word(owned.id))
+  unsafe hcore.connectionsRemoveNode(&mut engine, context, &mut s.connections, owned.id)
+  drop s
   unsafe c.silk_http_parser_free(owned.parser)
   unsafe c.free(owned.head) unsafe c.free(unsafe Intrinsic.pointerReinterpret<?*mut u32, ?*mut u8>(owned.marks))
   unsafe owners.release(&mut engine, context, owned.callback)
@@ -144,6 +173,10 @@ pub unsafe fn close<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>
     if !Pointer.isNull<Entry>(p) { unsafe destroy(&mut engine, context, state, unsafe nn(p)) }
     i = i + 1
   }
+  let mut m = () let sm = unsafe Pointer.borrowMut<(), State>(&mut m, state)
+  unsafe hcore.releaseDateCache(&mut engine, context, &mut sm.dateCache)
+  unsafe hcore.closeConnectionsState(&mut engine, context, &mut sm.connections)
+  drop sm
   let owned = unsafe Pointer.take<State>(state) drop owned
   unsafe c.free(unsafe raw(state))
 }
@@ -157,7 +190,7 @@ unsafe effect fn create<'m, C: Composition>(engine: &mut Engine<'m, host.Service
   let parser = unsafe c.silk_http_parser_new(unsafe raw(p), silkSilkHTTPParserEvent<C>)
   if Pointer.isNull<u8>(parser) { unsafe c.free(unsafe raw(p)) fail OutOfMemoryError {} }
   unsafe Pointer.put<Entry>(p, Entry {
-    state: state, id: id, parser: unsafe nn(parser), callback: unsafe callback.retained(),
+    state: state, id: id, listId: 0, parser: unsafe nn(parser), callback: unsafe callback.retained(),
     deferred: Pointer.null<Entry>(), active: false, dead: false, outOfMemory: false,
     maximum: 16384, headerBytes: 0, extensionBytes: 0,
     input: Pointer.null<u8>(), length: 0,
@@ -336,8 +369,25 @@ export "C" fn silkSilkHTTPParserEvent<C: Composition>(owner: ?*mut u8, event: i3
     if e.extensionBytes > 16384 { drop e unsafe c.silk_http_parser_error(parser, 2) return 24 }
   }
   if event == 7 { e.pairsKnown = false }
+  let listId = e.listId
+  let parserId = e.id
   let mut gathered = unsafe gather(&mut e, event, data, length)
   drop e
+  if listId != 0 {
+    if event == 0 {
+      let mut csA = () let st = unsafe Pointer.borrowMut<(), State>(&mut csA, state)
+      unsafe hcore.connectionsBeginExisting(&mut st.connections, listId, parserId, false)
+      drop st
+    } else if event == 7 {
+      let csA = () let st = unsafe Pointer.borrow<(), State>(&csA, state)
+      unsafe hcore.connectionsMarkHeadersComplete(&st.connections, parserId)
+      drop st
+    } else if event == 9 {
+      let mut csA = () let st = unsafe Pointer.borrowMut<(), State>(&mut csA, state)
+      unsafe hcore.connectionsComplete(&mut st.connections, listId, parserId)
+      drop st
+    }
+  }
   if gathered == -3 {
     let limit = unsafe callJS<C>(entry, state, parser, 14, data, length, position)
     if limit == JS_FAILED { return 24 }
@@ -483,11 +533,8 @@ unsafe effect fn execute<'m, C: Composition>(engine: &mut Engine<'m, host.Servic
   }
 }
 
-unsafe effect fn dispatchBody<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, argv: &FrameSlots, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-  let op = number(unsafe common.argument(argv, 0))
+unsafe effect fn dispatchBody<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, op: i32, argv: &FrameSlots, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   if op == 0 { return run unsafe create(&mut engine, context, state, unsafe common.argument(argv, 1)) }
-  // The parser's version, for process.versions.llhttp.
-  if op == 11 { return (run text.string(&mut engine, unsafe lendRealm(&context, context), b"silk")).intoBits() }
   if op == 8 {
     let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
     let mut i: i32 = 0
@@ -505,56 +552,203 @@ unsafe effect fn dispatchBody<'m, C: Composition>(engine: &mut Engine<'m, host.S
   let entry = unsafe nn(found)
   if op == 1 { unsafe dispose(&mut engine, context, state, entry) return ValueBits.Undefined }
   let a = () let e = unsafe Pointer.borrow<(), Entry>(&a, entry) let parser = e.parser let active = e.active drop e
-  if op == 2 {
-    if active { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Cannot reinitialize an active HTTP parser") }
-    unsafe c.silk_http_parser_initialize(parser, u64.toI32(number(unsafe common.argument(argv, 2))), u64.toU32(number(unsafe common.argument(argv, 4))))
-    let mut b = () let e2 = unsafe Pointer.borrowMut<(), Entry>(&mut b, entry)
-    e2.maximum = number(unsafe common.argument(argv, 3)) e2.headerBytes = 0 e2.extensionBytes = 0 e2.pairsKnown = false unsafe resetHead(&mut e2)
-    return ValueBits.Undefined
-  }
-  if op == 3 {
-    let value = unsafe common.argument(argv, 2)
-    let classId = unsafe buffers.classId(value)
-    if classId < classes.JS_CLASS_UINT8C_ARRAY || classId > classes.JS_CLASS_DATAVIEW {
-      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"HTTP parser input must be an ArrayBuffer view")
+  return match op {
+    2 => {
+      if active { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Cannot reinitialize an active HTTP parser") }
+      unsafe c.silk_http_parser_initialize(parser, u64.toI32(number(unsafe common.argument(argv, 2))), u64.toU32(number(unsafe common.argument(argv, 4))))
+      let mut b = () let e2 = unsafe Pointer.borrowMut<(), Entry>(&mut b, entry)
+      e2.maximum = number(unsafe common.argument(argv, 3)) e2.headerBytes = 0 e2.extensionBytes = 0 e2.pairsKnown = false e2.listId = 0 unsafe resetHead(&mut e2)
+      ValueBits.Undefined
     }
-    let object = core.reference(value)
-    // The parser holds the input's ArrayBuffer, so a lazy typed array gets one.
-    let memory = engine.memory
-    run unsafe buffers.materialize(&mut engine, memory, unsafe lendRealm(&context, context), object)
-    let view = unsafe buffers.view(object)
-    let mut offset: u64 = 0 let mut length: u64 = 0
-    if !unsafe buffers.isOutOfBounds(object) {
-      offset = view.offset length = view.byteLength
-      if view.tracking {
-        let backing = unsafe buffers.snapshot(view.buffer)
-        length = backing.byteLength - offset
-        if classId != classes.JS_CLASS_DATAVIEW {
-          let width = u64.shiftLeft(1, u32.toU64(buffers.sizeLog2(classId)))
-          length = length - length % width
+    3 => {
+      let value = unsafe common.argument(argv, 2)
+      let classId = unsafe buffers.classId(value)
+      if classId < classes.JS_CLASS_UINT8C_ARRAY || classId > classes.JS_CLASS_DATAVIEW {
+        return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"HTTP parser input must be an ArrayBuffer view")
+      }
+      let object = core.reference(value)
+      // The parser holds the input's ArrayBuffer, so a lazy typed array gets one.
+      let memory = engine.memory
+      run unsafe buffers.materialize(&mut engine, memory, unsafe lendRealm(&context, context), object)
+      let view = unsafe buffers.view(object)
+      let mut offset: u64 = 0 let mut length: u64 = 0
+      if !unsafe buffers.isOutOfBounds(object) {
+        offset = view.offset length = view.byteLength
+        if view.tracking {
+          let backing = unsafe buffers.snapshot(view.buffer)
+          length = backing.byteLength - offset
+          if classId != classes.JS_CLASS_DATAVIEW {
+            let width = u64.shiftLeft(1, u32.toU64(buffers.sizeLog2(classId)))
+            length = length - length % width
+          }
         }
       }
+      run unsafe execute(&mut engine, context, entry, ValueBits.Object { reference: view.buffer }, offset, length, &mut scope)
     }
-    return run unsafe execute(&mut engine, context, entry, ValueBits.Object { reference: view.buffer }, offset, length, &mut scope)
+    4 => run unsafe executeBytes(&mut engine, context, entry, Pointer.fromRef<u8>(&b"\0"[0]), 0, true, ValueBits.Undefined, 0, false, &mut scope)
+    5 => { unsafe c.llhttp_pause(parser) ValueBits.Undefined }
+    6 => { unsafe c.llhttp_resume(parser) ValueBits.Undefined }
+    7 => {
+      let e3 = unsafe Pointer.borrow<(), Entry>(&a, entry) let input = e3.input let length = e3.length drop e3
+      let memory = engine.memory
+      run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), input, usize.toU64(length))
+    }
+    9 => { unsafe c.silk_http_parser_error(parser, u64.toI32(number(unsafe common.argument(argv, 2)))) ValueBits.Undefined }
+    10 => { unsafe c.silk_http_parser_set_upgrade(parser, u64.toI32(number(unsafe common.argument(argv, 2)))) ValueBits.Undefined }
+    _ => run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown HTTP parser operation")
   }
-  if op == 4 { return run unsafe executeBytes(&mut engine, context, entry, Pointer.fromRef<u8>(&b"\0"[0]), 0, true, ValueBits.Undefined, 0, false, &mut scope) }
-  if op == 5 { unsafe c.llhttp_pause(parser) return ValueBits.Undefined }
-  if op == 6 { unsafe c.llhttp_resume(parser) return ValueBits.Undefined }
-  if op == 7 {
-    let e3 = unsafe Pointer.borrow<(), Entry>(&a, entry) let input = e3.input let length = e3.length drop e3
-    let memory = engine.memory
-    return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), input, usize.toU64(length))
-  }
-  if op == 9 { unsafe c.silk_http_parser_error(parser, u64.toI32(number(unsafe common.argument(argv, 2)))) return ValueBits.Undefined }
-  if op == 10 { unsafe c.silk_http_parser_set_upgrade(parser, u64.toI32(number(unsafe common.argument(argv, 2)))) return ValueBits.Undefined }
-  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown HTTP parser operation")
 }
+
+unsafe effect fn dispatchScoped<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, op: i32, argv: &FrameSlots, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  return match op {
+    24 => run unsafe hcore.buildStatusCodes(&mut engine, context, &mut scope)
+    33 => {
+      let a = () let s = unsafe Pointer.borrow<(), State>(&a, state)
+      run unsafe hcore.connectionsCollect(&mut engine, context, &s.connections, number(unsafe common.argument(argv, 1)), u64.toI32(number(unsafe common.argument(argv, 2))), &mut scope)
+    }
+    34 => {
+      let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+      run unsafe hcore.connectionsExpired(&mut engine, context, &mut s.connections, number(unsafe common.argument(argv, 1)), u64.toU32(number(unsafe common.argument(argv, 2))), u64.toU32(number(unsafe common.argument(argv, 3))), &mut scope)
+    }
+    35 => {
+      let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+      run unsafe hincoming.buildHeaders(&mut engine, context, &mut s.incoming, unsafe common.argument(argv, 1), u64.toU32(number(unsafe common.argument(argv, 2))), isTruthy(unsafe common.argument(argv, 3)), &mut scope)
+    }
+    36 => {
+      let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+      run unsafe hincoming.buildHeadersDistinct(&mut engine, context, &mut s.incoming, unsafe common.argument(argv, 1), u64.toU32(number(unsafe common.argument(argv, 2))), &mut scope)
+    }
+    37 => {
+      let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+      run unsafe houtgoing.serializeHead(
+        &mut engine, context, &mut s.dateCache, &mut s.outgoing,
+        unsafe common.argument(argv, 1), unsafe common.argument(argv, 2), u64.toU32(number(unsafe common.argument(argv, 3))),
+        u64.toU32(number(unsafe common.argument(argv, 4))), (unsafe common.argument(argv, 5)).numericValue(),
+        f64.toI32((unsafe common.argument(argv, 6)).numericValue()), f64.toI32((unsafe common.argument(argv, 7)).numericValue()),
+        &mut scope
+      )
+    }
+    38 => run unsafe houtgoing.serializeTrailers(&mut engine, context, unsafe common.argument(argv, 1), u64.toU32(number(unsafe common.argument(argv, 2))), isTruthy(unsafe common.argument(argv, 3)), &mut scope)
+    _ => ValueBits.Undefined
+  }
+}
+
 pub unsafe effect fn dispatch<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let op = opInt(unsafe common.argument(argv, 0))
+  // Fast leaf / non-reentrant Silk HTTP/1 operations: skip parser reentrancy bookkeeping, sweep, and Scope when unused.
+  if op >= 20 {
+    return match op {
+      20 => ValueBits.Bool { value: hcore.checkIsHttpToken(unsafe common.argument(argv, 1)) }
+      21 => {
+        let v = unsafe common.argument(argv, 1)
+        let lenient = isTruthy(unsafe common.argument(argv, 2))
+        if v.isString() { return ValueBits.Bool { value: hcore.checkInvalidHeaderCharString(v, lenient) } }
+        let t = v.tag()
+        if t == 0 || t == 1 || t == 8 { return ValueBits.Bool { value: false } }
+        let s = run unsafe common.toString(&mut engine, context, v)
+        let bad = hcore.checkInvalidHeaderCharString(s, lenient)
+        unsafe owners.release(&mut engine, context, s)
+        ValueBits.Bool { value: bad }
+      }
+      22 => ValueBits.Bool { value: hcore.checkInvalidRequestPath(unsafe common.argument(argv, 1)) }
+      23 => {
+        let asLine = isTruthy(unsafe common.argument(argv, 1))
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        run unsafe hcore.utcDateValue(&mut engine, context, &mut s.dateCache, asLine)
+      }
+      25 => {
+        let listVal = unsafe common.argument(argv, 1)
+        let hostVal = unsafe common.argument(argv, 2)
+        let portVal = unsafe common.argument(argv, 3)
+        let port = if portVal.isNumber() { f64.toI32(portVal.numericValue()) } else { 0 }
+        if !listVal.isString() || Strings.length(listVal) == 0 { return ValueBits.Bool { value: true } }
+        let listBytes = run Strings.toUtf8(listVal, false)
+        let hostBytes = if hostVal.isString() { run Strings.toUtf8(hostVal, false) } else { run Strings.toUtf8(ValueBits.Undefined, false) }
+        ValueBits.Bool { value: hcore.shouldUseProxy(listBytes.asSlice(), hostBytes.asSlice(), port) }
+      }
+      26 => {
+        let hayVal = unsafe common.argument(argv, 1)
+        let wordVal = unsafe common.argument(argv, 2)
+        if !hayVal.isString() || !wordVal.isString() { return ValueBits.Bool { value: false } }
+        let hayBytes = run Strings.toUtf8(hayVal, false)
+        let wordBytes = run Strings.toUtf8(wordVal, false)
+        ValueBits.Bool { value: houtgoing.containsWordFold(hayBytes.asSlice(), wordBytes.asSlice()) }
+      }
+      27 => {
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        let id = run hcore.createConnectionsList(&mut s.connections)
+        ValueBits.number(u64.toF64(id))
+      }
+      28 => {
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        unsafe hcore.destroyConnectionsList(&mut engine, context, &mut s.connections, number(unsafe common.argument(argv, 1)))
+        ValueBits.Undefined
+      }
+      29 => {
+        let listId = number(unsafe common.argument(argv, 1))
+        let parserId = number(unsafe common.argument(argv, 2))
+        let foundEntry = unsafe lookup(state, parserId)
+        if !Pointer.isNull<Entry>(foundEntry) {
+          let mut ea = () let ep = unsafe Pointer.borrowMut<(), Entry>(&mut ea, unsafe nn(foundEntry))
+          ep.listId = listId
+          drop ep
+        }
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        run unsafe hcore.connectionsBegin(&mut engine, context, &mut s.connections, listId, parserId, unsafe common.argument(argv, 3), isTruthy(unsafe common.argument(argv, 4)))
+        ValueBits.Undefined
+      }
+      30 => {
+        let a = () let s = unsafe Pointer.borrow<(), State>(&a, state)
+        unsafe hcore.connectionsMarkHeadersComplete(&s.connections, number(unsafe common.argument(argv, 1)))
+        ValueBits.Undefined
+      }
+      31 => {
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        unsafe hcore.connectionsComplete(&mut s.connections, number(unsafe common.argument(argv, 1)), number(unsafe common.argument(argv, 2)))
+        ValueBits.Undefined
+      }
+      32 => {
+        let parserId = number(unsafe common.argument(argv, 1))
+        let foundEntry = unsafe lookup(state, parserId)
+        if !Pointer.isNull<Entry>(foundEntry) {
+          let mut ea = () let ep = unsafe Pointer.borrowMut<(), Entry>(&mut ea, unsafe nn(foundEntry))
+          ep.listId = 0
+          drop ep
+        }
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        unsafe hcore.connectionsRemoveNode(&mut engine, context, &mut s.connections, parserId)
+        ValueBits.Undefined
+      }
+      39 => run unsafe hagent.formatAgentName(&mut engine, context, unsafe common.argument(argv, 1), unsafe common.argument(argv, 2), unsafe common.argument(argv, 3), f64.toI32((unsafe common.argument(argv, 4)).numericValue()), unsafe common.argument(argv, 5))
+      40 => run unsafe hagent.calculateServerName(&mut engine, context, unsafe common.argument(argv, 1), unsafe common.argument(argv, 2))
+      41 => ValueBits.Int { value: hagent.parseKeepAliveTimeout(unsafe common.argument(argv, 1)) }
+      42 => {
+        let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+        run unsafe houtgoing.serializeSimpleHead(
+          &mut engine, context, &mut s.dateCache, &mut s.outgoing,
+          unsafe common.argument(argv, 1), (unsafe common.argument(argv, 2)).numericValue(),
+          f64.toI32((unsafe common.argument(argv, 3)).numericValue()), f64.toI32((unsafe common.argument(argv, 4)).numericValue()),
+          isTruthy(unsafe common.argument(argv, 5))
+        )
+      }
+      24 | 33 | 34 | 35 | 36 | 37 | 38 => {
+        let mut scope = Scope.make()
+        let result = run Effect.result(unsafe dispatchScoped(&mut engine, context, state, op, argv, &mut scope))
+        unsafe owners.cleanup(&mut engine, context, move scope)
+        match move result {
+          Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+          Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+        }
+      }
+      _ => run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown HTTP parser operation")
+    }
+  }
+  if op == 11 { return (run text.string(&mut engine, unsafe lendRealm(&context, context), b"silk")).intoBits() }
   let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
   let previousEngine = s.engine let previousContext = s.context
   s.engine = unsafe raw(Pointer.fromMutRef<Engine<'m, host.Services<C>>>(&mut engine.*)) s.context = context s.depth = s.depth + 1 drop s
   let mut scope = Scope.make()
-  let result = run Effect.result(unsafe dispatchBody(&mut engine, context, state, argv, &mut scope))
+  let result = run Effect.result(unsafe dispatchBody(&mut engine, context, state, op, argv, &mut scope))
   unsafe owners.cleanup(&mut engine, context, move scope)
   let finished = unsafe Pointer.borrowMut<(), State>(&mut a, state)
   finished.engine = previousEngine finished.context = previousContext finished.depth = finished.depth - 1 drop finished

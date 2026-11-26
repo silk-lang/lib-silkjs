@@ -1,0 +1,195 @@
+//! Native Silk HTTP/1 Agent helpers: canonical pool key formatting (getName),
+//! TLS servername normalization (IPv6 bracket stripping & IP suppression),
+//! and Keep-Alive timeout hint parsing.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.net.address { AddressError, Ipv4Address, Ipv6Address }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u64
+import silk.num.i32
+import silk.num.f64
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.js_proxy_core as core
+import silkjs.js_realm { lendRealm }
+
+fn isIpBytes(bytes: &[u8]) -> bool {
+  if bytes.length == 0 { return false }
+  match Ipv4Address.parseBytes(bytes) {
+    Result<Ipv4Address, AddressError>.Success { .. } => { return true }
+    Result<Ipv4Address, AddressError>.Failure { .. } => ()
+  }
+  match Ipv6Address.parseBytes(bytes) {
+    Result<Ipv6Address, AddressError>.Success { .. } => { return true }
+    Result<Ipv6Address, AddressError>.Failure { .. } => { return false }
+  }
+}
+
+effect fn appendUtf8OrLatin1(out: &mut Bytes, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    return run out.append(unsafe Strings.flatLatin1(&anchor, value))
+  }
+  let bytes = run Strings.toUtf8(value, false)
+  run out.append(bytes.asSlice())
+}
+
+unsafe effect fn makeUtf8<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, bytes: &[u8]) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let made = run Effect.result(Strings.fromUtf8(bytes))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}
+
+/// Computes `Agent.prototype.getName` key in Silk: `host:port:localAddress[:family][:socketPath]`.
+pub unsafe effect fn formatAgentName<'m, S: EngineServices>(
+  engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader,
+  host: ValueBits,
+  port: ValueBits,
+  localAddress: ValueBits,
+  family: i32,
+  socketPath: ValueBits
+) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut out = Bytes.make()
+  run out.reserve(64)
+  if host.isString() && Strings.length(host) > 0 {
+    run appendUtf8OrLatin1(&mut out, host)
+  } else {
+    run out.append(b"localhost")
+  }
+  run out.append(b":")
+  if port.isString() && Strings.length(port) > 0 {
+    run appendUtf8OrLatin1(&mut out, port)
+  } else if port.isNumber() {
+    let p = port.numericValue()
+    if p != 0.0 {
+      let mut digits: [u8; 24] = [0; 24]
+      let mut n = i32.toU64(f64.toI32(p))
+      let mut count: usize = 0
+      while true {
+        digits[23 - count] = u64.toU8(48 + n % 10)
+        n = n / 10
+        count = count + 1
+        if n == 0 { break }
+      }
+      run out.append(Slice.view<u8>(&digits, 24 - count, count))
+    }
+  }
+  run out.append(b":")
+  if localAddress.isString() && Strings.length(localAddress) > 0 {
+    run appendUtf8OrLatin1(&mut out, localAddress)
+  }
+  if family == 4 {
+    run out.append(b":4")
+  } else if family == 6 {
+    run out.append(b":6")
+  }
+  if socketPath.isString() && Strings.length(socketPath) > 0 {
+    run out.append(b":")
+    run appendUtf8OrLatin1(&mut out, socketPath)
+  }
+  return run unsafe makeUtf8(&mut engine, context, out.asSlice())
+}
+
+/// Computes `calculateServerName` from `hostOption` and optional `hostHeader` string.
+/// Strips brackets/ports and returns `""` when the result is an IPv4/IPv6 literal.
+pub unsafe effect fn calculateServerName<'m, S: EngineServices>(
+  engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader,
+  hostOption: ValueBits,
+  hostHeader: ValueBits
+) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut buf = Bytes.make()
+  if hostHeader.isString() && Strings.length(hostHeader) > 0 {
+    run appendUtf8OrLatin1(&mut buf, hostHeader)
+    let s = buf.asSlice()
+    let mut selected = s
+    if s.length > 0 && s[0] == 91 {
+      let mut closeIdx: usize = s.length
+      let mut i: usize = 1
+      while i < s.length { if s[i] == 93 { closeIdx = i break } i = i + 1 }
+      if closeIdx < s.length {
+        selected = Slice.view<u8>(s, 1, closeIdx - 1)
+      }
+    } else {
+      let mut colonIdx: usize = s.length
+      let mut i: usize = 0
+      while i < s.length { if s[i] == 58 { colonIdx = i break } i = i + 1 }
+      selected = Slice.view<u8>(s, 0, colonIdx)
+    }
+    if isIpBytes(selected) { return run unsafe makeUtf8(&mut engine, context, b"") }
+    return run unsafe makeUtf8(&mut engine, context, selected)
+  }
+  if !hostOption.isString() || Strings.length(hostOption) == 0 {
+    return if hostOption.tag() == 3 { ValueBits.Undefined } else { unsafe hostOption.retained() }
+  }
+  run appendUtf8OrLatin1(&mut buf, hostOption)
+  if isIpBytes(buf.asSlice()) { return run unsafe makeUtf8(&mut engine, context, b"") }
+  return unsafe hostOption.retained()
+}
+
+/// Parses `^timeout=(\d+)` from a `Keep-Alive` response header value.
+/// Returns the timeout in seconds (>= 0), or -1 if no match.
+pub fn parseKeepAliveTimeout(value: ValueBits) -> i32 {
+  if !value.isString() { return -1 }
+  let prefix = b"timeout="
+  let len = Strings.length(value)
+  if len <= 8 { return -1 }
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    let s = unsafe Strings.flatLatin1(&anchor, value)
+    let mut i: usize = 0
+    while i < 8 { if s[i] != prefix[i] { return -1 } i = i + 1 }
+    if s[8] < 48 || s[8] > 57 { return -1 }
+    let mut acc: i32 = 0
+    let mut j: usize = 8
+    while j < s.length && s[j] >= 48 && s[j] <= 57 {
+      let digit = u8.toI32(s[j] - 48)
+      if acc > 214748364 { return 2147483647 }
+      acc = acc * 10 + digit
+      j = j + 1
+    }
+    return acc
+  }
+  let mut iter = RopeIterator.make(&value)
+  let mut i: usize = 0
+  while i < 8 {
+    match iter.next() {
+      Option<u16>.Some { value: u } => { if u != u8.toU16(prefix[i]) { return -1 } }
+      Option<u16>.None => { return -1 }
+    }
+    i = i + 1
+  }
+  let mut acc: i32 = 0
+  let mut sawDigit = false
+  while true {
+    match iter.next() {
+      Option<u16>.Some { value: u } => {
+        if u >= 48 && u <= 57 {
+          sawDigit = true
+          if acc > 214748364 { return 2147483647 }
+          acc = acc * 10 + u16.toI32(u - 48)
+        } else {
+          break
+        }
+      }
+      Option<u16>.None => { break }
+    }
+  }
+  return if sawDigit { acc } else { -1 }
+}
