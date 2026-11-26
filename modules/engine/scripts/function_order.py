@@ -80,6 +80,9 @@ def main():
     leaf_eval = declarations.get('silkjs-engine:js_vm_leaf.silk::evaluate')
     if 'silkjs_leaf_align' in known and leaf_eval and leaf_eval in known:
         names = [n for n in names if n not in ('silkjs_leaf_align', leaf_eval)] + ['silkjs_leaf_align', leaf_eval]
+    known_call = declarations.get('silkjs-engine:js_vm.silk::enterKnownCall')
+    if 'silkjs_hot_align' in known and known_call and known_call in known:
+        names = [n for n in names if n not in ('silkjs_hot_align', known_call)] + ['silkjs_hot_align', known_call]
     with open(os.path.join(ROOT, 'startup.order'), 'w') as out:
         out.write(HEADER)
         out.write(''.join(name + '\n' for name in names))
