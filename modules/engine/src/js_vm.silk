@@ -2663,6 +2663,43 @@ unsafe effect fn objectKeysSlow<H: HeapHooks>(hooks: &mut H, memory: &Allocation
   unsafe machine.push(answer)
   return true
 }
+/// Non-effect 5-register fast path for Object.keys(obj): bypasses leanInlineSlow,
+/// Allocator, AllocationObserver, and ValueBits parameter spills. Returns false on
+/// spare/cache miss so quickInline falls through to leanInlineSlow -> objectKeysInline.
+@inlineNever
+unsafe fn objectKeysFast<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode: u8, funcRef: *mut HeapHeader) -> bool {
+  let counter = unsafe interrupts.counter(machine.context)
+  let left = unsafe Pointer.read<i32>(counter)
+  if left <= 1 { return false }
+  let fnAnchor = ()
+  let fnData = unsafe HeapCell.payload<ObjectData, ()>(&fnAnchor, funcRef)
+  let homeOpt = match &fnData.payload {
+    ObjectPayload.NativeFunction { function: native } => native.realm()
+    _ => Pointer.null<HeapHeader>()
+  }
+  drop fnData
+  let home = match Pointer.nonNullMut<HeapHeader>(homeOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return false }
+  }
+  let data = unsafe operandCell(machine.stackTop, 1)
+  let input = unsafe Pointer.read<ValueBits>(data)
+  let inputRef = match input { ValueBits.Object { reference } => reference _ => { return false } }
+  let runtime = machine.runtime
+  let answer = unsafe objectIntrinsics.quickKeysSpareRef(runtime, home, inputRef)
+  if !answer.isObject() { return false }
+  let isMethod = opcode == op.OP_call_method
+  let first = if isMethod { unsafe operandCell(data, 2) } else { unsafe operandCell(data, 1) }
+  if opcode == op.OP_call || isMethod { unsafe machine.skip(2) }
+  unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
+  let receiver = if isMethod { unsafe Pointer.read<ValueBits>(first) } else { ValueBits.Undefined }
+  unsafe Pointer.write<ValueBits>(first, answer)
+  machine.stackTop = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(first), 1)
+  if isMethod { unsafe releaseStackValueFast(&mut hooks, runtime, receiver) }
+  unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
+  unsafe gc.releaseObjectHeader(&mut hooks, runtime, inputRef)
+  return true
+}
 /// A CALL_KIND_OBJECT_KEYS call (`Object.keys(obj)`): runs objectIntrinsics.quickKeysSpare
 /// directly without leanCall/genericFamilies/object_intrinsics dispatch layers,
 /// outlining the allocator-using quickKeys fallback and unrolling operand release.
@@ -2794,6 +2831,11 @@ unsafe fn asyncContextCall<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, o
   unsafe machine.push(answer)
   return true
 }
+/// Cold operand-release fallback for answerKnown / callMethodAnswer on unusual arg counts.
+@cold
+unsafe fn releaseOperandsSlow<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, first: *mut ValueBits) -> () {
+  unsafe releaseOperandsFrom(&mut hooks, &mut machine, first)
+}
 /// nativeFunctions.leanAnswerKnown in place of a CALL_KIND_ANSWER call:
 /// takes 6 register arguments (no ValueBits spill or stack arguments at call sites).
 @inlineNever
@@ -2829,7 +2871,8 @@ unsafe fn answerKnown<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode
   }
   let data = unsafe operandCell(machine.stackTop, count)
   let runtime = machine.runtime
-  let answer = unsafe nativeFunctions.leanAnswerKnown(runtime, family, method, receiver, &FrameSlots { data: data, count: count })
+  let answer = unsafe nativeFunctions.leanAnswerKnown(runtime, family, method, receiver,
+    unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(data), count)
   if answer < 0 { return false }
   if width != 0 { unsafe machine.skip(width) }
   unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
@@ -2847,8 +2890,29 @@ unsafe fn answerKnown<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode
     unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
     if isMethod { unsafe releaseStackValueFast(&mut hooks, runtime, receiver) }
   } else {
-    unsafe releaseOperandsFrom(&mut hooks, &mut machine, first)
+    unsafe releaseOperandsSlow(&mut hooks, &mut machine, first)
   }
+  unsafe pushOrBranchBool(&mut machine, answer != 0)
+  return true
+}
+/// Cold fallback for Function.prototype.call on CALL_KIND_ANSWER builtins other
+/// than the common 2-argument hasOwnProperty.call(obj, key).
+@cold
+unsafe fn callMethodAnswerOther<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, count: usize,
+  family: BuiltinFamily, method: u32) -> bool {
+  let counter = unsafe interrupts.counter(machine.context)
+  let left = unsafe Pointer.read<i32>(counter)
+  if left <= 1 { return false }
+  let data = unsafe operandCell(machine.stackTop, count)
+  let arg0 = unsafe Pointer.read<ValueBits>(data)
+  let restPtr = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1)
+  let restCount = usize.wrappingSubtract(count, 1)
+  let answer = unsafe nativeFunctions.leanAnswerKnown(machine.runtime, family, method, arg0,
+    unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(restPtr), restCount)
+  if answer < 0 { return false }
+  unsafe machine.skip(2)
+  unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
+  unsafe releaseOperandsFrom(&mut hooks, &mut machine, unsafe operandCell(data, 2))
   unsafe pushOrBranchBool(&mut machine, answer != 0)
   return true
 }
@@ -2878,28 +2942,25 @@ unsafe fn callMethodAnswer<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, c
   }
   drop rData
   if !matched { return false }
+  if count != 2 || family != BuiltinFamily.Object || method != nativeFunctions.OBJECT_HAS_OWN_PROPERTY {
+    return unsafe callMethodAnswerOther(&mut hooks, &mut machine, count, family, method)
+  }
   let counter = unsafe interrupts.counter(machine.context)
   let left = unsafe Pointer.read<i32>(counter)
   if left <= 1 { return false }
-  let data = unsafe operandCell(machine.stackTop, count)
+  let data = unsafe operandCell(machine.stackTop, 2)
   let arg0 = unsafe Pointer.read<ValueBits>(data)
-  let rest = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1), count: usize.wrappingSubtract(count, 1) }
+  let arg1 = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1))
   let runtime = machine.runtime
-  let answer = unsafe nativeFunctions.leanAnswerKnown(runtime, family, method, arg0, &rest)
+  let answer = unsafe nativeFunctions.leanHasOwnFast(runtime, arg0, arg1)
   if answer < 0 { return false }
   unsafe machine.skip(2)
   unsafe Pointer.write<i32>(counter, i32.wrappingSubtract(left, 1))
-  let first = unsafe operandCell(data, 2)
-  if count == 2 {
-    let arg1 = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(data), 1))
-    machine.stackTop = first
-    unsafe releaseStackValueFast(&mut hooks, runtime, arg1)
-    unsafe releaseStackValueFast(&mut hooks, runtime, arg0)
-    unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
-    unsafe gc.releaseObjectHeader(&mut hooks, runtime, recvRef)
-  } else {
-    unsafe releaseOperandsFrom(&mut hooks, &mut machine, first)
-  }
+  machine.stackTop = unsafe operandCell(data, 2)
+  unsafe releaseStackValueFast(&mut hooks, runtime, arg1)
+  unsafe releaseStackValueFast(&mut hooks, runtime, arg0)
+  unsafe gc.releaseObjectHeader(&mut hooks, runtime, funcRef)
+  unsafe gc.releaseObjectHeader(&mut hooks, runtime, recvRef)
   unsafe pushOrBranchBool(&mut machine, answer != 0)
   return true
 }
@@ -3371,6 +3432,11 @@ unsafe effect fn quickInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks + P
       if kind == nativeFunctions.CALL_KIND_ANSWER {
         drop data
         if unsafe answerKnown(&mut hooks, &mut machine, opcode, count, funcRef) { return true }
+        return run unsafe leanInlineSlow(&mut hooks, memory, &mut machine, opcode, count, function, kind)
+      }
+      if kind == nativeFunctions.CALL_KIND_OBJECT_KEYS && count == 1 {
+        drop data
+        if unsafe objectKeysFast(&mut hooks, &mut machine, opcode, funcRef) { return true }
         return run unsafe leanInlineSlow(&mut hooks, memory, &mut machine, opcode, count, function, kind)
       }
       if kind < nativeFunctions.CALL_KIND_LEAN && opcode == op.OP_call_method && count != 0 && native.magicBits == 0 {
