@@ -161,6 +161,17 @@ const MAX_INLINE_DEPTH: u32 = 7
 const MAX_INLINE_BYTES: usize = 460
 /// Inlined call sites one function may have (each takes a frame record on the native stack).
 const MAX_INLINE_SITES: usize = 64
+/// Inlining at a call that is in no loop (of the function, or of a body around the call)
+/// saves one call a run of the function, so it is kept cheap: the bodies inlined at such
+/// calls come to at most MAX_INLINED_BYTES bytes of code in one function, and a body with a
+/// loop of its own is inlined there only for a literal argument (the body is then compiled
+/// for it); that body runs in its own optimized code otherwise, where its loop's calls are
+/// inlined. A body of at most INLINE_SMALL bytes goes in wherever it is called. Without
+/// this a short function at the top of a call tree is compiled as the whole tree (Crypto's
+/// `decrypt`: 92 bytes of code, 3,294 instructions), as is each function between it and the
+/// loop the time is spent in.
+const MAX_INLINED_BYTES: usize = 920
+const INLINE_SMALL: usize = 96
 
 /// What an inlined body may be made of, opcode by opcode: straight-line code over constants,
 /// unchecked locals, arguments, numbers, tests, property and element access, globals, calls
@@ -872,6 +883,13 @@ struct Translator {
   /// The locals still to be read at each instruction of the code being translated, the
   /// function's own or an inlined body's (Liveness).
   liveness: Liveness,
+  /// The entry block's undefined, which an exit names for a dead local (deadLocal); NONE in
+  /// a translation that tracks no liveness.
+  undef: u32,
+  /// The bytes of code of the bodies inlined so far outside every loop (MAX_INLINED_BYTES),
+  /// and whether the body being translated is at a call in a loop, or inside such a body.
+  inlinedBytes: usize,
+  turning: bool,
   // ---- inlining (docs/jit/inlining.md): the state of the inlined body being translated.
   /// How many inlined bodies deep the translator is; 0 in the function's own code.
   depth: u32,
@@ -1008,10 +1026,11 @@ effect fn livenessOf(input: &FunctionInput) -> Liveness ! OutOfMemoryError ? &mu
     run starts.append(usize.toU32(pc))
     pc = pc + size
   }
-  run out.live.appendRepeated(0, length + 1)
+  // An offset that starts no instruction keeps every local live: nothing asks about one.
+  run out.live.appendRepeated(all, length + 1)
   run out.kill.appendRepeated(0, length + 1)
   let mut s: usize = 0
-  while s < starts.length() { let at = u32.toUsize(starts.get(s)) out.kill.set(at, localEffect(input, at, all).kill) s = s + 1 }
+  while s < starts.length() { let at = u32.toUsize(starts.get(s)) out.live.set(at, 0) out.kill.set(at, localEffect(input, at, all).kill) s = s + 1 }
   let mut changed = true
   while changed {
     changed = false
@@ -1209,7 +1228,11 @@ impl Translator {
         } else {
           run self.f.frameAt(ssa.ExitFrame { after: call.after, argc: call.argc, method: call.method, locals: usize.toU32(self.locals.length()), depth: usize.toU32(self.stack.length()), pc: pc })
           i = 0
-          while i < self.locals.length() { let v = self.locals.get(i) run self.innerSlot(v) i = i + 1 }
+          while i < self.locals.length() {
+            let v = self.locals.get(i)
+            if self.deadLocal(i, v, pc) { run self.f.innerAt(self.undef, SlotMode.Imm, NONE) } else { run self.innerSlot(v) }
+            i = i + 1
+          }
           i = 0
           while i < self.stack.length() { let v = self.stack.get(i) run self.innerSlot(v) i = i + 1 }
         }
@@ -1232,11 +1255,24 @@ impl Translator {
     // Locals, the stack, then the parameter slots (ssa.Exit).
     let real = u32.toUsize(self.f.localCount)
     let mut i: usize = 0
-    while i < real { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
+    while i < real {
+      let v = self.locals.get(i)
+      if self.deadLocal(i, v, pc) { run self.f.slotAt(self.undef, SlotMode.Imm, NONE) } else { run self.slot(v) }
+      i = i + 1
+    }
     i = 0
     while i < self.stack.length() { let v = self.stack.get(i) run self.slot(v) i = i + 1 }
     i = real
     while i < self.locals.length() { let v = self.locals.get(i) run self.slot(v) i = i + 1 }
+  }
+  /// Whether an exit at `pc` names undefined for local `index`, which holds `v`: no path from
+  /// `pc` reads the local before writing it (Liveness) and `v` holds no count. The value then
+  /// lives no longer than its last reader, where it would have kept a register to the last
+  /// exit before the local's next store (a temporary of a loop: to the end of the turn).
+  fn deadLocal(self: &Self, index: usize, v: u32, pc: u32) -> bool {
+    if self.undef == NONE || self.lazyLocal(index) { return false }
+    let own = self.f.value(v).own
+    return (own == Own.Unboxed || own == Own.Imm || own == Own.Borrowed) && self.deadAt(index, u32.toUsize(pc))
   }
   effect fn slot(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let info = self.f.value(v)
@@ -3018,7 +3054,7 @@ impl Translator {
   }
   /// The index in `input.targets` of what the method call of `function` (the value a cached
   /// field read of this code made) may inline, or usize.MAX.
-  fn inlineTarget(self: &mut Self, input: &FunctionInput, function: u32, pc: u32) -> usize {
+  fn inlineTarget(self: &mut Self, input: &FunctionInput, function: u32, pc: u32, count: usize) -> usize {
     self.missed = b"the inlining limits"
     if self.depth >= MAX_INLINE_DEPTH || self.f.inlineTargets.length() >= MAX_INLINE_SITES { return usize.MAX }
     // A call that left compiled code before (a deopt recorded at its pc) is not inlined again.
@@ -3041,6 +3077,7 @@ impl Translator {
         if !callee.normal || callee.closureVars != 0 || callee.scopeSlots != 0 { return usize.MAX }
         self.missed = b"the target is too long"
         if callee.code.length() == 0 || callee.code.length() > MAX_INLINE_BYTES { return usize.MAX }
+        if !self.affords(input, pc, callee, count) { return usize.MAX }
         return t
       }
       t = t + 1
@@ -3051,6 +3088,27 @@ impl Translator {
     return usize.MAX
   }
 
+  /// Whether `callee` may be inlined at the call at `pc` of `input`, whose `count` arguments
+  /// are on the stack (MAX_INLINED_BYTES); sets `missed` when not.
+  fn affords(self: &mut Self, input: &FunctionInput, pc: u32, callee: &FunctionInput, count: usize) -> bool {
+    let bytes = callee.code.length()
+    if bytes <= INLINE_SMALL || self.turning || insideLoop(input, pc) { return true }
+    self.missed = b"the function's inlined bodies are at their limit"
+    if self.inlinedBytes + bytes > MAX_INLINED_BYTES { return false }
+    if !loops(callee) { return true }
+    self.missed = b"the target loops and the call is in no loop"
+    let mut n: usize = 1
+    while n <= count && n <= self.stack.length() {
+      let info = self.f.value(self.top(n))
+      if info.def != NONE {
+        let made = self.f.inst(info.def).op
+        if made == Op.ConstI32 || made == Op.ConstF64 || made == Op.Imm { return true }
+      }
+      n = n + 1
+    }
+    return false
+  }
+
   /// Translates the method call at `pc` of `function` with `count` arguments as the body of
   /// the function its site last called, guarded by that function's identity, when it can:
   /// true, with the operands replaced by the result. False with nothing changed otherwise.
@@ -3059,7 +3117,7 @@ impl Translator {
     if self.lazyApply(method, count) { return false }
     // receiver is the boxed operand; the body reads the operand itself.
     if method && receiver == NONE { return false }
-    let t = self.inlineTarget(input, function, pc)
+    let t = self.inlineTarget(input, function, pc, count)
     if t == usize.MAX { run self.f.inlineMisses.append(InlineMiss { pc: pc, depth: self.depth, opcode: 0, why: self.missed }) return false }
     if input.targets.asSlice()[t].chained { return run self.callChain(input, method, count, pc) }
     return run self.inlineOne(input, t, function, receiver, method, count, pc, true)
@@ -3085,6 +3143,7 @@ impl Translator {
       if self.depth >= MAX_INLINE_DEPTH || self.f.inlineTargets.length() >= MAX_INLINE_SITES { break }
       let callee = &target.input
       if !callee.normal || callee.closureVars != 0 || callee.scopeSlots != 0 || callee.code.length() == 0 || callee.code.length() > MAX_INLINE_BYTES { continue }
+      if !self.affords(input, pc, callee, count) { continue }
       let mark = self.f.mark()
       let savedCurrent = self.current
       let savedLocals = run copyList(&self.locals)
@@ -3187,6 +3246,11 @@ impl Translator {
     let target = &input.targets.asSlice()[t]
     let mark = self.f.mark()
     let outer = self.depth
+    // A body at a call in a loop, and the bodies inside it, count nothing (MAX_INLINED_BYTES).
+    let spent = self.inlinedBytes
+    let turning = self.turning
+    self.turning = turning || insideLoop(input, pc)
+    if !self.turning { self.inlinedBytes = spent + target.input.code.length() }
     let savedCurrent = self.current
     let savedLocals = run copyList(&self.locals)
     let savedStack = run copyList(&self.stack)
@@ -3245,6 +3309,7 @@ impl Translator {
     let bodyLiveness = run livenessOf(&target.input)
     let outerLiveness = Intrinsic.replace(self.liveness, move bodyLiveness)
     let outcome = run Effect.result(self.inlineBody(&target.input, pc))
+    self.turning = turning
     self.liveness = move outerLiveness
     self.ownedCells = outerOwned
     self.bodyLoops = outerLoops
@@ -3279,6 +3344,7 @@ impl Translator {
       self.stack = move savedStack
       self.held = move savedHeld
       self.paramWrites = savedWrites
+      self.inlinedBytes = spent
       run self.f.inlineMisses.append(InlineMiss { pc: pc, depth: self.depth, opcode: stopped, why: why })
       return false
     }
@@ -3761,7 +3827,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, 0, false, false, 0, u32.MAX), initialized: List<bool>.make(), liveness: run livenessOf(input), undef: NONE, inlinedBytes: 0, turning: false, addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownChain: true, ownedCells: 0, broken: false, paramWrites: false, missed: b"", wideEquality: wideEquality(input), osr: false, exits: true, argSlots: argumentSlots(input) }
   t.lazySlot = lazyArgumentsLocal(input)
@@ -3786,6 +3852,7 @@ pub effect fn translate(input: &FunctionInput) -> Function ! Refusal | OutOfMemo
   // The entry: locals start undefined, then the code's first block.
   t.current = entry
   let undefined = run t.imm(Imm.Undefined, 0)
+  t.undef = undefined
   let mut i: u32 = 0
   while i < input.localCount { run t.locals.append(undefined) i = i + 1 }
   t.f.argumentSlots = t.argSlots
@@ -4008,7 +4075,7 @@ effect fn translateOsrWith(input: &FunctionInput, header: u32, calls: bool, spec
     locals: List<u32>.make(), stack: List<u32>.make(), doubleSites: run copyList(&input.doubleSites),
     catchTop: run copyI32(&shapeOf.catchTop), catchLevel: run copyI32(&shapeOf.catchLevel), depthAt: run copyI32(&shapeOf.depth),
     returns: run copyList(&shapeOf.returns),
-    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make(), kill: List<u64>.make() }, addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
+    tdz: run tdzOf(input, &shapeOf, begin, true, calls, region.start, region.end), initialized: List<bool>.make(), liveness: Liveness { tracked: false, all: 0, live: List<u64>.make(), kill: List<u64>.make() }, undef: NONE, inlinedBytes: 0, turning: false, addKey: objects.fieldLayout().addKey, records: run copyRecords(&input.records), argNumbers: List<u32>.make(), namedClosure: usize.MAX, lazySlot: usize.MAX, lazyAlias: usize.MAX,
     depth: 0, rootPc: 0, rootDepth: 0, rootInst: 0, held: List<u32>.make(), frames: List<usize>.make(),
     argsBase: 0, argCount: 0, receiverAt: usize.MAX, formals: 0, calls: List<InlineCall>.make(), leaves: input.leavesBodies, arrayPush: input.arrayPush, arrayPop: input.arrayPop, bodyLoops: 0, ownChain: true, ownedCells: 0, broken: false, paramWrites: false, missed: b"", wideEquality: wideEquality(input), osr: true, exits: false, argSlots: argumentSlots(input) }
   run t.blockAt.appendRepeated(NONE, length + 1)
@@ -4217,6 +4284,22 @@ pub effect fn loopRegion(input: &FunctionInput, header: u32) -> LoopRegion ! Out
 }
 
 /// Whether `pc` is inside a loop of `input`: between the target of a backward jump and it.
+/// Whether `input`'s code jumps backward anywhere.
+fn loops(input: &FunctionInput) -> bool {
+  let length = input.code.length()
+  let mut at: usize = 0
+  while at < length {
+    let opcode = byteAt(input, at)
+    let size = sizeAt(input, at)
+    if size == 0 || at + size > length { return false }
+    if isBranch(opcode) || isGoto(opcode) {
+      let target = targetOf(input, at)
+      if target >= 0 && target <= usize.toI64(at) { return true }
+    }
+    at = at + size
+  }
+  return false
+}
 fn insideLoop(input: &FunctionInput, pc: u32) -> bool {
   let length = input.code.length()
   let mut at: usize = 0

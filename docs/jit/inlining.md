@@ -27,9 +27,9 @@ target, from one of two sources:
 In both cases:
 
 - the function is a plain function (`FunctionKind.Normal`) of the caller's realm, with no
-  closure variables and no scope of its own, at most 96 bytes of code;
-- its code is made of the opcodes `ssa_translate.inlinable` lists and has no loop (forward
-  branches only, at most eight blocks past the first). The list is its own, not "everything the translator supports": an opcode a later
+  closure variables and no scope of its own, at most 460 bytes of code;
+- its code is made of the opcodes `ssa_translate.inlinable` lists (a loop is taken on a
+  baseline frame: code-quality.md, "Inlined loops"). The list is its own, not "everything the translator supports": an opcode a later
   change adds to the subset (one whose handler reads a table of the function by pc, say) is
   not inlinable until it is put there;
 - the body of a plain call does not read `this` (what it is depends on the callee's mode).
@@ -39,8 +39,30 @@ The target is a snapshot taken when the caller is compiled (`jit_runtime.candida
 callee's identity every time (section 3), so a wrong hint costs a deoptimization, never a
 wrong result.
 
-Candidates nest: a target's own call sites are looked up too, two levels down, and the
-translator inlines at most three bodies deep and sixteen sites per function.
+Candidates nest: a target's own call sites are looked up too, and the translator inlines
+at most seven bodies deep (`MAX_INLINE_DEPTH`), 64 sites per function (`MAX_INLINE_SITES`)
+and bodies of at most 460 bytes of code each (`MAX_INLINE_BYTES`).
+
+**How much one function takes in.** Those limits bound each body, not their sum: a short
+function at the top of a call tree was compiled as the whole tree (Crypto's `decrypt`, 92
+bytes of code, became 3,294 instructions with 781 exits), and so was each function between
+it and the loop the time is spent in, each of them again when a shape guard in any of the
+bodies failed. `Translator.affords` therefore asks where the call is:
+
+- a call inside a loop (of the function, or of a body the call is nested in: `turning`) is
+  inlined whatever was spent, as is a body of at most 96 bytes (`INLINE_SMALL`);
+- the bodies inlined at calls in no loop sum to at most 920 bytes (`MAX_INLINED_BYTES`,
+  counted along the chain of bodies the translator is in: `inlinedBytes`);
+- a body with a loop of its own is inlined at a call in no loop only when the call passes
+  a literal number (the body is then compiled for it: section 4's `lin_solve`). Otherwise
+  it stays a call and runs in its own optimized code, where the calls in its loop are
+  inlined.
+
+At scale 20 Crypto's compiled code went from 3.7 MB to 1.3 MB, its compile time from 208
+to 87 ms and its compiles from 94 to 70 (45 unlinked to 21); the run from 585 to 493 ms
+against node's 341. Richards went from 146 to 137 ms. A limit on the sum alone, with no
+exemption for calls in loops, cost Richards 20 ms and RayTrace 70: their hot loops call
+through several levels.
 
 A call site at whose pc compiled code deoptimized before (`jit_recompile`'s sites) is not
 inlined again: the next compilation makes an ordinary call there.

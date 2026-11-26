@@ -205,6 +205,17 @@ bounds, before the start, past the end, with steps of two and three, with a limi
 the Array, an Array that grows, counters next to 2^31, and a relaxation step on grids too
 small for it.
 
+A loop that counts down is the same proof from the other end: one latch reached by the
+true edge of `branch (i + n > limit)` or `(i + n >= limit)`, the counter passed back minus
+1 (`while (--n >= 0)`, `for (i = n - 1; i >= 0; --i)`). The trip bound is then
+`start(i) - limit + e`, and the counter's own subtraction is proven after `start(i) - 1`
+(and `limit - 1` under `>=`) were computed in front. A step may go either way in either
+loop: one that goes down is between `start(q) + d - bound * |step(q)|` and `start(q) + d`.
+Crypto's `am3` is `while (--n >= 0)` with `i` and `j` stepping up: its two reads, its store
+and its three counters lost their tests, 11 of the loop's 81 instructions.
+`tests/baseline/t91.js` runs loops that count down by one and by two, with none and one
+turn, one past the end, an Array that grows and elements that are no int32 part of the way.
+
 Such a loop ends before long whatever the program does: its turns are counted, nothing in
 it calls, and its accesses stay inside the Arrays it reads. Its `poll` (three instructions a
 turn: the realm, the countdown, a branch) is therefore taken once in the front block, with
@@ -306,6 +317,19 @@ straight from the array (below). Only a borrowed `v` (an owned one is moved by t
 the ownership rules count that), and only exits one instruction uses: an exit shared with an
 instruction in front of the unbox (the front block of a hoist) runs before `u` exists.
 
+## Exits leave dead locals out
+
+An exit writes every local to the interpreter's frame, so every local was live at every
+guard: a temporary read once kept its register, or its slot's store, until the last guard
+of the loop. An exit now names undefined for a local the bytecode's liveness says no path
+reads from the exit's pc on (`Translator.deadLocal`, in `exitHere` and for the innermost
+frame of `inlineExit`), when letting the value go costs nothing: an unboxed number, an
+immediate or a borrowed value (an owned one still has to be released by someone, so it
+stays). The interpreter resumes at that pc and writes the local before any read. The
+liveness is per instruction start; an offset inside an instruction keeps every local live.
+In `am3` the values of `l`, `h` and `m` from the turn before, and `xl`'s and `xh`'s
+sources, no longer hold registers across the loop: 70 instructions a turn became 60.
+
 ## In the backend
 
 - **Constant operands are immediates.** `and`, `or` and `xor` with a constant, and
@@ -369,6 +393,18 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   constants, number boxes and unboxes, shifts by a constant: `r11Kept`), takes the element's
   address from R11 instead of loading the object, testing the count and indexing again
   (`reusesElement`). Seven instructions of each turn of Crypto's `am3` loop.
+  When the read's unbox found a number (the fused read leaves through its piece
+  otherwise), the element still holds that number at the store: nothing in between
+  writes memory. The store then has no test of the old value and no cold piece
+  (`elementNumber`): two instructions a turn.
+- **Spill weights count what a slot costs.** A value read from its slot by an operation
+  that takes a memory operand (`imul esi, [slot]`, `add`, `and`, a compare) costs one
+  micro-operation more; one that must be loaded first, or stored when it is defined,
+  costs a load or a store. `x64_regalloc.weigh` counts 4 for those and 1 for a second
+  operand read from memory (and a first operand that lives on), times 8 for each loop
+  level, where it counted every read alike. `am3` then keeps `i` and `n` in registers and
+  reads `xl` and `xh` from their slots in the multiplications: 58 instructions a turn
+  became 54.
 - **An index a trusted access bounded does not overflow.** `i + 1` after a trusted read
   or store of element `i` in the same block has no overflow test: `i` is below an
   Array's count, far below 2^31 (`cannotOverflow`). And a compare that reads the value the

@@ -451,7 +451,9 @@ the two guards are what is left.
   `set_loc` to a local no path reads again stores undefined: `var c = list[i]; c.run()` is a
   `set_loc` whose value stays on the stack, and the store's retain, the release of the old
   value and the local's loop parameter all go. The pass runs on the function's own code and
-  on each inlined body. An exit names undefined for such a local, which nothing reads.
+  on each inlined body. An exit names undefined for such a local, which nothing reads,
+  and for any local dead at the exit's pc whose value is a number, an immediate or a
+  borrow (code-quality.md, "Exits leave dead locals out").
   The same holds across a loop's back edge: a local the loop writes before it reads it is
   dead at the header, so the latch lets its value go and passes undefined
   (`Translator.destination`, for locals some instruction between the header and the jump

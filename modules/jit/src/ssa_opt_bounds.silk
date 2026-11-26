@@ -5,9 +5,11 @@
 //! `(i + n <= limit)`: `i` a header parameter the latch passes back plus 1, `limit` a value
 //! from outside the loop. Turn m of the loop (the first is 0) then runs only when
 //! `m <= limit - start(i) + e` for a constant e, the trip bound, where `start` is what the
-//! entry edge passes. A header parameter the latch passes back plus a positive constant
-//! (a step) is `start + m * step` in turn m, so an index `q + d` of a step `q` stays between
-//! `start(q) + d` and `start(q) + d + bound * step(q)`.
+//! entry edge passes. A loop that counts down is the same the other way around: `i` comes
+//! back minus 1, the test is `>` or `>=`, and turn m runs only when `m <= start(i) - limit + e`
+//! (`while (--n >= 0)`). A header parameter the latch passes back plus a constant that is
+//! not 0 (a step) is `start + m * step` in turn m, so an index `q + d` of a step `q` stays
+//! between `start(q) + d` and `start(q) + d + bound * step(q)`.
 //!
 //! For every Array and step that the loop's trusted element accesses (ssa_opt_hoist) index
 //! that way, a new block on the loop's entry edge computes those two ends with exiting
@@ -233,7 +235,7 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
       let start = f.edgeArg(f.edge(entry), g)
       if f.value(p).ty == Type.I32 && f.value(start).ty == Type.I32 {
         let returned = affine(&f.*, h, f.edgeArg(f.edge(back), g))
-        if returned.base == p && returned.offset > 0 { run steps.append(Step { value: p, by: returned.offset, start: start }) }
+        if returned.base == p && returned.offset != 0 { run steps.append(Step { value: p, by: returned.offset, start: start }) }
       }
       g = g + 1
     }
@@ -248,17 +250,23 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
     let branch = f.inst(testBlock.firstInst + testBlock.instCount - 1)
     if branch.op != Op.Branch || branch.edge != way || defOp(&f.*, branch.a) != Op.Cmp { continue }
     let compare = f.inst(f.value(branch.a).def)
-    let below = compare.k == u8.toI32(Cmp.value(Cmp.Lt))
-    if !below && compare.k != u8.toI32(Cmp.value(Cmp.Le)) { continue }
+    // Up to a limit (`<`, `<=`) or down to one (`>`, `>=`); `strict` leaves the limit out.
+    let up = compare.k == u8.toI32(Cmp.value(Cmp.Lt)) || compare.k == u8.toI32(Cmp.value(Cmp.Le))
+    let down = compare.k == u8.toI32(Cmp.value(Cmp.Gt)) || compare.k == u8.toI32(Cmp.value(Cmp.Ge))
+    if !up && !down { continue }
+    let strict = compare.k == u8.toI32(Cmp.value(Cmp.Lt)) || compare.k == u8.toI32(Cmp.value(Cmp.Gt))
     let limit = compare.b
     if limit == NONE || u32.toUsize(limit) >= f.values.length() || f.value(limit).ty != Type.I32 || member.get(u32.toUsize(f.value(limit).block)) == serial { continue }
     let tested = affine(&f.*, h, compare.a)
     if tested.base == NONE { continue }
     let counter = stepOf(&steps, tested.base)
-    if counter == usize.MAX || steps.get(counter).by != 1 { continue }
-    // Turn m runs only when m <= limit - start + trip.
+    if counter == usize.MAX { continue }
+    if (up && steps.get(counter).by != 1) || (down && steps.get(counter).by != 0 - 1) { continue }
+    // Turn m runs only when m <= span + trip: span is limit - start going up, start - limit
+    // going down.
     let mut trip = 1 - tested.offset
-    if below { trip = trip - 1 }
+    if down { trip = 1 + tested.offset }
+    if strict { trip = trip - 1 }
     // What the accesses reach.
     reaches.clear()
     let mut fits = true
@@ -319,14 +327,20 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
     let mut front = Front { block: frontBlock, order: 2, exit: NONE, pc: pc }
     // The trip bound; its sub is the first guard, and the others take its exit.
     let begin = steps.get(counter).start
-    let span = run f.emit(front.block, Op.Sub, true, Type.I32, Own.Unboxed, limit, begin, 0, pc)
+    let mut from = begin
+    let mut to = limit
+    if down { from = limit to = begin }
+    let span = run f.emit(front.block, Op.Sub, true, Type.I32, Own.Unboxed, to, from, 0, pc)
     let first = place(&mut f, &mut front.order)
     front.exit = run entryExit(&mut f, first, state, &entryArgs)
     let turns = run plus(&mut f, &mut front, span, trip)
-    // The counter's own add: at most start + 1, or limit + 1 (limit under `<`).
-    if tested.offset == 1 && defOp(&f.*, compare.a) == Op.Add {
-      drop run plus(&mut f, &mut front, begin, 1)
-      if !below { drop run plus(&mut f, &mut front, limit, 1) }
+    // The counter's own add: at most start + 1, or limit + 1 (limit under `<`). Going down,
+    // its sub: at least start - 1, or limit - 1 (limit under `>`).
+    let toward = steps.get(counter).by
+    let own = defOp(&f.*, compare.a)
+    if tested.offset == toward && (own == Op.Add || (down && own == Op.Sub)) {
+      drop run plus(&mut f, &mut front, begin, toward)
+      if !strict { drop run plus(&mut f, &mut front, limit, toward) }
       let at = f.value(compare.a).def
       let mut add = f.inst(at) add.proven = true f.setInst(at, add)
     }
@@ -344,14 +358,19 @@ pub effect fn bounds(f: &mut Function, sites: &List<u32>, deoptCount: usize) -> 
       let low = run plus(&mut f, &mut front, step.start, reach.low)
       let mut high = low
       if reach.high != reach.low { high = run plus(&mut f, &mut front, step.start, reach.high) }
+      let mut size = step.by
+      if size < 0 { size = 0 - size }
       let mut across = turns
-      if step.by != 1 {
-        let by = run number(&mut f, &mut front, step.by)
+      if size != 1 {
+        let by = run number(&mut f, &mut front, size)
         across = run guarded(&mut f, &mut front, Op.Mul, turns, by)
       }
-      let last = run guarded(&mut f, &mut front, Op.Add, high, across)
+      let mut last = NONE
+      if step.by > 0 { last = run guarded(&mut f, &mut front, Op.Add, high, across) }
+      else { last = run guarded(&mut f, &mut front, Op.Sub, low, across) }
       // The first turn reaches low to high whatever the trip bound is; the later ones up
-      // to last. A negative index is no index below a count.
+      // to last (down to it, for a step that goes down). A negative index is no index
+      // below a count.
       let mut which: u32 = 0
       while which < 3 {
         let mut index = low
