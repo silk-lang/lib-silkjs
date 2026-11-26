@@ -15,6 +15,7 @@ breaks a rule turns into a refused function, not into wrong code.
 | Reads without counts | `ssa_opt_borrow.silk` | `--jit-no-borrow` |
 | Hoisting | `ssa_opt_hoist.silk` | `--jit-no-hoist` |
 | Exits name the unboxed number | `ssa_opt_unboxed.silk` | `--jit-no-unboxed` |
+| Products that need no sign of zero | `ssa_opt_unboxed.silk` | `--jit-no-unboxed` |
 
 ## Reads without counts
 
@@ -330,6 +331,44 @@ liveness is per instruction start; an offset inside an instruction keeps every l
 In `am3` the values of `l`, `h` and `m` from the turn before, and `xl`'s and `xh`'s
 sources, no longer hold registers across the loop: 70 instructions a turn became 60.
 
+## Products that need no sign of zero
+
+`0 * -5` is -0, which no i32 holds, so a `mul.i32` leaves when its product is zero and a
+factor is negative: a `test`, a branch, and both factors kept in their places for the piece
+after the blocks that tells which zero it was. `ssa_opt_unboxed.zeroProducts`, the last
+pass, marks the products where nothing can tell (`Inst.proven` on a `mul.i32`, printed
+`proven`): the product has one reader, in its block and its frame, which is
+
+- a bit operation, a shift, `Math.imul` or a compare: ToInt32 of -0 is 0, and -0 compares
+  as 0;
+- an `add.i32` or `sub.i32` that takes it second: `x + -0` and `x - -0` are `x` for an i32
+  `x`, which is never -0;
+- an `add.i32` that takes it first, when the second operand is no product (two products
+  that are both -0 add up to -0, and `-0 - x` is -0 for a zero `x`, so a difference never
+  takes it first).
+
+The exits are what is left to get right, since an exit hands the product to the
+interpreter as the number 0:
+
+- An exit may name the product only as one operand on a stack (the frame's or an inlined
+  body's), once, at or in front of the reader. The interpreter that resumes there takes it
+  with the same instruction the compiled reader stands for. A local or an argument is read
+  by whatever runs next, so a product named as one, twice, after its reader, on an edge or
+  in a virtual object keeps its test.
+- For a sum or a difference no instruction between the product and its reader may leave.
+  The other operand is an i32 only at the reader: in `a[i] + x * y` the element is unboxed
+  between the two, and where that leaves (the element is -0, say) the interpreter adds the
+  product to a value that is no i32. The reader's own exit (overflow) has both as i32s.
+
+A marked product whose range cannot overflow either (`ssa_ranges.mulRangeSafe`) has no
+exit to keep its factors for, so the register allocator gives it the register of a factor
+that dies there and the backend multiplies in place; any other product still avoids both
+factors' registers. In `am3`, `h * xl` and `xh * h` lose the test and `xh * h` no longer
+goes through `rax`: 54 instructions a turn became 49. `xh * l` keeps its test, as its sum
+takes two products. Checked by `tests/baseline/t92.js`: every reader above and every way
+to keep the test, with zero products of both signs, an element, a field and a `valueOf`
+that yield -0, compared through `1 / x`.
+
 ## In the backend
 
 - **Constant operands are immediates.** `and`, `or` and `xor` with a constant, and
@@ -380,7 +419,8 @@ sources, no longer hold registers across the loop: 70 instructions a turn became
   that ors the operands, still in their places, and leaves when that is negative, so a
   nonzero product runs `imul`, `jo`, `test` and a branch not taken. Operands known never
   to be negative (a constant that is not, an `and` with one, `>>>` by a nonzero constant)
-  need no test at all.
+  need no test at all, and neither does a product whose one reader cannot tell the zeros
+  apart (above).
 - **Trusted accesses keep their slow paths out of line.** A trusted read fused with its
   unbox branches to a piece after the blocks when the element is no Int (it copies the
   element to its slot and leaves at the unbox's exit) and the unbox itself is not lowered

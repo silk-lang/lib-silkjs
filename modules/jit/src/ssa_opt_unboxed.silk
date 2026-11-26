@@ -462,3 +462,153 @@ pub effect fn repeatedReads(f: &mut Function) -> bool ! OutOfMemoryError ? &mut 
   forward.apply(&mut f)
   return changed
 }
+
+/// Whether `op` reads its operands through ToInt32 or only compares them: a zero operand and
+/// -0 are one to it, whatever the other operand is.
+fn blindToSign(op: Op) -> bool {
+  return op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.Imul || op == Op.Cmp
+}
+
+/// Whether slot `s` of `exit` is an operand on a stack (the frame's own or an inlined
+/// body's): a temporary one instruction takes, where a local or an argument may be read by
+/// whatever the interpreter runs next.
+fn operandSlot(f: &Function, exit: Exit, s: u32) -> bool {
+  if s < f.localCount { return false }
+  if s < f.localCount + exit.stackDepth { return true }
+  let mut at = f.localCount + exit.stackDepth + f.argumentSlots
+  if s < at { return false }
+  let mut k: u32 = 0
+  while k < exit.frames {
+    let frame = f.exitFrame(exit, k)
+    if s < at + frame.locals { return false }
+    at = at + frame.locals
+    if s < at + frame.depth { return true }
+    at = at + frame.depth
+    k = k + 1
+  }
+  return false
+}
+
+/// Marks the products whose zero need not be told from -0 (Inst.proven on a `mul.i32`;
+/// docs/jit/code-quality.md, "Products that need no sign of zero"). `0 * -5` is -0, which
+/// no i32 holds, so a `mul.i32` leaves when its product is zero and a factor negative. It
+/// need not when nothing can tell: the product has one reader, in its block and its frame,
+/// which is
+///
+/// - a bit operation, a shift, `imul` or a compare (ToInt32 of -0 is 0, and -0 compares as 0);
+/// - an `add.i32` or `sub.i32` that takes it second: `x + -0` and `x - -0` are `x` for an
+///   i32 `x`, which is never -0;
+/// - an `add.i32` that takes it first, when the second operand is no product (two products
+///   that are both -0 add up to -0).
+///
+/// For a sum or a difference no instruction between the product and its reader may leave:
+/// the other operand is an i32 only at the reader (an element still boxed is unboxed
+/// there, and may be -0), so only the reader's own exit, which has both as i32s, may hand
+/// the product to the interpreter. Any exit may name the product only as the one operand
+/// of a stack that this reader takes, so the interpreter that resumes there reads it by
+/// the same instruction. One that names it as a local or an argument, twice, after the
+/// reader, or on an edge, keeps the test.
+/// Requires compacted blocks; changes no exit.
+pub effect fn zeroProducts(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  let mut any = false
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Mul && inst.result != NONE && u32.toUsize(inst.result) < values { any = true }
+    i = i + 1
+  }
+  f.work = f.work + usize.toU64(f.insts.length())
+  if !any { return () }
+  // Per product: its readers, the last instruction whose exit names it (plus one), and
+  // whether anything names it in a way that keeps the test.
+  let mut product = List<bool>.make() run product.appendRepeated(false, values)
+  let mut readers = List<u32>.make() run readers.appendRepeated(0, values)
+  let mut named = List<u32>.make() run named.appendRepeated(0, values)
+  let mut kept = List<bool>.make() run kept.appendRepeated(false, values)
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Mul && inst.result != NONE && u32.toUsize(inst.result) < values { product.set(u32.toUsize(inst.result), true) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Removed {
+      if inst.a != NONE && u32.toUsize(inst.a) < values && product.get(u32.toUsize(inst.a)) { let n = readers.get(u32.toUsize(inst.a)) readers.set(u32.toUsize(inst.a), n + 1) }
+      if inst.b != NONE && u32.toUsize(inst.b) < values && product.get(u32.toUsize(inst.b)) { let n = readers.get(u32.toUsize(inst.b)) readers.set(u32.toUsize(inst.b), n + 1) }
+      if readsK(inst.op) {
+        let k = i32.wrappingToU32(inst.k)
+        if u32.toUsize(k) < values && product.get(u32.toUsize(k)) { let n = readers.get(u32.toUsize(k)) readers.set(u32.toUsize(k), n + 1) }
+      }
+      if inst.exit != NONE {
+        let exit = f.exit(inst.exit)
+        // The drops after these are released or ignored, never handed to the interpreter.
+        let count = f.localCount + exit.stackDepth + f.argumentSlots + exit.inner
+        let stamp = usize.toU32(i) + 1
+        let mut s: u32 = 0
+        while s < count {
+          let slot = f.slot(exit, s)
+          if slot.mode != SlotMode.Virtual && u32.toUsize(slot.value) < values && product.get(u32.toUsize(slot.value)) {
+            let v = u32.toUsize(slot.value)
+            // Twice in one exit, or where the interpreter may read it again.
+            if named.get(v) == stamp || !operandSlot(&f.*, exit, s) { kept.set(v, true) }
+            named.set(v, stamp)
+          }
+          s = s + 1
+        }
+        f.work = f.work + u32.toU64(count)
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { let e = f.edgeArgs.get(i) if u32.toUsize(e) < values && product.get(u32.toUsize(e)) { kept.set(u32.toUsize(e), true) } i = i + 1 }
+  i = 0
+  while i < f.virtualObjs.length() {
+    let object = f.virtualObjs.get(i)
+    let mut k: u32 = 0
+    while k < object.slotCount && k < 8 {
+      let field = object.fields[u32.toUsize(k)]
+      if u32.toUsize(field) < values && product.get(u32.toUsize(field)) { kept.set(u32.toUsize(field), true) }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let end = block.firstInst + block.instCount
+    let mut at = block.firstInst
+    while at < end {
+      let mut inst = f.inst(at)
+      at = at + 1
+      if inst.block != b || inst.op != Op.Mul || inst.result == NONE || inst.proven { continue }
+      let v = inst.result
+      if u32.toUsize(v) >= values || readers.get(u32.toUsize(v)) != 1 || kept.get(u32.toUsize(v)) { continue }
+      // The reader, and whether anything between the two can leave.
+      let mut reader = at
+      let mut found = false
+      let mut leaves = false
+      while reader < end && !found {
+        let next = f.inst(reader)
+        if next.op != Op.Removed && next.block == b {
+          if next.a == v || next.b == v || (readsK(next.op) && i32.wrappingToU32(next.k) == v) { found = true continue }
+          if next.exit != NONE { leaves = true }
+        }
+        reader = reader + 1
+      }
+      if !found || named.get(u32.toUsize(v)) > reader + 1 { continue }
+      let by = f.inst(reader)
+      if by.frame != inst.frame { continue }
+      let mut blind = blindToSign(by.op) && (by.a == v || by.b == v)
+      if (by.op == Op.Add || by.op == Op.Sub) && by.b == v && by.a != v && !leaves { blind = true }
+      if by.op == Op.Add && by.a == v && by.b != v && !leaves && by.b != NONE && u32.toUsize(by.b) < values && !product.get(u32.toUsize(by.b)) { blind = true }
+      if !blind { continue }
+      inst.proven = true
+      f.setInst(at - 1, inst)
+    }
+    b = b + 1
+  }
+}
