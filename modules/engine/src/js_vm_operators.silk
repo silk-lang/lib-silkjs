@@ -139,6 +139,14 @@ pub unsafe fn quickTypeofIs(value: ValueBits, index: u8) -> i32 {
   return -1
 }
 
+@cold
+unsafe fn typeofAtomCold<H: HeapHooks + CoercionHooks>(hooks: &mut H, machine: &Machine, input: ValueBits) -> u32 {
+  return unsafe typeofAtom(&mut hooks, machine, input)
+}
+@cold
+unsafe effect fn typeofAtomValueCold<H: HeapHooks + CoercionHooks>(hooks: &mut H, machine: &Machine, atom: u32) -> ValueBits ? &mut Allocator {
+  return run unsafe values.atomValue(&mut hooks, machine, atom, true)
+}
 /// OP_typeof without step's opcode chain: it cannot fail, and the type names
 /// are predefined string atoms the runtime keeps alive.
 @inlineNever
@@ -167,12 +175,12 @@ pub unsafe effect fn typeofValue<H: HeapHooks + CoercionHooks>(hooks: &mut H, ma
     ValueBits.ShortBigInt { .. } => { atom = atoms.JS_ATOM_bigint }
     _ => { atom = atoms.JS_ATOM_unknown }
   }
-  if atom == 0 { atom = unsafe typeofAtom(&mut hooks, &machine.*, input) }
+  if atom == 0 { atom = unsafe typeofAtomCold(&mut hooks, &machine.*, input) }
   let stateAnchor = ()
   let borrowed = (unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, machine.runtime)).atoms.borrowedString(atom)
-  let output = if borrowed.isString() { Strings.duplicate(borrowed) } else { run unsafe values.atomValue(&mut hooks, &machine.*, atom, true) }
+  let output = if borrowed.isString() { Strings.duplicate(borrowed) } else { run unsafe typeofAtomValueCold(&mut hooks, &machine.*, atom) }
   unsafe machine.set(1, output)
-  if input.tag() < 0 { unsafe gc.release(&mut hooks, machine.runtime, input) }
+  unsafe gc.releaseValueCold(&mut hooks, machine.runtime, input)
 }
 @inlineAlways
 unsafe fn writeTypeofAnswer(machine: &mut Machine, runtime: *mut HeapHeader, answer: bool) -> () {
@@ -1343,6 +1351,49 @@ pub unsafe effect fn intTextTop(machine: &Machine) -> bool ? &mut Allocator {
   unsafe machine.set(1, text)
   return true
 }
+@cold
+unsafe effect fn failAddText(machine: &mut Machine, error: OutOfMemoryError | StringLengthError) -> bool ! OutOfMemoryError | StringLengthError {
+  // The concatenation consumed its string operands.
+  unsafe machine.set(2, ValueBits.Undefined) unsafe machine.set(1, ValueBits.Undefined)
+  unsafe machine.publishPc()
+  fail move error
+}
+@inlineNever
+unsafe effect fn addIntEmptyText(machine: &mut Machine, text: ValueBits, integer: i32) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if integer >= 0 && integer < 256 {
+    let cached = run Effect.result(unitStrings.decimal(unsafe lendRealm(&machine.context, machine.context), i32.toU32(integer)))
+    if let Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: digit } = move cached {
+      releaseString(text)
+      unsafe machine.set(2, digit) unsafe machine.discard(1)
+      return true
+    }
+  }
+  let made = run Effect.result(Strings.fromInteger(integer))
+  releaseString(text)
+  match move made {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => {
+      unsafe machine.set(2, value) unsafe machine.discard(1)
+      return true
+    }
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => {
+      return run unsafe failAddText(&mut machine, move error)
+    }
+  }
+}
+@cold
+unsafe effect fn addFloatText(machine: &mut Machine, text: ValueBits, floating: f64, floatFirst: bool) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let joined = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(joinText(text, text, 0, true, floatFirst, floating, true), failedText)
+  match move joined {
+    ValueBits value => {
+      if value.isException() { return false }
+      unsafe machine.set(2, value) unsafe machine.discard(1)
+      return true
+    }
+    FailedText { error } => {
+      return run unsafe failAddText(&mut machine, move error)
+    }
+  }
+}
 /// OP_add with a string operand and a string or number partner, without the
 /// generic operator chain. False leaves the operands for step.
 @inlineAlways
@@ -1365,10 +1416,7 @@ unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError | Str
       return true
     }
     FailedText { error } => {
-      // The concatenation consumed its string operands.
-      unsafe machine.set(2, ValueBits.Undefined) unsafe machine.set(1, ValueBits.Undefined)
-      unsafe machine.publishPc()
-      fail move error
+      return run unsafe failAddText(&mut machine, move error)
     }
   }
 }
@@ -1377,48 +1425,39 @@ unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError | Str
 @inlineNever
 unsafe effect fn addNumberText(machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let left = unsafe machine.top(2) let right = unsafe machine.top(1)
-  let mut integer: i32 = 0 let mut mixed = false let mut integerFirst = false
-  let mut floating: f64 = 0.0 let mut float = false
+  let mut integer: i32 = 0
+  let mut integerFirst = false
+  let mut text = left
   if left.isString() {
-    if !right.isString() {
-      match right {
-        ValueBits.Int { value } => { integer = value mixed = true }
-        ValueBits.Float64 { value } => { floating = value float = true mixed = true }
-        _ => { return false }
-      }
+    match right {
+      ValueBits.Int { value } => { integer = value }
+      ValueBits.Float64 { value } => { return run unsafe addFloatText(&mut machine, left, value, false) }
+      _ => { return false }
     }
   } else {
     if !right.isString() { return false }
+    text = right
+    integerFirst = true
     match left {
-      ValueBits.Int { value } => { integer = value mixed = true integerFirst = true }
-      ValueBits.Float64 { value } => { floating = value float = true mixed = true integerFirst = true }
+      ValueBits.Int { value } => { integer = value }
+      ValueBits.Float64 { value } => { return run unsafe addFloatText(&mut machine, right, value, true) }
       _ => { return false }
     }
   }
-  // `n + ''` for 0 <= n < 256: the runtime's cached decimal string, no new cell.
-  if mixed && !float && integer >= 0 && integer < 256 {
-    let mut text = left if integerFirst { text = right }
-    if text.tag() == -7 && Strings.length(text) == 0 {
-      let cached = run Effect.result(unitStrings.decimal(unsafe lendRealm(&machine.context, machine.context), i32.toU32(integer)))
-      if let Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: digit } = move cached {
-        releaseString(text)
-        unsafe machine.set(2, digit) unsafe machine.discard(1)
+  if text.tag() == -7 && Strings.length(text) == 0 {
+    return run unsafe addIntEmptyText(&mut machine, text, integer)
+  }
+  let joined = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(Strings.concatIntegerOwned(text, integer, integerFirst), failedText)
+  match move joined {
+    Option<ValueBits> result => match result {
+      Option<ValueBits>.Some { value } => {
+        unsafe machine.set(2, value) unsafe machine.discard(1)
         return true
       }
-    }
-  }
-  let joined = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(joinText(left, right, integer, mixed, integerFirst, floating, float), failedText)
-  match move joined {
-    ValueBits value => {
-      if value.isException() { return false }
-      unsafe machine.set(2, value) unsafe machine.discard(1)
-      return true
+      Option<ValueBits>.None => { return false }
     }
     FailedText { error } => {
-      // The concatenation consumed its string operands.
-      unsafe machine.set(2, ValueBits.Undefined) unsafe machine.set(1, ValueBits.Undefined)
-      unsafe machine.publishPc()
-      fail move error
+      return run unsafe failAddText(&mut machine, move error)
     }
   }
 }
