@@ -17,6 +17,7 @@
 //! helper calls compiled code makes, and the prologue saves those it uses. Doubles take xmm2 to
 //! xmm15. rax, rcx, rdx, rsi, rdi, r8 to r11 and xmm0, xmm1 stay with the lowering (scratch, and
 //! the ABI's state, counter and stress words). A `value` (16 bytes) always lives in its slot.
+//! A raw word (an Array's elements) takes an integer register, all 64 bits of it.
 //! When a pool runs out, the interval read least often is spilled to its slot: each read counts
 //! 8 to the power of its block's loop depth (exit slots, read only on the way out, count
 //! nothing), and between equal weights the one that ends furthest away goes. A value live
@@ -335,12 +336,12 @@ pub effect fn allocateIn(f: &Function, pool: Pool) -> Allocation ! OutOfMemoryEr
 /// of jumps and branches (rax, rcx, r8 to r11 and a scratch slot are theirs).
 /// Whether a value in a fragile register lives through inst: a gentle instruction or an
 /// `inline.frame`; a
-/// `check.array` or a `check.bound`, or an element read a `check.array` proved (Inst.trusted), which leave
+/// `check.array`, a `check.bound` or an `elements`, or an element read a `check.array` proved (Inst.trusted), which leave
 /// instead of calling out; a trusted element store or a poll, which keep the fragile
 /// registers over the call their slow path makes (x64_backend.keepFragile).
 fn keepsFragile(inst: Inst) -> bool {
   // An inlined body's `inline.frame` (at each of its blocks) emits nothing.
-  if gentle(inst.op) || inst.op == Op.CheckArray || inst.op == Op.CheckBound || inst.op == Op.Poll || inst.op == Op.CheckConstruct || inst.op == Op.InlineFrame { return true }
+  if gentle(inst.op) || inst.op == Op.CheckArray || inst.op == Op.CheckBound || inst.op == Op.Elements || inst.op == Op.Poll || inst.op == Op.CheckConstruct || inst.op == Op.InlineFrame { return true }
   return (inst.op == Op.GetElem && inst.trusted && inst.k == 0) || (inst.op == Op.PutElem && inst.trusted)
 }
 fn gentle(op: Op) -> bool {
@@ -440,6 +441,28 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u
     }
     e = e + 1
   }
+  // The result of arithmetic would rather take the register of an operand that ends there,
+  // where the operation then runs in place (`operand`): the first operand's, or the second's
+  // when the operands may change sides. Where they may not (a difference, a quotient), the
+  // second operand's register is the one the result would rather not take (`shunned`): the
+  // operation there goes through a scratch register and back.
+  let mut operand = List<u32>.make()
+  run operand.appendRepeated(NONE, u32.toUsize(values))
+  let mut shunned = List<u32>.make()
+  run shunned.appendRepeated(NONE, u32.toUsize(values))
+  let mut c: usize = 0
+  while c < f.insts.length() {
+    let inst = f.insts.get(c)
+    let op = inst.op
+    let sided = op == Op.SubF64 || op == Op.DivF64 || op == Op.Sub
+    if (sided || op == Op.AddF64 || op == Op.MulF64 || op == Op.Add) && inst.result != NONE && inst.a != NONE && inst.b != NONE {
+      let at = position(usize.toU32(c))
+      if ends.get(u32.toUsize(inst.a)) == at { operand.set(u32.toUsize(inst.result), inst.a) }
+      else if !sided && ends.get(u32.toUsize(inst.b)) == at { operand.set(u32.toUsize(inst.result), inst.b) }
+      if sided { shunned.set(u32.toUsize(inst.result), inst.b) }
+    }
+    c = c + 1
+  }
   // Candidates by start, then value.
   let mut order = List<u64>.make()
   let mut v: u32 = 0
@@ -448,7 +471,7 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u
     // A constant takes no register: its readers take it as an immediate, or from its slot.
     let def = f.value(v).def
     let constant = def != NONE && f.inst(def).op == Op.ConstI32
-    if !constant && (ty == Type.I32 || ty == Type.Bool || ty == Type.F64) && starts.get(u32.toUsize(v)) != NONE && across.get(u32.toUsize(v)) != NOWHERE {
+    if !constant && (ty == Type.I32 || ty == Type.Bool || ty == Type.F64 || ty == Type.Raw) && starts.get(u32.toUsize(v)) != NONE && across.get(u32.toUsize(v)) != NOWHERE {
       run order.append(u64.bitOr(u64.shiftLeft(u32.toU64(starts.get(u32.toUsize(v))), 32), u32.toU64(v)))
     }
     v = v + 1
@@ -470,20 +493,30 @@ effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u
     let mut allowed: u32 = u32.MAX
     if !double && across.get(u32.toUsize(v)) == OVER_CALL { allowed = pool.overCalls }
     if !double && !calm.get(u32.toUsize(v)) { allowed = u32.bitAnd(allowed, u32.bitXor(pool.fragile, u32.MAX)) }
-    // Expire what ended before this start; take a free register.
+    // Expire what ended before this start; take a free register, the first that is not the
+    // shunned one.
+    let mut shun = usize.MAX
+    let other = shunned.get(u32.toUsize(v))
+    if other != NONE && kinds.get(u32.toUsize(other)) == poolKind(double) { shun = first + u8.toUsize(registers.get(u32.toUsize(other))) }
     let mut free = usize.MAX
     let mut r = first
     while r < last {
       let owner = owners.get(r)
       if owner != NONE && ends.get(u32.toUsize(owner)) < start { owners.set(r, NONE) }
-      if owners.get(r) == NONE && free == usize.MAX && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(r - first)), 1) != 0 { free = r }
+      if owners.get(r) == NONE && (free == usize.MAX || free == shun) && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(r - first)), 1) != 0 { free = r }
       r = r + 1
     }
-    // The hinted value's register, when it is already placed in this pool and free now.
-    let hint = hints.get(u32.toUsize(v))
-    if free != usize.MAX && hint != NONE && kinds.get(u32.toUsize(hint)) == poolKind(double) {
-      let wanted = first + u8.toUsize(registers.get(u32.toUsize(hint)))
-      if owners.get(wanted) == NONE && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(wanted - first)), 1) != 0 { free = wanted }
+    // The register of the operand that ends here, then the hinted value's (which wins),
+    // when that value is already placed in this pool and its register is free now.
+    let mut pass: u32 = 0
+    while pass < 2 {
+      let mut hint = operand.get(u32.toUsize(v))
+      if pass == 1 { hint = hints.get(u32.toUsize(v)) }
+      if free != usize.MAX && hint != NONE && kinds.get(u32.toUsize(hint)) == poolKind(double) {
+        let wanted = first + u8.toUsize(registers.get(u32.toUsize(hint)))
+        if owners.get(wanted) == NONE && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(wanted - first)), 1) != 0 { free = wanted }
+      }
+      pass = pass + 1
     }
     if free == usize.MAX {
       // Spill whichever of v and the holders is read least, then ends last.

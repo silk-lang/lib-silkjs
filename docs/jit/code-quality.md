@@ -29,12 +29,19 @@ what each read needs kept away:
 
 | Read | Borrows from | Ends at |
 | --- | --- | --- |
-| `get.elem a, i` | `a`, or what `a` borrows from | a call, a `put.elem` (the store's slow path releases the element it replaces, and a string is freed at once), the release of `a` |
+| `get.elem a, i` | `a`, or what `a` borrows from | a call, a `put.elem` (the store's slow path releases the element it replaces, and a string is freed at once) other than the store of the value itself, the release of `a` |
 | `get.length a` | the same | a call, the release of `a` (a length is a number, or the length of a string `a` keeps) |
 | `get.var k`, `get.scope k` | the binding (`RootKind.Binding`, printed `borrowed(binding)`) | a call, `put.var`, `put.scope` (a captured variable and a global can be one cell), `put.field` (a global is a property of the global object) |
 
 An element or a length read from an object that itself borrows from a binding borrows from
 the binding too, and ends at both lists.
+
+`a[i] = b[j]` borrows as well: a `put.elem` that stores the element read, as its last reader
+with only releases up to the value's own, takes the Array's count of the value before it
+lets go of the element it replaces (`writeElement`), so the store may be what ends the
+borrow, even when it replaces the very element that was read. A copy loop runs 16
+instructions a turn where it ran 21 (`tests/baseline/t90.js` copies numbers, strings and
+objects, an Array onto itself and shifted within itself).
 
 "A call" is any instruction not listed in `ssa_opt_borrow.quiet`: the instructions known not
 to run the program's code or free a holder. An instruction a stream adds later ends every
@@ -204,9 +211,31 @@ turn: the realm, the countdown, a branch) is therefore taken once in the front b
 an exit of its own at the header, and the latch is left a bare jump. A loop inside a
 counted loop keeps its own poll unless it is counted too.
 
-A proven access with its index in a register makes the element's address with two `lea`
-(`lea r11d, [i + i]`, `lea r11, [r9 + r11 * 8]`): the index is below 2^31, so twice it
-fits 32 bits whatever the register's upper half holds.
+## Elements in front of the loop
+
+A proven access still loaded the Array from its slot and the elements from the Array, and
+made the element's address with two `lea`: five instructions before the element is touched.
+Where the elements are cannot change while the count cannot, so the front block of a
+counted loop loads them once: `elements a` (after the `check.array` of `a`) answers a raw
+word (`Type.Raw`: no value of the program, in no exit and on no edge), and every access the
+loop proves on `a` takes that value for its first operand in place of `a`
+(`Function.arrayOf` gives the Array back, which a store's helper still needs). The
+allocator gives it an integer register like any number, all 64 bits of it.
+
+The access is then one addressing mode: an element is 16 bytes, so R11 takes twice the
+index (`lea r11d, [i + i]`; the index is below 2^31, so twice it fits 32 bits) and the tag
+and the payload are at `[elements + r11 * 8]` and `[elements + r11 * 8 + 8]`
+(`x64_backend.Element`). Accesses of the same index one after another (`x[i] += dt * s[i]`)
+share R11 (`Emitter.scaled`, kept over the instructions that leave R11 alone). Elements
+that got no register are loaded to R9 from their slot, one load, and stay there for the
+next access of that Array.
+
+| Loop, instructions a turn | Before | After |
+| --- | --- | --- |
+| `x[i] += dt * s[i]` | 27 | 16 |
+| `lin_solve`'s relaxation | 47 | 36 |
+| `x[i] = x0[i]` (with the borrowed copy above) | 27 | 16 |
+| `advect` (with the backend items below) | 145 | 128 |
 
 NavierStokes' `lin_solve` runs 49 instructions a turn where it ran 68 (five accesses, four
 steps), and the benchmark at scale 20 2.69G instructions where it ran 3.29G. The clock
@@ -306,6 +335,22 @@ instruction in front of the unbox (the front block of a hoist) runs before `u` e
   a jump with no moves (a counted loop's latch, its poll taken in front) jumps straight to
   that jump's target on its true edge (`through`): one taken jump a turn where there were
   two.
+- **Additions next to counted accesses keep the count.** `d0[i0 + row1]` with the sum in
+  no register: the add ran in RAX, which holds the Array's count for the accesses around
+  it, so each of advect's four reads loaded the Array, its count and its elements again.
+  The add now runs in R8 while EAX holds a count (`cachedCount`), and the access takes its
+  index from the scratch register the add left it in (`r8Holds`, `raxHolds`) instead of
+  from the slot: 11 instructions a read where there were 15.
+- **A constant is stored from its immediate.** `p[i] = 0` wrote the constant to its slot
+  (two stores), loaded it and stored it; the fused store writes the immediate, and the
+  constant takes no slot (`countUses`).
+- **Results take the register of an operand that ends there.** `x64_regalloc.scan` prefers,
+  for the result of an add, a sub, a multiplication or a division, the register of an
+  operand whose interval ends at that instruction (the first operand's; the second's too
+  where the operands may change sides), so the operation runs in place; and for a
+  difference or a quotient it avoids the second operand's register, where the operation
+  has to go through a scratch register and back (`movapd xmm0, a; subsd xmm0, b; movapd b,
+  xmm0`). The hint an edge gives (a loop's parameter) still wins when its register is free.
 - **`mul.i32` tests for -0 out of line.** The product is taken from the second operand's
   register or slot (`imul eax, [slot]`); a zero product jumps to a piece after the blocks
   that ors the operands, still in their places, and leaves when that is negative, so a
